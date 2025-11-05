@@ -1,5 +1,11 @@
 use std::collections::HashMap;
 use tonic::{Request, Response, Status};
+use oci_distribution::{
+    client::{ClientConfig, Client, ImageData},
+    secrets::RegistryAuth,
+    Reference,
+};
+use std::path::PathBuf;
 
 use crate::proto::runtime::v1alpha2::{
     image_service_server::ImageService, Image, ImageStatusRequest, ImageStatusResponse,
@@ -12,14 +18,74 @@ use crate::proto::runtime::v1alpha2::{
 pub struct ImageServiceImpl {
     // 存储镜像信息的线程安全HashMap
     images: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Image>>>,
+    storage_path: PathBuf,
+    oci_client: oci_distribution::Client,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageMeta {
+    pub id: String,
+    pub repo_tags: Vec<String>,
+    pub size: u64,
 }
 
 impl ImageServiceImpl {
-    pub fn new() -> Self {
-        Self {
-            images: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+    pub fn new(storage_path: impl AsRef<Path>) ->  Result<Self> {
+        let storage_path = storage_path.as_ref().to_path_buf();
+
+        if !storage_path.exists() {
+            std::fs::create_dir_all(&storage_path).context("Failed to create storage directory")?;
         }
+
+        let client_config = oci_distribution::ClientConfig {
+            protocol: oci_distribution::client::ClientProtocol::Https,
+            ..Default::default()
+        };
+        let oci_client = oci_distribution::Client::new(client_config);
+        let images = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        
+        Ok(Self {
+            images,
+            storage_path,
+            oci_client,
+        })
     }
+
+    // 加载本地镜像
+     async fn load_local_images(&self) -> Result<()> {
+        let imaages_dir = self.storage_path.join("images");
+        if !imaages_dir.exists() {
+            return Ok(());
+        }
+
+        let mut images = self.images.lock().await;
+        for entry in std::fs::read_dir(imaages_dir).context("Failed to read images directory")? {
+            let entry = entry.context("Failed to read entry")?;
+
+            let meta_path = entry.path().join("metadata.json");
+            if !meta_path.exists() {
+                continue;
+            }
+
+            let meta_data = std::fs::read(meta_path).context("Failed to read metadata")?;
+            let meta: ImageMeta = serde_json::from_slice(&meta_data).context("Failed to parse metadata")?;
+
+            let path = entry.path();
+            if path.is_file() {
+                let image = Image {
+                    id: meta.id,
+                    repo_tags: meta.repo_tags,
+                    size: meta.size,
+                    // 待填充其他字段...
+                    ..Default::default()
+                };
+                for tag in meta.repo_tags {
+                    images.insert(tag.clone(), image.clone());
+                }
+            }
+        }
+        Ok(())
+     }
 }
 
 #[tonic::async_trait]
