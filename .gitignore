@@ -1,0 +1,19 @@
+# 构建产物
+/target
+
+# 编译输出
+/target/
+**/*.rs.bk
+
+# 日志文件
+*.log
+
+# 编辑器临时文件
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 本地配置文件
+/.env
+*.local

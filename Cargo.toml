@@ -1,0 +1,51 @@
+[package]
+name = "crius"
+version = "0.1.0"
+edition = "2021"
+authors = ["tdnorthgarden@gmail.com>"]
+description = "A Rust implementation of CRI API"
+license = "Apache-2.0"
+
+[lib]
+name = "crius"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crius"
+path = "src/main.rs"
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+
+# gRPC和Protocol Buffers
+tonic = { version = "0.8", features = ["tls", "tls-roots"] }
+prost = "0.11"
+prost-types = "0.11"
+
+# 日志和错误处理
+tracing = "0.1"
+tracing-subscriber = "0.3"
+thiserror = "1.0"
+anyhow = "1.0"
+
+# 配置管理
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.7"
+
+# 工具库
+lazy_static = "1.4"
+log = "0.4"
+nix = "0.25"
+clap = { version = "4.0", features = ["derive"] }
+tower = "0.4"
+
+
+[dev-dependencies]
+tempfile = "3.3"
+
+[build-dependencies]
+tonic-build = "0.12.3"
+
