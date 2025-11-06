@@ -109,16 +109,29 @@ impl ImageService for ImageServiceImpl {
         request: Request<ImageStatusRequest>,
     ) -> Result<Response<ImageStatusResponse>, Status> {
         let req = request.into_inner();
+        let image_spec = req.image.ok_or_else(|| Status::invalid_argument("Image not specified"))?;
+
         let images = self.images.lock().await;
         
-        if let Some(image) = images.get(&req.image.unwrap().image) {
+        // 尝试通过完整引用查找镜像
+        if let Some(image) = images.get(&image_spec.image) {
             Ok(Response::new(ImageStatusResponse {
                 image: Some(image.clone()),
                 info: HashMap::new(),
             }))
-        } else {
-            Err(Status::not_found("Image not found"))
         }
+
+        // 尝试通过ID查找
+        for image in images.values() {
+            if image.id.starts_with(&image_spec.image) {
+                Ok(Response::new(ImageStatusResponse {
+                    image: Some(image.clone()),
+                    info: HashMap::new(),
+                }));
+            }
+        }
+
+        Err(Status::not_found("Image not found"))
     }
 
     // 拉取镜像
