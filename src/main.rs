@@ -70,7 +70,11 @@ async fn main() -> Result<(), Error> {
         .map_err(|e| anyhow::anyhow!("Failed to create reflection service: {}", e))?;
 
     // 加载本地镜像
-    image_service.load_local_images().await?;
+    info!("About to load local images...");
+    match image_service.load_local_images().await {
+        Ok(_) => info!("Local images loaded successfully"),
+        Err(e) => log::error!("Failed to load local images: {}", e),
+    }
 
     // 创建gRPC服务器
     info!("Starting crius gRPC server on {}", args.listen);

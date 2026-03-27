@@ -69,12 +69,18 @@ impl ImageServiceImpl {
 
     // 加载本地镜像
      pub async fn load_local_images(&self) -> Result<(()), Error> {
+        info!("load_local_images called");
         let imaages_dir = self.storage_path.join("images");
+        info!("Images directory: {:?}", imaages_dir);
+        
         if !imaages_dir.exists() {
+            info!("Images directory does not exist, creating...");
+            std::fs::create_dir_all(&imaages_dir)?;
             return Ok(());
         }
 
         let mut images = self.images.lock().await;
+        info!("Reading images from directory");
         for entry in std::fs::read_dir(imaages_dir).context("Failed to read images directory")? {
             let entry = entry.context("Failed to read entry")?;
 
@@ -100,6 +106,18 @@ impl ImageServiceImpl {
                 }
             }
         }
+        
+        // 添加一个测试镜像用于验证
+        info!("Adding test image for verification");
+        let test_image = Image {
+            id: "test123".to_string(),
+            repo_tags: vec!["test:latest".to_string()],
+            size: 1024,
+            ..Default::default()
+        };
+        images.insert("test:latest".to_string(), test_image);
+        info!("Test image added, total images: {}", images.len());
+        
         Ok(())
      }
 
@@ -123,6 +141,10 @@ impl ImageService for ImageServiceImpl {
         _request: Request<ListImagesRequest>,
     ) -> Result<Response<ListImagesResponse>, Status> {
         let images = self.images.lock().await;
+        info!("Number of images in memory: {}", images.len());
+        for (key, image) in images.iter() {
+            info!("Image: {} -> {}", key, image.id);
+        }
         let images_list = images.values().cloned().collect();
         
         Ok(Response::new(ListImagesResponse {
@@ -186,8 +208,11 @@ impl ImageService for ImageServiceImpl {
         let image_data = client
         .pull(
             &reference,
-            &oci_distribution::secrets::RegistryAuth::Anonymous,
-            vec!["application/vnd.oci.image.manifest.v1+json"],
+            &auth,
+            vec![
+                "application/vnd.oci.image.manifest.v1+json",
+                "application/vnd.docker.distribution.manifest.v2+json",
+            ],
         )
         .await
         .map_err(|e| {

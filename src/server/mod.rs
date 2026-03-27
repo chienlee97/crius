@@ -46,6 +46,8 @@ use crate::proto::runtime::v1::{
 pub struct RuntimeServiceImpl {
     // 存储容器状态的线程安全HashMap
     containers: Arc<Mutex<HashMap<String, Container>>>,
+    // 存储Pod沙箱状态的线程安全HashMap
+    pod_sandboxes: Arc<Mutex<HashMap<String, crate::proto::runtime::v1::PodSandbox>>>,
     // 运行时配置
     config: RuntimeConfig,
 }
@@ -63,6 +65,7 @@ impl RuntimeServiceImpl {
     pub fn new(config: RuntimeConfig) -> Self {
         Self {
             containers: Arc::new(Mutex::new(HashMap::new())),
+            pod_sandboxes: Arc::new(Mutex::new(HashMap::new())),
             config,
         }
     }
@@ -93,6 +96,24 @@ impl RuntimeService for RuntimeServiceImpl {
         
         log::info!("Creating pod sandbox with ID: {}", pod_id);
         log::debug!("Pod config: {:?}", req.config);
+        
+        // 创建Pod沙箱元数据
+        let pod_sandbox = crate::proto::runtime::v1::PodSandbox {
+            id: pod_id.clone(),
+            metadata: req.config.clone().map(|c| c.metadata).flatten(),
+            state: PodSandboxState::SandboxReady as i32,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            labels: req.config.clone().map(|c| c.labels).unwrap_or_default(),
+            annotations: req.config.clone().map(|c| c.annotations).unwrap_or_default(),
+            ..Default::default()
+        };
+        
+        // 存储Pod沙箱信息
+        let mut pod_sandboxes = self.pod_sandboxes.lock().await;
+        pod_sandboxes.insert(pod_id.clone(), pod_sandbox);
         
         // 这里应该实现实际的Pod沙箱创建逻辑
         // 1. 创建网络命名空间
@@ -190,10 +211,18 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        // 实现获取运行时状态的逻辑
+        let mut info = HashMap::new();
+        info.insert("runtime_name".to_string(), "crius".to_string());
+        info.insert("runtime_version".to_string(), "0.1.0".to_string());
+        info.insert("runtime_api_version".to_string(), "v1".to_string());
+        info.insert("root_dir".to_string(), self.config.root_dir.to_string_lossy().to_string());
+        info.insert("runtime".to_string(), self.config.runtime.clone());
+        
         Ok(Response::new(StatusResponse {
-            status: None,
-            info: HashMap::new(),
+            status: Some(crate::proto::runtime::v1::RuntimeStatus {
+                conditions: Vec::new(),
+            }),
+            info,
         }))
     }
 
@@ -209,17 +238,36 @@ impl RuntimeService for RuntimeServiceImpl {
     // 获取pod_sandbox状态
     async fn pod_sandbox_status(
         &self,
-        _request: Request<PodSandboxStatusRequest>,
+        request: Request<PodSandboxStatusRequest>,
     ) -> Result<Response<PodSandboxStatusResponse>, Status> {
-        // 实现获取Pod沙箱状态的逻辑
-        Ok(Response::new(PodSandboxStatusResponse {
-            info: HashMap::new(),
-            status: None,
-            containers_statuses: Vec::new(),
-            timestamp: 0,
-            // 填充其他状态字段...
-            //..Default::default()
-        }))
+        let req = request.into_inner();
+        let pod_sandboxes = self.pod_sandboxes.lock().await;
+        
+        if let Some(pod_sandbox) = pod_sandboxes.get(&req.pod_sandbox_id) {
+            let mut info = HashMap::new();
+            info.insert("podSandboxId".to_string(), pod_sandbox.id.clone());
+            if let Some(metadata) = &pod_sandbox.metadata {
+                info.insert("name".to_string(), metadata.name.clone());
+            }
+            
+            let status = PodSandboxStatus {
+                state: pod_sandbox.state,
+                created_at: pod_sandbox.created_at,
+                ..Default::default()
+            };
+            
+            Ok(Response::new(PodSandboxStatusResponse {
+                status: Some(status),
+                info,
+                containers_statuses: Vec::new(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64,
+            }))
+        } else {
+            Err(Status::not_found("Pod sandbox not found"))
+        }
     }
 
     // 列出pod_sandbox
@@ -227,20 +275,57 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<ListPodSandboxRequest>,
     ) -> Result<Response<ListPodSandboxResponse>, Status> {
-        // 实现列出Pod沙箱的逻辑
+        let pod_sandboxes = self.pod_sandboxes.lock().await;
+        let items = pod_sandboxes.values().cloned().collect();
+        
         Ok(Response::new(ListPodSandboxResponse {
-            items: Vec::new(),
+            items,
         }))
     }
 
     // 创建容器
     async fn create_container(
         &self,
-        _request: Request<CreateContainerRequest>,
+        request: Request<CreateContainerRequest>,
     ) -> Result<Response<CreateContainerResponse>, Status> {
-        // 实现创建容器的逻辑
+        log::info!("CreateContainer called");
+        let req = request.into_inner();
+        let pod_sandbox_id = req.pod_sandbox_id.clone();
+        let config = req.config.ok_or_else(|| Status::invalid_argument("Container config not specified"))?;
+        
+        let container_id = format!("container-{}", uuid::Uuid::new_v4().to_string());
+        
+        log::info!("Creating container with ID: {}", container_id);
+        log::debug!("Container config: {:?}", config);
+        
+        // 创建容器元数据
+        let container = Container {
+            id: container_id.clone(),
+            pod_sandbox_id: pod_sandbox_id.clone(),
+            state: ContainerState::ContainerCreated as i32,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            labels: config.labels.clone(),
+            metadata: config.metadata.clone(),
+            image_ref: config.image.as_ref().map(|i| i.image.clone()).unwrap_or_default(),
+            ..Default::default()
+        };
+        
+        // 存储容器信息
+        let mut containers = self.containers.lock().await;
+        containers.insert(container_id.clone(), container);
+        log::info!("Container stored, total containers: {}", containers.len());
+        
+        // 这里应该实现实际的容器创建逻辑
+        // 1. 验证镜像存在
+        // 2. 创建容器根目录
+        // 3. 设置容器配置
+        // 4. 启动容器
+        
         Ok(Response::new(CreateContainerResponse {
-            container_id: "".to_string(),
+            container_id,
         }))
     }
 
