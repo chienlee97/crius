@@ -11,15 +11,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::process::Command;
 
-mod cni;
+pub mod cni;
 mod error;
 mod types;
 mod port_mapping;
+pub mod multi;
 
 pub use cni::CniManager;
 pub use error::NetworkError;
 pub use types::*;
 pub use port_mapping::{PortMappingManager, PortMapping, Protocol, PortMappingBackend};
+pub use multi::{MultiNetworkManager, MultiNetworkConfig, NetworkInterfaceStatus, PodNetworkStatus, NetworkSelector};
 
 /// 网络管理器接口
 #[async_trait]
