@@ -14,10 +14,12 @@ use tokio::process::Command;
 mod cni;
 mod error;
 mod types;
+mod port_mapping;
 
 pub use cni::CniManager;
 pub use error::NetworkError;
 pub use types::*;
+pub use port_mapping::{PortMappingManager, PortMapping, Protocol, PortMappingBackend};
 
 /// 网络管理器接口
 #[async_trait]

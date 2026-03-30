@@ -9,7 +9,8 @@ use log::{info, debug, error};
 use tokio::process::Command;
 
 use crate::runtime::{ContainerRuntime, ContainerConfig, ContainerStatus};
-use crate::network::{NetworkManager, DefaultNetworkManager, NetworkStatus};
+use crate::network::{NetworkManager, DefaultNetworkManager, NetworkStatus, PortMappingManager, PortMapping as NetworkPortMapping, Protocol, PortMappingBackend};
+use std::net::IpAddr;
 
 /// Pod沙箱配置
 #[derive(Debug, Clone)]
