@@ -10,6 +10,8 @@ pub mod network;
 pub mod oci;
 pub mod pod;
 pub mod runtime;
+pub mod rootless;
+pub mod security;
 pub mod server;
 pub mod storage;
 pub mod utils;

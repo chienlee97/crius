@@ -328,7 +328,19 @@ impl SecurityManager {
 
     /// 生成OCI Linux安全配置
     pub fn generate_oci_linux_config(&self, config: &SecurityConfig) -> crate::oci::spec::Linux {
-        let mut linux = crate::oci::spec::Linux::default();
+        let mut linux = crate::oci::spec::Linux {
+            namespaces: None,
+            uid_mappings: None,
+            gid_mappings: None,
+            devices: None,
+            cgroups_path: None,
+            resources: None,
+            rootfs_propagation: None,
+            seccomp: None,
+            sysctl: None,
+            mount_label: None,
+            intel_rdt: None,
+        };
 
         // 配置SELinux - 使用mount_label字段
         if let Some(ref selinux) = config.selinux {
