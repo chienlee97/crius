@@ -74,6 +74,11 @@ impl ContentStore {
             return Ok(hash);
         }
         
+        // 确保父目录存在
+        if let Some(parent) = blob_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        
         // 写入临时文件，然后原子重命名
         let temp_path = blob_path.with_extension("tmp");
         let mut file = fs::File::create(&temp_path)?;

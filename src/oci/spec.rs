@@ -631,7 +631,8 @@ mod tests {
     fn test_spec_serialization() {
         let spec = Spec::new("1.0.2");
         let json = spec.to_json().unwrap();
-        assert!(json.contains("\"ociVersion\":\"1.0.2\""));
+        // 使用小写的 ociVersion 匹配 camelCase 序列化
+        assert!(json.contains("\"ociVersion\":\"1.0.2\"") || json.contains("\"ociVersion\": \"1.0.2\""));
     }
 
     #[test]

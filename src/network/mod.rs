@@ -160,20 +160,27 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
+    #[ignore = "requires root privileges and iproute2"]  // 需要root权限运行ip netns
     async fn test_network_namespace() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = tempdir()?;
-        let ns_path = temp_dir.path().join("testns");
-        let ns_path_str = ns_path.to_str().unwrap();
-
         let manager = DefaultNetworkManager::new(None, None, None);
         
+        // 使用简单的命名空间名称（不是路径）
+        let ns_name = "crius-test-ns";
+        
         // 测试创建网络命名空间
-        manager.create_network_namespace(ns_path_str).await?;
-        assert!(ns_path.exists());
+        manager.create_network_namespace(ns_name).await?;
+        
+        // 验证命名空间存在（在 /var/run/netns/ 或 /run/netns/）
+        let ns_exists = std::path::Path::new("/run/netns").join(ns_name).exists() || 
+                       std::path::Path::new("/var/run/netns").join(ns_name).exists();
+        assert!(ns_exists, "Network namespace should exist");
 
         // 测试删除网络命名空间
-        manager.remove_network_namespace(ns_path_str).await?;
-        assert!(!ns_path.exists());
+        manager.remove_network_namespace(ns_name).await?;
+        
+        let ns_exists_after = std::path::Path::new("/run/netns").join(ns_name).exists() || 
+                              std::path::Path::new("/var/run/netns").join(ns_name).exists();
+        assert!(!ns_exists_after, "Network namespace should be deleted");
 
         Ok(())
     }
