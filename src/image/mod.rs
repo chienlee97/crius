@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::path::PathBuf;
 use std::io;
@@ -46,6 +46,23 @@ pub struct ImageMeta {
 }
 
 impl ImageServiceImpl {
+    fn normalize_image_id(id: &str) -> &str {
+        id.strip_prefix("sha256:").unwrap_or(id)
+    }
+
+    fn image_id_matches(image_id: &str, candidate: &str) -> bool {
+        if image_id == candidate {
+            return true;
+        }
+
+        let normalized_image_id = Self::normalize_image_id(image_id);
+        let normalized_candidate = Self::normalize_image_id(candidate);
+
+        normalized_image_id == normalized_candidate
+            || normalized_image_id.starts_with(normalized_candidate)
+            || normalized_candidate.starts_with(normalized_image_id)
+    }
+
     pub fn new(storage_path: impl AsRef<Path>) ->  Result<Self, Error> {
         let storage_path = storage_path.as_ref().to_path_buf();
 
@@ -490,11 +507,12 @@ impl ImageService for ImageServiceImpl {
     ) -> Result<Response<ImageStatusResponse>, Status> {
         let req = request.into_inner();
         let image_spec = req.image.ok_or_else(|| Status::invalid_argument("Image not specified"))?;
+        let requested_ref = image_spec.image;
 
         let images = self.images.lock().await;
         
         // 尝试通过完整引用查找镜像
-        if let Some(image) = images.get(&image_spec.image) {
+        if let Some(image) = images.get(&requested_ref) {
             return Ok(Response::new(ImageStatusResponse {
                 image: Some(image.clone()),
                 info: HashMap::new(),
@@ -503,7 +521,7 @@ impl ImageService for ImageServiceImpl {
 
         // 尝试通过ID查找
         for image in images.values() {
-            if image.id.starts_with(&image_spec.image) {
+            if Self::image_id_matches(&image.id, &requested_ref) {
                 return Ok(Response::new(ImageStatusResponse {
                     image: Some(image.clone()),
                     info: HashMap::new(),
@@ -644,37 +662,51 @@ impl ImageService for ImageServiceImpl {
         request: Request<RemoveImageRequest>,
     ) -> Result<Response<RemoveImageResponse>, Status> {
         let req = request.into_inner();
-        let mut images = self.images.lock().await;
         
         match req.image {
             Some(image_spec) => {
-                if let Some(image) = images.remove(&image_spec.image) {
-                    // 清理磁盘上的镜像文件
-                    let image_dir = self.storage_path.join("images").join(&image.id);
-                    if image_dir.exists() {
-                        info!("Removing image directory: {:?}", image_dir);
-                        if let Err(e) = tokio::fs::remove_dir_all(&image_dir).await {
-                            error!("Failed to remove image directory {:?}: {}", image_dir, e);
-                            // 即使磁盘清理失败，也返回成功，因为内存中的信息已经删除
+                let requested_ref = image_spec.image;
+
+                let image_ids_to_remove: Vec<String> = {
+                    let mut images = self.images.lock().await;
+
+                    if let Some(image) = images.remove(&requested_ref) {
+                        vec![image.id]
+                    } else {
+                        let matched_ids: HashSet<String> = images
+                            .values()
+                            .filter(|image| Self::image_id_matches(&image.id, &requested_ref))
+                            .map(|image| image.id.clone())
+                            .collect();
+
+                        if matched_ids.is_empty() {
+                            Vec::new()
                         } else {
-                            info!("Successfully removed image directory: {:?}", image_dir);
+                            // 按镜像 ID 删除所有别名/标签映射，避免残留脏数据
+                            images.retain(|_, image| !matched_ids.contains(&image.id));
+                            matched_ids.into_iter().collect()
                         }
                     }
-                    
-                    // 清理镜像元数据文件
-                    let metadata_path = self.storage_path.join("images").join(format!("{}.json", image.id));
-                    if metadata_path.exists() {
-                        info!("Removing image metadata: {:?}", metadata_path);
-                        if let Err(e) = tokio::fs::remove_file(&metadata_path).await {
-                            error!("Failed to remove image metadata {:?}: {}", metadata_path, e);
-                        } else {
-                            info!("Successfully removed image metadata: {:?}", metadata_path);
-                        }
-                    }
-                    
-                    Ok(Response::new(RemoveImageResponse {}))
-                } else {
+                };
+
+                if image_ids_to_remove.is_empty() {
                     Err(Status::not_found("Image not found"))
+                } else {
+                    for image_id in image_ids_to_remove {
+                        // 清理磁盘上的镜像文件（包含 metadata.json）
+                        let image_dir = self.storage_path.join("images").join(&image_id);
+                        if image_dir.exists() {
+                            info!("Removing image directory: {:?}", image_dir);
+                            if let Err(e) = tokio::fs::remove_dir_all(&image_dir).await {
+                                error!("Failed to remove image directory {:?}: {}", image_dir, e);
+                                // 即使磁盘清理失败，也返回成功，因为内存中的信息已经删除
+                            } else {
+                                info!("Successfully removed image directory: {:?}", image_dir);
+                            }
+                        }
+                    }
+
+                    Ok(Response::new(RemoveImageResponse {}))
                 }
             }
             None => {
