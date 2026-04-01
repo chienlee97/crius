@@ -7,12 +7,12 @@ use std::sync::Arc;
 use anyhow::Context;
 use tonic::{Request, Response, Status};
 use oci_distribution::{
-    client::{ClientConfig, Client, ImageData},
     secrets::RegistryAuth,
     Reference,
 };
-use log::{info, error};
+use log::{info, warn, error};
 use serde::{Serialize, Deserialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::error::Error;
@@ -68,7 +68,7 @@ impl ImageServiceImpl {
     }
 
     // 加载本地镜像
-     pub async fn load_local_images(&self) -> Result<(()), Error> {
+     pub async fn load_local_images(&self) -> Result<(), Error> {
         info!("load_local_images called");
         let imaages_dir = self.storage_path.join("images");
         info!("Images directory: {:?}", imaages_dir);
@@ -93,7 +93,7 @@ impl ImageServiceImpl {
             let meta: ImageMeta = serde_json::from_slice(&meta_data).context("Failed to parse metadata")?;
 
             let path = entry.path();
-            if path.is_file() {
+            if path.is_dir() {
                 let image = Image {
                     id: meta.id.clone(),
                     repo_tags: meta.repo_tags.clone(),
@@ -121,6 +121,64 @@ impl ImageServiceImpl {
         Ok(())
      }
 
+    async fn find_local_image(&self, image_ref: &str) -> Option<Image> {
+        {
+            let images = self.images.lock().await;
+            if let Some(image) = images.get(image_ref) {
+                return Some(image.clone());
+            }
+        }
+
+        let images_dir = self.storage_path.join("images");
+        if !images_dir.exists() {
+            return None;
+        }
+
+        let entries = match std::fs::read_dir(&images_dir) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to read images directory {:?}: {}", images_dir, e);
+                return None;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let meta_path = entry.path().join("metadata.json");
+            if !meta_path.exists() {
+                continue;
+            }
+            let meta_data = match std::fs::read(&meta_path) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Failed to read image metadata {:?}: {}", meta_path, e);
+                    continue;
+                }
+            };
+            let meta: ImageMeta = match serde_json::from_slice(&meta_data) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Failed to parse image metadata {:?}: {}", meta_path, e);
+                    continue;
+                }
+            };
+            if meta.repo_tags.iter().any(|tag| tag == image_ref) {
+                let image = Image {
+                    id: meta.id.clone(),
+                    repo_tags: meta.repo_tags.clone(),
+                    size: meta.size,
+                    ..Default::default()
+                };
+                let mut images = self.images.lock().await;
+                for tag in &meta.repo_tags {
+                    images.insert(tag.clone(), image.clone());
+                }
+                return Some(image);
+            }
+        }
+
+        None
+    }
+
      // 保存镜像元数据
      async fn save_image_metadata(&self, image: &CriusImage) -> Result<(), Error> {
         let meta_path = self.storage_path.join("images").join(&image.id).join("metadata.json");
@@ -131,6 +189,290 @@ impl ImageServiceImpl {
         std::fs::write(meta_path, meta_data).context("Failed to write metadata")?;
         Ok(())
      }
+
+    fn parse_bearer_challenge(header: &str) -> Option<(String, Option<String>)> {
+        let raw = header.trim();
+        if !raw.to_ascii_lowercase().starts_with("bearer ") {
+            return None;
+        }
+        let fields = &raw[7..];
+        let mut realm: Option<String> = None;
+        let mut service: Option<String> = None;
+        for part in fields.split(',') {
+            let mut kv = part.trim().splitn(2, '=');
+            let key = kv.next()?.trim();
+            let value = kv.next()?.trim().trim_matches('"').to_string();
+            match key {
+                "realm" => realm = Some(value),
+                "service" => service = Some(value),
+                _ => {}
+            }
+        }
+        realm.map(|r| (r, service))
+    }
+
+    fn manifest_url(reference: &Reference) -> String {
+        if let Some(digest) = reference.digest() {
+            format!(
+                "https://{}/v2/{}/manifests/{}",
+                reference.resolve_registry(),
+                reference.repository(),
+                digest
+            )
+        } else {
+            format!(
+                "https://{}/v2/{}/manifests/{}",
+                reference.resolve_registry(),
+                reference.repository(),
+                reference.tag().unwrap_or("latest")
+            )
+        }
+    }
+
+    async fn pull_via_registry_api(
+        &self,
+        reference: &Reference,
+        auth: &RegistryAuth,
+    ) -> Result<(String, u64, Vec<Vec<u8>>), Status> {
+        info!(
+            "Using registry API pull flow for {}",
+            reference
+        );
+        let http = reqwest::Client::new();
+        let ping_url = format!("https://{}/v2/", reference.resolve_registry());
+        info!("Registry ping: {}", ping_url);
+        let ping = http
+            .get(&ping_url)
+            .send()
+            .await
+            .map_err(|e| Status::internal(format!("registry ping failed: {}", e)))?;
+
+        let mut token: Option<String> = None;
+        if ping.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let challenge = ping
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|h| h.to_str().ok())
+                .ok_or_else(|| Status::internal("missing WWW-Authenticate header"))?;
+            let (realm, service) = Self::parse_bearer_challenge(challenge)
+                .ok_or_else(|| Status::internal("invalid bearer challenge"))?;
+            let scope = format!("repository:{}:pull", reference.repository());
+            info!(
+                "Requesting bearer token, scope={}",
+                scope
+            );
+            let mut token_req = http.get(&realm).query(&[("scope", scope.as_str())]);
+            if let Some(s) = service.as_deref() {
+                token_req = token_req.query(&[("service", s)]);
+            }
+            if let RegistryAuth::Basic(username, password) = auth {
+                token_req = token_req.basic_auth(username, Some(password));
+            }
+            let token_resp = token_req
+                .send()
+                .await
+                .map_err(|e| Status::internal(format!("token request failed: {}", e)))?;
+            if !token_resp.status().is_success() {
+                let status = token_resp.status();
+                let text = token_resp.text().await.unwrap_or_default();
+                return Err(Status::internal(format!(
+                    "token request failed: {} {}",
+                    status,
+                    text
+                )));
+            }
+            let token_json: serde_json::Value = token_resp
+                .json()
+                .await
+                .map_err(|e| Status::internal(format!("invalid token response: {}", e)))?;
+            token = token_json
+                .get("token")
+                .or_else(|| token_json.get("access_token"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+
+        let manifest_url = Self::manifest_url(reference);
+        info!("Fetching manifest: {}", manifest_url);
+        let mut manifest_req = http.get(&manifest_url).header(
+            reqwest::header::ACCEPT,
+            "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json",
+        );
+        if let Some(t) = token.as_deref() {
+            manifest_req = manifest_req.bearer_auth(t);
+        }
+        let manifest_resp = manifest_req
+            .send()
+            .await
+            .map_err(|e| Status::internal(format!("manifest request failed: {}", e)))?;
+        if !manifest_resp.status().is_success() {
+            let status = manifest_resp.status();
+            let text = manifest_resp.text().await.unwrap_or_default();
+            return Err(Status::internal(format!(
+                "manifest request failed: {} {}",
+                status,
+                text
+            )));
+        }
+        let digest = manifest_resp
+            .headers()
+            .get("Docker-Content-Digest")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        let manifest_bytes = manifest_resp
+            .bytes()
+            .await
+            .map_err(|e| Status::internal(format!("read manifest failed: {}", e)))?;
+        let mut manifest_json: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| Status::internal(format!("parse manifest failed: {}", e)))?;
+        let mut effective_digest = digest;
+
+        if manifest_json.get("layers").and_then(|v| v.as_array()).is_none() {
+            let target_arch = match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                "loongarch64" => "loong64",
+                other => other,
+            };
+            let manifests = manifest_json
+                .get("manifests")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| Status::internal("manifest index missing manifests"))?;
+            let selected = manifests.iter().find(|m| {
+                let os = m
+                    .get("platform")
+                    .and_then(|p| p.get("os"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let arch = m
+                    .get("platform")
+                    .and_then(|p| p.get("architecture"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                os == "linux" && arch == target_arch
+            });
+            let selected_digest = if let Some(entry) = selected {
+                entry
+                    .get("digest")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| Status::internal("selected manifest missing digest"))?
+            } else {
+                manifests
+                    .first()
+                    .and_then(|m| m.get("digest"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| Status::internal("manifest index has no usable digest"))?
+            };
+            info!(
+                "Manifest index detected, selected child manifest digest={} (arch={})",
+                selected_digest, target_arch
+            );
+
+            let child_url = format!(
+                "https://{}/v2/{}/manifests/{}",
+                reference.resolve_registry(),
+                reference.repository(),
+                selected_digest
+            );
+            let mut child_req = http.get(child_url).header(
+                reqwest::header::ACCEPT,
+                "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json",
+            );
+            if let Some(t) = token.as_deref() {
+                child_req = child_req.bearer_auth(t);
+            }
+            let child_resp = child_req
+                .send()
+                .await
+                .map_err(|e| Status::internal(format!("child manifest request failed: {}", e)))?;
+            if !child_resp.status().is_success() {
+                let status = child_resp.status();
+                let text = child_resp.text().await.unwrap_or_default();
+                return Err(Status::internal(format!(
+                    "child manifest request failed: {} {}",
+                    status, text
+                )));
+            }
+            effective_digest = child_resp
+                .headers()
+                .get("Docker-Content-Digest")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string())
+                .or_else(|| Some(selected_digest.to_string()));
+            let child_bytes = child_resp
+                .bytes()
+                .await
+                .map_err(|e| Status::internal(format!("read child manifest failed: {}", e)))?;
+            manifest_json = serde_json::from_slice(&child_bytes)
+                .map_err(|e| Status::internal(format!("parse child manifest failed: {}", e)))?;
+        }
+
+        let layers = manifest_json
+            .get("layers")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| Status::internal("manifest missing layers"))?;
+
+        let mut total_size: u64 = 0;
+        let mut layer_data: Vec<Vec<u8>> = Vec::new();
+        info!("Start downloading {} layers", layers.len());
+        for (idx, layer) in layers.iter().enumerate() {
+            let layer_digest = layer
+                .get("digest")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Status::internal("layer missing digest"))?;
+            info!(
+                "Downloading layer {}/{}: {}",
+                idx + 1,
+                layers.len(),
+                layer_digest
+            );
+            let blob_url = format!(
+                "https://{}/v2/{}/blobs/{}",
+                reference.resolve_registry(),
+                reference.repository(),
+                layer_digest
+            );
+            let mut blob_req = http.get(blob_url);
+            if let Some(t) = token.as_deref() {
+                blob_req = blob_req.bearer_auth(t);
+            }
+            let blob_resp = blob_req
+                .send()
+                .await
+                .map_err(|e| Status::internal(format!("blob request failed: {}", e)))?;
+            if !blob_resp.status().is_success() {
+                let status = blob_resp.status();
+                let text = blob_resp.text().await.unwrap_or_default();
+                return Err(Status::internal(format!(
+                    "blob request failed: {} {}",
+                    status,
+                    text
+                )));
+            }
+            let bytes = blob_resp
+                .bytes()
+                .await
+                .map_err(|e| Status::internal(format!("read blob failed: {}", e)))?
+                .to_vec();
+            total_size += bytes.len() as u64;
+            layer_data.push(bytes);
+            info!(
+                "Layer {}/{} downloaded, size={} bytes, total={} bytes",
+                idx + 1,
+                layers.len(),
+                layer_data.last().map(|v| v.len()).unwrap_or(0),
+                total_size
+            );
+        }
+
+        let image_id = if let Some(d) = effective_digest {
+            d
+        } else {
+            format!("sha256:{:x}", Sha256::digest(&manifest_bytes))
+        };
+
+        Ok((image_id, total_size, layer_data))
+    }
 }
 
 #[tonic::async_trait]
@@ -202,69 +544,100 @@ impl ImageService for ImageServiceImpl {
         })?;
 
         info!("Pulling image: {}", image_spec.image);
+        info!("Checking whether image exists locally: {}", image_spec.image);
+        if let Some(existing_image) = self.find_local_image(&image_spec.image).await {
+            info!(
+                "Image already exists locally: {} -> {}",
+                image_spec.image, existing_image.id
+            );
+            return Ok(Response::new(PullImageResponse {
+                image_ref: existing_image.id,
+            }));
+        }
+        info!("Local image not found, start remote pull: {}", image_spec.image);
 
-        // 拉取镜像
+        // 拉取镜像（优先 OCI 库，失败时走标准 Registry API）
         let mut client = self.oci_client.lock().await;
-        let image_data = client
-        .pull(
-            &reference,
-            &auth,
-            vec![
-                "application/vnd.oci.image.manifest.v1+json",
-                "application/vnd.docker.distribution.manifest.v2+json",
-            ],
-        )
-        .await
-        .map_err(|e| {
-            error!("Failed to pull image {}: {}", reference, e);
-            Status::internal(format!("Failed to pull image: {}", e))
-        })?;
-        
-        // 生成镜像ID
-        let image_id = format!("sha256:{}", &image_data.digest.expect("Digest should be present").replace("sha256:", "")[..12]);
+        let pull_result = client
+            .pull(
+                &reference,
+                &auth,
+                vec![
+                    "application/vnd.oci.image.manifest.v1+json",
+                    "application/vnd.docker.distribution.manifest.v2+json",
+                ],
+            )
+            .await;
+        drop(client);
 
-        let image = Image {
-            id: image_id.clone(),
-            repo_tags: vec![image_spec.image.clone()],
-            size: 0,
-            // 填充其他字段...
-            ..Default::default()
+        let (image_id, image_size, layers_to_persist) = match pull_result {
+            Ok(image_data) => {
+                let digest = image_data.digest.unwrap_or_else(|| "sha256:unknown".to_string());
+                let short = digest.replace("sha256:", "");
+                let id = format!("sha256:{}", &short[..short.len().min(12)]);
+                info!(
+                    "OCI library pull succeeded for {}, layers={}",
+                    image_spec.image,
+                    image_data.layers.len()
+                );
+                let layers = image_data
+                    .layers
+                    .into_iter()
+                    .map(|l| l.data)
+                    .collect::<Vec<Vec<u8>>>();
+                (id, 0, layers)
+            }
+            Err(e) => {
+                let err_text = e.to_string();
+                if err_text.contains("application/vnd.docker.distribution.manifest.list.v2+json")
+                    || err_text.contains("application/vnd.oci.image.index.v1+json")
+                {
+                    info!(
+                        "OCI pull returned manifest index for {}, using registry api fallback: {}",
+                        reference, err_text
+                    );
+                } else {
+                    warn!(
+                        "OCI pull failed for {}, fallback to registry api: {}",
+                        reference, err_text
+                    );
+                }
+                self.pull_via_registry_api(&reference, &auth).await?
+            }
         };
 
-        // 创建镜像存储位置
         let image_dir = self.storage_path.join("images").join(&image_id);
         std::fs::create_dir_all(&image_dir)
-            .map_err(|e: io::Error| {
-                error!("Failed to create image directory: {}", e);
-                tonic::Status::internal(format!("Failed to create image directory: {}", e))
-            })?;
-        
-        // 保存镜像层
-        for (i, layer) in image_data.layers.iter().enumerate() {
+            .map_err(|e: io::Error| Status::internal(format!("Failed to create image directory: {}", e)))?;
+        info!(
+            "Persisting {} layers to {:?}",
+            layers_to_persist.len(),
+            image_dir
+        );
+        for (i, layer) in layers_to_persist.iter().enumerate() {
             let layer_path = image_dir.join(format!("{}.tar.gz", i));
-            std::fs::write(&layer_path, &layer.data)
-            .map_err(|e: io::Error| {
-                error!("Failed to write layer: {}", e);
-                tonic::Status::internal(format!("Failed to write layer: {}", e))
-            })?;
+            std::fs::write(&layer_path, layer)
+                .map_err(|e: io::Error| Status::internal(format!("Failed to write layer: {}", e)))?;
+            info!("Saved layer {} to {:?}", i, layer_path);
         }
 
-        // 保存镜像配置
-        // let config_path = image_dir.join("config.json");
-        // std::fs::write(&config_path, serde_json::to_vec(&image_data).context("Failed to write config")?).context("Failed to write config")?;
-        
         // 保存镜像元数据
         self.save_image_metadata(&CriusImage {
             id: image_id.clone(),
             repo_tags: vec![image_spec.image.clone()],
-            size: 0,
-            // 填充其他字段...
-            // ..Default::default()
+            size: image_size,
         }).await.map_err(|e| {
             error!("Failed to save image metadata: {}", e);
             Status::internal(format!("Failed to save image metadata: {}", e))
         })?;
-        
+
+        let image = Image {
+            id: image_id.clone(),
+            repo_tags: vec![image_spec.image.clone()],
+            size: image_size,
+            ..Default::default()
+        };
+
         // 更新内存中镜像数据
         let mut images = self.images.lock().await;
         images.insert(image_spec.image, image);
@@ -294,9 +667,12 @@ impl ImageService for ImageServiceImpl {
     // 获取镜像文件信息
     async fn image_fs_info(
         &self,
-        request: Request<ImageFsInfoRequest>,
+        _request: Request<ImageFsInfoRequest>,
     ) -> Result<Response<ImageFsInfoResponse>, Status> {
-        Err(Status::not_found("Image not found"))
+        Ok(Response::new(ImageFsInfoResponse {
+            image_filesystems: Vec::new(),
+            container_filesystems: Vec::new(),
+        }))
     }
 }
 

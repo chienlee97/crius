@@ -393,6 +393,7 @@ dependencies = [
  "prost-build",
  "prost-types",
  "rand",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_derive",
