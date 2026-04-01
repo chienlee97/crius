@@ -57,6 +57,7 @@ tower = "0.4"
 oci-distribution = "0.8.0"
 rand = "0.8.0"
 uuid = { version = "0.8", features = ["v4"] }
+reqwest = { version = "0.11", features = ["json"] }
 
 # 状态持久化
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
