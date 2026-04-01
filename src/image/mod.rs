@@ -107,17 +107,6 @@ impl ImageServiceImpl {
             }
         }
         
-        // 添加一个测试镜像用于验证
-        info!("Adding test image for verification");
-        let test_image = Image {
-            id: "test123".to_string(),
-            repo_tags: vec!["test:latest".to_string()],
-            size: 1024,
-            ..Default::default()
-        };
-        images.insert("test:latest".to_string(), test_image);
-        info!("Test image added, total images: {}", images.len());
-        
         Ok(())
      }
 
@@ -657,10 +646,41 @@ impl ImageService for ImageServiceImpl {
         let req = request.into_inner();
         let mut images = self.images.lock().await;
         
-        if images.remove(&req.image.unwrap().image).is_some() {
-            Ok(Response::new(RemoveImageResponse {}))
-        } else {
-            Err(Status::not_found("Image not found"))
+        match req.image {
+            Some(image_spec) => {
+                if let Some(image) = images.remove(&image_spec.image) {
+                    // 清理磁盘上的镜像文件
+                    let image_dir = self.storage_path.join("images").join(&image.id);
+                    if image_dir.exists() {
+                        info!("Removing image directory: {:?}", image_dir);
+                        if let Err(e) = tokio::fs::remove_dir_all(&image_dir).await {
+                            error!("Failed to remove image directory {:?}: {}", image_dir, e);
+                            // 即使磁盘清理失败，也返回成功，因为内存中的信息已经删除
+                        } else {
+                            info!("Successfully removed image directory: {:?}", image_dir);
+                        }
+                    }
+                    
+                    // 清理镜像元数据文件
+                    let metadata_path = self.storage_path.join("images").join(format!("{}.json", image.id));
+                    if metadata_path.exists() {
+                        info!("Removing image metadata: {:?}", metadata_path);
+                        if let Err(e) = tokio::fs::remove_file(&metadata_path).await {
+                            error!("Failed to remove image metadata {:?}: {}", metadata_path, e);
+                        } else {
+                            info!("Successfully removed image metadata: {:?}", metadata_path);
+                        }
+                    }
+                    
+                    Ok(Response::new(RemoveImageResponse {}))
+                } else {
+                    Err(Status::not_found("Image not found"))
+                }
+            }
+            None => {
+                // 如果没有指定镜像，返回成功而不是错误
+                Ok(Response::new(RemoveImageResponse {}))
+            }
         }
     }
 
