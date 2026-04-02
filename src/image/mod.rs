@@ -235,6 +235,54 @@ impl ImageServiceImpl {
         }
     }
 
+    fn apply_basic_auth(
+        builder: reqwest::RequestBuilder,
+        auth: &RegistryAuth,
+    ) -> reqwest::RequestBuilder {
+        match auth {
+            RegistryAuth::Basic(username, password) => builder.basic_auth(username, Some(password)),
+            RegistryAuth::Anonymous => builder,
+        }
+    }
+
+    async fn request_bearer_token(
+        http: &reqwest::Client,
+        challenge: &str,
+        reference: &Reference,
+        auth: &RegistryAuth,
+    ) -> Result<Option<String>, Status> {
+        let (realm, service) = Self::parse_bearer_challenge(challenge)
+            .ok_or_else(|| Status::internal("invalid bearer challenge"))?;
+        let scope = format!("repository:{}:pull", reference.repository());
+        info!("Requesting bearer token, scope={}", scope);
+        let mut token_req = http.get(&realm).query(&[("scope", scope.as_str())]);
+        if let Some(s) = service.as_deref() {
+            token_req = token_req.query(&[("service", s)]);
+        }
+        token_req = Self::apply_basic_auth(token_req, auth);
+        let token_resp = token_req
+            .send()
+            .await
+            .map_err(|e| Status::internal(format!("token request failed: {}", e)))?;
+        if !token_resp.status().is_success() {
+            let status = token_resp.status();
+            let text = token_resp.text().await.unwrap_or_default();
+            return Err(Status::internal(format!(
+                "token request failed: {} {}",
+                status, text
+            )));
+        }
+        let token_json: serde_json::Value = token_resp
+            .json()
+            .await
+            .map_err(|e| Status::internal(format!("invalid token response: {}", e)))?;
+        Ok(token_json
+            .get("token")
+            .or_else(|| token_json.get("access_token"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()))
+    }
+
     async fn pull_via_registry_api(
         &self,
         reference: &Reference,
@@ -247,8 +295,7 @@ impl ImageServiceImpl {
         let http = reqwest::Client::new();
         let ping_url = format!("https://{}/v2/", reference.resolve_registry());
         info!("Registry ping: {}", ping_url);
-        let ping = http
-            .get(&ping_url)
+        let ping = Self::apply_basic_auth(http.get(&ping_url), auth)
             .send()
             .await
             .map_err(|e| Status::internal(format!("registry ping failed: {}", e)))?;
@@ -260,64 +307,47 @@ impl ImageServiceImpl {
                 .get(reqwest::header::WWW_AUTHENTICATE)
                 .and_then(|h| h.to_str().ok())
                 .ok_or_else(|| Status::internal("missing WWW-Authenticate header"))?;
-            let (realm, service) = Self::parse_bearer_challenge(challenge)
-                .ok_or_else(|| Status::internal("invalid bearer challenge"))?;
-            let scope = format!("repository:{}:pull", reference.repository());
-            info!(
-                "Requesting bearer token, scope={}",
-                scope
-            );
-            let mut token_req = http.get(&realm).query(&[("scope", scope.as_str())]);
-            if let Some(s) = service.as_deref() {
-                token_req = token_req.query(&[("service", s)]);
-            }
-            if let RegistryAuth::Basic(username, password) = auth {
-                token_req = token_req.basic_auth(username, Some(password));
-            }
-            let token_resp = token_req
-                .send()
-                .await
-                .map_err(|e| Status::internal(format!("token request failed: {}", e)))?;
-            if !token_resp.status().is_success() {
-                let status = token_resp.status();
-                let text = token_resp.text().await.unwrap_or_default();
-                return Err(Status::internal(format!(
-                    "token request failed: {} {}",
-                    status,
-                    text
-                )));
-            }
-            let token_json: serde_json::Value = token_resp
-                .json()
-                .await
-                .map_err(|e| Status::internal(format!("invalid token response: {}", e)))?;
-            token = token_json
-                .get("token")
-                .or_else(|| token_json.get("access_token"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            token = Self::request_bearer_token(&http, challenge, reference, auth).await?;
         }
 
         let manifest_url = Self::manifest_url(reference);
         info!("Fetching manifest: {}", manifest_url);
-        let mut manifest_req = http.get(&manifest_url).header(
+        let mut manifest_req = Self::apply_basic_auth(http.get(&manifest_url), auth).header(
             reqwest::header::ACCEPT,
             "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json",
         );
         if let Some(t) = token.as_deref() {
             manifest_req = manifest_req.bearer_auth(t);
         }
-        let manifest_resp = manifest_req
+        let mut manifest_resp = manifest_req
             .send()
             .await
             .map_err(|e| Status::internal(format!("manifest request failed: {}", e)))?;
+        if manifest_resp.status() == reqwest::StatusCode::UNAUTHORIZED && token.is_none() {
+            let challenge = manifest_resp
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|h| h.to_str().ok())
+                .ok_or_else(|| Status::internal("missing WWW-Authenticate header"))?;
+            token = Self::request_bearer_token(&http, challenge, reference, auth).await?;
+            let mut retry_manifest_req = Self::apply_basic_auth(http.get(&manifest_url), auth).header(
+                reqwest::header::ACCEPT,
+                "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json",
+            );
+            if let Some(t) = token.as_deref() {
+                retry_manifest_req = retry_manifest_req.bearer_auth(t);
+            }
+            manifest_resp = retry_manifest_req
+                .send()
+                .await
+                .map_err(|e| Status::internal(format!("manifest request failed: {}", e)))?;
+        }
         if !manifest_resp.status().is_success() {
             let status = manifest_resp.status();
             let text = manifest_resp.text().await.unwrap_or_default();
             return Err(Status::internal(format!(
                 "manifest request failed: {} {}",
-                status,
-                text
+                status, text
             )));
         }
         let digest = manifest_resp
@@ -380,7 +410,7 @@ impl ImageServiceImpl {
                 reference.repository(),
                 selected_digest
             );
-            let mut child_req = http.get(child_url).header(
+            let mut child_req = Self::apply_basic_auth(http.get(child_url), auth).header(
                 reqwest::header::ACCEPT,
                 "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json",
             );
@@ -438,7 +468,7 @@ impl ImageServiceImpl {
                 reference.repository(),
                 layer_digest
             );
-            let mut blob_req = http.get(blob_url);
+            let mut blob_req = Self::apply_basic_auth(http.get(blob_url), auth);
             if let Some(t) = token.as_deref() {
                 blob_req = blob_req.bearer_auth(t);
             }
@@ -549,7 +579,6 @@ impl ImageService for ImageServiceImpl {
         let reference: Reference = image_spec.image.parse().map_err(|e| {
             Status::invalid_argument(format!("Invalid image reference: {}", e))
         })?;
-
         info!("Pulling image: {}", image_spec.image);
         info!("Checking whether image exists locally: {}", image_spec.image);
         if let Some(existing_image) = self.find_local_image(&image_spec.image).await {
