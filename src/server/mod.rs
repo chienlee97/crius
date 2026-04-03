@@ -227,23 +227,24 @@ impl RuntimeServiceImpl {
             Ok(containers) => {
                 let mut memory_containers = self.containers.lock().await;
                 for (id, _status, record) in containers {
-                    // 从记录重建容器元数据
-                    let container = Container {
-                        id: id.clone(),
-                        pod_sandbox_id: record.pod_id,
-                        state: match record.state.as_str() {
-                            "created" => ContainerState::ContainerCreated as i32,
-                            "running" => ContainerState::ContainerRunning as i32,
-                            "stopped" => ContainerState::ContainerExited as i32,
-                            _ => ContainerState::ContainerCreated as i32,
-                        },
-                        created_at: record.created_at,
+                    // 从command字段解析容器名称（因为ContainerRecord没有name字段）
+                    let container_name = record.command.split_whitespace().next().unwrap_or("unknown");
+                    
+                    let container = crate::proto::runtime::v1::Container {
+                        id: record.id.clone(),
+                        metadata: Some(crate::proto::runtime::v1::ContainerMetadata {
+                            name: container_name.to_string(),
+                            attempt: 1, // ContainerRecord没有attempt字段，使用默认值
+                        }),
+                        state: ContainerState::ContainerCreated as i32,
                         image_ref: record.image,
                         labels: serde_json::from_str(&record.labels).unwrap_or_default(),
                         annotations: serde_json::from_str(&record.annotations).unwrap_or_default(),
+                        created_at: record.created_at,
                         ..Default::default()
                     };
-                    memory_containers.insert(id, container);
+                    log::info!("Recovered container: {} with name {}", record.id, container_name);
+                    memory_containers.insert(record.id, container);
                 }
                 log::info!("Recovered {} containers from database", memory_containers.len());
             }
@@ -269,6 +270,7 @@ impl RuntimeServiceImpl {
                         annotations: serde_json::from_str(&record.annotations).unwrap_or_default(),
                         ..Default::default()
                     };
+                    log::info!("Recovered pod: {} with state {}", record.id, record.state);
                     memory_pods.insert(record.id, pod);
                 }
                 log::info!("Recovered {} pod sandboxes from database", memory_pods.len());
@@ -479,9 +481,20 @@ impl RuntimeService for RuntimeServiceImpl {
         let container_id = req.container_id;
         let containers = self.containers.lock().await;
         
-        if let Some(container) = containers.get(&container_id) {
+        // 支持短ID匹配
+        let found_container_id = if containers.contains_key(&container_id) {
+            Some(container_id.clone())
+        } else {
+            // 尝试前缀匹配（支持短ID）
+            containers.keys()
+                .find(|full_id| full_id.starts_with(&container_id))
+                .cloned()
+        };
+        
+        if let Some(actual_container_id) = found_container_id {
+            if let Some(container) = containers.get(&actual_container_id) {
             // 查询runtime获取实时状态
-            let runtime_state = match self.runtime.container_status(&container_id) {
+            let runtime_state = match self.runtime.container_status(&actual_container_id) {
                 Ok(status) => match status {
                     ContainerStatus::Created => ContainerState::ContainerCreated,
                     ContainerStatus::Running => ContainerState::ContainerRunning,
@@ -513,6 +526,9 @@ impl RuntimeService for RuntimeServiceImpl {
                 status: Some(status),
                 ..Default::default()
             }))
+            } else {
+                Err(Status::not_found("Container not found"))
+            }
         } else {
             Err(Status::not_found("Container not found"))
         }
@@ -970,25 +986,42 @@ impl RuntimeService for RuntimeServiceImpl {
         
         log::info!("Starting container {}", container_id);
 
-        // 检查容器是否存在
+        // 检查容器是否存在 - 支持短ID匹配
         let containers = self.containers.lock().await;
-        if !containers.contains_key(&container_id) {
-            return Err(Status::not_found("Container not found"));
-        }
+        log::info!("Current containers in memory: {:?}", containers.keys().collect::<Vec<_>>());
+        
+        // 尝试精确匹配
+        let found_container_id = if containers.contains_key(&container_id) {
+            Some(container_id.clone())
+        } else {
+            // 尝试前缀匹配（支持短ID）
+            containers.keys()
+                .find(|full_id| full_id.starts_with(&container_id))
+                .cloned()
+        };
+        
+        let actual_container_id = match found_container_id {
+            Some(id) => id,
+            None => {
+                log::error!("Container {} not found in memory. Available containers: {:?}", 
+                           container_id, containers.keys().collect::<Vec<_>>());
+                return Err(Status::not_found("Container not found"));
+            }
+        };
         drop(containers);
 
         // 调用runtime启动容器
         let runtime = self.runtime.clone();
-        let container_id_clone = container_id.clone();
+        let actual_container_id_clone = actual_container_id.clone();
         tokio::task::spawn_blocking(move || {
-            runtime.start_container(&container_id_clone)
+            runtime.start_container(&actual_container_id_clone)
         }).await
         .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
         .map_err(|e| Status::internal(format!("Failed to start container: {}", e)))?;
 
         // 更新容器状态到内存
         let mut containers = self.containers.lock().await;
-        if let Some(container) = containers.get_mut(&container_id) {
+        if let Some(container) = containers.get_mut(&actual_container_id) {
             container.state = ContainerState::ContainerRunning as i32;
         }
         drop(containers);
@@ -996,7 +1029,7 @@ impl RuntimeService for RuntimeServiceImpl {
         // 更新持久化状态
         let mut persistence = self.persistence.lock().await;
         if let Err(e) = persistence.update_container_state(
-            &container_id,
+            &actual_container_id,
             crate::runtime::ContainerStatus::Running,
         ) {
             log::error!("Failed to update container {} state in database: {}", container_id, e);
@@ -1017,18 +1050,37 @@ impl RuntimeService for RuntimeServiceImpl {
         
         log::info!("Stopping container {}", container_id);
 
+        // 支持短ID匹配
+        let containers = self.containers.lock().await;
+        let found_container_id = if containers.contains_key(&container_id) {
+            Some(container_id.clone())
+        } else {
+            // 尝试前缀匹配（支持短ID）
+            containers.keys()
+                .find(|full_id| full_id.starts_with(&container_id))
+                .cloned()
+        };
+        drop(containers);
+        
+        let actual_container_id = match found_container_id {
+            Some(id) => id,
+            None => {
+                return Err(Status::not_found("Container not found"));
+            }
+        };
+
         // 调用runtime停止容器
         let runtime = self.runtime.clone();
-        let container_id_clone = container_id.clone();
+        let actual_container_id_clone = actual_container_id.clone();
         tokio::task::spawn_blocking(move || {
-            runtime.stop_container(&container_id_clone, Some(timeout))
+            runtime.stop_container(&actual_container_id_clone, Some(timeout))
         }).await
         .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
         .map_err(|e| Status::internal(format!("Failed to stop container: {}", e)))?;
 
         // 更新容器状态到内存
         let mut containers = self.containers.lock().await;
-        if let Some(container) = containers.get_mut(&container_id) {
+        if let Some(container) = containers.get_mut(&actual_container_id) {
             container.state = ContainerState::ContainerExited as i32;
         }
         drop(containers);
@@ -1036,13 +1088,13 @@ impl RuntimeService for RuntimeServiceImpl {
         // 更新持久化状态（标记为已停止）
         let mut persistence = self.persistence.lock().await;
         if let Err(e) = persistence.update_container_state(
-            &container_id,
+            &actual_container_id,
             crate::runtime::ContainerStatus::Stopped(0),
         ) {
-            log::error!("Failed to update container {} state in database: {}", container_id, e);
+            log::error!("Failed to update container {} state in database: {}", actual_container_id, e);
         }
         
-        log::info!("Container {} stopped", container_id);
+        log::info!("Container {} stopped", actual_container_id);
         Ok(Response::new(StopContainerResponse { }))
     }
 
@@ -1056,29 +1108,48 @@ impl RuntimeService for RuntimeServiceImpl {
         
         log::info!("Removing container {}", container_id);
 
+        // 支持短ID匹配
+        let containers = self.containers.lock().await;
+        let found_container_id = if containers.contains_key(&container_id) {
+            Some(container_id.clone())
+        } else {
+            // 尝试前缀匹配（支持短ID）
+            containers.keys()
+                .find(|full_id| full_id.starts_with(&container_id))
+                .cloned()
+        };
+        drop(containers);
+        
+        let actual_container_id = match found_container_id {
+            Some(id) => id,
+            None => {
+                return Err(Status::not_found("Container not found"));
+            }
+        };
+
         // 调用runtime删除容器
         let runtime = self.runtime.clone();
-        let container_id_clone = container_id.clone();
+        let actual_container_id_clone = actual_container_id.clone();
         tokio::task::spawn_blocking(move || {
-            runtime.remove_container(&container_id_clone)
+            runtime.remove_container(&actual_container_id_clone)
         }).await
         .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
         .map_err(|e| Status::internal(format!("Failed to remove container: {}", e)))?;
 
         // 从内存中移除
         let mut containers = self.containers.lock().await;
-        containers.remove(&container_id);
+        containers.remove(&actual_container_id);
         drop(containers);
         
         // 从持久化存储中删除
         let mut persistence = self.persistence.lock().await;
-        if let Err(e) = persistence.delete_container(&container_id) {
-            log::error!("Failed to delete container {} from database: {}", container_id, e);
+        if let Err(e) = persistence.delete_container(&actual_container_id) {
+            log::error!("Failed to delete container {} from database: {}", actual_container_id, e);
         } else {
-            log::info!("Container {} removed from database", container_id);
+            log::info!("Container {} removed from database", actual_container_id);
         }
         
-        log::info!("Container {} removed", container_id);
+        log::info!("Container {} removed", actual_container_id);
         Ok(Response::new(RemoveContainerResponse { }))
     }
 
