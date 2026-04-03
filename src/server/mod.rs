@@ -107,6 +107,68 @@ impl RuntimeServiceImpl {
         }
     }
 
+    fn container_matches_filter(
+        container: &Container,
+        filter: &crate::proto::runtime::v1::ContainerFilter,
+    ) -> bool {
+        if !filter.id.is_empty()
+            && !(container.id == filter.id
+                || container.id.starts_with(&filter.id)
+                || filter.id.starts_with(&container.id))
+        {
+            return false;
+        }
+
+        if let Some(state) = &filter.state {
+            if container.state != state.state {
+                return false;
+            }
+        }
+
+        if !filter.pod_sandbox_id.is_empty()
+            && !(container.pod_sandbox_id == filter.pod_sandbox_id
+                || container.pod_sandbox_id.starts_with(&filter.pod_sandbox_id)
+                || filter.pod_sandbox_id.starts_with(&container.pod_sandbox_id))
+        {
+            return false;
+        }
+
+        for (k, v) in &filter.label_selector {
+            if container.labels.get(k) != Some(v) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn pod_sandbox_matches_filter(
+        pod: &crate::proto::runtime::v1::PodSandbox,
+        filter: &crate::proto::runtime::v1::PodSandboxFilter,
+    ) -> bool {
+        if !filter.id.is_empty()
+            && !(pod.id == filter.id
+                || pod.id.starts_with(&filter.id)
+                || filter.id.starts_with(&pod.id))
+        {
+            return false;
+        }
+
+        if let Some(state) = &filter.state {
+            if pod.state != state.state {
+                return false;
+            }
+        }
+
+        for (k, v) in &filter.label_selector {
+            if pod.labels.get(k) != Some(v) {
+                return false;
+            }
+        }
+
+        true
+    }
+
     pub fn new(config: RuntimeConfig) -> Self {
         let mut shim_config = ShimConfig::default();
         shim_config.runtime_path = config.runtime_path.clone();
@@ -459,8 +521,10 @@ impl RuntimeService for RuntimeServiceImpl {
     // 列出容器
     async fn list_containers(
         &self,
-        _request: Request<ListContainersRequest>,
+        request: Request<ListContainersRequest>,
     ) -> Result<Response<ListContainersResponse>, Status> {
+        let req = request.into_inner();
+        let filter = req.filter;
         let containers = self.containers.lock().await;
         let pod_meta_by_id: HashMap<String, (String, String, String)> = {
             let pod_sandboxes = self.pod_sandboxes.lock().await;
@@ -507,6 +571,13 @@ impl RuntimeService for RuntimeServiceImpl {
                 }
                 c.created_at = Self::normalize_timestamp_nanos(c.created_at);
                 c
+            })
+            .filter(|c| {
+                if let Some(f) = &filter {
+                    Self::container_matches_filter(c, f)
+                } else {
+                    true
+                }
             })
             .collect();
         
@@ -760,8 +831,10 @@ impl RuntimeService for RuntimeServiceImpl {
     // 列出pod_sandbox
     async fn list_pod_sandbox(
         &self,
-        _request: Request<ListPodSandboxRequest>,
+        request: Request<ListPodSandboxRequest>,
     ) -> Result<Response<ListPodSandboxResponse>, Status> {
+        let req = request.into_inner();
+        let filter = req.filter;
         let pod_sandboxes = self.pod_sandboxes.lock().await;
         let items = pod_sandboxes
             .values()
@@ -777,6 +850,13 @@ impl RuntimeService for RuntimeServiceImpl {
                 }
                 p.created_at = Self::normalize_timestamp_nanos(p.created_at);
                 p
+            })
+            .filter(|p| {
+                if let Some(f) = &filter {
+                    Self::pod_sandbox_matches_filter(p, f)
+                } else {
+                    true
+                }
             })
             .collect();
         
