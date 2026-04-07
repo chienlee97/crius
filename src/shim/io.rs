@@ -6,13 +6,14 @@
 //! 3. 支持TTY模式
 //! 4. 日志持久化
 
-use std::path::PathBuf;
+use crate::attach::{encode_attach_output_frame, ATTACH_PIPE_STDERR, ATTACH_PIPE_STDOUT};
+use anyhow::{Context, Result};
+use log::{debug, error, info};
 use std::fs::File;
-use std::io::{self, Write, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use anyhow::{Result, Context};
-use log::{info, debug, error};
 
 /// IO配置
 #[derive(Debug, Clone)]
@@ -42,12 +43,13 @@ impl Default for IoConfig {
 }
 
 /// IO管理器
+#[derive(Clone)]
 pub struct IoManager {
     config: IoConfig,
     /// 当前attach的客户端
     clients: Arc<Mutex<Vec<ClientConnection>>>,
     /// 日志文件
-    log_file: Option<File>,
+    log_file: Arc<Mutex<Option<File>>>,
 }
 
 /// 客户端连接
@@ -58,12 +60,64 @@ struct ClientConnection {
 }
 
 impl IoManager {
+    fn remove_clients(&self, disconnected_ids: &[usize]) {
+        if disconnected_ids.is_empty() {
+            return;
+        }
+
+        let mut clients = self.clients.lock().unwrap();
+        clients.retain(|client| !disconnected_ids.contains(&client.id));
+    }
+
+    fn broadcast(&self, data: &[u8]) -> Result<()> {
+        let streams: Vec<(usize, UnixStream)> = {
+            let clients = self.clients.lock().unwrap();
+            clients
+                .iter()
+                .filter_map(|client| {
+                    client
+                        .stream
+                        .try_clone()
+                        .ok()
+                        .map(|stream| (client.id, stream))
+                })
+                .collect()
+        };
+
+        let mut disconnected = Vec::new();
+        for (id, mut stream) in streams {
+            if let Err(e) = stream.write_all(data) {
+                debug!("Client {} disconnected: {}", id, e);
+                disconnected.push(id);
+            }
+        }
+
+        self.remove_clients(&disconnected);
+        Ok(())
+    }
+
+    fn broadcast_output(&self, pipe: u8, data: &[u8]) -> Result<()> {
+        let frame = encode_attach_output_frame(pipe, data);
+        self.broadcast(&frame)
+    }
+
+    fn first_client_stream(&self) -> Option<(usize, UnixStream)> {
+        let clients = self.clients.lock().unwrap();
+        clients.iter().find_map(|client| {
+            client
+                .stream
+                .try_clone()
+                .ok()
+                .map(|stream| (client.id, stream))
+        })
+    }
+
     /// 创建新的IO管理器
     pub fn new() -> Self {
         Self {
             config: IoConfig::default(),
             clients: Arc::new(Mutex::new(Vec::new())),
-            log_file: None,
+            log_file: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -75,7 +129,8 @@ impl IoManager {
         if let Some(stdout) = &config.stdout {
             let parent = stdout.parent().context("Invalid stdout path")?;
             std::fs::create_dir_all(parent)?;
-            self.log_file = Some(File::create(stdout)?);
+            let mut log_file = self.log_file.lock().unwrap();
+            *log_file = Some(File::create(stdout)?);
             info!("Log file configured: {:?}", stdout);
         }
 
@@ -87,7 +142,7 @@ impl IoManager {
         if let Some(socket) = &self.config.attach_socket {
             // 删除已存在的socket文件
             let _ = std::fs::remove_file(socket);
-            
+
             let listener = UnixListener::bind(socket)?;
             info!("Attach server listening on {:?}", socket);
 
@@ -113,49 +168,96 @@ impl IoManager {
     }
 
     /// 写入stdout
-    pub fn write_stdout(&mut self, data: &[u8]) -> Result<()> {
+    pub fn write_stdout(&self, data: &[u8]) -> Result<()> {
         // 写入日志文件
-        if let Some(file) = &mut self.log_file {
+        if let Some(file) = &mut *self.log_file.lock().unwrap() {
             file.write_all(data)?;
             file.flush()?;
         }
 
         // 发送到所有attach客户端
-        let mut clients = self.clients.lock().unwrap();
-        clients.retain_mut(|client| {
-            match client.stream.write_all(data) {
-                Ok(_) => true,
-                Err(e) => {
-                    debug!("Client {} disconnected: {}", client.id, e);
-                    false
-                }
-            }
-        });
+        self.broadcast_output(ATTACH_PIPE_STDOUT, data)?;
 
         Ok(())
     }
 
     /// 写入stderr
-    pub fn write_stderr(&mut self, data: &[u8]) -> Result<()> {
-        // 如果有单独的stderr文件，写入
-        // 否则按stdout处理
-        self.write_stdout(data)
+    pub fn write_stderr(&self, data: &[u8]) -> Result<()> {
+        if let Some(file) = &mut *self.log_file.lock().unwrap() {
+            file.write_all(data)?;
+            file.flush()?;
+        }
+
+        self.broadcast_output(ATTACH_PIPE_STDERR, data)
     }
 
     /// 读取stdin
-    pub fn read_stdin(&mut self) -> Result<Vec<u8>> {
-        // 从第一个客户端读取（如果有）
-        let mut clients = self.clients.lock().unwrap();
-        if let Some(client) = clients.first_mut() {
+    pub fn read_stdin(&self) -> Result<Vec<u8>> {
+        if let Some((id, mut stream)) = self.first_client_stream() {
             let mut buffer = [0u8; 1024];
-            match client.stream.read(&mut buffer) {
-                Ok(n) if n > 0 => {
-                    return Ok(buffer[..n].to_vec());
+            match stream.read(&mut buffer) {
+                Ok(n) if n > 0 => return Ok(buffer[..n].to_vec()),
+                Ok(_) => {}
+                Err(e) => {
+                    debug!("Client {} disconnected: {}", id, e);
+                    self.remove_clients(&[id]);
                 }
-                _ => {}
             }
         }
         Ok(Vec::new())
+    }
+
+    /// 启动控制台转发
+    pub fn start_console_bridge(&self, console: File) -> Result<()> {
+        let reader = console
+            .try_clone()
+            .context("Failed to clone console file for reading")?;
+        let writer = console;
+        let io_for_output = self.clone();
+        let io_for_input = self.clone();
+
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut buffer = [0u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Err(e) = io_for_output.write_stdout(&buffer[..n]) {
+                            error!("Failed to forward console output: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Console output pump stopped: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        std::thread::spawn(move || {
+            let mut writer = writer;
+            loop {
+                match io_for_input.read_stdin() {
+                    Ok(data) if !data.is_empty() => {
+                        if let Err(e) = writer.write_all(&data) {
+                            debug!("Console input pump stopped: {}", e);
+                            break;
+                        }
+                        let _ = writer.flush();
+                    }
+                    Ok(_) => {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(e) => {
+                        debug!("Console input pump stopped: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(())
     }
 
     /// 设置容器IO重定向（用于runc）
@@ -199,7 +301,7 @@ impl IoManager {
         let mut clients = self.clients.lock().unwrap();
         clients.clear();
 
-        if let Some(file) = &mut self.log_file {
+        if let Some(file) = &mut *self.log_file.lock().unwrap() {
             file.flush()?;
         }
 
@@ -238,6 +340,6 @@ mod tests {
         };
 
         manager.configure(config).unwrap();
-        assert!(manager.log_file.is_some());
+        assert!(manager.log_file.lock().unwrap().is_some());
     }
 }

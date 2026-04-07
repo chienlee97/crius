@@ -7,12 +7,12 @@
 //! - 无特权容器生命周期管理
 //! - 存储驱动支持（overlay2 in user namespace）
 
+use anyhow::{Context, Result};
+use log::{debug, info, warn};
+use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::fs;
-use anyhow::{Context, Result};
-use log::{info, debug, warn};
-use serde::{Serialize, Deserialize};
 
 /// Rootless配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,7 +159,7 @@ impl RootlessManager {
         let uid = Self::current_uid();
         let subuid_path = PathBuf::from(format!("/etc/subuid"));
         let subgid_path = PathBuf::from(format!("/etc/subgid"));
-        
+
         let mut manager = Self {
             config,
             subuid_path,
@@ -175,7 +175,7 @@ impl RootlessManager {
 
             // 检查subuid/subgid配置
             manager.subids_configured = manager.check_subids()?;
-            
+
             if !manager.subids_configured && manager.config.auto_configure_subids {
                 warn!("SubUID/GID not configured, attempting auto-configuration");
                 // 这里可以添加自动配置逻辑，但通常需要root权限
@@ -198,7 +198,7 @@ impl RootlessManager {
     /// 检查subuid/subgid是否已配置
     fn check_subids(&self) -> Result<bool> {
         let username = Self::current_username();
-        
+
         // 检查subuid
         let subuid_configured = if self.subuid_path.exists() {
             let content = fs::read_to_string(&self.subuid_path)?;
@@ -231,9 +231,12 @@ impl RootlessManager {
         std::fs::read_to_string("/proc/self/status")
             .ok()
             .and_then(|content| {
-                content.lines().find(|l| l.starts_with("Uid:"))
+                content
+                    .lines()
+                    .find(|l| l.starts_with("Uid:"))
                     .and_then(|line| {
-                        line.split_whitespace().nth(1)
+                        line.split_whitespace()
+                            .nth(1)
                             .and_then(|uid| uid.parse().ok())
                     })
             })
@@ -246,9 +249,12 @@ impl RootlessManager {
         std::fs::read_to_string("/proc/self/status")
             .ok()
             .and_then(|content| {
-                content.lines().find(|l| l.starts_with("Gid:"))
+                content
+                    .lines()
+                    .find(|l| l.starts_with("Gid:"))
                     .and_then(|line| {
-                        line.split_whitespace().nth(1)
+                        line.split_whitespace()
+                            .nth(1)
                             .and_then(|gid| gid.parse().ok())
                     })
             })
@@ -257,24 +263,28 @@ impl RootlessManager {
 
     /// 生成OCI Linux UID映射配置
     pub fn generate_uid_mappings(&self) -> Vec<crate::oci::spec::IdMapping> {
-        self.config.uid_mappings.iter().map(|m| {
-            crate::oci::spec::IdMapping {
+        self.config
+            .uid_mappings
+            .iter()
+            .map(|m| crate::oci::spec::IdMapping {
                 container_id: m.container_id,
                 host_id: m.host_id,
                 size: m.size,
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     /// 生成OCI Linux GID映射配置
     pub fn generate_gid_mappings(&self) -> Vec<crate::oci::spec::IdMapping> {
-        self.config.gid_mappings.iter().map(|m| {
-            crate::oci::spec::IdMapping {
+        self.config
+            .gid_mappings
+            .iter()
+            .map(|m| crate::oci::spec::IdMapping {
                 container_id: m.container_id,
                 host_id: m.host_id,
                 size: m.size,
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     /// 配置OCI spec以支持rootless
@@ -318,12 +328,10 @@ impl RootlessManager {
                 });
             }
         } else {
-            linux.namespaces = Some(vec![
-                crate::oci::spec::Namespace {
-                    ns_type: "user".to_string(),
-                    path: None,
-                }
-            ]);
+            linux.namespaces = Some(vec![crate::oci::spec::Namespace {
+                ns_type: "user".to_string(),
+                path: None,
+            }]);
         }
 
         // 设置UID映射
@@ -351,35 +359,35 @@ impl RootlessManager {
     /// 获取新uidmap命令参数
     pub fn get_newuidmap_args(&self, pid: u32) -> Vec<String> {
         let mut args = vec![pid.to_string()];
-        
+
         for mapping in &self.config.uid_mappings {
             args.push(format!(
                 "{} {} {}",
                 mapping.container_id, mapping.host_id, mapping.size
             ));
         }
-        
+
         args
     }
 
     /// 获取newgidmap命令参数
     pub fn get_newgidmap_args(&self, pid: u32) -> Vec<String> {
         let mut args = vec![pid.to_string()];
-        
+
         for mapping in &self.config.gid_mappings {
             args.push(format!(
                 "{} {} {}",
                 mapping.container_id, mapping.host_id, mapping.size
             ));
         }
-        
+
         args
     }
 
     /// 执行newuidmap
     pub fn exec_newuidmap(&self, pid: u32) -> Result<()> {
         let args = self.get_newuidmap_args(pid);
-        
+
         let output = Command::new("newuidmap")
             .args(&args)
             .output()
@@ -397,7 +405,7 @@ impl RootlessManager {
     /// 执行newgidmap
     pub fn exec_newgidmap(&self, pid: u32) -> Result<()> {
         let args = self.get_newgidmap_args(pid);
-        
+
         let output = Command::new("newgidmap")
             .args(&args)
             .output()
@@ -495,10 +503,10 @@ pub struct RootlessToolsStatus {
 pub fn is_rootless_supported() -> bool {
     // 检查用户命名空间支持
     let user_ns_supported = Path::new("/proc/self/ns/user").exists();
-    
+
     // 检查是否可以写入/proc/self/uid_map
     let uid_map_writable = Path::new("/proc/self/uid_map").exists();
-    
+
     user_ns_supported && uid_map_writable
 }
 
@@ -534,13 +542,11 @@ mod tests {
 
     #[test]
     fn test_id_mapping_generation() {
-        let config = RootlessConfig::new()
-            .enable()
-            .with_sub_uid(100000, 65536);
-        
+        let config = RootlessConfig::new().enable().with_sub_uid(100000, 65536);
+
         let manager = RootlessManager::new(config).unwrap();
         let uid_mappings = manager.generate_uid_mappings();
-        
+
         assert!(!uid_mappings.is_empty());
         // 第一个映射应该是root -> 当前用户
         assert_eq!(uid_mappings[0].container_id, 0);
@@ -554,9 +560,8 @@ mod tests {
 
     #[test]
     fn test_network_mode() {
-        let config = RootlessConfig::new()
-            .with_network_mode(NetworkMode::Slirp4netns);
-        
+        let config = RootlessConfig::new().with_network_mode(NetworkMode::Slirp4netns);
+
         assert_eq!(config.network_mode, NetworkMode::Slirp4netns);
     }
 }

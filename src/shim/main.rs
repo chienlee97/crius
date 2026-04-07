@@ -7,16 +7,18 @@
 //! 4. IO流管理（stdin/stdout/stderr重定向）
 //! 5. 信号传递
 
-use std::path::PathBuf;
-use std::fs;
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{info, debug};
+use log::{debug, info};
+use std::fs;
+use std::path::PathBuf;
 
+#[path = "../attach.rs"]
+mod attach;
 mod daemon;
-mod subreaper;
-mod process;
 mod io;
+mod process;
+mod subreaper;
 
 use daemon::Daemon;
 
@@ -61,30 +63,35 @@ fn main() -> Result<()> {
 
     // 验证bundle目录
     if !args.bundle.exists() {
-        return Err(anyhow::anyhow!("Bundle directory does not exist: {:?}", args.bundle));
+        return Err(anyhow::anyhow!(
+            "Bundle directory does not exist: {:?}",
+            args.bundle
+        ));
     }
 
     // 验证config.json
     let config_path = args.bundle.join("config.json");
     if !config_path.exists() {
-        return Err(anyhow::anyhow!("config.json not found in bundle: {:?}", config_path));
+        return Err(anyhow::anyhow!(
+            "config.json not found in bundle: {:?}",
+            config_path
+        ));
     }
 
     // rootfs 不再要求位于 bundle/rootfs，实际路径以 OCI config.json 的 root.path 为准。
 
     // 创建并运行shim守护进程
-    let daemon = Daemon::new(
-        args.id,
-        args.bundle,
-        args.runtime,
-        args.exit_code_file,
-    );
+    let daemon = Daemon::new(args.id, args.bundle, args.runtime, args.exit_code_file);
 
     daemon.run()
 }
 
 fn init_logging(debug: bool, log_file: Option<&PathBuf>) -> Result<()> {
-    let level = if debug { log::LevelFilter::Debug } else { log::LevelFilter::Info };
+    let level = if debug {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Info
+    };
 
     if let Some(path) = log_file {
         // 文件日志
@@ -107,11 +114,7 @@ fn init_logging(debug: bool, log_file: Option<&PathBuf>) -> Result<()> {
         // stderr日志 - 使用简单格式
         fern::Dispatch::new()
             .format(|out, message, record| {
-                out.finish(format_args!(
-                    "[{}] {}",
-                    record.level(),
-                    message
-                ))
+                out.finish(format_args!("[{}] {}", record.level(), message))
             })
             .level(level)
             .chain(std::io::stderr())

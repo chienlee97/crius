@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::fs;
+use std::path::Path;
 
 use crate::prelude::*;
 
@@ -9,13 +9,13 @@ use crate::prelude::*;
 pub struct Config {
     /// 根目录
     pub root: String,
-    
+
     /// 运行时配置
     pub runtime: RuntimeConfig,
-    
+
     /// 镜像配置
     pub image: ImageConfig,
-    
+
     /// 网络配置
     pub network: NetworkConfig,
 }
@@ -25,10 +25,10 @@ pub struct Config {
 pub struct RuntimeConfig {
     /// 运行时类型
     pub runtime_type: String,
-    
+
     /// 运行时路径
     pub runtime_path: String,
-    
+
     /// 运行时根目录
     pub root: String,
 }
@@ -38,7 +38,7 @@ pub struct RuntimeConfig {
 pub struct ImageConfig {
     /// 镜像存储后端
     pub driver: String,
-    
+
     /// 镜像存储路径
     pub root: String,
 }
@@ -48,7 +48,7 @@ pub struct ImageConfig {
 pub struct NetworkConfig {
     /// 网络插件
     pub plugin: String,
-    
+
     /// 网络配置目录
     pub config_dir: String,
 }
@@ -60,7 +60,7 @@ impl Config {
         let config: Self = toml::from_str(&content)?;
         Ok(config)
     }
-    
+
     /// 获取默认配置
     pub fn default() -> Self {
         Self {

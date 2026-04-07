@@ -1,36 +1,42 @@
+use anyhow::{Context, Result};
+use log::{debug, error, info};
+use nix::sys::stat::{major, makedev, minor, mknod, stat, Mode, SFlag};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
-use anyhow::{Context, Result};
-use log::{debug, error, info};
-use nix::sys::stat::{makedev, mknod, Mode, SFlag};
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::cgroups::{to_oci_resources, CpuLimit, MemoryLimit, ResourceLimits};
 use crate::oci::spec::{
-    Linux, LinuxCapabilities, LinuxDeviceCgroup, LinuxResources, Mount, Process, Root, Spec, User,
+    Device as OciDevice, Linux, LinuxCapabilities, LinuxDeviceCgroup, LinuxResources, Mount,
+    Namespace as OciNamespace, Process, Root, Spec, User,
+};
+use crate::proto::runtime::v1::{
+    Capability, LinuxContainerResources, NamespaceMode, NamespaceOption,
 };
 
 pub mod shim_manager;
-pub use shim_manager::{ShimManager, ShimConfig, ShimProcess};
+pub use shim_manager::{ShimConfig, ShimManager, ShimProcess};
 
 /// 容器运行时接口
 pub trait ContainerRuntime {
     /// 创建容器
     fn create_container(&self, config: &ContainerConfig) -> Result<String>;
-    
+
     /// 启动容器
     fn start_container(&self, container_id: &str) -> Result<()>;
-    
+
     /// 停止容器
     fn stop_container(&self, container_id: &str, timeout: Option<u32>) -> Result<()>;
-    
+
     /// 删除容器
     fn remove_container(&self, container_id: &str) -> Result<()>;
-    
+
     /// 获取容器状态
     fn container_status(&self, container_id: &str) -> Result<ContainerStatus>;
-    
+
     /// 在容器中执行命令
     fn exec_in_container(&self, container_id: &str, command: &[String], tty: bool) -> Result<i32>;
 }
@@ -49,8 +55,33 @@ pub struct ContainerConfig {
     pub annotations: Vec<(String, String)>,
     pub privileged: bool,
     pub user: Option<String>,
+    pub run_as_group: Option<u32>,
+    pub supplemental_groups: Vec<u32>,
     pub hostname: Option<String>,
+    pub tty: bool,
+    pub stdin: bool,
+    pub stdin_once: bool,
+    pub log_path: Option<PathBuf>,
+    pub readonly_rootfs: bool,
+    pub no_new_privileges: Option<bool>,
+    pub apparmor_profile: Option<String>,
+    pub capabilities: Option<Capability>,
+    pub cgroup_parent: Option<String>,
+    pub sysctls: HashMap<String, String>,
+    pub namespace_options: Option<NamespaceOption>,
+    pub namespace_paths: NamespacePaths,
+    pub linux_resources: Option<LinuxContainerResources>,
+    pub devices: Vec<DeviceMapping>,
     pub rootfs: PathBuf,
+}
+
+/// 命名空间路径覆盖
+#[derive(Debug, Clone, Default)]
+pub struct NamespacePaths {
+    pub network: Option<PathBuf>,
+    pub pid: Option<PathBuf>,
+    pub ipc: Option<PathBuf>,
+    pub uts: Option<PathBuf>,
 }
 
 /// 挂载点配置
@@ -59,6 +90,14 @@ pub struct MountConfig {
     pub source: PathBuf,
     pub destination: PathBuf,
     pub read_only: bool,
+}
+
+/// 设备映射配置
+#[derive(Debug, Clone)]
+pub struct DeviceMapping {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub permissions: String,
 }
 
 /// 容器状态
@@ -93,6 +132,259 @@ pub struct RuncRuntime {
 }
 
 impl RuncRuntime {
+    fn normalize_capability_name(name: &str) -> String {
+        let upper = name.trim().to_ascii_uppercase();
+        if upper.starts_with("CAP_") {
+            upper
+        } else {
+            format!("CAP_{}", upper)
+        }
+    }
+
+    fn default_capabilities() -> Vec<String> {
+        vec![
+            "CAP_CHOWN".to_string(),
+            "CAP_DAC_OVERRIDE".to_string(),
+            "CAP_FSETID".to_string(),
+            "CAP_FOWNER".to_string(),
+            "CAP_MKNOD".to_string(),
+            "CAP_NET_RAW".to_string(),
+            "CAP_SETGID".to_string(),
+            "CAP_SETUID".to_string(),
+            "CAP_SETFCAP".to_string(),
+            "CAP_SETPCAP".to_string(),
+            "CAP_NET_BIND_SERVICE".to_string(),
+            "CAP_SYS_CHROOT".to_string(),
+            "CAP_KILL".to_string(),
+            "CAP_AUDIT_WRITE".to_string(),
+        ]
+    }
+
+    fn apply_capability_overrides(
+        default_caps: &[String],
+        overrides: Option<&Capability>,
+    ) -> LinuxCapabilities {
+        let mut base = default_caps.to_vec();
+        let mut ambient = Vec::new();
+
+        if let Some(capabilities) = overrides {
+            let normalized_drops: Vec<String> = capabilities
+                .drop_capabilities
+                .iter()
+                .map(|cap| Self::normalize_capability_name(cap))
+                .collect();
+
+            if normalized_drops.iter().any(|cap| cap == "CAP_ALL") {
+                base.clear();
+            } else {
+                base.retain(|cap| !normalized_drops.iter().any(|drop| drop == cap));
+            }
+
+            for cap in &capabilities.add_capabilities {
+                let normalized = Self::normalize_capability_name(cap);
+                if !base.contains(&normalized) {
+                    base.push(normalized);
+                }
+            }
+
+            ambient = capabilities
+                .add_ambient_capabilities
+                .iter()
+                .map(|cap| Self::normalize_capability_name(cap))
+                .collect();
+
+            for cap in &ambient {
+                if !base.contains(cap) {
+                    base.push(cap.clone());
+                }
+            }
+        }
+
+        LinuxCapabilities {
+            bounding: Some(base.clone()),
+            effective: Some(base.clone()),
+            inheritable: Some(base.clone()),
+            permitted: Some(base),
+            ambient: Some(ambient),
+        }
+    }
+
+    fn build_user(config: &ContainerConfig) -> Option<User> {
+        let user = config.user.as_ref()?;
+        let additional_gids = if config.supplemental_groups.is_empty() {
+            None
+        } else {
+            Some(config.supplemental_groups.clone())
+        };
+
+        if let Ok(uid) = user.parse::<u32>() {
+            Some(User {
+                uid,
+                gid: config.run_as_group.unwrap_or(uid),
+                additional_gids,
+                username: None,
+            })
+        } else {
+            Some(User {
+                uid: 0,
+                gid: config.run_as_group.unwrap_or(0),
+                additional_gids,
+                username: Some(user.clone()),
+            })
+        }
+    }
+
+    fn host_namespace_path(ns_type: &str) -> Option<String> {
+        let path = PathBuf::from(format!("/proc/1/ns/{}", ns_type));
+        path.exists().then(|| path.to_string_lossy().to_string())
+    }
+
+    fn build_namespaces(config: &ContainerConfig) -> Vec<OciNamespace> {
+        let mut namespaces = Spec::default_namespaces();
+        let options = config.namespace_options.as_ref();
+
+        for namespace in &mut namespaces {
+            match namespace.ns_type.as_str() {
+                "network" => {
+                    if let Some(path) = &config.namespace_paths.network {
+                        namespace.path = Some(path.to_string_lossy().to_string());
+                    } else if matches!(
+                        options.map(|o| o.network),
+                        Some(mode) if mode == NamespaceMode::Node as i32
+                    ) {
+                        namespace.path = Self::host_namespace_path("net");
+                    }
+                }
+                "pid" => {
+                    if let Some(path) = &config.namespace_paths.pid {
+                        namespace.path = Some(path.to_string_lossy().to_string());
+                    } else if matches!(
+                        options.map(|o| o.pid),
+                        Some(mode) if mode == NamespaceMode::Node as i32
+                    ) {
+                        namespace.path = Self::host_namespace_path("pid");
+                    }
+                }
+                "ipc" => {
+                    if let Some(path) = &config.namespace_paths.ipc {
+                        namespace.path = Some(path.to_string_lossy().to_string());
+                    } else if matches!(
+                        options.map(|o| o.ipc),
+                        Some(mode) if mode == NamespaceMode::Node as i32
+                    ) {
+                        namespace.path = Self::host_namespace_path("ipc");
+                    }
+                }
+                "uts" => {
+                    if let Some(path) = &config.namespace_paths.uts {
+                        namespace.path = Some(path.to_string_lossy().to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        namespaces
+    }
+
+    fn linux_resources_to_oci(resources: &LinuxContainerResources) -> LinuxResources {
+        let limits = ResourceLimits {
+            cpu: Some(CpuLimit {
+                shares: (resources.cpu_shares > 0).then_some(resources.cpu_shares as u64),
+                quota: (resources.cpu_quota > 0).then_some(resources.cpu_quota),
+                period: (resources.cpu_period > 0).then_some(resources.cpu_period as u64),
+                realtime_runtime: None,
+                realtime_period: None,
+                cpus: (!resources.cpuset_cpus.is_empty()).then(|| resources.cpuset_cpus.clone()),
+                mems: (!resources.cpuset_mems.is_empty()).then(|| resources.cpuset_mems.clone()),
+            }),
+            memory: Some(MemoryLimit {
+                limit: (resources.memory_limit_in_bytes > 0)
+                    .then_some(resources.memory_limit_in_bytes),
+                reservation: None,
+                swap: (resources.memory_swap_limit_in_bytes > 0)
+                    .then_some(resources.memory_swap_limit_in_bytes),
+                kernel: None,
+                kernel_tcp: None,
+                swappiness: None,
+                disable_oom_killer: None,
+                use_hierarchy: None,
+            }),
+            blkio: None,
+            network: None,
+            pids: None,
+        };
+
+        let mut oci_resources = to_oci_resources(&limits);
+        if !resources.unified.is_empty() {
+            oci_resources.unified = Some(resources.unified.clone());
+        }
+        if !resources.hugepage_limits.is_empty() {
+            oci_resources.hugepage_limits = Some(
+                resources
+                    .hugepage_limits
+                    .iter()
+                    .map(|limit| crate::oci::spec::LinuxHugepageLimit {
+                        page_size: limit.page_size.clone(),
+                        limit: limit.limit,
+                    })
+                    .collect(),
+            );
+        }
+
+        oci_resources
+    }
+
+    fn device_mappings_to_oci(
+        devices: &[DeviceMapping],
+    ) -> Result<(Vec<OciDevice>, Vec<LinuxDeviceCgroup>)> {
+        let mut oci_devices = Vec::new();
+        let mut cgroup_rules = Vec::new();
+
+        for device in devices {
+            let file_stat = stat(&device.source)
+                .with_context(|| format!("Failed to stat device path {:?}", device.source))?;
+            let file_type = SFlag::from_bits_truncate(file_stat.st_mode);
+            let device_type = if file_type.contains(SFlag::S_IFCHR) {
+                "c"
+            } else if file_type.contains(SFlag::S_IFBLK) {
+                "b"
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Unsupported device type for {:?}",
+                    device.source
+                ));
+            };
+
+            let major_id = major(file_stat.st_rdev) as i64;
+            let minor_id = minor(file_stat.st_rdev) as i64;
+            let access = if device.permissions.trim().is_empty() {
+                "rwm".to_string()
+            } else {
+                device.permissions.clone()
+            };
+
+            oci_devices.push(OciDevice {
+                device_type: device_type.to_string(),
+                path: device.destination.to_string_lossy().to_string(),
+                major: Some(major_id),
+                minor: Some(minor_id),
+                file_mode: Some((file_stat.st_mode & 0o777) as u32),
+                uid: Some(file_stat.st_uid),
+                gid: Some(file_stat.st_gid),
+            });
+            cgroup_rules.push(LinuxDeviceCgroup {
+                allow: true,
+                device_type: Some(device_type.to_string()),
+                major: Some(major_id),
+                minor: Some(minor_id),
+                access: Some(access),
+            });
+        }
+
+        Ok((oci_devices, cgroup_rules))
+    }
+
     fn unpack_layer_with_tar(layer_file: &Path, rootfs_dir: &Path) -> Result<()> {
         let output = Command::new("tar")
             .arg("-xzf")
@@ -179,7 +471,11 @@ impl RuncRuntime {
         ))
     }
 
-    fn prepare_rootfs_from_image(&self, config: &ContainerConfig, container_id: &str) -> Result<()> {
+    fn prepare_rootfs_from_image(
+        &self,
+        config: &ContainerConfig,
+        container_id: &str,
+    ) -> Result<()> {
         let rootfs_dir = config.rootfs.clone();
         if rootfs_dir.exists() {
             std::fs::remove_dir_all(&rootfs_dir)
@@ -242,8 +538,8 @@ impl RuncRuntime {
     }
 
     pub fn new(runtime_path: PathBuf, root: PathBuf) -> Self {
-        Self { 
-            runtime_path, 
+        Self {
+            runtime_path,
             root,
             shim_manager: None,
         }
@@ -283,24 +579,32 @@ impl RuncRuntime {
     fn config_path(&self, container_id: &str) -> PathBuf {
         self.bundle_path(container_id).join("config.json")
     }
-    
+
     /// 执行runc命令并返回输出（仅用于需要解析stdout的查询类命令）
     fn run_command_output(&self, args: &[&str]) -> Result<Output> {
-        debug!("Executing: {} {}", self.runtime_path.display(), args.join(" "));
-        
+        debug!(
+            "Executing: {} {}",
+            self.runtime_path.display(),
+            args.join(" ")
+        );
+
         let output = Command::new(&self.runtime_path)
             .args(args)
             .env("XDG_RUNTIME_DIR", "/run/user/0")
             .output()
             .context("Failed to execute runc command")?;
-            
+
         Ok(output)
     }
 
     /// 执行runc命令并检查状态（用于start/stop/run等动作类命令）
     /// 注意：不能对`runc run -d`使用output()，否则可能因后台子进程继承pipe导致阻塞。
     fn runc_exec(&self, args: &[&str]) -> Result<()> {
-        debug!("Executing (status): {} {}", self.runtime_path.display(), args.join(" "));
+        debug!(
+            "Executing (status): {} {}",
+            self.runtime_path.display(),
+            args.join(" ")
+        );
 
         let status = Command::new(&self.runtime_path)
             .args(args)
@@ -327,7 +631,7 @@ impl RuncRuntime {
             error!("runc command failed: {}", detail);
             return Err(anyhow::anyhow!("runc command failed: {}", detail));
         }
-        
+
         Ok(())
     }
 
@@ -338,7 +642,7 @@ impl RuncRuntime {
         // 设置root配置
         spec.root = Some(Root {
             path: config.rootfs.to_string_lossy().to_string(),
-            readonly: Some(false),
+            readonly: Some(config.readonly_rootfs),
         });
 
         // 设置进程配置
@@ -353,59 +657,29 @@ impl RuncRuntime {
         }
 
         // 转换环境变量为字符串格式
-        let env: Vec<String> = config.env.iter()
+        let env: Vec<String> = config
+            .env
+            .iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
 
-        // 解析用户配置
-        let user = config.user.as_ref().and_then(|u| {
-            if let Ok(uid) = u.parse::<u32>() {
-                Some(User {
-                    uid,
-                    gid: uid,
-                    additional_gids: None,
-                    username: None,
-                })
-            } else {
-                None
-            }
-        });
-
-        let default_caps = vec![
-            "CAP_CHOWN".to_string(),
-            "CAP_DAC_OVERRIDE".to_string(),
-            "CAP_FSETID".to_string(),
-            "CAP_FOWNER".to_string(),
-            "CAP_MKNOD".to_string(),
-            "CAP_NET_RAW".to_string(),
-            "CAP_SETGID".to_string(),
-            "CAP_SETUID".to_string(),
-            "CAP_SETFCAP".to_string(),
-            "CAP_SETPCAP".to_string(),
-            "CAP_NET_BIND_SERVICE".to_string(),
-            "CAP_SYS_CHROOT".to_string(),
-            "CAP_KILL".to_string(),
-            "CAP_AUDIT_WRITE".to_string(),
-        ];
-
         spec.process = Some(Process {
-            terminal: Some(false),
-            user,
+            terminal: Some(config.tty),
+            user: Self::build_user(config),
             args,
             env: if env.is_empty() { None } else { Some(env) },
-            cwd: config.working_dir.as_ref()
+            cwd: config
+                .working_dir
+                .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "/".to_string()),
-            capabilities: Some(LinuxCapabilities {
-                bounding: Some(default_caps.clone()),
-                effective: Some(default_caps.clone()),
-                inheritable: Some(default_caps.clone()),
-                permitted: Some(default_caps),
-                ambient: Some(Vec::new()),
-            }),
+            capabilities: Some(Self::apply_capability_overrides(
+                &Self::default_capabilities(),
+                config.capabilities.as_ref(),
+            )),
             rlimits: None,
-            no_new_privileges: Some(!config.privileged),
-            apparmor_profile: None,
+            no_new_privileges: Some(config.no_new_privileges.unwrap_or(!config.privileged)),
+            apparmor_profile: config.apparmor_profile.clone(),
             selinux_label: None,
         });
 
@@ -414,16 +688,20 @@ impl RuncRuntime {
 
         // 设置挂载点
         let default_mounts = Spec::default_mounts();
-        let custom_mounts: Vec<Mount> = config.mounts.iter().map(|m| Mount {
-            destination: m.destination.to_string_lossy().to_string(),
-            source: Some(m.source.to_string_lossy().to_string()),
-            mount_type: Some("bind".to_string()),
-            options: if m.read_only {
-                Some(vec!["rbind".to_string(), "ro".to_string()])
-            } else {
-                Some(vec!["rbind".to_string(), "rw".to_string()])
-            },
-        }).collect();
+        let custom_mounts: Vec<Mount> = config
+            .mounts
+            .iter()
+            .map(|m| Mount {
+                destination: m.destination.to_string_lossy().to_string(),
+                source: Some(m.source.to_string_lossy().to_string()),
+                mount_type: Some("bind".to_string()),
+                options: if m.read_only {
+                    Some(vec!["rbind".to_string(), "ro".to_string()])
+                } else {
+                    Some(vec!["rbind".to_string(), "rw".to_string()])
+                },
+            })
+            .collect();
 
         let mut all_mounts: Vec<Mount> = default_mounts
             .into_iter()
@@ -433,47 +711,70 @@ impl RuncRuntime {
         spec.mounts = Some(all_mounts);
 
         // 设置Linux配置
-        let namespaces = Spec::default_namespaces();
-        let devices = if config.privileged {
+        let mut devices = if config.privileged {
             // 特权容器可以访问所有设备
             vec![]
         } else {
             Spec::default_devices()
         };
 
-        spec.linux = Some(Linux {
-            namespaces: Some(namespaces),
-            uid_mappings: None,
-            gid_mappings: None,
-            devices: Some(devices),
-            cgroups_path: None,
-            resources: Some(LinuxResources {
+        let mut resources = config
+            .linux_resources
+            .as_ref()
+            .map(Self::linux_resources_to_oci)
+            .unwrap_or_else(|| LinuxResources {
                 network: None,
                 pids: None,
                 memory: None,
                 cpu: None,
                 block_io: None,
                 hugepage_limits: None,
-                devices: Some(vec![LinuxDeviceCgroup {
-                    allow: true,
-                    device_type: None,
-                    major: None,
-                    minor: None,
-                    access: Some("rwm".to_string()),
-                }]),
+                devices: None,
                 intel_rdt: None,
                 unified: None,
-            }),
+            });
+
+        if !config.devices.is_empty() {
+            let (extra_devices, extra_cgroup_rules) =
+                Self::device_mappings_to_oci(&config.devices)?;
+            devices.extend(extra_devices);
+            resources.devices = Some(extra_cgroup_rules);
+        }
+
+        if resources.devices.is_none() {
+            resources.devices = Some(vec![LinuxDeviceCgroup {
+                allow: true,
+                device_type: None,
+                major: None,
+                minor: None,
+                access: Some("rwm".to_string()),
+            }]);
+        }
+
+        spec.linux = Some(Linux {
+            namespaces: Some(Self::build_namespaces(config)),
+            uid_mappings: None,
+            gid_mappings: None,
+            devices: Some(devices),
+            cgroups_path: config.cgroup_parent.clone(),
+            resources: Some(resources),
             rootfs_propagation: None,
             seccomp: None,
-            sysctl: None,
+            sysctl: if config.sysctls.is_empty() {
+                None
+            } else {
+                Some(config.sysctls.clone())
+            },
             mount_label: None,
             intel_rdt: None,
         });
 
         // 设置注解
         let mut annotations = std::collections::HashMap::new();
-        annotations.insert("org.opencontainers.image.ref.name".to_string(), config.image.clone());
+        annotations.insert(
+            "org.opencontainers.image.ref.name".to_string(),
+            config.image.clone(),
+        );
         for (k, v) in &config.annotations {
             annotations.insert(k.clone(), v.clone());
         }
@@ -485,10 +786,9 @@ impl RuncRuntime {
     /// 创建bundle目录结构
     fn create_bundle(&self, container_id: &str, rootfs: &Path, spec: &Spec) -> Result<()> {
         let bundle_path = self.bundle_path(container_id);
-        
+
         // 创建bundle目录
-        std::fs::create_dir_all(&bundle_path)
-            .context("Failed to create bundle directory")?;
+        std::fs::create_dir_all(&bundle_path).context("Failed to create bundle directory")?;
 
         // 保存config.json
         spec.save(&self.config_path(container_id))?;
@@ -496,22 +796,25 @@ impl RuncRuntime {
         // 当前运行时使用 OCI spec.root.path 作为 rootfs 来源，bundle 内不再强制准备 rootfs 目录。
         let _ = rootfs;
 
-        info!("Created bundle for container {} at {:?}", container_id, bundle_path);
+        info!(
+            "Created bundle for container {} at {:?}",
+            container_id, bundle_path
+        );
         Ok(())
     }
 
     /// 获取runc容器状态
     fn get_runc_state(&self, container_id: &str) -> Result<Option<RuncState>> {
         let output = self.run_command_output(&["state", container_id])?;
-        
+
         if !output.status.success() {
             return Ok(None);
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let state: RuncState = serde_json::from_str(&stdout)
-            .context("Failed to parse runc state")?;
-        
+        let state: RuncState =
+            serde_json::from_str(&stdout).context("Failed to parse runc state")?;
+
         Ok(Some(state))
     }
 }
@@ -520,15 +823,19 @@ impl ContainerRuntime for RuncRuntime {
     fn create_container(&self, config: &ContainerConfig) -> Result<String> {
         // 生成容器ID
         let container_id = Uuid::new_v4().to_simple().to_string();
-        
-        info!("Creating container {} with image {}", container_id, config.image);
+
+        info!(
+            "Creating container {} with image {}",
+            container_id, config.image
+        );
 
         // 先从镜像构建rootfs，再生成OCI配置
         self.prepare_rootfs_from_image(config, &container_id)
             .context("Failed to prepare rootfs from image")?;
 
         // 创建OCI配置
-        let spec = self.create_spec(config, &container_id)
+        let spec = self
+            .create_spec(config, &container_id)
             .context("Failed to create OCI spec")?;
 
         // 创建bundle
@@ -538,7 +845,7 @@ impl ContainerRuntime for RuncRuntime {
         info!("Container {} bundle prepared successfully", container_id);
         Ok(container_id)
     }
-    
+
     fn start_container(&self, container_id: &str) -> Result<()> {
         info!("Starting container {}", container_id);
 
@@ -548,7 +855,10 @@ impl ContainerRuntime for RuncRuntime {
         if let Some(ref shim_manager) = self.shim_manager {
             let bundle_path = self.bundle_path(container_id);
             let _process = shim_manager.start_shim(container_id, &bundle_path)?;
-            info!("Container {} started via shim (PID: {})", container_id, _process.shim_pid);
+            info!(
+                "Container {} started via shim (PID: {})",
+                container_id, _process.shim_pid
+            );
         } else {
             match state {
                 None => {
@@ -580,7 +890,7 @@ impl ContainerRuntime for RuncRuntime {
 
         Ok(())
     }
-    
+
     fn stop_container(&self, container_id: &str, timeout: Option<u32>) -> Result<()> {
         info!("Stopping container {}", container_id);
 
@@ -594,7 +904,7 @@ impl ContainerRuntime for RuncRuntime {
 
         // 获取当前状态
         let state = self.get_runc_state(container_id)?;
-        
+
         match state {
             None => {
                 info!("Container {} not found, already stopped", container_id);
@@ -616,7 +926,7 @@ impl ContainerRuntime for RuncRuntime {
         let timeout_secs = timeout.unwrap_or(10);
         for _ in 0..timeout_secs {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            
+
             match self.get_runc_state(container_id)? {
                 None => break,
                 Some(s) if s.status == "stopped" => break,
@@ -627,7 +937,10 @@ impl ContainerRuntime for RuncRuntime {
         // 如果还在运行，发送SIGKILL
         if let Ok(Some(state)) = self.get_runc_state(container_id) {
             if state.status != "stopped" {
-                info!("Container {} did not stop gracefully, sending SIGKILL", container_id);
+                info!(
+                    "Container {} did not stop gracefully, sending SIGKILL",
+                    container_id
+                );
                 let _ = self.runc_exec(&["kill", container_id, "KILL"]);
             }
         }
@@ -635,7 +948,7 @@ impl ContainerRuntime for RuncRuntime {
         info!("Container {} stopped", container_id);
         Ok(())
     }
-    
+
     fn remove_container(&self, container_id: &str) -> Result<()> {
         info!("Removing container {}", container_id);
 
@@ -644,7 +957,7 @@ impl ContainerRuntime for RuncRuntime {
 
         // 删除容器
         let output = self.run_command_output(&["delete", container_id])?;
-        
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // 检查是否已经是"container does not exist"错误
@@ -658,14 +971,13 @@ impl ContainerRuntime for RuncRuntime {
         // 清理bundle目录
         let bundle_path = self.bundle_path(container_id);
         if bundle_path.exists() {
-            std::fs::remove_dir_all(&bundle_path)
-                .context("Failed to remove bundle directory")?;
+            std::fs::remove_dir_all(&bundle_path).context("Failed to remove bundle directory")?;
         }
 
         info!("Container {} removed", container_id);
         Ok(())
     }
-    
+
     fn container_status(&self, container_id: &str) -> Result<ContainerStatus> {
         // 如果启用了shim，检查shim是否还在运行
         if let Some(ref shim_manager) = self.shim_manager {
@@ -673,7 +985,7 @@ impl ContainerRuntime for RuncRuntime {
             if let Ok(Some(exit_code)) = shim_manager.get_exit_code(container_id) {
                 return Ok(ContainerStatus::Stopped(exit_code));
             }
-            
+
             // 检查shim是否还在运行
             if shim_manager.is_shim_running(container_id) {
                 return Ok(ContainerStatus::Running);
@@ -696,27 +1008,29 @@ impl ContainerRuntime for RuncRuntime {
     }
 
     fn exec_in_container(&self, container_id: &str, command: &[String], tty: bool) -> Result<i32> {
-        info!("Executing command in container {}: {:?}", container_id, command);
+        info!(
+            "Executing command in container {}: {:?}",
+            container_id, command
+        );
 
         let mut cmd = std::process::Command::new(&self.runtime_path);
         cmd.arg("exec");
-        
+
         if tty {
             cmd.arg("-t");
         }
         cmd.arg("-i"); // 始终启用stdin交互
-        
+
         // 添加容器ID
         cmd.arg(container_id);
-        
+
         // 添加命令
         for arg in command {
             cmd.arg(arg);
         }
 
         // 执行命令并等待结果
-        let output = cmd.output()
-            .context("Failed to execute runc exec")?;
+        let output = cmd.output().context("Failed to execute runc exec")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -725,7 +1039,10 @@ impl ContainerRuntime for RuncRuntime {
 
         // 返回退出码
         let exit_code = output.status.code().unwrap_or(0);
-        info!("Command executed in container {} with exit code {}", container_id, exit_code);
+        info!(
+            "Command executed in container {} with exit code {}",
+            container_id, exit_code
+        );
         Ok(exit_code)
     }
 }
@@ -737,10 +1054,7 @@ mod tests {
 
     fn create_test_runtime() -> (RuncRuntime, tempfile::TempDir) {
         let temp_dir = tempdir().unwrap();
-        let runtime = RuncRuntime::new(
-            PathBuf::from("runc"),
-            temp_dir.path().join("containers"),
-        );
+        let runtime = RuncRuntime::new(PathBuf::from("runc"), temp_dir.path().join("containers"));
         (runtime, temp_dir)
     }
 
@@ -757,7 +1071,23 @@ mod tests {
             annotations: vec![],
             privileged: false,
             user: None,
+            run_as_group: None,
+            supplemental_groups: vec![],
             hostname: None,
+            tty: false,
+            stdin: false,
+            stdin_once: false,
+            log_path: None,
+            readonly_rootfs: false,
+            no_new_privileges: None,
+            apparmor_profile: None,
+            capabilities: None,
+            cgroup_parent: None,
+            sysctls: HashMap::new(),
+            namespace_options: None,
+            namespace_paths: NamespacePaths::default(),
+            linux_resources: None,
+            devices: vec![],
             rootfs: PathBuf::from("/tmp/rootfs"),
         }
     }
@@ -766,9 +1096,9 @@ mod tests {
     fn test_create_spec() {
         let (runtime, _temp) = create_test_runtime();
         let config = create_test_config();
-        
+
         let spec = runtime.create_spec(&config, "test-id").unwrap();
-        
+
         assert_eq!(spec.oci_version, "1.0.2");
         assert!(spec.process.is_some());
         assert!(spec.root.is_some());
@@ -786,17 +1116,15 @@ mod tests {
     fn test_spec_with_custom_mounts() {
         let (runtime, _temp) = create_test_runtime();
         let mut config = create_test_config();
-        config.mounts = vec![
-            MountConfig {
-                source: PathBuf::from("/host/path"),
-                destination: PathBuf::from("/container/path"),
-                read_only: true,
-            }
-        ];
-        
+        config.mounts = vec![MountConfig {
+            source: PathBuf::from("/host/path"),
+            destination: PathBuf::from("/container/path"),
+            read_only: true,
+        }];
+
         let spec = runtime.create_spec(&config, "test-id").unwrap();
         let mounts = spec.mounts.unwrap();
-        
+
         // Should have default mounts + 1 custom mount
         assert!(mounts.len() > 1);
         assert!(mounts.iter().any(|m| m.destination == "/container/path"));
@@ -807,13 +1135,26 @@ mod tests {
         let (runtime, _temp) = create_test_runtime();
         let mut config = create_test_config();
         config.user = Some("1000".to_string());
-        
+
         let spec = runtime.create_spec(&config, "test-id").unwrap();
         let process = spec.process.unwrap();
         let user = process.user.unwrap();
-        
+
         assert_eq!(user.uid, 1000);
         assert_eq!(user.gid, 1000);
+    }
+
+    #[test]
+    fn test_spec_with_username() {
+        let (runtime, _temp) = create_test_runtime();
+        let mut config = create_test_config();
+        config.user = Some("nobody".to_string());
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let process = spec.process.unwrap();
+        let user = process.user.unwrap();
+
+        assert_eq!(user.username.as_deref(), Some("nobody"));
     }
 
     #[test]
@@ -821,11 +1162,100 @@ mod tests {
         let (runtime, _temp) = create_test_runtime();
         let mut config = create_test_config();
         config.privileged = true;
-        
+
         let spec = runtime.create_spec(&config, "test-id").unwrap();
         let linux = spec.linux.unwrap();
-        
+
         // Privileged containers have empty device list
         assert!(linux.devices.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_spec_with_runtime_options() {
+        let (runtime, _temp) = create_test_runtime();
+        let mut config = create_test_config();
+        config.tty = true;
+        config.readonly_rootfs = true;
+        config.cgroup_parent = Some("kubepods.slice/pod123".to_string());
+        config
+            .sysctls
+            .insert("net.ipv4.ip_forward".to_string(), "1".to_string());
+        config.namespace_paths.network = Some(PathBuf::from("/var/run/netns/test-pod"));
+        config.linux_resources = Some(LinuxContainerResources {
+            cpu_period: 100000,
+            cpu_quota: 200000,
+            cpu_shares: 2048,
+            memory_limit_in_bytes: 536870912,
+            oom_score_adj: 0,
+            cpuset_cpus: "0-1".to_string(),
+            cpuset_mems: "0".to_string(),
+            hugepage_limits: vec![],
+            unified: HashMap::new(),
+            memory_swap_limit_in_bytes: 1073741824,
+        });
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let process = spec.process.unwrap();
+        let root = spec.root.unwrap();
+        let linux = spec.linux.unwrap();
+
+        assert_eq!(process.terminal, Some(true));
+        assert_eq!(root.readonly, Some(true));
+        assert_eq!(linux.cgroups_path.as_deref(), Some("kubepods.slice/pod123"));
+        assert_eq!(
+            linux
+                .sysctl
+                .as_ref()
+                .and_then(|sysctls| sysctls.get("net.ipv4.ip_forward"))
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            linux
+                .namespaces
+                .as_ref()
+                .and_then(|namespaces| namespaces.iter().find(|ns| ns.ns_type == "network"))
+                .and_then(|namespace| namespace.path.as_deref()),
+            Some("/var/run/netns/test-pod")
+        );
+        assert_eq!(
+            linux
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.cpu.as_ref())
+                .and_then(|cpu| cpu.quota),
+            Some(200000)
+        );
+        assert_eq!(
+            linux
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.memory.as_ref())
+                .and_then(|memory| memory.limit),
+            Some(536870912)
+        );
+    }
+
+    #[test]
+    fn test_spec_with_device_mappings() {
+        let (runtime, _temp) = create_test_runtime();
+        let mut config = create_test_config();
+        config.devices = vec![DeviceMapping {
+            source: PathBuf::from("/dev/null"),
+            destination: PathBuf::from("/dev/custom-null"),
+            permissions: "rw".to_string(),
+        }];
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let linux = spec.linux.unwrap();
+        let devices = linux.devices.unwrap();
+        let cgroup_rules = linux.resources.unwrap().devices.unwrap();
+
+        assert!(devices
+            .iter()
+            .any(|device| device.path == "/dev/custom-null"));
+        assert!(cgroup_rules.iter().any(|rule| {
+            rule.access.as_deref() == Some("rw") && rule.device_type.as_deref() == Some("c")
+        }));
     }
 }

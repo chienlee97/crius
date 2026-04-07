@@ -2,9 +2,9 @@
 //!
 //! 提供容器资源限制管理功能，支持cgroups v1和v2
 
-use std::path::PathBuf;
 use anyhow::{Context, Result};
-use log::{info, debug};
+use log::{debug, info};
+use std::path::PathBuf;
 
 /// 资源限制配置
 #[derive(Debug, Clone, Default)]
@@ -134,9 +134,9 @@ impl CgroupManager {
     /// 创建新的cgroups管理器
     pub fn new(container_id: String) -> Result<Self> {
         let (mount_point, version) = Self::detect_cgroup_version()?;
-        
+
         info!("Detected cgroups {:?} at {:?}", version, mount_point);
-        
+
         Ok(Self {
             mount_point,
             version,
@@ -151,13 +151,13 @@ impl CgroupManager {
         if v2_mount.join("cgroup.controllers").exists() {
             return Ok((v2_mount, CgroupVersion::V2));
         }
-        
+
         // 检查cgroup v1
         let v1_mount = PathBuf::from("/sys/fs/cgroup");
         if v1_mount.join("cpu").exists() {
             return Ok((v1_mount, CgroupVersion::V1));
         }
-        
+
         Err(anyhow::anyhow!("No cgroups mount found"))
     }
 
@@ -187,15 +187,21 @@ impl CgroupManager {
 
     /// 创建cgroup v1
     fn create_cgroup_v1(&self) -> Result<()> {
-        let subsystems = ["cpu", "cpuacct", "cpuset", "memory", "blkio", "pids", "devices"];
-        
+        let subsystems = [
+            "cpu", "cpuacct", "cpuset", "memory", "blkio", "pids", "devices",
+        ];
+
         for subsystem in &subsystems {
-            let path = self.mount_point.join(subsystem).join("crius").join(&self.container_id);
+            let path = self
+                .mount_point
+                .join(subsystem)
+                .join("crius")
+                .join(&self.container_id);
             std::fs::create_dir_all(&path)
                 .with_context(|| format!("Failed to create cgroup v1 directory: {:?}", path))?;
             debug!("Created cgroup v1 directory: {:?}", path);
         }
-        
+
         Ok(())
     }
 
@@ -204,7 +210,7 @@ impl CgroupManager {
         let path = self.mount_point.join("crius").join(&self.container_id);
         std::fs::create_dir_all(&path)
             .with_context(|| format!("Failed to create cgroup v2 directory: {:?}", path))?;
-        
+
         // 启用所有控制器
         let cgroup_subtree = self.mount_point.join("cgroup.subtree_control");
         if cgroup_subtree.exists() {
@@ -213,22 +219,28 @@ impl CgroupManager {
                 let _ = std::fs::write(&cgroup_subtree, format!("+{}", controller));
             }
         }
-        
+
         debug!("Created cgroup v2 directory: {:?}", path);
         Ok(())
     }
 
     /// 删除cgroup v1
     fn remove_cgroup_v1(&self) -> Result<()> {
-        let subsystems = ["cpu", "cpuacct", "cpuset", "memory", "blkio", "pids", "devices"];
-        
+        let subsystems = [
+            "cpu", "cpuacct", "cpuset", "memory", "blkio", "pids", "devices",
+        ];
+
         for subsystem in &subsystems {
-            let path = self.mount_point.join(subsystem).join("crius").join(&self.container_id);
+            let path = self
+                .mount_point
+                .join(subsystem)
+                .join("crius")
+                .join(&self.container_id);
             if path.exists() {
                 let _ = std::fs::remove_dir(&path);
             }
         }
-        
+
         info!("Removed cgroup v1 for container {}", self.container_id);
         Ok(())
     }
@@ -245,17 +257,17 @@ impl CgroupManager {
                         if let Ok(pid) = pid.parse::<i32>() {
                             let _ = nix::sys::signal::kill(
                                 nix::unistd::Pid::from_raw(pid),
-                                nix::sys::signal::Signal::SIGKILL
+                                nix::sys::signal::Signal::SIGKILL,
                             );
                         }
                     }
                 }
             }
-            
+
             std::fs::remove_dir(&path)
                 .with_context(|| format!("Failed to remove cgroup v2 directory: {:?}", path))?;
         }
-        
+
         info!("Removed cgroup v2 for container {}", self.container_id);
         Ok(())
     }
@@ -264,8 +276,12 @@ impl CgroupManager {
     fn set_resources_v1(&self, limits: &ResourceLimits) -> Result<()> {
         // 设置CPU限制
         if let Some(cpu) = &limits.cpu {
-            let cpu_path = self.mount_point.join("cpu").join("crius").join(&self.container_id);
-            
+            let cpu_path = self
+                .mount_point
+                .join("cpu")
+                .join("crius")
+                .join(&self.container_id);
+
             if let Some(shares) = cpu.shares {
                 self.write_file(&cpu_path.join("cpu.shares"), shares.to_string())?;
             }
@@ -282,16 +298,26 @@ impl CgroupManager {
 
         // 设置内存限制
         if let Some(memory) = &limits.memory {
-            let mem_path = self.mount_point.join("memory").join("crius").join(&self.container_id);
-            
+            let mem_path = self
+                .mount_point
+                .join("memory")
+                .join("crius")
+                .join(&self.container_id);
+
             if let Some(limit) = memory.limit {
                 self.write_file(&mem_path.join("memory.limit_in_bytes"), limit.to_string())?;
             }
             if let Some(swap) = memory.swap {
-                self.write_file(&mem_path.join("memory.memsw.limit_in_bytes"), swap.to_string())?;
+                self.write_file(
+                    &mem_path.join("memory.memsw.limit_in_bytes"),
+                    swap.to_string(),
+                )?;
             }
             if let Some(reservation) = memory.reservation {
-                self.write_file(&mem_path.join("memory.soft_limit_in_bytes"), reservation.to_string())?;
+                self.write_file(
+                    &mem_path.join("memory.soft_limit_in_bytes"),
+                    reservation.to_string(),
+                )?;
             }
             if let Some(swappiness) = memory.swappiness {
                 self.write_file(&mem_path.join("memory.swappiness"), swappiness.to_string())?;
@@ -303,8 +329,12 @@ impl CgroupManager {
 
         // 设置PID限制
         if let Some(pids) = &limits.pids {
-            let pids_path = self.mount_point.join("pids").join("crius").join(&self.container_id);
-            
+            let pids_path = self
+                .mount_point
+                .join("pids")
+                .join("crius")
+                .join(&self.container_id);
+
             if let Some(max) = pids.max {
                 self.write_file(&pids_path.join("pids.max"), max.to_string())?;
             }
@@ -321,29 +351,29 @@ impl CgroupManager {
         // 设置CPU限制
         if let Some(cpu) = &limits.cpu {
             let mut cpu_max = String::new();
-            
+
             if let Some(quota) = cpu.quota {
                 cpu_max.push_str(&quota.to_string());
             } else {
                 cpu_max.push_str("max");
             }
-            
+
             cpu_max.push(' ');
-            
+
             if let Some(period) = cpu.period {
                 cpu_max.push_str(&period.to_string());
             } else {
                 cpu_max.push_str("100000");
             }
-            
+
             self.write_file(&cgroup_path.join("cpu.max"), cpu_max)?;
-            
+
             if let Some(shares) = cpu.shares {
                 // v2使用cpu.weight，范围1-10000
                 let weight = ((shares as f64 / 1024.0) * 100.0) as u64;
                 self.write_file(&cgroup_path.join("cpu.weight"), weight.to_string())?;
             }
-            
+
             if let Some(cpus) = &cpu.cpus {
                 self.write_file(&cgroup_path.join("cpuset.cpus"), cpus.clone())?;
             }
@@ -369,7 +399,10 @@ impl CgroupManager {
             }
         }
 
-        info!("Set resource limits (v2) for container {}", self.container_id);
+        info!(
+            "Set resource limits (v2) for container {}",
+            self.container_id
+        );
         Ok(())
     }
 
@@ -379,26 +412,31 @@ impl CgroupManager {
             CgroupVersion::V1 => {
                 let subsystems = ["cpu", "memory", "pids"];
                 for subsystem in &subsystems {
-                    let procs_file = self.mount_point
+                    let procs_file = self
+                        .mount_point
                         .join(subsystem)
                         .join("crius")
                         .join(&self.container_id)
                         .join("cgroup.procs");
-                    
+
                     self.write_file(&procs_file, pid.to_string())?;
                 }
             }
             CgroupVersion::V2 => {
-                let procs_file = self.mount_point
+                let procs_file = self
+                    .mount_point
                     .join("crius")
                     .join(&self.container_id)
                     .join("cgroup.procs");
-                
+
                 self.write_file(&procs_file, pid.to_string())?;
             }
         }
-        
-        debug!("Added process {} to cgroup for container {}", pid, self.container_id);
+
+        debug!(
+            "Added process {} to cgroup for container {}",
+            pid, self.container_id
+        );
         Ok(())
     }
 
@@ -429,49 +467,108 @@ pub fn to_oci_resources(limits: &ResourceLimits) -> crate::oci::spec::LinuxResou
             cpus: cpu.cpus.clone(),
             mems: cpu.mems.clone(),
         }),
-        memory: limits.memory.as_ref().map(|memory| crate::oci::spec::LinuxMemory {
-            limit: memory.limit,
-            reservation: memory.reservation,
-            swap: memory.swap,
-            kernel: memory.kernel,
-            kernel_tcp: memory.kernel_tcp,
-            swappiness: memory.swappiness,
-            disable_oom_killer: memory.disable_oom_killer,
-            use_hierarchy: memory.use_hierarchy,
-        }),
-        pids: limits.pids.as_ref().map(|pids| crate::oci::spec::LinuxPids {
-            limit: pids.max.unwrap_or(-1),
-        }),
-        block_io: limits.blkio.as_ref().map(|blkio| crate::oci::spec::LinuxBlockIo {
-            weight: blkio.weight,
-            leaf_weight: blkio.leaf_weight,
-            weight_device: if blkio.device_weights.is_empty() { None } else { Some(blkio.device_weights.iter().map(|d| crate::oci::spec::LinuxWeightDevice {
-                major: d.major,
-                minor: d.minor,
-                weight: d.weight,
-                leaf_weight: d.leaf_weight,
-            }).collect()) },
-            throttle_read_bps_device: if blkio.device_read_bps.is_empty() { None } else { Some(blkio.device_read_bps.iter().map(|d| crate::oci::spec::LinuxThrottleDevice {
-                major: d.major,
-                minor: d.minor,
-                rate: d.rate,
-            }).collect()) },
-            throttle_write_bps_device: if blkio.device_write_bps.is_empty() { None } else { Some(blkio.device_write_bps.iter().map(|d| crate::oci::spec::LinuxThrottleDevice {
-                major: d.major,
-                minor: d.minor,
-                rate: d.rate,
-            }).collect()) },
-            throttle_read_iops_device: if blkio.device_read_iops.is_empty() { None } else { Some(blkio.device_read_iops.iter().map(|d| crate::oci::spec::LinuxThrottleDevice {
-                major: d.major,
-                minor: d.minor,
-                rate: d.rate,
-            }).collect()) },
-            throttle_write_iops_device: if blkio.device_write_iops.is_empty() { None } else { Some(blkio.device_write_iops.iter().map(|d| crate::oci::spec::LinuxThrottleDevice {
-                major: d.major,
-                minor: d.minor,
-                rate: d.rate,
-            }).collect()) },
-        }),
+        memory: limits
+            .memory
+            .as_ref()
+            .map(|memory| crate::oci::spec::LinuxMemory {
+                limit: memory.limit,
+                reservation: memory.reservation,
+                swap: memory.swap,
+                kernel: memory.kernel,
+                kernel_tcp: memory.kernel_tcp,
+                swappiness: memory.swappiness,
+                disable_oom_killer: memory.disable_oom_killer,
+                use_hierarchy: memory.use_hierarchy,
+            }),
+        pids: limits
+            .pids
+            .as_ref()
+            .map(|pids| crate::oci::spec::LinuxPids {
+                limit: pids.max.unwrap_or(-1),
+            }),
+        block_io: limits
+            .blkio
+            .as_ref()
+            .map(|blkio| crate::oci::spec::LinuxBlockIo {
+                weight: blkio.weight,
+                leaf_weight: blkio.leaf_weight,
+                weight_device: if blkio.device_weights.is_empty() {
+                    None
+                } else {
+                    Some(
+                        blkio
+                            .device_weights
+                            .iter()
+                            .map(|d| crate::oci::spec::LinuxWeightDevice {
+                                major: d.major,
+                                minor: d.minor,
+                                weight: d.weight,
+                                leaf_weight: d.leaf_weight,
+                            })
+                            .collect(),
+                    )
+                },
+                throttle_read_bps_device: if blkio.device_read_bps.is_empty() {
+                    None
+                } else {
+                    Some(
+                        blkio
+                            .device_read_bps
+                            .iter()
+                            .map(|d| crate::oci::spec::LinuxThrottleDevice {
+                                major: d.major,
+                                minor: d.minor,
+                                rate: d.rate,
+                            })
+                            .collect(),
+                    )
+                },
+                throttle_write_bps_device: if blkio.device_write_bps.is_empty() {
+                    None
+                } else {
+                    Some(
+                        blkio
+                            .device_write_bps
+                            .iter()
+                            .map(|d| crate::oci::spec::LinuxThrottleDevice {
+                                major: d.major,
+                                minor: d.minor,
+                                rate: d.rate,
+                            })
+                            .collect(),
+                    )
+                },
+                throttle_read_iops_device: if blkio.device_read_iops.is_empty() {
+                    None
+                } else {
+                    Some(
+                        blkio
+                            .device_read_iops
+                            .iter()
+                            .map(|d| crate::oci::spec::LinuxThrottleDevice {
+                                major: d.major,
+                                minor: d.minor,
+                                rate: d.rate,
+                            })
+                            .collect(),
+                    )
+                },
+                throttle_write_iops_device: if blkio.device_write_iops.is_empty() {
+                    None
+                } else {
+                    Some(
+                        blkio
+                            .device_write_iops
+                            .iter()
+                            .map(|d| crate::oci::spec::LinuxThrottleDevice {
+                                major: d.major,
+                                minor: d.minor,
+                                rate: d.rate,
+                            })
+                            .collect(),
+                    )
+                },
+            }),
         hugepage_limits: None,
         devices: None,
         intel_rdt: None,

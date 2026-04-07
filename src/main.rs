@@ -1,33 +1,35 @@
-use std::path::{Path, PathBuf};
+use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::net::UnixListener;
-use std::fs;
+use std::path::{Path, PathBuf};
 
+use anyhow::Error;
+use clap::Parser;
 use tokio::net::UnixListener as TokioUnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
-use clap::Parser;
 use tonic::transport::Server;
 use tonic_reflection::server::Builder as ReflectionBuilder;
-use tracing_subscriber::{fmt, EnvFilter};
 use tracing::{debug, info};
-use anyhow::Error;
+use tracing_subscriber::{fmt, EnvFilter};
 
-use crate::server::{RuntimeConfig, RuntimeServiceImpl};
 use crate::image::ImageServiceImpl;
 use crate::proto::runtime::v1::{
-    runtime_service_server::RuntimeServiceServer,
-    image_service_server::ImageServiceServer,
+    image_service_server::ImageServiceServer, runtime_service_server::RuntimeServiceServer,
 };
+use crate::server::{RuntimeConfig, RuntimeServiceImpl};
 
-mod server;
-mod image;
-mod proto;
+mod attach;
+mod cgroups;
 mod error;
-mod runtime;
+mod image;
+mod network;
 mod oci;
 mod pod;
-mod network;
+mod proto;
+mod runtime;
+mod server;
 mod storage;
+mod streaming;
 
 /// crius - OCI-based implementation of Kubernetes Container Runtime Interface
 #[derive(Parser, Debug)]
@@ -54,10 +56,10 @@ struct Args {
 async fn main() -> Result<(), Error> {
     // 初始化日志
     init_logging()?;
-    
+
     // 解析命令行参数
     let args = Args::parse();
-    
+
     // 创建运行时配置
     let runtime_config = RuntimeConfig {
         root_dir: PathBuf::from("/var/lib/crius"),
@@ -73,7 +75,11 @@ async fn main() -> Result<(), Error> {
 
     // 创建服务实例
     let runtime_service = RuntimeServiceImpl::new(runtime_config.clone());
-    
+    let streaming_server = crate::streaming::StreamingServer::start("127.0.0.1:0").await?;
+    runtime_service
+        .set_streaming_server(streaming_server.clone())
+        .await;
+
     // 从持久化存储恢复状态
     info!("Recovering state from database...");
     if let Err(e) = runtime_service.recover_state().await {
@@ -81,7 +87,10 @@ async fn main() -> Result<(), Error> {
     }
     let image_service = ImageServiceImpl::new(runtime_config.root_dir.join("storage"))?;
     let reflection_service = ReflectionBuilder::configure()
-        .register_encoded_file_descriptor_set(include_bytes!(concat!(env!("OUT_DIR"), "/file_descriptor_set.bin")))
+        .register_encoded_file_descriptor_set(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/file_descriptor_set.bin"
+        )))
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to create reflection service: {}", e))?;
 
@@ -95,7 +104,11 @@ async fn main() -> Result<(), Error> {
     // 创建gRPC服务器
     info!("Starting crius gRPC server on {}", args.listen);
     debug!("Using configuration: {:?}", runtime_config);
-    
+    info!(
+        "Streaming server listening on {}",
+        streaming_server.base_url()
+    );
+
     let server = Server::builder()
         .add_service(RuntimeServiceServer::new(runtime_service))
         .add_service(ImageServiceServer::new(image_service))
@@ -105,39 +118,38 @@ async fn main() -> Result<(), Error> {
         // Unix domain socket
         let socket_path = args.listen.trim_start_matches("unix://");
         let path = Path::new(socket_path);
-        
+
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        
+
         // 清理旧socket文件
         let _ = fs::remove_file(path);
-        
+
         // 创建Unix监听器
         let uds = UnixListener::bind(path)?;
         let uds_stream = UnixListenerStream::new(TokioUnixListener::from_std(uds)?);
-        
+
         // 启动服务
         server.serve_with_incoming(uds_stream).await?;
     } else {
         let addr: SocketAddr = args.listen.parse()?;
         server.serve(addr).await?;
     }
-    
+
     Ok(())
 }
 
 fn init_logging() -> Result<(), Error> {
-       
     let filter = EnvFilter::from_default_env()
         .add_directive("crius=info".parse()?)
         .add_directive("tower_http=info".parse()?);
-    
+
     fmt()
         .with_file(true)
         .with_line_number(true)
         .with_writer(std::io::stderr)
         .init();
-    
+
     Ok(())
 }

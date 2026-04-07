@@ -6,10 +6,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 // 使用crius库
-use crius::runtime::{ContainerRuntime, RuncRuntime, ContainerConfig, MountConfig, ContainerStatus};
-use crius::pod::{PodSandboxManager, PodSandboxConfig};
-use crius::storage::{StorageManager, ContainerRecord, PodSandboxRecord};
-use crius::storage::persistence::{PersistenceManager, PersistenceConfig};
+use crius::pod::{PodSandboxConfig, PodSandboxManager};
+use crius::runtime::{
+    ContainerConfig, ContainerRuntime, ContainerStatus, MountConfig, RuncRuntime,
+};
+use crius::storage::persistence::{PersistenceConfig, PersistenceManager};
+use crius::storage::{ContainerRecord, PodSandboxRecord, StorageManager};
 
 /// 测试辅助函数：创建临时目录
 fn temp_dir() -> PathBuf {
@@ -30,7 +32,23 @@ fn create_test_container_config(name: &str, image: &str) -> ContainerConfig {
         annotations: vec![],
         privileged: false,
         user: None,
+        run_as_group: None,
+        supplemental_groups: vec![],
         hostname: None,
+        tty: false,
+        stdin: false,
+        stdin_once: false,
+        log_path: None,
+        readonly_rootfs: false,
+        no_new_privileges: None,
+        apparmor_profile: None,
+        capabilities: None,
+        cgroup_parent: None,
+        sysctls: HashMap::new(),
+        namespace_options: None,
+        namespace_paths: crius::runtime::NamespacePaths::default(),
+        linux_resources: None,
+        devices: vec![],
         rootfs: temp_dir().join("rootfs"),
     }
 }
@@ -42,11 +60,24 @@ fn create_test_pod_config(name: &str, namespace: &str) -> PodSandboxConfig {
         namespace: namespace.to_string(),
         uid: format!("test-uid-{}", uuid::Uuid::new_v4()),
         hostname: "test-host".to_string(),
+        log_directory: None,
+        runtime_handler: "runc".to_string(),
         labels: vec![],
         annotations: vec![],
         dns_config: None,
         port_mappings: vec![],
         network_config: None,
+        cgroup_parent: None,
+        sysctls: HashMap::new(),
+        namespace_options: None,
+        privileged: false,
+        run_as_user: None,
+        run_as_group: None,
+        supplemental_groups: vec![],
+        readonly_rootfs: false,
+        no_new_privileges: None,
+        apparmor_profile: None,
+        linux_resources: None,
     }
 }
 
@@ -58,11 +89,8 @@ mod runtime_tests {
     #[test]
     fn test_runc_runtime_creation() {
         let temp_dir = temp_dir();
-        let runtime = RuncRuntime::new(
-            PathBuf::from("/usr/bin/runc"),
-            temp_dir.clone(),
-        );
-        
+        let runtime = RuncRuntime::new(PathBuf::from("/usr/bin/runc"), temp_dir.clone());
+
         // 验证runtime创建成功
         assert!(!runtime.is_shim_enabled()); // 默认未启用shim
     }
@@ -71,7 +99,7 @@ mod runtime_tests {
     #[test]
     fn test_container_config_creation() {
         let config = create_test_container_config("test-container", "test:latest");
-        
+
         assert_eq!(config.name, "test-container");
         assert_eq!(config.image, "test:latest");
         assert_eq!(config.command, vec!["echo", "hello"]);
@@ -87,7 +115,7 @@ mod storage_tests {
     fn test_storage_manager_creation() {
         let temp_dir = temp_dir();
         let db_path = temp_dir.join("test.db");
-        
+
         let manager = StorageManager::new(&db_path);
         assert!(manager.is_ok());
     }
@@ -97,9 +125,9 @@ mod storage_tests {
     fn test_container_crud() {
         let temp_dir = temp_dir();
         let db_path = temp_dir.join("test.db");
-        
+
         let mut manager = StorageManager::new(&db_path).unwrap();
-        
+
         // 创建容器记录
         let container = ContainerRecord {
             id: "container-1".to_string(),
@@ -113,23 +141,25 @@ mod storage_tests {
             exit_code: None,
             exit_time: None,
         };
-        
+
         manager.save_container(&container).unwrap();
-        
+
         // 查询容器
         let retrieved = manager.get_container("container-1").unwrap();
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.id, "container-1");
         assert_eq!(retrieved.state, "running");
-        
+
         // 更新状态
-        manager.update_container_state("container-1", "stopped", Some(0)).unwrap();
-        
+        manager
+            .update_container_state("container-1", "stopped", Some(0))
+            .unwrap();
+
         let updated = manager.get_container("container-1").unwrap().unwrap();
         assert_eq!(updated.state, "stopped");
         assert_eq!(updated.exit_code, Some(0));
-        
+
         // 删除容器
         manager.delete_container("container-1").unwrap();
         let deleted = manager.get_container("container-1").unwrap();
@@ -141,9 +171,9 @@ mod storage_tests {
     fn test_pod_sandbox_crud() {
         let temp_dir = temp_dir();
         let db_path = temp_dir.join("test.db");
-        
+
         let mut manager = StorageManager::new(&db_path).unwrap();
-        
+
         // 创建Pod记录
         let pod = PodSandboxRecord {
             id: "pod-1".to_string(),
@@ -158,22 +188,22 @@ mod storage_tests {
             pause_container_id: Some("pause-1".to_string()),
             ip: Some("10.88.0.1".to_string()),
         };
-        
+
         manager.save_pod_sandbox(&pod).unwrap();
-        
+
         // 查询Pod
         let retrieved = manager.get_pod_sandbox("pod-1").unwrap();
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.id, "pod-1");
         assert_eq!(retrieved.name, "test-pod");
-        
+
         // 更新状态
         manager.update_pod_state("pod-1", "notready").unwrap();
-        
+
         let updated = manager.get_pod_sandbox("pod-1").unwrap().unwrap();
         assert_eq!(updated.state, "notready");
-        
+
         // 删除Pod
         manager.delete_pod_sandbox("pod-1").unwrap();
         let deleted = manager.get_pod_sandbox("pod-1").unwrap();
@@ -195,38 +225,44 @@ mod storage_tests {
         // 保存容器
         let mut labels = HashMap::new();
         labels.insert("app".to_string(), "test".to_string());
-        
-        manager.save_container(
-            "container-1",
-            "pod-1",
-            ContainerStatus::Running,
-            "test:latest",
-            &["echo".to_string(), "hello".to_string()],
-            &labels,
-            &HashMap::new(),
-        ).unwrap();
+
+        manager
+            .save_container(
+                "container-1",
+                "pod-1",
+                ContainerStatus::Running,
+                "test:latest",
+                &["echo".to_string(), "hello".to_string()],
+                &labels,
+                &HashMap::new(),
+            )
+            .unwrap();
 
         // 更新状态
-        manager.update_container_state("container-1", ContainerStatus::Stopped(0)).unwrap();
+        manager
+            .update_container_state("container-1", ContainerStatus::Stopped(0))
+            .unwrap();
 
         // 恢复容器
         let recovered = manager.recover_containers().unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].0, "container-1");
-        
+
         // 保存Pod
-        manager.save_pod_sandbox(
-            "pod-1",
-            "ready",
-            "test-pod",
-            "default",
-            "uid-123",
-            "/var/run/netns/pod-1",
-            &labels,
-            &HashMap::new(),
-            Some("pause-1"),
-            Some("10.88.0.1"),
-        ).unwrap();
+        manager
+            .save_pod_sandbox(
+                "pod-1",
+                "ready",
+                "test-pod",
+                "default",
+                "uid-123",
+                "/var/run/netns/pod-1",
+                &labels,
+                &HashMap::new(),
+                Some("pause-1"),
+                Some("10.88.0.1"),
+            )
+            .unwrap();
 
         // 恢复Pod
         let recovered_pods = manager.recover_pods().unwrap();
@@ -244,17 +280,14 @@ mod pod_tests {
     #[test]
     fn test_pod_sandbox_manager_creation() {
         let temp_dir = temp_dir();
-        let runtime = RuncRuntime::new(
-            PathBuf::from("/usr/bin/runc"),
-            temp_dir.join("runtime"),
-        );
-        
+        let runtime = RuncRuntime::new(PathBuf::from("/usr/bin/runc"), temp_dir.join("runtime"));
+
         let manager = PodSandboxManager::new(
             runtime,
             temp_dir.join("pods"),
             "registry.k8s.io/pause:3.9".to_string(),
         );
-        
+
         // 验证创建成功 - 检查Debug输出包含root_dir
         let debug_str = format!("{:?}", manager);
         assert!(debug_str.contains("root_dir"));
@@ -264,7 +297,7 @@ mod pod_tests {
     #[test]
     fn test_pod_sandbox_config_creation() {
         let config = create_test_pod_config("test-pod", "default");
-        
+
         assert_eq!(config.name, "test-pod");
         assert_eq!(config.namespace, "default");
         assert!(!config.uid.is_empty());
@@ -280,14 +313,14 @@ mod integration_tests {
     fn test_container_lifecycle_with_persistence() {
         let temp_dir = temp_dir();
         let db_path = temp_dir.join("integration.db");
-        
+
         // 步骤1：创建存储管理器
         let mut storage = StorageManager::new(&db_path).unwrap();
-        
+
         // 步骤2：创建容器记录
         let container_id = format!("container-{}", uuid::Uuid::new_v4());
         let pod_id = format!("pod-{}", uuid::Uuid::new_v4());
-        
+
         let container = ContainerRecord {
             id: container_id.clone(),
             pod_id: pod_id.clone(),
@@ -300,34 +333,38 @@ mod integration_tests {
             exit_code: None,
             exit_time: None,
         };
-        
+
         storage.save_container(&container).unwrap();
-        
+
         // 步骤3：验证创建
         let retrieved = storage.get_container(&container_id).unwrap();
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.state, "created");
         assert_eq!(retrieved.image, "nginx:latest");
-        
+
         // 步骤4：更新状态为运行中
-        storage.update_container_state(&container_id, "running", None).unwrap();
+        storage
+            .update_container_state(&container_id, "running", None)
+            .unwrap();
         let updated = storage.get_container(&container_id).unwrap().unwrap();
         assert_eq!(updated.state, "running");
         assert!(updated.exit_code.is_none());
-        
+
         // 步骤5：更新状态为已停止
-        storage.update_container_state(&container_id, "stopped", Some(0)).unwrap();
+        storage
+            .update_container_state(&container_id, "stopped", Some(0))
+            .unwrap();
         let stopped = storage.get_container(&container_id).unwrap().unwrap();
         assert_eq!(stopped.state, "stopped");
         assert_eq!(stopped.exit_code, Some(0));
         assert!(stopped.exit_time.is_some());
-        
+
         // 步骤6：删除容器
         storage.delete_container(&container_id).unwrap();
         let deleted = storage.get_container(&container_id).unwrap();
         assert!(deleted.is_none());
-        
+
         println!("✅ 容器生命周期集成测试通过");
     }
 
@@ -336,9 +373,9 @@ mod integration_tests {
     fn test_pod_with_containers_integration() {
         let temp_dir = temp_dir();
         let db_path = temp_dir.join("pod_integration.db");
-        
+
         let mut storage = StorageManager::new(&db_path).unwrap();
-        
+
         // 步骤1：创建Pod
         let pod_id = format!("pod-{}", uuid::Uuid::new_v4());
         let pod = PodSandboxRecord {
@@ -354,13 +391,13 @@ mod integration_tests {
             pause_container_id: Some(format!("pause-{}", uuid::Uuid::new_v4())),
             ip: Some("10.88.0.10".to_string()),
         };
-        
+
         storage.save_pod_sandbox(&pod).unwrap();
-        
+
         // 步骤2：创建关联的容器
         let container1_id = format!("container-{}", uuid::Uuid::new_v4());
         let container2_id = format!("container-{}", uuid::Uuid::new_v4());
-        
+
         let container1 = ContainerRecord {
             id: container1_id.clone(),
             pod_id: pod_id.clone(),
@@ -373,7 +410,7 @@ mod integration_tests {
             exit_code: None,
             exit_time: None,
         };
-        
+
         let container2 = ContainerRecord {
             id: container2_id.clone(),
             pod_id: pod_id.clone(),
@@ -386,22 +423,22 @@ mod integration_tests {
             exit_code: None,
             exit_time: None,
         };
-        
+
         storage.save_container(&container1).unwrap();
         storage.save_container(&container2).unwrap();
-        
+
         // 步骤3：查询Pod下的所有容器
         let containers = storage.list_containers_by_pod(&pod_id).unwrap();
         assert_eq!(containers.len(), 2);
-        
+
         // 步骤4：删除Pod（应该级联删除容器）
         storage.delete_pod_sandbox(&pod_id).unwrap();
-        
+
         // 步骤5：验证Pod和容器都已删除
         assert!(storage.get_pod_sandbox(&pod_id).unwrap().is_none());
         assert!(storage.get_container(&container1_id).unwrap().is_none());
         assert!(storage.get_container(&container2_id).unwrap().is_none());
-        
+
         println!("✅ Pod与容器关联集成测试通过");
     }
 
@@ -410,11 +447,11 @@ mod integration_tests {
     fn test_state_recovery_integration() {
         let temp_dir = temp_dir();
         let db_path = temp_dir.join("recovery.db");
-        
+
         // 步骤1：第一次会话 - 创建数据
         {
             let mut storage = StorageManager::new(&db_path).unwrap();
-            
+
             // 创建Pod
             let pod_id = format!("pod-{}", uuid::Uuid::new_v4());
             let pod = PodSandboxRecord {
@@ -431,7 +468,7 @@ mod integration_tests {
                 ip: Some("10.88.0.5".to_string()),
             };
             storage.save_pod_sandbox(&pod).unwrap();
-            
+
             // 创建容器
             let container_id = format!("container-{}", uuid::Uuid::new_v4());
             let container = ContainerRecord {
@@ -447,33 +484,33 @@ mod integration_tests {
                 exit_time: None,
             };
             storage.save_container(&container).unwrap();
-            
+
             // 模拟正常关闭
             storage.close().unwrap();
         }
-        
+
         // 步骤2：第二次会话 - 恢复数据（模拟daemon重启）
         {
             let storage = StorageManager::new(&db_path).unwrap();
-            
+
             // 恢复所有Pod
             let pods = storage.list_pod_sandboxes().unwrap();
             assert_eq!(pods.len(), 1);
             assert_eq!(pods[0].state, "ready");
             assert_eq!(pods[0].ip, Some("10.88.0.5".to_string()));
-            
+
             // 恢复所有容器
             let containers = storage.list_containers().unwrap();
             assert_eq!(containers.len(), 1);
             assert_eq!(containers[0].state, "running");
             assert_eq!(containers[0].image, "alpine:latest");
-            
+
             // 验证关联
             let pod_containers = storage.list_containers_by_pod(&pods[0].id).unwrap();
             assert_eq!(pod_containers.len(), 1);
             assert_eq!(pod_containers[0].id, containers[0].id);
         }
-        
+
         println!("✅ 状态恢复集成测试通过");
     }
 }
@@ -492,28 +529,28 @@ mod test_main {
     #[test]
     fn test_suite_summary() {
         setup();
-        
+
         println!("\n========================================");
         println!("CRIUS 集成测试套件");
         println!("========================================\n");
-        
+
         println!("✅ 运行时模块测试");
         println!("   - RuncRuntime 创建");
         println!("   - 容器配置创建");
         println!("   - PodSandboxManager 创建");
         println!("   - PodSandboxConfig 创建\n");
-        
+
         println!("✅ 存储模块测试");
         println!("   - StorageManager 创建");
         println!("   - 容器 CRUD 操作");
         println!("   - Pod沙箱 CRUD 操作");
         println!("   - 持久化管理器\n");
-        
+
         println!("✅ 集成测试");
         println!("   - 容器生命周期（创建→保存→更新→删除）");
         println!("   - Pod沙箱与容器关联");
         println!("   - 状态恢复（模拟daemon重启）\n");
-        
+
         println!("========================================");
         println!("所有集成测试完成！");
         println!("========================================\n");

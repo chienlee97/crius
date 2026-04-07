@@ -1,10 +1,10 @@
 //! 网络模块
-//! 
+//!
 //! 提供容器网络功能，包括网络命名空间管理、CNI 接口等。
 
-use std::path::Path;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::Path;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -13,28 +13,31 @@ use tokio::process::Command;
 
 pub mod cni;
 mod error;
-mod types;
-mod port_mapping;
 pub mod multi;
+mod port_mapping;
+mod types;
 
 pub use cni::CniManager;
 pub use error::NetworkError;
+pub use multi::{
+    MultiNetworkConfig, MultiNetworkManager, NetworkInterfaceStatus, NetworkSelector,
+    PodNetworkStatus,
+};
+pub use port_mapping::{PortMapping, PortMappingBackend, PortMappingManager, Protocol};
 pub use types::*;
-pub use port_mapping::{PortMappingManager, PortMapping, Protocol, PortMappingBackend};
-pub use multi::{MultiNetworkManager, MultiNetworkConfig, NetworkInterfaceStatus, PodNetworkStatus, NetworkSelector};
 
 /// 网络管理器接口
 #[async_trait]
 pub trait NetworkManager: Send + Sync + 'static {
     /// 初始化网络
     async fn init(&self) -> Result<(), NetworkError>;
-    
+
     /// 创建网络命名空间
     async fn create_network_namespace(&self, ns_path: &str) -> Result<(), NetworkError>;
-    
+
     /// 删除网络命名空间
     async fn remove_network_namespace(&self, ns_path: &str) -> Result<(), NetworkError>;
-    
+
     /// 设置 Pod 网络
     async fn setup_pod_network(
         &self,
@@ -43,13 +46,9 @@ pub trait NetworkManager: Send + Sync + 'static {
         pod_name: &str,
         pod_namespace: &str,
     ) -> Result<NetworkStatus, NetworkError>;
-    
+
     /// 清理 Pod 网络
-    async fn teardown_pod_network(
-        &self,
-        pod_id: &str,
-        netns: &str,
-    ) -> Result<(), NetworkError>;
+    async fn teardown_pod_network(&self, pod_id: &str, netns: &str) -> Result<(), NetworkError>;
 }
 
 /// 默认网络管理器实现
@@ -75,16 +74,8 @@ impl DefaultNetworkManager {
         cni_cache_dir: Option<String>,
     ) -> Self {
         Self {
-            cni_plugin_dirs: cni_plugin_dirs.unwrap_or_else(|| {
-                vec![
-                    "/opt/cni/bin".to_string(),
-                ]
-            }),
-            cni_config_dirs: cni_config_dirs.unwrap_or_else(|| {
-                vec![
-                    "/etc/cni/net.d".to_string(),
-                ]
-            }),
+            cni_plugin_dirs: cni_plugin_dirs.unwrap_or_else(|| vec!["/opt/cni/bin".to_string()]),
+            cni_config_dirs: cni_config_dirs.unwrap_or_else(|| vec!["/etc/cni/net.d".to_string()]),
             cni_cache_dir: cni_cache_dir.unwrap_or_else(|| "/var/lib/cni/cache".to_string()),
         }
     }
@@ -106,7 +97,7 @@ impl NetworkManager for DefaultNetworkManager {
                 .args(["netns", "add", ns_path])
                 .status()
                 .await?;
-            
+
             if !status.success() {
                 return Err(NetworkError::CommandExecutionError {
                     command: format!("ip netns add {}", ns_path),
@@ -123,7 +114,7 @@ impl NetworkManager for DefaultNetworkManager {
                 .args(["netns", "delete", ns_path])
                 .status()
                 .await?;
-            
+
             if !status.success() {
                 return Err(NetworkError::CommandExecutionError {
                     command: format!("ip netns delete {}", ns_path),
@@ -151,11 +142,7 @@ impl NetworkManager for DefaultNetworkManager {
         })
     }
 
-    async fn teardown_pod_network(
-        &self,
-        _pod_id: &str,
-        _netns: &str,
-    ) -> Result<(), NetworkError> {
+    async fn teardown_pod_network(&self, _pod_id: &str, _netns: &str) -> Result<(), NetworkError> {
         // 这里将调用 CNI 插件来清理网络
         Ok(())
     }
@@ -167,26 +154,30 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    #[ignore = "requires root privileges and iproute2"]  // 需要root权限运行ip netns
+    #[ignore = "requires root privileges and iproute2"] // 需要root权限运行ip netns
     async fn test_network_namespace() -> Result<(), Box<dyn std::error::Error>> {
         let manager = DefaultNetworkManager::new(None, None, None);
-        
+
         // 使用简单的命名空间名称（不是路径）
         let ns_name = "crius-test-ns";
-        
+
         // 测试创建网络命名空间
         manager.create_network_namespace(ns_name).await?;
-        
+
         // 验证命名空间存在（在 /var/run/netns/ 或 /run/netns/）
-        let ns_exists = std::path::Path::new("/run/netns").join(ns_name).exists() || 
-                       std::path::Path::new("/var/run/netns").join(ns_name).exists();
+        let ns_exists = std::path::Path::new("/run/netns").join(ns_name).exists()
+            || std::path::Path::new("/var/run/netns")
+                .join(ns_name)
+                .exists();
         assert!(ns_exists, "Network namespace should exist");
 
         // 测试删除网络命名空间
         manager.remove_network_namespace(ns_name).await?;
-        
-        let ns_exists_after = std::path::Path::new("/run/netns").join(ns_name).exists() || 
-                              std::path::Path::new("/var/run/netns").join(ns_name).exists();
+
+        let ns_exists_after = std::path::Path::new("/run/netns").join(ns_name).exists()
+            || std::path::Path::new("/var/run/netns")
+                .join(ns_name)
+                .exists();
         assert!(!ns_exists_after, "Network namespace should be deleted");
 
         Ok(())

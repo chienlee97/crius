@@ -2,12 +2,12 @@
 //!
 //! 负责启动、监控和与shim进程通信
 
+use anyhow::{Context, Result};
+use log::{debug, info};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::fs;
 use std::sync::{Arc, Mutex};
-use anyhow::{Context, Result};
-use log::{info, debug};
 
 /// Shim配置
 #[derive(Debug, Clone)]
@@ -63,7 +63,7 @@ impl ShimManager {
     pub fn new(config: ShimConfig) -> Self {
         // 确保工作目录存在
         let _ = fs::create_dir_all(&config.work_dir);
-        
+
         Self {
             config,
             processes: Arc::new(Mutex::new(Vec::new())),
@@ -85,10 +85,14 @@ impl ShimManager {
 
         // 构建shim命令
         let mut cmd = Command::new(&self.config.shim_path);
-        cmd.arg("--id").arg(container_id)
-           .arg("--bundle").arg(bundle_path)
-           .arg("--runtime").arg(&self.config.runtime_path)
-           .arg("--exit-code-file").arg(&exit_code_file);
+        cmd.arg("--id")
+            .arg(container_id)
+            .arg("--bundle")
+            .arg(bundle_path)
+            .arg("--runtime")
+            .arg(&self.config.runtime_path)
+            .arg("--exit-code-file")
+            .arg(&exit_code_file);
 
         if self.config.debug {
             cmd.arg("--debug");
@@ -98,7 +102,7 @@ impl ShimManager {
 
         // 启动shim进程
         debug!("Executing: {:?}", cmd);
-        
+
         let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -107,13 +111,16 @@ impl ShimManager {
             .context("Failed to start shim process")?;
 
         let shim_pid = child.id();
-        
+
         // 在后台等待shim进程（避免僵尸进程）
         std::thread::spawn(move || {
             let _ = child.wait();
         });
 
-        info!("Shim started for container {} with PID {}", container_id, shim_pid);
+        info!(
+            "Shim started for container {} with PID {}",
+            container_id, shim_pid
+        );
 
         let process = ShimProcess {
             container_id: container_id.to_string(),
@@ -134,16 +141,18 @@ impl ShimManager {
     /// 获取容器的退出码
     pub fn get_exit_code(&self, container_id: &str) -> Result<Option<i32>> {
         let processes = self.processes.lock().unwrap();
-        
+
         if let Some(process) = processes.iter().find(|p| p.container_id == container_id) {
             if process.exit_code_file.exists() {
                 let content = fs::read_to_string(&process.exit_code_file)?;
-                let exit_code = content.trim().parse::<i32>()
+                let exit_code = content
+                    .trim()
+                    .parse::<i32>()
                     .context("Failed to parse exit code")?;
                 return Ok(Some(exit_code));
             }
         }
-        
+
         Ok(None)
     }
 
@@ -152,23 +161,26 @@ impl ShimManager {
         info!("Stopping shim for container {}", container_id);
 
         let mut processes = self.processes.lock().unwrap();
-        
-        if let Some(index) = processes.iter().position(|p| p.container_id == container_id) {
+
+        if let Some(index) = processes
+            .iter()
+            .position(|p| p.container_id == container_id)
+        {
             let process = processes.remove(index);
-            
+
             // 发送SIGTERM给shim进程
             #[cfg(unix)]
             {
                 use nix::sys::signal::{self, Signal};
                 use nix::unistd::Pid;
-                
+
                 let pid = Pid::from_raw(process.shim_pid as i32);
                 let _ = signal::kill(pid, Signal::SIGTERM);
             }
-            
+
             // 清理socket文件
             let _ = fs::remove_file(&process.socket_path);
-            
+
             info!("Shim for container {} stopped", container_id);
         }
 
@@ -184,14 +196,14 @@ impl ShimManager {
     /// 检查shim是否还在运行
     pub fn is_shim_running(&self, container_id: &str) -> bool {
         let processes = self.processes.lock().unwrap();
-        
+
         if let Some(process) = processes.iter().find(|p| p.container_id == container_id) {
             // 检查进程是否存在
             #[cfg(unix)]
             {
                 use nix::sys::signal::{self, Signal};
                 use nix::unistd::Pid;
-                
+
                 let pid = Pid::from_raw(process.shim_pid as i32);
                 // 发送信号0检查进程是否存在
                 signal::kill(pid, Signal::SIGCHLD).is_ok()
@@ -209,7 +221,7 @@ impl ShimManager {
     pub fn cleanup_exited_shims(&self) -> Result<usize> {
         let mut processes = self.processes.lock().unwrap();
         let initial_count = processes.len();
-        
+
         processes.retain(|process| {
             // 检查进程是否还在运行
             let is_running = {
@@ -217,7 +229,7 @@ impl ShimManager {
                 {
                     use nix::sys::signal::{self, Signal};
                     use nix::unistd::Pid;
-                    
+
                     let pid = Pid::from_raw(process.shim_pid as i32);
                     signal::kill(pid, Signal::SIGCHLD).is_ok()
                 }
@@ -226,35 +238,38 @@ impl ShimManager {
                     false
                 }
             };
-            
+
             if !is_running {
-                debug!("Cleaning up exited shim for container {}", process.container_id);
+                debug!(
+                    "Cleaning up exited shim for container {}",
+                    process.container_id
+                );
                 // 清理socket文件
                 let _ = fs::remove_file(&process.socket_path);
             }
-            
+
             is_running
         });
-        
+
         let cleaned = initial_count - processes.len();
         if cleaned > 0 {
             info!("Cleaned up {} exited shim processes", cleaned);
         }
-        
+
         Ok(cleaned)
     }
 
     /// 读取shim日志
     pub fn read_shim_log(&self, container_id: &str) -> Result<String> {
         let processes = self.processes.lock().unwrap();
-        
+
         if let Some(process) = processes.iter().find(|p| p.container_id == container_id) {
             if process.log_file.exists() {
                 let content = fs::read_to_string(&process.log_file)?;
                 return Ok(content);
             }
         }
-        
+
         Ok(String::new())
     }
 }
@@ -278,7 +293,7 @@ mod tests {
             work_dir: temp_dir.path().to_path_buf(),
             ..Default::default()
         };
-        
+
         let manager = ShimManager::new(config);
         let shims = manager.list_shims();
         assert!(shims.is_empty());

@@ -7,12 +7,12 @@
 //! - 网络IO统计
 //! - 进程数统计
 
+use anyhow::{Context, Result};
+use log::{debug, warn};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use anyhow::{Context, Result};
-use log::{debug, warn};
-use serde::{Serialize, Deserialize};
 
 /// 容器性能统计
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -162,14 +162,20 @@ impl MetricsCollector {
     fn is_cgroup_v2() -> bool {
         // 检查cgroup v2的挂载
         if let Ok(content) = fs::read_to_string("/proc/mounts") {
-            content.lines().any(|line| line.contains("cgroup2") || line.contains("cgroups2"))
+            content
+                .lines()
+                .any(|line| line.contains("cgroup2") || line.contains("cgroups2"))
         } else {
             false
         }
     }
 
     /// 采集容器指标
-    pub fn collect_container_stats(&self, container_id: &str, cgroup_path: &Path) -> Result<ContainerStats> {
+    pub fn collect_container_stats(
+        &self,
+        container_id: &str,
+        cgroup_path: &Path,
+    ) -> Result<ContainerStats> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -201,8 +207,12 @@ impl MetricsCollector {
             stats.pids = Some(pids);
         }
 
-        debug!("Collected stats for container {}: cpu={:?}, memory={:?}", 
-               container_id, stats.cpu.is_some(), stats.memory.is_some());
+        debug!(
+            "Collected stats for container {}: cpu={:?}, memory={:?}",
+            container_id,
+            stats.cpu.is_some(),
+            stats.memory.is_some()
+        );
 
         Ok(stats)
     }
@@ -219,8 +229,7 @@ impl MetricsCollector {
     /// 采集cgroup v2 CPU统计
     fn collect_cpu_stats_v2(&self, cgroup_path: &Path) -> Result<CpuStats> {
         let cpu_stat_path = cgroup_path.join("cpu.stat");
-        let content = fs::read_to_string(&cpu_stat_path)
-            .context("Failed to read cpu.stat")?;
+        let content = fs::read_to_string(&cpu_stat_path).context("Failed to read cpu.stat")?;
 
         let mut stats = CpuStats::default();
 
@@ -234,7 +243,7 @@ impl MetricsCollector {
                 "usage_usec" => stats.usage_total = parts[1].parse::<u64>()? * 1000,
                 "user_usec" => stats.usage_user = parts[1].parse::<u64>()? * 1000,
                 "system_usec" => stats.usage_kernel = parts[1].parse::<u64>()? * 1000,
-                "nr_periods" => stats.throttle_periods = parts[1].parse()?,  
+                "nr_periods" => stats.throttle_periods = parts[1].parse()?,
                 "nr_throttled" => stats.throttled_count = parts[1].parse()?,
                 "throttled_usec" => stats.throttled_time = parts[1].parse::<u64>()? * 1000,
                 _ => {}
@@ -246,7 +255,8 @@ impl MetricsCollector {
             if let Some(line) = cpuinfo.lines().next() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() > 1 && parts[0] == "cpu" {
-                    let total: u64 = parts[1..].iter()
+                    let total: u64 = parts[1..]
+                        .iter()
                         .filter_map(|p| p.parse::<u64>().ok())
                         .sum();
                     stats.system_usage = total * 10_000_000; // 转换为纳秒
@@ -271,7 +281,8 @@ impl MetricsCollector {
         let usage_percpu_path = cgroup_path.join("cpuacct.usage_percpu");
         let (usage_user, usage_kernel) = if usage_percpu_path.exists() {
             let content = fs::read_to_string(&usage_percpu_path)?;
-            let values: Vec<u64> = content.split_whitespace()
+            let values: Vec<u64> = content
+                .split_whitespace()
                 .filter_map(|s| s.parse().ok())
                 .collect();
             let total: u64 = values.iter().sum();
@@ -340,7 +351,9 @@ impl MetricsCollector {
 
         let memory_peak_path = cgroup_path.join("memory.peak");
         let max_usage = if memory_peak_path.exists() {
-            fs::read_to_string(&memory_peak_path)?.trim().parse::<u64>()?
+            fs::read_to_string(&memory_peak_path)?
+                .trim()
+                .parse::<u64>()?
         } else {
             usage
         };
@@ -371,7 +384,9 @@ impl MetricsCollector {
         // 读取swap使用
         let memory_swap_path = cgroup_path.join("memory.swap.current");
         let swap = if memory_swap_path.exists() {
-            fs::read_to_string(&memory_swap_path)?.trim().parse::<u64>()?
+            fs::read_to_string(&memory_swap_path)?
+                .trim()
+                .parse::<u64>()?
         } else {
             0
         };
@@ -460,8 +475,7 @@ impl MetricsCollector {
     /// 采集cgroup v2块IO统计
     fn collect_blkio_stats_v2(&self, cgroup_path: &Path) -> Result<BlkioStats> {
         let io_stat_path = cgroup_path.join("io.stat");
-        let content = fs::read_to_string(&io_stat_path)
-            .context("Failed to read io.stat")?;
+        let content = fs::read_to_string(&io_stat_path).context("Failed to read io.stat")?;
 
         let mut io_service_bytes = vec![];
         let mut io_serviced = vec![];
@@ -490,16 +504,28 @@ impl MetricsCollector {
                 let value = kv[1].parse::<u64>()?;
                 match kv[0] {
                     "rbytes" => io_service_bytes.push(BlkioDeviceStat {
-                        major, minor, op: "read".to_string(), value,
+                        major,
+                        minor,
+                        op: "read".to_string(),
+                        value,
                     }),
                     "wbytes" => io_service_bytes.push(BlkioDeviceStat {
-                        major, minor, op: "write".to_string(), value,
+                        major,
+                        minor,
+                        op: "write".to_string(),
+                        value,
                     }),
                     "rios" => io_serviced.push(BlkioDeviceStat {
-                        major, minor, op: "read".to_string(), value,
+                        major,
+                        minor,
+                        op: "read".to_string(),
+                        value,
                     }),
                     "wios" => io_serviced.push(BlkioDeviceStat {
-                        major, minor, op: "write".to_string(), value,
+                        major,
+                        minor,
+                        op: "write".to_string(),
+                        value,
                     }),
                     _ => {}
                 }
@@ -536,7 +562,12 @@ impl MetricsCollector {
                 let op = parts[1].to_string();
                 let value = parts[2].parse::<u64>()?;
 
-                io_service_bytes.push(BlkioDeviceStat { major, minor, op, value });
+                io_service_bytes.push(BlkioDeviceStat {
+                    major,
+                    minor,
+                    op,
+                    value,
+                });
             }
         }
 
@@ -559,7 +590,12 @@ impl MetricsCollector {
                 let op = parts[1].to_string();
                 let value = parts[2].parse::<u64>()?;
 
-                io_serviced.push(BlkioDeviceStat { major, minor, op, value });
+                io_serviced.push(BlkioDeviceStat {
+                    major,
+                    minor,
+                    op,
+                    value,
+                });
             }
         }
 
@@ -571,10 +607,20 @@ impl MetricsCollector {
 
     /// 采集PIDs统计
     fn collect_pids_stats(&self, cgroup_path: &Path) -> Result<PidsStats> {
-        let pids_current_path = cgroup_path.join(if self.cgroup_v2 { "pids.current" } else { "pids.current" });
-        let current = fs::read_to_string(&pids_current_path)?.trim().parse::<u64>()?;
+        let pids_current_path = cgroup_path.join(if self.cgroup_v2 {
+            "pids.current"
+        } else {
+            "pids.current"
+        });
+        let current = fs::read_to_string(&pids_current_path)?
+            .trim()
+            .parse::<u64>()?;
 
-        let pids_max_path = cgroup_path.join(if self.cgroup_v2 { "pids.max" } else { "pids.max" });
+        let pids_max_path = cgroup_path.join(if self.cgroup_v2 {
+            "pids.max"
+        } else {
+            "pids.max"
+        });
         let limit_str = fs::read_to_string(&pids_max_path)?;
         let limit = if limit_str.trim() == "max" {
             u64::MAX
@@ -586,7 +632,12 @@ impl MetricsCollector {
     }
 
     /// 计算CPU使用率
-    pub fn calculate_cpu_percent(&self, current: &CpuStats, previous: &CpuStats, duration_secs: f64) -> f64 {
+    pub fn calculate_cpu_percent(
+        &self,
+        current: &CpuStats,
+        previous: &CpuStats,
+        duration_secs: f64,
+    ) -> f64 {
         if duration_secs <= 0.0 {
             return 0.0;
         }
@@ -619,13 +670,13 @@ mod tests {
         let collector = MetricsCollector::new().unwrap();
 
         let prev = CpuStats {
-            usage_total: 1_000_000_000, // 1 second
+            usage_total: 1_000_000_000,   // 1 second
             system_usage: 10_000_000_000, // 10 seconds
             ..Default::default()
         };
 
         let current = CpuStats {
-            usage_total: 1_500_000_000, // 1.5 seconds
+            usage_total: 1_500_000_000,   // 1.5 seconds
             system_usage: 11_000_000_000, // 11 seconds
             ..Default::default()
         };

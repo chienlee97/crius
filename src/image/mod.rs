@@ -1,25 +1,22 @@
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
-use std::io;
 use std::sync::Arc;
 
 use anyhow::Context;
-use tonic::{Request, Response, Status};
-use oci_distribution::{
-    secrets::RegistryAuth,
-    Reference,
-};
-use log::{info, warn, error};
-use serde::{Serialize, Deserialize};
+use log::{error, info, warn};
+use oci_distribution::{secrets::RegistryAuth, Reference};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+use tonic::{Request, Response, Status};
 
 use crate::error::Error;
 use crate::proto::runtime::v1::{
-    image_service_server::ImageService, Image, ImageStatusRequest, ImageStatusResponse,ListImagesRequest,
-    ListImagesResponse, PullImageRequest, PullImageResponse, RemoveImageRequest,ImageFsInfoRequest,ImageFsInfoResponse,
-    RemoveImageResponse,
+    image_service_server::ImageService, Image, ImageFsInfoRequest, ImageFsInfoResponse,
+    ImageStatusRequest, ImageStatusResponse, ListImagesRequest, ListImagesResponse,
+    PullImageRequest, PullImageResponse, RemoveImageRequest, RemoveImageResponse,
 };
 
 /// crius镜像
@@ -63,7 +60,7 @@ impl ImageServiceImpl {
             || normalized_candidate.starts_with(normalized_image_id)
     }
 
-    pub fn new(storage_path: impl AsRef<Path>) ->  Result<Self, Error> {
+    pub fn new(storage_path: impl AsRef<Path>) -> Result<Self, Error> {
         let storage_path = storage_path.as_ref().to_path_buf();
 
         if !storage_path.exists() {
@@ -76,7 +73,7 @@ impl ImageServiceImpl {
         };
         let oci_client = oci_distribution::Client::new(client_config);
         let images = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        
+
         Ok(Self {
             images,
             storage_path,
@@ -85,11 +82,11 @@ impl ImageServiceImpl {
     }
 
     // 加载本地镜像
-     pub async fn load_local_images(&self) -> Result<(), Error> {
+    pub async fn load_local_images(&self) -> Result<(), Error> {
         info!("load_local_images called");
         let imaages_dir = self.storage_path.join("images");
         info!("Images directory: {:?}", imaages_dir);
-        
+
         if !imaages_dir.exists() {
             info!("Images directory does not exist, creating...");
             std::fs::create_dir_all(&imaages_dir)?;
@@ -107,7 +104,8 @@ impl ImageServiceImpl {
             }
 
             let meta_data = std::fs::read(meta_path).context("Failed to read metadata")?;
-            let meta: ImageMeta = serde_json::from_slice(&meta_data).context("Failed to parse metadata")?;
+            let meta: ImageMeta =
+                serde_json::from_slice(&meta_data).context("Failed to parse metadata")?;
 
             let path = entry.path();
             if path.is_dir() {
@@ -123,9 +121,9 @@ impl ImageServiceImpl {
                 }
             }
         }
-        
+
         Ok(())
-     }
+    }
 
     async fn find_local_image(&self, image_ref: &str) -> Option<Image> {
         {
@@ -185,16 +183,21 @@ impl ImageServiceImpl {
         None
     }
 
-     // 保存镜像元数据
-     async fn save_image_metadata(&self, image: &CriusImage) -> Result<(), Error> {
-        let meta_path = self.storage_path.join("images").join(&image.id).join("metadata.json");
+    // 保存镜像元数据
+    async fn save_image_metadata(&self, image: &CriusImage) -> Result<(), Error> {
+        let meta_path = self
+            .storage_path
+            .join("images")
+            .join(&image.id)
+            .join("metadata.json");
         if !meta_path.exists() {
-            std::fs::create_dir_all(meta_path.parent().unwrap()).context("Failed to create metadata directory")?;
+            std::fs::create_dir_all(meta_path.parent().unwrap())
+                .context("Failed to create metadata directory")?;
         }
         let meta_data = serde_json::to_vec(image).context("Failed to serialize metadata")?;
         std::fs::write(meta_path, meta_data).context("Failed to write metadata")?;
         Ok(())
-     }
+    }
 
     fn parse_bearer_challenge(header: &str) -> Option<(String, Option<String>)> {
         let raw = header.trim();
@@ -288,10 +291,7 @@ impl ImageServiceImpl {
         reference: &Reference,
         auth: &RegistryAuth,
     ) -> Result<(String, u64, Vec<Vec<u8>>), Status> {
-        info!(
-            "Using registry API pull flow for {}",
-            reference
-        );
+        info!("Using registry API pull flow for {}", reference);
         let http = reqwest::Client::new();
         let ping_url = format!("https://{}/v2/", reference.resolve_registry());
         info!("Registry ping: {}", ping_url);
@@ -363,7 +363,11 @@ impl ImageServiceImpl {
             .map_err(|e| Status::internal(format!("parse manifest failed: {}", e)))?;
         let mut effective_digest = digest;
 
-        if manifest_json.get("layers").and_then(|v| v.as_array()).is_none() {
+        if manifest_json
+            .get("layers")
+            .and_then(|v| v.as_array())
+            .is_none()
+        {
             let target_arch = match std::env::consts::ARCH {
                 "x86_64" => "amd64",
                 "aarch64" => "arm64",
@@ -481,8 +485,7 @@ impl ImageServiceImpl {
                 let text = blob_resp.text().await.unwrap_or_default();
                 return Err(Status::internal(format!(
                     "blob request failed: {} {}",
-                    status,
-                    text
+                    status, text
                 )));
             }
             let bytes = blob_resp
@@ -524,7 +527,7 @@ impl ImageService for ImageServiceImpl {
             info!("Image: {} -> {}", key, image.id);
         }
         let images_list = images.values().cloned().collect();
-        
+
         Ok(Response::new(ListImagesResponse {
             images: images_list,
         }))
@@ -536,11 +539,13 @@ impl ImageService for ImageServiceImpl {
         request: Request<ImageStatusRequest>,
     ) -> Result<Response<ImageStatusResponse>, Status> {
         let req = request.into_inner();
-        let image_spec = req.image.ok_or_else(|| Status::invalid_argument("Image not specified"))?;
+        let image_spec = req
+            .image
+            .ok_or_else(|| Status::invalid_argument("Image not specified"))?;
         let requested_ref = image_spec.image;
 
         let images = self.images.lock().await;
-        
+
         // 尝试通过完整引用查找镜像
         if let Some(image) = images.get(&requested_ref) {
             return Ok(Response::new(ImageStatusResponse {
@@ -568,19 +573,25 @@ impl ImageService for ImageServiceImpl {
         request: Request<PullImageRequest>,
     ) -> Result<Response<PullImageResponse>, Status> {
         let req = request.into_inner();
-        let image_spec = req.image.ok_or_else(|| Status::invalid_argument("Image spec not specified"))?;
+        let image_spec = req
+            .image
+            .ok_or_else(|| Status::invalid_argument("Image spec not specified"))?;
 
-        let auth = req.auth.map(|a| RegistryAuth::Basic(
-            a.username, 
-            a.password
-        )).unwrap_or(RegistryAuth::Anonymous);
+        let auth = req
+            .auth
+            .map(|a| RegistryAuth::Basic(a.username, a.password))
+            .unwrap_or(RegistryAuth::Anonymous);
 
         // 解析镜像引用
-        let reference: Reference = image_spec.image.parse().map_err(|e| {
-            Status::invalid_argument(format!("Invalid image reference: {}", e))
-        })?;
+        let reference: Reference = image_spec
+            .image
+            .parse()
+            .map_err(|e| Status::invalid_argument(format!("Invalid image reference: {}", e)))?;
         info!("Pulling image: {}", image_spec.image);
-        info!("Checking whether image exists locally: {}", image_spec.image);
+        info!(
+            "Checking whether image exists locally: {}",
+            image_spec.image
+        );
         if let Some(existing_image) = self.find_local_image(&image_spec.image).await {
             info!(
                 "Image already exists locally: {} -> {}",
@@ -590,7 +601,10 @@ impl ImageService for ImageServiceImpl {
                 image_ref: existing_image.id,
             }));
         }
-        info!("Local image not found, start remote pull: {}", image_spec.image);
+        info!(
+            "Local image not found, start remote pull: {}",
+            image_spec.image
+        );
 
         // 拉取镜像（优先 OCI 库，失败时走标准 Registry API）
         let mut client = self.oci_client.lock().await;
@@ -608,7 +622,9 @@ impl ImageService for ImageServiceImpl {
 
         let (image_id, image_size, layers_to_persist) = match pull_result {
             Ok(image_data) => {
-                let digest = image_data.digest.unwrap_or_else(|| "sha256:unknown".to_string());
+                let digest = image_data
+                    .digest
+                    .unwrap_or_else(|| "sha256:unknown".to_string());
                 let short = digest.replace("sha256:", "");
                 let id = format!("sha256:{}", &short[..short.len().min(12)]);
                 info!(
@@ -643,8 +659,9 @@ impl ImageService for ImageServiceImpl {
         };
 
         let image_dir = self.storage_path.join("images").join(&image_id);
-        std::fs::create_dir_all(&image_dir)
-            .map_err(|e: io::Error| Status::internal(format!("Failed to create image directory: {}", e)))?;
+        std::fs::create_dir_all(&image_dir).map_err(|e: io::Error| {
+            Status::internal(format!("Failed to create image directory: {}", e))
+        })?;
         info!(
             "Persisting {} layers to {:?}",
             layers_to_persist.len(),
@@ -652,8 +669,9 @@ impl ImageService for ImageServiceImpl {
         );
         for (i, layer) in layers_to_persist.iter().enumerate() {
             let layer_path = image_dir.join(format!("{}.tar.gz", i));
-            std::fs::write(&layer_path, layer)
-                .map_err(|e: io::Error| Status::internal(format!("Failed to write layer: {}", e)))?;
+            std::fs::write(&layer_path, layer).map_err(|e: io::Error| {
+                Status::internal(format!("Failed to write layer: {}", e))
+            })?;
             info!("Saved layer {} to {:?}", i, layer_path);
         }
 
@@ -662,7 +680,9 @@ impl ImageService for ImageServiceImpl {
             id: image_id.clone(),
             repo_tags: vec![image_spec.image.clone()],
             size: image_size,
-        }).await.map_err(|e| {
+        })
+        .await
+        .map_err(|e| {
             error!("Failed to save image metadata: {}", e);
             Status::internal(format!("Failed to save image metadata: {}", e))
         })?;
@@ -677,7 +697,7 @@ impl ImageService for ImageServiceImpl {
         // 更新内存中镜像数据
         let mut images = self.images.lock().await;
         images.insert(image_spec.image, image);
-        
+
         info!("Image {} pulled successfully", image_id);
 
         Ok(Response::new(PullImageResponse {
@@ -691,7 +711,7 @@ impl ImageService for ImageServiceImpl {
         request: Request<RemoveImageRequest>,
     ) -> Result<Response<RemoveImageResponse>, Status> {
         let req = request.into_inner();
-        
+
         match req.image {
             Some(image_spec) => {
                 let requested_ref = image_spec.image;

@@ -461,7 +461,11 @@ impl Spec {
                 destination: "/proc".to_string(),
                 source: Some("proc".to_string()),
                 mount_type: Some("proc".to_string()),
-                options: Some(vec!["nosuid".to_string(), "noexec".to_string(), "nodev".to_string()]),
+                options: Some(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                ]),
             },
             Mount {
                 destination: "/sys".to_string(),
@@ -632,7 +636,9 @@ mod tests {
         let spec = Spec::new("1.0.2");
         let json = spec.to_json().unwrap();
         // 使用小写的 ociVersion 匹配 camelCase 序列化
-        assert!(json.contains("\"ociVersion\":\"1.0.2\"") || json.contains("\"ociVersion\": \"1.0.2\""));
+        assert!(
+            json.contains("\"ociVersion\":\"1.0.2\"") || json.contains("\"ociVersion\": \"1.0.2\"")
+        );
     }
 
     #[test]

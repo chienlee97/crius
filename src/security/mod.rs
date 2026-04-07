@@ -6,11 +6,11 @@
 //! - Seccomp系统调用过滤
 //! - Capabilities能力管理
 
+use anyhow::{Context, Result};
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
-use anyhow::{Context, Result};
-use log::{info, debug, warn, error};
-use serde::{Serialize, Deserialize};
 
 /// 安全配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,9 +154,7 @@ impl Default for CapabilitiesConfig {
     fn default() -> Self {
         Self {
             add: vec![],
-            drop: vec![
-                "ALL".to_string(),
-            ],
+            drop: vec!["ALL".to_string()],
         }
     }
 }
@@ -285,10 +283,9 @@ impl SecurityManager {
     /// 加载自定义AppArmor配置文件
     fn load_custom_apparmor_profile(&self, name: &str, content: &str) -> Result<()> {
         let profile_path = format!("/etc/apparmor.d/{}", name);
-        
+
         // 写入配置文件
-        std::fs::write(&profile_path, content)
-            .context("Failed to write AppArmor profile")?;
+        std::fs::write(&profile_path, content).context("Failed to write AppArmor profile")?;
 
         // 加载配置文件
         let output = std::process::Command::new("apparmor_parser")
@@ -298,7 +295,10 @@ impl SecurityManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("Failed to load AppArmor profile: {}", stderr));
+            return Err(anyhow::anyhow!(
+                "Failed to load AppArmor profile: {}",
+                stderr
+            ));
         }
 
         debug!("Custom AppArmor profile '{}' loaded", name);
@@ -371,20 +371,24 @@ impl SecurityManager {
         let syscalls = if config.syscalls.is_empty() {
             None
         } else {
-            Some(config.syscalls.iter().map(|rule| {
-                crate::oci::spec::SeccompSyscall {
-                    action: match rule.action {
-                        SeccompAction::Allow => "SCMP_ACT_ALLOW".to_string(),
-                        SeccompAction::Errno => "SCMP_ACT_ERRNO".to_string(),
-                        SeccompAction::Kill => "SCMP_ACT_KILL".to_string(),
-                        SeccompAction::Trap => "SCMP_ACT_TRAP".to_string(),
-                        SeccompAction::Trace => "SCMP_ACT_TRACE".to_string(),
-                        SeccompAction::Log => "SCMP_ACT_LOG".to_string(),
-                    },
-                    names: rule.names.clone(),
-                    args: None,
-                }
-            }).collect())
+            Some(
+                config
+                    .syscalls
+                    .iter()
+                    .map(|rule| crate::oci::spec::SeccompSyscall {
+                        action: match rule.action {
+                            SeccompAction::Allow => "SCMP_ACT_ALLOW".to_string(),
+                            SeccompAction::Errno => "SCMP_ACT_ERRNO".to_string(),
+                            SeccompAction::Kill => "SCMP_ACT_KILL".to_string(),
+                            SeccompAction::Trap => "SCMP_ACT_TRAP".to_string(),
+                            SeccompAction::Trace => "SCMP_ACT_TRACE".to_string(),
+                            SeccompAction::Log => "SCMP_ACT_LOG".to_string(),
+                        },
+                        names: rule.names.clone(),
+                        args: None,
+                    })
+                    .collect(),
+            )
         };
 
         crate::oci::spec::Seccomp {
@@ -460,7 +464,7 @@ mod tests {
         let manager = SecurityManager::new();
         let config = SeccompConfig::default();
         let seccomp = manager.convert_seccomp_config(&config);
-        
+
         assert_eq!(seccomp.default_action, "SCMP_ACT_ERRNO");
         assert!(seccomp.architectures.is_some());
     }

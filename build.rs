@@ -1,7 +1,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-     let out_dir = std::env::var("OUT_DIR")?;
+    let out_dir = std::env::var("OUT_DIR")?;
     let descriptor_path = format!("{}/file_descriptor_set.bin", out_dir);
-    
+
     let mut config = prost_build::Config::new();
     config.file_descriptor_set_path(&descriptor_path);
 
@@ -15,6 +15,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["proto"],
         )?;
     let _ = std::fs::copy(descriptor_path, "src/proto/file_descriptor_set.bin");
-    
+
     Ok(())
 }

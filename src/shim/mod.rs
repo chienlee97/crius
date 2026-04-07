@@ -8,4 +8,4 @@ pub mod process;
 pub mod subreaper;
 
 pub use daemon::Daemon;
-pub use io::{IoManager, IoConfig};
+pub use io::{IoConfig, IoManager};

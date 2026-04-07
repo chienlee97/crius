@@ -7,27 +7,27 @@ pub enum Error {
     /// I/O错误
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    
+
     /// 配置错误
     #[error("Configuration error: {0}")]
     Config(String),
-    
+
     /// 运行时错误
     #[error("Runtime error: {0}")]
     Runtime(String),
-    
+
     /// 镜像错误
     #[error("Image error: {0}")]
     Image(String),
-    
+
     /// 网络错误
     #[error("Network error: {0}")]
     Network(String),
-    
+
     /// 存储错误
     #[error("Storage error: {0}")]
     Storage(String),
-    
+
     /// 其他错误
     #[error(transparent)]
     Other(#[from] anyhow::Error),

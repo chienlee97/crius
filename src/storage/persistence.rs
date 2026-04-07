@@ -2,10 +2,10 @@
 //!
 //! 提供与server模块的集成，实现容器和Pod状态的自动持久化
 
-use crate::storage::{StorageManager, ContainerRecord, PodSandboxRecord};
-use crate::runtime::{ContainerStatus};
-use std::collections::HashMap;
+use crate::runtime::ContainerStatus;
+use crate::storage::{ContainerRecord, PodSandboxRecord, StorageManager};
 use anyhow::Result;
+use std::collections::HashMap;
 
 /// 将容器配置转换为存储记录
 pub fn container_to_record(
@@ -121,11 +121,8 @@ impl PersistenceManager {
     /// 创建新的持久化管理器
     pub fn new(config: PersistenceConfig) -> Result<Self> {
         let storage = StorageManager::new(&config.db_path)?;
-        
-        Ok(Self {
-            storage,
-            config,
-        })
+
+        Ok(Self { storage, config })
     }
 
     /// 获取存储管理器的可变引用
@@ -165,8 +162,9 @@ impl PersistenceManager {
             ContainerStatus::Stopped(code) => ("stopped", Some(code)),
             ContainerStatus::Unknown => ("unknown", None),
         };
-        
-        self.storage.update_container_state(container_id, state_str, exit_code)
+
+        self.storage
+            .update_container_state(container_id, state_str, exit_code)
     }
 
     /// 删除容器记录
@@ -189,8 +187,16 @@ impl PersistenceManager {
         ip: Option<&str>,
     ) -> Result<()> {
         let record = pod_to_record(
-            id, state, name, namespace, uid, netns_path,
-            labels, annotations, pause_container_id, ip,
+            id,
+            state,
+            name,
+            namespace,
+            uid,
+            netns_path,
+            labels,
+            annotations,
+            pause_container_id,
+            ip,
         );
         self.storage.save_pod_sandbox(&record)
     }
@@ -208,13 +214,13 @@ impl PersistenceManager {
     /// 恢复所有容器状态
     pub fn recover_containers(&self) -> Result<Vec<(String, ContainerStatus, ContainerRecord)>> {
         let records = self.storage.list_containers()?;
-        
+
         let mut result = Vec::new();
         for record in records {
             let status = record_to_container_status(&record);
             result.push((record.id.clone(), status, record));
         }
-        
+
         Ok(result)
     }
 
@@ -248,38 +254,44 @@ mod tests {
         // 保存容器
         let mut labels = HashMap::new();
         labels.insert("app".to_string(), "test".to_string());
-        
-        manager.save_container(
-            "container-1",
-            "pod-1",
-            ContainerStatus::Running,
-            "test:latest",
-            &["echo".to_string(), "hello".to_string()],
-            &labels,
-            &HashMap::new(),
-        ).unwrap();
+
+        manager
+            .save_container(
+                "container-1",
+                "pod-1",
+                ContainerStatus::Running,
+                "test:latest",
+                &["echo".to_string(), "hello".to_string()],
+                &labels,
+                &HashMap::new(),
+            )
+            .unwrap();
 
         // 更新状态
-        manager.update_container_state("container-1", ContainerStatus::Stopped(0)).unwrap();
+        manager
+            .update_container_state("container-1", ContainerStatus::Stopped(0))
+            .unwrap();
 
         // 恢复容器
         let recovered = manager.recover_containers().unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].0, "container-1");
-        
+
         // 保存Pod
-        manager.save_pod_sandbox(
-            "pod-1",
-            "ready",
-            "test-pod",
-            "default",
-            "uid-123",
-            "/var/run/netns/pod-1",
-            &labels,
-            &HashMap::new(),
-            Some("pause-1"),
-            Some("10.88.0.1"),
-        ).unwrap();
+        manager
+            .save_pod_sandbox(
+                "pod-1",
+                "ready",
+                "test-pod",
+                "default",
+                "uid-123",
+                "/var/run/netns/pod-1",
+                &labels,
+                &HashMap::new(),
+                Some("pause-1"),
+                Some("10.88.0.1"),
+            )
+            .unwrap();
 
         // 恢复Pod
         let recovered_pods = manager.recover_pods().unwrap();
