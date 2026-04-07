@@ -2,10 +2,10 @@
 //!
 //! 提供容器进程的启动、监控和清理功能
 
-use std::process::{Command, Stdio};
+use anyhow::{Context, Result};
+use log::{debug, error, info};
 use std::path::Path;
-use anyhow::{Result, Context};
-use log::{info, debug, error};
+use std::process::{Command, Stdio};
 
 /// 容器进程管理器
 pub struct ProcessManager {
@@ -26,12 +26,16 @@ impl ProcessManager {
 
     /// 创建容器
     pub fn create(&self, bundle: &Path) -> Result<()> {
-        info!("Creating container {} with bundle {:?}", self.container_id, bundle);
+        info!(
+            "Creating container {} with bundle {:?}",
+            self.container_id, bundle
+        );
 
         let output = Command::new(&self.runtime)
             .args(&[
                 "create",
-                "--bundle", bundle.to_str().unwrap(),
+                "--bundle",
+                bundle.to_str().unwrap(),
                 &self.container_id,
             ])
             .stdout(Stdio::piped())
@@ -72,7 +76,10 @@ impl ProcessManager {
 
     /// 停止容器
     pub fn stop(&self, timeout: u32) -> Result<()> {
-        info!("Stopping container {} with timeout {}", self.container_id, timeout);
+        info!(
+            "Stopping container {} with timeout {}",
+            self.container_id, timeout
+        );
 
         // 首先尝试发送SIGTERM
         let output = Command::new(&self.runtime)
@@ -106,7 +113,10 @@ impl ProcessManager {
         }
 
         // 超时后强制停止
-        info!("Container {} did not stop gracefully, force killing", self.container_id);
+        info!(
+            "Container {} did not stop gracefully, force killing",
+            self.container_id
+        );
         let output = Command::new(&self.runtime)
             .args(&["kill", &self.container_id, "KILL"])
             .stdout(Stdio::piped())
@@ -144,49 +154,58 @@ impl ProcessManager {
     }
 
     /// 在容器中执行命令 (exec)
-    pub fn exec(&self, command: &[String], tty: bool, stdin: bool, stdout: bool, stderr: bool) -> Result<std::process::Child> {
-        info!("Executing command in container {}: {:?}", self.container_id, command);
+    pub fn exec(
+        &self,
+        command: &[String],
+        tty: bool,
+        stdin: bool,
+        stdout: bool,
+        stderr: bool,
+    ) -> Result<std::process::Child> {
+        info!(
+            "Executing command in container {}: {:?}",
+            self.container_id, command
+        );
 
         let mut cmd = Command::new(&self.runtime);
         cmd.arg("exec");
-        
+
         if tty {
             cmd.arg("-t");
         }
         if stdin {
             cmd.arg("-i");
         }
-        
+
         // 添加容器ID
         cmd.arg(&self.container_id);
-        
+
         // 添加命令
         for arg in command {
             cmd.arg(arg);
         }
-        
+
         // 设置stdio
         if stdin {
             cmd.stdin(Stdio::piped());
         } else {
             cmd.stdin(Stdio::null());
         }
-        
+
         if stdout {
             cmd.stdout(Stdio::piped());
         } else {
             cmd.stdout(Stdio::null());
         }
-        
+
         if stderr {
             cmd.stderr(Stdio::piped());
         } else {
             cmd.stderr(Stdio::null());
         }
-        
-        let child = cmd.spawn()
-            .context("Failed to spawn runc exec")?;
-        
+
+        let child = cmd.spawn().context("Failed to spawn runc exec")?;
+
         debug!("Exec process spawned with PID: {:?}", child.id());
         Ok(child)
     }
@@ -205,8 +224,8 @@ impl ProcessManager {
             return Err(anyhow::anyhow!("Failed to get container state: {}", stderr));
         }
 
-        let state: ContainerState = serde_json::from_slice(&output.stdout)
-            .context("Failed to parse container state")?;
+        let state: ContainerState =
+            serde_json::from_slice(&output.stdout).context("Failed to parse container state")?;
 
         Ok(state)
     }

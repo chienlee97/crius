@@ -7,11 +7,11 @@
 //! - 网络状态聚合
 
 use super::*;
+use anyhow::{Context, Result};
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use anyhow::{Context, Result};
-use log::{info, debug, error, warn};
-use serde::{Serialize, Deserialize};
 
 /// 多网络配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,11 +120,16 @@ impl NetworkSelector {
 
     /// 添加注解映射
     pub fn add_mapping(&mut self, annotation: impl Into<String>, network: impl Into<String>) {
-        self.annotation_mapping.insert(annotation.into(), network.into());
+        self.annotation_mapping
+            .insert(annotation.into(), network.into());
     }
 
     /// 根据Pod配置选择网络
-    pub fn select_networks(&self, labels: &[(String, String)], annotations: &[(String, String)]) -> Vec<String> {
+    pub fn select_networks(
+        &self,
+        labels: &[(String, String)],
+        annotations: &[(String, String)],
+    ) -> Vec<String> {
         let mut selected = Vec::new();
 
         // 检查注解
@@ -136,9 +141,16 @@ impl NetworkSelector {
         }
 
         // 检查特定注解
-        if let Some(network) = annotations.iter()
-            .find(|(k, _)| k == "cni.networks")
-            .map(|(_, v)| v.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>()) {
+        if let Some(network) =
+            annotations
+                .iter()
+                .find(|(k, _)| k == "cni.networks")
+                .map(|(_, v)| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect::<Vec<_>>()
+                })
+        {
             selected.extend(network);
         }
 
@@ -191,12 +203,16 @@ impl MultiNetworkManager {
             }),
         };
 
-        self.network_configs.insert("default".to_string(), default_config);
+        self.network_configs
+            .insert("default".to_string(), default_config);
 
         // 尝试加载额外的网络配置
         self.load_additional_networks().await?;
 
-        info!("Loaded {} network configurations", self.network_configs.len());
+        info!(
+            "Loaded {} network configurations",
+            self.network_configs.len()
+        );
         Ok(())
     }
 
@@ -225,7 +241,8 @@ impl MultiNetworkManager {
             dns_config: None,
         };
 
-        self.network_configs.insert("secondary".to_string(), extra_network);
+        self.network_configs
+            .insert("secondary".to_string(), extra_network);
         Ok(())
     }
 
@@ -248,7 +265,9 @@ impl MultiNetworkManager {
 
         // 为每个网络配置接口
         for (idx, network_name) in network_names.iter().enumerate() {
-            let network_config = self.network_configs.get(network_name)
+            let network_config = self
+                .network_configs
+                .get(network_name)
                 .context(format!("Network config {} not found", network_name))?;
 
             let if_name = if idx == 0 {
@@ -258,14 +277,17 @@ impl MultiNetworkManager {
             };
 
             // 设置网络接口
-            match self.setup_network_interface(
-                pod_id,
-                netns,
-                pod_name,
-                pod_namespace,
-                network_config,
-                &if_name,
-            ).await {
+            match self
+                .setup_network_interface(
+                    pod_id,
+                    netns,
+                    pod_name,
+                    pod_namespace,
+                    network_config,
+                    &if_name,
+                )
+                .await
+            {
                 Ok(status) => {
                     if dns_config.is_none() && network_config.dns_config.is_some() {
                         dns_config = network_config.dns_config.clone();
@@ -273,7 +295,10 @@ impl MultiNetworkManager {
                     interfaces.push(status);
                 }
                 Err(e) => {
-                    error!("Failed to setup network {} for pod {}: {}", network_name, pod_id, e);
+                    error!(
+                        "Failed to setup network {} for pod {}: {}",
+                        network_name, pod_id, e
+                    );
                     // 继续配置其他网络，不中断
                 }
             }
@@ -287,9 +312,14 @@ impl MultiNetworkManager {
         };
 
         // 缓存网络状态
-        self.pod_networks.insert(pod_id.to_string(), pod_status.clone());
+        self.pod_networks
+            .insert(pod_id.to_string(), pod_status.clone());
 
-        info!("Pod {} network setup completed with {} interfaces", pod_id, pod_status.interfaces.len());
+        info!(
+            "Pod {} network setup completed with {} interfaces",
+            pod_id,
+            pod_status.interfaces.len()
+        );
         Ok(pod_status)
     }
 
@@ -304,19 +334,19 @@ impl MultiNetworkManager {
         if_name: &str,
     ) -> Result<NetworkInterfaceStatus> {
         // 使用基础CNI管理器设置网络
-        let status = self.cni_manager.setup_pod_network(
-            pod_id,
-            netns,
-            pod_name,
-            pod_namespace,
-        ).await?;
+        let status = self
+            .cni_manager
+            .setup_pod_network(pod_id, netns, pod_name, pod_namespace)
+            .await?;
 
         Ok(NetworkInterfaceStatus {
             name: if_name.to_string(),
             network_name: network_config.name.clone(),
             ip_address: status.ip,
             mac_address: status.mac,
-            gateway: network_config.ipam_config.as_ref()
+            gateway: network_config
+                .ipam_config
+                .as_ref()
                 .and_then(|c| c.gateway.as_ref())
                 .and_then(|g| g.parse().ok()),
             mtu: Some(1500),
@@ -325,23 +355,25 @@ impl MultiNetworkManager {
     }
 
     /// 清理Pod的所有网络
-    pub async fn teardown_pod_networks(
-        &mut self,
-        pod_id: &str,
-        netns: &str,
-    ) -> Result<()> {
+    pub async fn teardown_pod_networks(&mut self, pod_id: &str, netns: &str) -> Result<()> {
         // 获取Pod的网络状态
         if let Some(pod_status) = self.pod_networks.get(pod_id) {
-            info!("Tearing down {} networks for pod {}", pod_status.interfaces.len(), pod_id);
+            info!(
+                "Tearing down {} networks for pod {}",
+                pod_status.interfaces.len(),
+                pod_id
+            );
 
             // 清理每个网络接口
             for interface in &pod_status.interfaces {
-                if let Err(e) = self.teardown_network_interface(
-                    pod_id,
-                    netns,
-                    &interface.network_name,
-                ).await {
-                    error!("Failed to teardown network {} for pod {}: {}", interface.network_name, pod_id, e);
+                if let Err(e) = self
+                    .teardown_network_interface(pod_id, netns, &interface.network_name)
+                    .await
+                {
+                    error!(
+                        "Failed to teardown network {} for pod {}: {}",
+                        interface.network_name, pod_id, e
+                    );
                 }
             }
 

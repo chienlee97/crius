@@ -7,14 +7,14 @@
 //! - emptyDir卷
 //! - 卷生命周期管理
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::fs;
 use anyhow::{Context, Result};
-use log::{info, debug, warn, error};
-use serde::{Serialize, Deserialize};
-use nix::mount::{mount, MsFlags, umount};
+use log::{debug, error, info, warn};
+use nix::mount::{mount, umount, MsFlags};
 use nix::sys::stat::Mode;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// 卷类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -79,7 +79,11 @@ impl Default for HostPathType {
 
 impl VolumeConfig {
     /// 创建bind mount卷配置
-    pub fn bind_mount(name: impl Into<String>, source: impl Into<String>, target: impl Into<String>) -> Self {
+    pub fn bind_mount(
+        name: impl Into<String>,
+        source: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             volume_type: VolumeType::Bind,
@@ -93,28 +97,44 @@ impl VolumeConfig {
     }
 
     /// 创建只读bind mount卷配置
-    pub fn bind_mount_ro(name: impl Into<String>, source: impl Into<String>, target: impl Into<String>) -> Self {
+    pub fn bind_mount_ro(
+        name: impl Into<String>,
+        source: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             volume_type: VolumeType::Bind,
             source: Some(source.into()),
             target: target.into(),
             read_only: true,
-            mount_options: vec!["rbind".to_string(), "ro".to_string(), "rprivate".to_string()],
+            mount_options: vec![
+                "rbind".to_string(),
+                "ro".to_string(),
+                "rprivate".to_string(),
+            ],
             size_limit: None,
             host_path_type: None,
         }
     }
 
     /// 创建tmpfs卷配置
-    pub fn tmpfs(name: impl Into<String>, target: impl Into<String>, size_limit: Option<u64>) -> Self {
+    pub fn tmpfs(
+        name: impl Into<String>,
+        target: impl Into<String>,
+        size_limit: Option<u64>,
+    ) -> Self {
         Self {
             name: name.into(),
             volume_type: VolumeType::Tmpfs,
             source: None,
             target: target.into(),
             read_only: false,
-            mount_options: vec!["noexec".to_string(), "nosuid".to_string(), "nodev".to_string()],
+            mount_options: vec![
+                "noexec".to_string(),
+                "nosuid".to_string(),
+                "nodev".to_string(),
+            ],
             size_limit,
             host_path_type: None,
         }
@@ -135,7 +155,11 @@ impl VolumeConfig {
     }
 
     /// 创建hostPath卷配置
-    pub fn host_path(name: impl Into<String>, path: impl Into<String>, target: impl Into<String>) -> Self {
+    pub fn host_path(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             volume_type: VolumeType::HostPath,
@@ -188,13 +212,13 @@ impl VolumeManager {
     pub fn new(root_dir: impl AsRef<Path>) -> Result<Self> {
         let root_dir = root_dir.as_ref().to_path_buf();
         let empty_dir_root = root_dir.join("emptydirs");
-        
+
         // 创建目录
         fs::create_dir_all(&root_dir)?;
         fs::create_dir_all(&empty_dir_root)?;
-        
+
         info!("VolumeManager initialized at {:?}", root_dir);
-        
+
         Ok(Self {
             root_dir,
             mounted_volumes: HashMap::new(),
@@ -211,7 +235,10 @@ impl VolumeManager {
                     let source_path = Path::new(source);
                     if !source_path.exists() {
                         if config.volume_type == VolumeType::Bind {
-                            return Err(anyhow::anyhow!("Bind mount source does not exist: {}", source));
+                            return Err(anyhow::anyhow!(
+                                "Bind mount source does not exist: {}",
+                                source
+                            ));
                         }
                         // HostPath with DirectoryOrCreate
                         if let Some(HostPathType::DirectoryOrCreate) = config.host_path_type {
@@ -245,19 +272,19 @@ impl VolumeManager {
     ) -> Result<MountedVolume> {
         // 准备卷
         let source = self.prepare_volume(config, pod_id)?;
-        
+
         // 计算目标路径
         let target_path = if config.target.starts_with('/') {
             container_rootfs.join(&config.target[1..])
         } else {
             container_rootfs.join(&config.target)
         };
-        
+
         // 确保目标目录存在
         if config.volume_type != VolumeType::Tmpfs {
             fs::create_dir_all(&target_path)?;
         }
-        
+
         // 执行挂载
         match config.volume_type {
             VolumeType::Bind | VolumeType::HostPath => {
@@ -270,7 +297,7 @@ impl VolumeManager {
                 self.bind_mount(&source, &target_path, config)?;
             }
         }
-        
+
         let mounted_volume = MountedVolume {
             name: config.name.clone(),
             config: config.clone(),
@@ -278,21 +305,22 @@ impl VolumeManager {
             mounted_at: std::time::SystemTime::now(),
             is_mounted: true,
         };
-        
-        self.mounted_volumes.insert(config.name.clone(), mounted_volume.clone());
-        
+
+        self.mounted_volumes
+            .insert(config.name.clone(), mounted_volume.clone());
+
         info!(
             "Mounted volume {} (type: {:?}) from {:?} to {:?}",
             config.name, config.volume_type, source, target_path
         );
-        
+
         Ok(mounted_volume)
     }
 
     /// 执行bind mount
     fn bind_mount(&self, source: &Path, target: &Path, config: &VolumeConfig) -> Result<()> {
         let mut flags = MsFlags::MS_BIND | MsFlags::MS_REC;
-        
+
         // 解析挂载选项
         for opt in &config.mount_options {
             match opt.as_str() {
@@ -309,42 +337,57 @@ impl VolumeManager {
                 _ => {}
             }
         }
-        
+
         // 首先进行基础bind mount
         mount(Some(source), target, None::<&str>, flags, None::<&str>)
             .context(format!("Failed to bind mount {:?} to {:?}", source, target))?;
-        
+
         // 如果需要只读，重新挂载为只读
         if config.read_only && !flags.contains(MsFlags::MS_RDONLY) {
             let remount_flags = MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_BIND;
-            mount(None::<&str>, target, None::<&str>, remount_flags, None::<&str>)
-                .context(format!("Failed to remount {:?} as readonly", target))?;
+            mount(
+                None::<&str>,
+                target,
+                None::<&str>,
+                remount_flags,
+                None::<&str>,
+            )
+            .context(format!("Failed to remount {:?} as readonly", target))?;
         }
-        
-        debug!("Bind mounted {:?} to {:?} with flags {:?}", source, target, flags);
+
+        debug!(
+            "Bind mounted {:?} to {:?} with flags {:?}",
+            source, target, flags
+        );
         Ok(())
     }
 
     /// 挂载tmpfs
     fn mount_tmpfs(&self, target: &Path, config: &VolumeConfig) -> Result<()> {
         let mut flags = MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
-        
+
         // 构建挂载选项字符串
         let mut options = vec![];
-        
+
         if let Some(size) = config.size_limit {
             options.push(format!("size={}", size));
         }
-        
+
         let opts_str = if options.is_empty() {
             None
         } else {
             Some(options.join(","))
         };
-        
-        mount(Some("tmpfs"), target, Some("tmpfs"), flags, opts_str.as_deref())
-            .context(format!("Failed to mount tmpfs at {:?}", target))?;
-        
+
+        mount(
+            Some("tmpfs"),
+            target,
+            Some("tmpfs"),
+            flags,
+            opts_str.as_deref(),
+        )
+        .context(format!("Failed to mount tmpfs at {:?}", target))?;
+
         debug!("Mounted tmpfs at {:?} with options {:?}", target, opts_str);
         Ok(())
     }
@@ -355,31 +398,35 @@ impl VolumeManager {
             if volume.is_mounted {
                 umount(&volume.mount_point)
                     .context(format!("Failed to unmount {:?}", volume.mount_point))?;
-                
-                info!("Unmounted volume {} from {:?}", volume_name, volume.mount_point);
+
+                info!(
+                    "Unmounted volume {} from {:?}",
+                    volume_name, volume.mount_point
+                );
             }
-            
+
             self.mounted_volumes.remove(volume_name);
         }
-        
+
         Ok(())
     }
 
     /// 卸载Pod的所有卷
     pub fn unmount_pod_volumes(&mut self, pod_id: &str) -> Result<()> {
         // 找到所有属于该Pod的卷
-        let pod_volumes: Vec<String> = self.mounted_volumes
+        let pod_volumes: Vec<String> = self
+            .mounted_volumes
             .iter()
             .filter(|(_, v)| v.mount_point.to_string_lossy().contains(pod_id))
             .map(|(name, _)| name.clone())
             .collect();
-        
+
         for volume_name in pod_volumes {
             if let Err(e) = self.unmount_volume(&volume_name) {
                 error!("Failed to unmount volume {}: {}", volume_name, e);
             }
         }
-        
+
         // 清理emptyDir目录
         let pod_empty_dir = self.empty_dir_root.join(pod_id);
         if pod_empty_dir.exists() {
@@ -389,7 +436,7 @@ impl VolumeManager {
                 debug!("Removed emptyDir directory {:?}", pod_empty_dir);
             }
         }
-        
+
         Ok(())
     }
 
@@ -405,7 +452,8 @@ impl VolumeManager {
 
     /// 检查卷是否已挂载
     pub fn is_mounted(&self, name: &str) -> bool {
-        self.mounted_volumes.get(name)
+        self.mounted_volumes
+            .get(name)
             .map(|v| v.is_mounted)
             .unwrap_or(false)
     }
@@ -451,10 +499,10 @@ mod tests {
     fn test_empty_dir_preparation() {
         let temp_dir = tempdir().unwrap();
         let manager = VolumeManager::new(temp_dir.path()).unwrap();
-        
+
         let config = VolumeConfig::empty_dir("test-empty", "/work");
         let path = manager.prepare_volume(&config, "pod-123").unwrap();
-        
+
         assert!(path.exists());
         assert!(path.to_string_lossy().contains("pod-123"));
         assert!(path.to_string_lossy().contains("test-empty"));
@@ -464,14 +512,14 @@ mod tests {
     fn test_bind_mount_preparation() {
         let temp_dir = tempdir().unwrap();
         let manager = VolumeManager::new(temp_dir.path()).unwrap();
-        
+
         // 创建源目录
         let source = temp_dir.path().join("source");
         fs::create_dir(&source).unwrap();
-        
+
         let config = VolumeConfig::bind_mount("data", source.to_str().unwrap(), "/data");
         let path = manager.prepare_volume(&config, "pod-123").unwrap();
-        
+
         assert_eq!(path, source);
     }
 }

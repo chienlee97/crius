@@ -3,10 +3,10 @@
 //! 当容器进程的父进程（runc）退出后，容器进程会被重新父进程化为shim。
 //! 通过设置PR_SET_CHILD_SUBREAPER，shim可以监控所有后代进程的状态。
 
+use anyhow::{Context, Result};
+use log::{debug, error, info, warn};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
-use log::{info, debug, warn, error};
-use anyhow::{Result, Context};
 
 /// 子进程收割器
 pub struct SubReaper;
@@ -18,9 +18,12 @@ impl SubReaper {
     pub fn enable() -> Result<()> {
         const PR_SET_CHILD_SUBREAPER: i32 = 36;
         let result = unsafe { libc::prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-        
+
         if result != 0 {
-            return Err(anyhow::anyhow!("Failed to set child subreaper: {}", std::io::Error::last_os_error()));
+            return Err(anyhow::anyhow!(
+                "Failed to set child subreaper: {}",
+                std::io::Error::last_os_error()
+            ));
         }
 
         info!("Subreaper enabled for current process");
@@ -31,9 +34,12 @@ impl SubReaper {
     pub fn disable() -> Result<()> {
         const PR_SET_CHILD_SUBREAPER: i32 = 36;
         let result = unsafe { libc::prctl(PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) };
-        
+
         if result != 0 {
-            return Err(anyhow::anyhow!("Failed to disable child subreaper: {}", std::io::Error::last_os_error()));
+            return Err(anyhow::anyhow!(
+                "Failed to disable child subreaper: {}",
+                std::io::Error::last_os_error()
+            ));
         }
 
         info!("Subreaper disabled");
@@ -146,6 +152,19 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    fn get_child_subreaper() -> anyhow::Result<bool> {
+        const PR_GET_CHILD_SUBREAPER: i32 = 37;
+        let mut value = 0i32;
+        let result = unsafe { libc::prctl(PR_GET_CHILD_SUBREAPER, &mut value, 0, 0, 0) };
+        if result != 0 {
+            return Err(anyhow::anyhow!(
+                "Failed to get subreaper status: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(value != 0)
+    }
+
     #[test]
     fn test_subreaper_enable_disable() {
         // 注意：这个测试需要root权限
@@ -159,23 +178,20 @@ mod tests {
         SubReaper::enable().expect("Failed to enable subreaper");
 
         // 检查是否设置成功
-        let is_subreaper = prctl::get_child_subreaper()
-            .expect("Failed to get subreaper status");
+        let is_subreaper = get_child_subreaper().expect("Failed to get subreaper status");
         assert!(is_subreaper, "Subreaper should be enabled");
 
         // 禁用subreaper
         SubReaper::disable().expect("Failed to disable subreaper");
 
-        let is_subreaper = prctl::get_child_subreaper()
-            .expect("Failed to get subreaper status");
+        let is_subreaper = get_child_subreaper().expect("Failed to get subreaper status");
         assert!(!is_subreaper, "Subreaper should be disabled");
     }
 
     #[test]
     fn test_reap_no_children() {
         // 确保没有僵尸进程等待
-        let count = SubReaper::reap_all_children()
-            .expect("Failed to reap children");
+        let count = SubReaper::reap_all_children().expect("Failed to reap children");
         // 可能没有子进程，也可能有系统留下的僵尸
         // 所以不断言具体值，只确保不panic
         println!("Reaped {} children", count);

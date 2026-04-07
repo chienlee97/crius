@@ -17,10 +17,7 @@ pub enum NetworkError {
 
     /// 命令执行错误
     #[error("Command '{command}' failed with status: {status}")]
-    CommandExecutionError {
-        command: String,
-        status: ExitStatus,
-    },
+    CommandExecutionError { command: String, status: ExitStatus },
 
     /// 不支持的配置
     #[error("Unsupported configuration: {0}")]

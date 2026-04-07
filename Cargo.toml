@@ -47,6 +47,7 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_derive = "1.0"
 serde_with = "2.0"
 toml = "0.7"
+miniz_oxide = "0.8"
 
 # 工具库
 lazy_static = "1.4"
@@ -54,6 +55,7 @@ log = "0.4"
 nix = "0.25"
 clap = { version = "4.0", features = ["derive"] }
 tower = "0.4"
+hyper = { version = "0.14", features = ["server", "tcp", "http1"] }
 oci-distribution = "0.8.0"
 rand = "0.8.0"
 uuid = { version = "0.8", features = ["v4"] }
