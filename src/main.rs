@@ -61,9 +61,28 @@ async fn main() -> Result<(), Error> {
     let args = Args::parse();
 
     // 创建运行时配置
+    let runtime_name = "runc".to_string();
+    let mut runtime_handlers: Vec<String> = std::env::var("CRIUS_RUNTIME_HANDLERS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|handler| !handler.is_empty())
+                .map(|handler| handler.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !runtime_handlers
+        .iter()
+        .any(|handler| handler == &runtime_name)
+    {
+        runtime_handlers.push(runtime_name.clone());
+    }
+
     let runtime_config = RuntimeConfig {
         root_dir: PathBuf::from("/var/lib/crius"),
-        runtime: "runc".to_string(),
+        runtime: runtime_name,
+        runtime_handlers,
         // Keep runc state root (/run/runc) separate from crius bundle root.
         // Using /var/run/runc for bundles causes "container ID already exists".
         runtime_root: PathBuf::from("/var/lib/crius/runc-bundles"),

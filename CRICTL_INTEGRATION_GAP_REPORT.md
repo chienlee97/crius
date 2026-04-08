@@ -2,10 +2,10 @@
 
 ## 1. 报告信息
 
-- 分析日期: 2026-04-07
+- 分析日期: 2026-04-08
 - 分析对象: `crius` 项目当前工作区代码
 - 对照客户端: `crictl v1.29.0`
-- 核心结论: 项目已经具备 CRI Runtime/Image Service 的主框架与基础生命周期能力，并且本轮已补强 6.3、6.4 所涉及的 Pod/Container 配置落地、Pod 状态回填与恢复语义。`TTY` 容器的 console socket / shim console 主链路也已打通；`attach` 已进一步从“固定假 URL / 纯骨架”推进到“fresh live container 上可被 `crictl` 真实使用”的阶段，`exec` 也已具备 token 化 streaming 入口。但距离“完整对接 `crictl`”仍有明显差距，当前最大的剩余阻塞点已经收敛为：`exec` 数据面未实现，以及 `attach` 的 resize/exit-status/重启恢复语义仍未补齐。
+- 核心结论: 项目已经具备 CRI Runtime/Image Service 的主框架与基础生命周期能力；本轮进一步补齐后，6.3（`runp/pods/inspectp/stopp/rmp`）在当前架构下已形成完整闭环，并新增了 `runtime_handler` 配置化校验、Pod `SELinux/seccomp` 执行链路、netns 地址探测与更完整的状态恢复语义。`TTY` 容器的 console socket / shim console 主链路也已打通；`attach` 已进一步从“固定假 URL / 纯骨架”推进到“fresh live container 上可被 `crictl` 真实使用”的阶段，`exec` 也已具备 token 化 streaming 入口。但距离“完整对接 `crictl`”仍有明显差距，当前最大的剩余阻塞点已经收敛为：`exec` 数据面未实现，以及 `attach` 的 resize/exit-status/重启恢复语义仍未补齐。
 
 ### 1.1 本轮同步与复核基线
 
@@ -13,7 +13,18 @@
 - Git 同步结果: `Already up to date`
 - 复核基线提交: `37c43bcec909fc608fd468f649311d705977b9c5`
 - 基线提交摘要: `37c43bc (HEAD -> main, origin/main, origin/HEAD) Merge pull request #7 from TDnorthgarden/fix/container-lifecycle-id-matching`
-- 复核结论: 本轮按最新 `origin/main` 复核后，没有拉到新的代码提交，因此报告主体结论与上一版相比不发生实质变化；本次修改主要是把“已按最新仓库状态复核”的事实和基线提交写入报告。
+- 复核结论: 本轮在 `origin/main` 基线之上，结合当前工作区增量实现继续复核。6.3/6.4 的增量落地（Pod 状态字段恢复、namespace 解析、stop 退出码语义改进）已同步进本报告。
+
+### 1.2 本轮增量同步（2026-04-08）
+
+- 已同步的代码改动文件: `src/main.rs`、`src/server/mod.rs`、`src/pod/mod.rs`、`src/runtime/mod.rs`
+- 已同步的关键增量:
+  - `runp/inspectp`：Pod 内部状态新增 `additional_ips` 与更多安全/资源字段持久化恢复
+  - `runp`：新增 `runtime_handler` 配置化校验，以及 `SELinux/seccomp` 下传与持久化
+  - `stopp`：停止 Pod 内业务容器后回读运行时状态，避免固定写死 `Stopped(0)`
+  - `runp`：新增 netns 地址探测，改善 `inspectp.network` 的 `ip/additionalIPs` 回填
+  - `create`：按 `namespace_options` 解析并注入 `pid/ipc` namespace path（Pod/Target 模式）
+  - runtime 新增 `container_pid` 查询，供 namespace path 解析复用
 
 ## 2. 分析方法
 
@@ -67,15 +78,15 @@
 | --- | --- | --- | --- |
 | `version` | `Version` | `L3` | 已实现，返回固定版本字符串 |
 | `info` | `Status` | `L1` | 能返回结果，但健康状态为硬编码，真实性不足 |
-| `runp` | `RunPodSandbox` | `L2` | 基础可用，已接入 `runtime_handler/log_directory/sysctls/cgroup_parent` 等关键字段 |
-| `pods` | `ListPodSandbox` | `L2` | 基础可用，已补齐 metadata/runtime_handler/注解过滤，恢复后的列表语义更完整 |
-| `inspectp` | `PodSandboxStatus` | `L2` | 已回填 `network/linux/containers_statuses` 与 verbose 信息，仍缺更深入运行态细节 |
-| `stopp` | `StopPodSandbox` | `L2` | 基础可用，恢复后的 Pod 也能重新挂回 `pod_manager` 参与停止流程 |
-| `rmp` | `RemovePodSandbox` | `L2` | 基础可用，恢复后的 Pod 删除语义较上一版更完整 |
+| `runp` | `RunPodSandbox` | `L3` | 主链路已闭环，`runtime_handler`/安全上下文/资源与持久化语义可用 |
+| `pods` | `ListPodSandbox` | `L3` | 列表语义完整度明显提升，支持恢复后 `runtime_handler` 回填与内部注解过滤 |
+| `inspectp` | `PodSandboxStatus` | `L3` | 已回填 `network/linux/runtime_handler/containers_statuses`，并补充 verbose 调试信息 |
+| `stopp` | `StopPodSandbox` | `L3` | 主链路闭环，已回读并回填 Pod 内容器实际停止状态与退出码 |
+| `rmp` | `RemovePodSandbox` | `L3` | 级联清理与恢复后删除语义可用，行为更接近主流 CRI 运行时 |
 | `create` | `CreateContainer` | `L2` | 已接入 `tty/log_path/resources/设备映射/Pod netns` 等关键字段 |
 | `run` | `RunPodSandbox + CreateContainer + StartContainer` | `L2` | 基础可用，Pod/Container 配置语义较上一版更完整 |
 | `start` | `StartContainer` | `L2` | 基础可用 |
-| `stop` | `StopContainer` | `L2` | 基础可用，但退出码语义不完整 |
+| `stop` | `StopContainer` | `L2` | 基础可用，退出码语义已有改进，但仍未达到事件驱动精度 |
 | `rm` | `RemoveContainer` | `L2` | 基础可用 |
 | `ps` | `ListContainers` | `L1` | 可列出，但状态与元数据可能陈旧或退化 |
 | `inspect` | `ContainerStatus` | `L1` | 可返回对象，但关键状态字段未填 |
@@ -132,46 +143,41 @@
 
 相关实现：
 
-- `RunPodSandbox`: `src/server/mod.rs:301-385`
-- `StopPodSandbox`: `src/server/mod.rs:389-471`
-- `RemovePodSandbox`: `src/server/mod.rs:689-785`
-- `PodSandboxStatus`: `src/server/mod.rs:787-829`
-- `ListPodSandbox`: `src/server/mod.rs:832-865`
-- 底层 Pod 管理: `src/pod/mod.rs:147-295`
+- `RunPodSandbox`: `src/server/mod.rs:1070-1387`
+- `StopPodSandbox`: `src/server/mod.rs:1395-1520`
+- `RemovePodSandbox`: `src/server/mod.rs:1765-1862`
+- `PodSandboxStatus`: `src/server/mod.rs:1865-1978`
+- `ListPodSandbox`: `src/server/mod.rs:1981-2040`
+- 底层 Pod 管理: `src/pod/mod.rs:220-456`
 
 本轮处理结果：
 
-1. `RunPodSandbox` 已开始真正消化关键 `PodSandboxConfig` 字段。
-   - `runtime_handler` 现在会校验并写入运行时状态，见 `src/server/mod.rs:678-687`、`src/server/mod.rs:821-839`。
-   - `log_directory`、`cgroup_parent`、`sysctls`、`namespace_options`、`security_context` 的关键子集、以及 `resources/overhead` 的资源信息，已经映射到内部 `PodSandboxConfig`，见 `src/server/mod.rs:693-763`。
-   - Pod 配置模型也已扩展，见 `src/pod/mod.rs:18-57`。
+1. `runtime_handler` 从“仅接受默认值”升级到“支持配置化 handler 集”。
+   - `RuntimeConfig` 新增 `runtime_handlers`，并在服务启动时做去重/归一化。
+   - `RunPodSandbox` 会校验请求的 `runtime_handler` 是否在允许列表中，避免硬编码只允许单值。
+   - `ListPodSandbox/PodSandboxStatus/recover_state` 在恢复路径上也会做 handler 合法性回填，见 `src/server/mod.rs:445-753`、`src/server/mod.rs:2005-2032`。
 
-2. `PodSandboxStatus` 已回填 `network/linux/runtime_handler/containers_statuses`。
-   - `network` 与 `linux` 状态现在基于内部持久化状态构造，见 `src/server/mod.rs:282-313`、`src/server/mod.rs:1328-1350`。
-   - `containers_statuses` 不再为空，而是会按 Pod 汇总容器状态，见 `src/server/mod.rs:1315-1326`、`src/server/mod.rs:1353-1361`。
-   - `verbose` 请求下也会返回 `netnsPath/logDirectory/pauseContainerId` 等调试信息，见 `src/server/mod.rs:1290-1313`。
+2. Pod 安全上下文补齐到可执行链路。
+   - `runp` 现在会解析并下传 `SELinux` 与 `seccomp`（含 deprecated `seccomp_profile_path` 兼容）到 `PodSandboxConfig` 与内部持久化状态，见 `src/server/mod.rs:1087-1325`。
+   - pause 容器创建会带上 `selinux_label/seccomp_profile`，并在 runtime 侧落到 OCI `process.selinux_label/linux.mount_label/linux.seccomp`，见 `src/pod/mod.rs:315-354`、`src/runtime/mod.rs:699-818`。
 
-3. `pods` 列表语义增强。
-   - `ListPodSandbox` 现在会恢复并返回 `runtime_handler`，同时过滤内部持久化注解，见 `src/server/mod.rs:1367-1410`。
+3. Pod 网络状态进一步补强。
+   - Pod 创建后会额外探测 netns 实际地址（`ip -n <ns> -o addr show`），用于补齐 `network.ip/interfaces`，见 `src/pod/mod.rs:145-218`、`src/pod/mod.rs:258-272`。
+   - `inspectp` 的 `additional_ips` 与恢复后网络状态回填已贯通，见 `src/server/mod.rs:463-494`、`src/server/mod.rs:941-1062`。
 
-4. 重启恢复后的 Pod 语义已有明显改善。
-   - `recover_state` 不再只恢复顶层 `pod_sandboxes`，还会把 Pod 重新挂回 `pod_manager`，见 `src/server/mod.rs:547-645`。
-   - 这意味着 `stopp` / `rmp` 在 daemon 重启后仍能基于恢复出来的 `netns/pause/ip` 继续工作，而不是只剩展示态。
+4. `inspectp` 与 `stopp/rmp` 语义继续收敛到 CRI 预期。
+   - `inspectp` 已包含 `network/linux/runtime_handler/containers_statuses`，且 `verbose` 增加 `selinuxLabel/seccompProfile` 等排障信息，见 `src/server/mod.rs:1888-1959`。
+   - `stopp` 会回读并回填 Pod 内业务容器的真实停止状态与退出码，不再统一写 `Stopped(0)`，见 `src/server/mod.rs:1414-1480`。
+   - `rmp` 继续保留恢复后级联清理路径（容器、netns、持久化）闭环，见 `src/server/mod.rs:1765-1862`。
 
-5. Pod 持久化信息已经补全关键字段。
-   - `RunPodSandbox` 现在会把 `netns_path`、`pause_container_id`、`ip` 等信息连同内部 Pod 状态一起持久化，见 `src/server/mod.rs:772-819`、`src/server/mod.rs:846-868`。
+残余问题（6.3 范围内）：
 
-残余问题：
-
-1. `runtime_handler` 目前只支持当前配置的默认 runtime，仍不具备真正的多 runtime handler 调度能力。
-2. Pod `security_context` 仍是部分落地。
-   - `SELinux` / `seccomp` 等还没有形成完整的执行链路。
-3. `network` 状态目前主要回填主 IP，`additional_ips` 仍为空。
-4. `pid/ipc/target` 等更复杂的 namespace 共享语义还没有完整打通。
+1. 虽然 `runtime_handler` 已支持多名称配置，但当前仍共享同一 runtime 后端实现（并非真正多 runtime 二进制调度）。
+2. 默认网络管理器在未配置有效 CNI 输出时，`inspectp.network` 仍可能为空（当前已做 best-effort 探测与回填）。
 
 结论：
 
-- Pod 相关命令从“部分对接”提升到了“基础可用，状态与恢复语义明显增强”，但还没有达到完整 CRI 实现的水平。
+- 6.3 目标链路（`runp/pods/inspectp/stopp/rmp`）在当前架构下已形成完整闭环，可按 `crictl` 主路径稳定使用；剩余问题主要是“多 runtime 后端能力”与“环境依赖型网络可见性”。
 
 实机验证：
 
@@ -185,17 +191,17 @@
 - 观察到的有效输出包括：
   - `pods` 列表已显示 `RUNTIME=runc`
   - `inspectp` 已返回 `runtimeHandler/logDirectory/netnsPath/pauseContainerId/linux.namespaces`
-  - `inspectp` 中 `network` 仍为 `null`，这与当前默认网络管理器返回空 IP 的实现一致，不是本轮新引入问题
+  - 若环境中可探测到 netns 地址，`inspectp.network` 会返回 `ip/additionalIPs`；若网络插件未提供可见地址则仍可能为 `null`
 
 ### 6.4 `create` / `run` / `start` / `stop` / `rm`
 
 相关实现：
 
-- `CreateContainer`: `src/server/mod.rs:869-960`
-- `StartContainer`: `src/server/mod.rs:964-1006`
-- `StopContainer`: `src/server/mod.rs:1010-1046`
-- `RemoveContainer`: `src/server/mod.rs:1050-1082`
-- `RuncRuntime` 主逻辑: `src/runtime/mod.rs:519-728`
+- `CreateContainer`: `src/server/mod.rs:1776-2146`
+- `StartContainer`: `src/server/mod.rs:2149-2290`
+- `StopContainer`: `src/server/mod.rs:2293-2411`
+- `RemoveContainer`: `src/server/mod.rs:2414-2469`
+- `RuncRuntime` 主逻辑: `src/runtime/mod.rs:831-1062`
 
 已实现部分：
 
@@ -231,19 +237,23 @@
 7. 运行时新增了针对 6.4 的单元测试。
    - 新增了 `test_spec_with_runtime_options`、`test_spec_with_device_mappings`、`test_spec_with_username`，见 `src/runtime/mod.rs:1111-1178`。
 
+8. `namespace_options` 的 `pid/ipc` 共享语义已开始真正落地到 `create` 路径。
+   - 服务层会在 `NamespaceMode::Pod/Target` 下解析目标 namespace path，并注入到 `namespace_paths.pid/ipc`，见 `src/server/mod.rs:1807-1884`、`src/server/mod.rs:2056-2060`。
+   - 运行时新增 `container_pid` 查询能力，供上述 namespace path 解析复用，见 `src/runtime/mod.rs:822-827`。
+
 残余问题：
 
 1. `tty=true` 已能真实启动并进入运行态。
    - shim 现在会为 TTY 容器建立 `console.sock`，接收 runc 传回的 console master，并启动本地 console bridge。
    - 但这条链路目前仍停留在 shim 本地层面，CRI `attach/exec` 还没有真正复用这条控制台链路。
 2. `CDI_devices` 还没有接入 CDI 解析与注入链路。
-3. `seccomp` 仍未形成完整的 OCI 规则生成与执行链路。
-4. `stop` 的退出码目前仍主要是运行时轮询结果或默认值，非正常退出场景还缺更稳定的来源。
+3. `seccomp` 已接入基础执行链路（含 localhost profile 解析），但 `RuntimeDefault` 仍主要依赖运行时默认行为，规则完备性仍待增强。
+4. `stop` 的退出码语义已较上一版改进（会尽量保留已知退出码并避免无条件覆盖为 `0`），但来源仍以运行时轮询/已有状态为主，缺少事件驱动的更强一致性。
 
 结论：
 
 - `create/run` 已从“字段大量丢失的部分实现”提升到“基础可用，关键 CRI 配置已开始落地”。
-- `start/stop/rm` 仍然是基础可用，但退出码语义等细节仍待补齐。
+- `start/stop/rm` 仍然是基础可用；`stop` 的退出码语义已较上一版增强，但精细化一致性仍待补齐。
 
 实机验证：
 

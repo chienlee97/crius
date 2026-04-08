@@ -9,11 +9,14 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use crate::network::{
-    DefaultNetworkManager, NetworkManager, NetworkStatus, PortMapping as NetworkPortMapping,
-    PortMappingBackend, PortMappingManager, Protocol,
+    DefaultNetworkManager, NetworkInterface, NetworkManager, NetworkStatus,
+    PortMapping as NetworkPortMapping, PortMappingBackend, PortMappingManager, Protocol,
 };
 use crate::proto::runtime::v1::{LinuxContainerResources, NamespaceOption};
-use crate::runtime::{ContainerConfig, ContainerRuntime, ContainerStatus, NamespacePaths};
+use crate::runtime::{
+    ContainerConfig, ContainerRuntime, ContainerStatus, NamespacePaths, SeccompProfile,
+};
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 /// Pod沙箱配置
@@ -55,6 +58,8 @@ pub struct PodSandboxConfig {
     pub readonly_rootfs: bool,
     pub no_new_privileges: Option<bool>,
     pub apparmor_profile: Option<String>,
+    pub selinux_label: Option<String>,
+    pub seccomp_profile: Option<SeccompProfile>,
     /// Pod级资源限制（优先使用 resources）
     pub linux_resources: Option<LinuxContainerResources>,
 }
@@ -137,6 +142,63 @@ impl<R: ContainerRuntime> std::fmt::Debug for PodSandboxManager<R> {
 }
 
 impl<R: ContainerRuntime> PodSandboxManager<R> {
+    async fn discover_netns_interfaces(&self, netns_name: &str) -> Vec<NetworkInterface> {
+        let output = match Command::new("ip")
+            .args(["-n", netns_name, "-o", "addr", "show"])
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => output,
+            Ok(output) => {
+                debug!(
+                    "Failed to probe netns addresses for {}: status {:?}",
+                    netns_name,
+                    output.status.code()
+                );
+                return Vec::new();
+            }
+            Err(e) => {
+                debug!("Failed to execute ip addr in netns {}: {}", netns_name, e);
+                return Vec::new();
+            }
+        };
+
+        let mut seen = HashSet::new();
+        let mut interfaces = Vec::new();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 4 {
+                continue;
+            }
+            let iface_name = fields[1].trim_end_matches(':');
+            let family = fields[2];
+            if family != "inet" && family != "inet6" {
+                continue;
+            }
+            let addr = fields[3].split('/').next().unwrap_or_default();
+            let ip = match addr.parse::<IpAddr>() {
+                Ok(ip) => ip,
+                Err(_) => continue,
+            };
+            if ip.is_loopback() {
+                continue;
+            }
+            if !seen.insert(ip) {
+                continue;
+            }
+            interfaces.push(NetworkInterface {
+                name: iface_name.to_string(),
+                ip: Some(ip),
+                mac: None,
+                netmask: None,
+                gateway: None,
+            });
+        }
+
+        interfaces
+    }
+
     fn resolve_pause_image(&self, pod_config: &PodSandboxConfig) -> Result<String> {
         // Match CRI-O behavior: configured pause image is the default source.
         // Allow kubelet-provided sandbox image annotation to override when present.
@@ -189,7 +251,7 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
 
         // 3. 设置Pod网络（CNI）
         debug!("Setting up pod network for {}", pod_id);
-        let network_status = self
+        let mut network_status = self
             .network_manager
             .setup_pod_network(
                 &pod_id,
@@ -198,6 +260,15 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
                 &config.namespace,
             )
             .await?;
+        let discovered_interfaces = self.discover_netns_interfaces(&netns_name).await;
+        if network_status.ip.is_none() {
+            network_status.ip = discovered_interfaces
+                .iter()
+                .find_map(|iface| iface.ip.as_ref().copied());
+        }
+        if !discovered_interfaces.is_empty() {
+            network_status.interfaces = discovered_interfaces;
+        }
 
         // 4. 创建pause容器
         debug!("Creating pause container for pod {}", pod_id);
@@ -265,6 +336,8 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
             readonly_rootfs: pod_config.readonly_rootfs,
             no_new_privileges: pod_config.no_new_privileges,
             apparmor_profile: pod_config.apparmor_profile.clone(),
+            selinux_label: pod_config.selinux_label.clone(),
+            seccomp_profile: pod_config.seccomp_profile.clone(),
             capabilities: None,
             cgroup_parent: pod_config.cgroup_parent.clone(),
             sysctls: pod_config.sysctls.clone(),
@@ -474,6 +547,8 @@ mod tests {
             readonly_rootfs: false,
             no_new_privileges: None,
             apparmor_profile: None,
+            selinux_label: None,
+            seccomp_profile: None,
             linux_resources: None,
         };
 

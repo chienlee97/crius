@@ -65,6 +65,8 @@ pub struct ContainerConfig {
     pub readonly_rootfs: bool,
     pub no_new_privileges: Option<bool>,
     pub apparmor_profile: Option<String>,
+    pub selinux_label: Option<String>,
+    pub seccomp_profile: Option<SeccompProfile>,
     pub capabilities: Option<Capability>,
     pub cgroup_parent: Option<String>,
     pub sysctls: HashMap<String, String>,
@@ -73,6 +75,14 @@ pub struct ContainerConfig {
     pub linux_resources: Option<LinuxContainerResources>,
     pub devices: Vec<DeviceMapping>,
     pub rootfs: PathBuf,
+}
+
+/// Seccomp 配置来源
+#[derive(Debug, Clone)]
+pub enum SeccompProfile {
+    RuntimeDefault,
+    Unconfined,
+    Localhost(PathBuf),
 }
 
 /// 命名空间路径覆盖
@@ -239,7 +249,16 @@ impl RuncRuntime {
         path.exists().then(|| path.to_string_lossy().to_string())
     }
 
-    fn build_namespaces(config: &ContainerConfig) -> Vec<OciNamespace> {
+    fn target_namespace_path(&self, target_container_id: &str, ns_type: &str) -> Option<String> {
+        if target_container_id.is_empty() {
+            return None;
+        }
+
+        let state = self.get_runc_state(target_container_id).ok().flatten()?;
+        (state.pid > 0).then(|| format!("/proc/{}/ns/{}", state.pid, ns_type))
+    }
+
+    fn build_namespaces(&self, config: &ContainerConfig) -> Vec<OciNamespace> {
         let mut namespaces = Spec::default_namespaces();
         let options = config.namespace_options.as_ref();
 
@@ -263,6 +282,12 @@ impl RuncRuntime {
                         Some(mode) if mode == NamespaceMode::Node as i32
                     ) {
                         namespace.path = Self::host_namespace_path("pid");
+                    } else if matches!(
+                        options.map(|o| o.pid),
+                        Some(mode) if mode == NamespaceMode::Target as i32
+                    ) {
+                        namespace.path =
+                            options.and_then(|o| self.target_namespace_path(&o.target_id, "pid"));
                     }
                 }
                 "ipc" => {
@@ -273,6 +298,12 @@ impl RuncRuntime {
                         Some(mode) if mode == NamespaceMode::Node as i32
                     ) {
                         namespace.path = Self::host_namespace_path("ipc");
+                    } else if matches!(
+                        options.map(|o| o.ipc),
+                        Some(mode) if mode == NamespaceMode::Target as i32
+                    ) {
+                        namespace.path =
+                            options.and_then(|o| self.target_namespace_path(&o.target_id, "ipc"));
                     }
                 }
                 "uts" => {
@@ -285,6 +316,25 @@ impl RuncRuntime {
         }
 
         namespaces
+    }
+
+    fn load_seccomp_profile(
+        &self,
+        profile: Option<&SeccompProfile>,
+    ) -> Result<Option<crate::oci::spec::Seccomp>> {
+        match profile {
+            None => Ok(None),
+            Some(SeccompProfile::RuntimeDefault) => Ok(None),
+            Some(SeccompProfile::Unconfined) => Ok(None),
+            Some(SeccompProfile::Localhost(path)) => {
+                let content = std::fs::read_to_string(path)
+                    .with_context(|| format!("Failed to read seccomp profile from {:?}", path))?;
+                let seccomp = serde_json::from_str(&content).with_context(|| {
+                    format!("Failed to parse seccomp profile JSON from {:?}", path)
+                })?;
+                Ok(Some(seccomp))
+            }
+        }
     }
 
     fn linux_resources_to_oci(resources: &LinuxContainerResources) -> LinuxResources {
@@ -680,7 +730,7 @@ impl RuncRuntime {
             rlimits: None,
             no_new_privileges: Some(config.no_new_privileges.unwrap_or(!config.privileged)),
             apparmor_profile: config.apparmor_profile.clone(),
-            selinux_label: None,
+            selinux_label: config.selinux_label.clone(),
         });
 
         // 设置主机名
@@ -752,20 +802,20 @@ impl RuncRuntime {
         }
 
         spec.linux = Some(Linux {
-            namespaces: Some(Self::build_namespaces(config)),
+            namespaces: Some(self.build_namespaces(config)),
             uid_mappings: None,
             gid_mappings: None,
             devices: Some(devices),
             cgroups_path: config.cgroup_parent.clone(),
             resources: Some(resources),
             rootfs_propagation: None,
-            seccomp: None,
+            seccomp: self.load_seccomp_profile(config.seccomp_profile.as_ref())?,
             sysctl: if config.sysctls.is_empty() {
                 None
             } else {
                 Some(config.sysctls.clone())
             },
-            mount_label: None,
+            mount_label: config.selinux_label.clone(),
             intel_rdt: None,
         });
 
@@ -816,6 +866,14 @@ impl RuncRuntime {
             serde_json::from_str(&stdout).context("Failed to parse runc state")?;
 
         Ok(Some(state))
+    }
+
+    /// 获取容器 init 进程 PID
+    pub fn container_pid(&self, container_id: &str) -> Result<Option<i32>> {
+        match self.get_runc_state(container_id)? {
+            Some(state) if state.pid > 0 => Ok(Some(state.pid)),
+            _ => Ok(None),
+        }
     }
 }
 
@@ -1081,6 +1139,8 @@ mod tests {
             readonly_rootfs: false,
             no_new_privileges: None,
             apparmor_profile: None,
+            selinux_label: None,
+            seccomp_profile: None,
             capabilities: None,
             cgroup_parent: None,
             sysctls: HashMap::new(),
@@ -1257,5 +1317,39 @@ mod tests {
         assert!(cgroup_rules.iter().any(|rule| {
             rule.access.as_deref() == Some("rw") && rule.device_type.as_deref() == Some("c")
         }));
+    }
+
+    #[test]
+    fn test_spec_with_selinux_and_localhost_seccomp() {
+        let (runtime, temp) = create_test_runtime();
+        let mut config = create_test_config();
+        config.selinux_label = Some("system_u:system_r:container_t:s0".to_string());
+
+        let seccomp_profile_path = temp.path().join("seccomp.json");
+        let seccomp_profile = crate::oci::spec::Seccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            architectures: None,
+            syscalls: None,
+        };
+        std::fs::write(
+            &seccomp_profile_path,
+            serde_json::to_vec(&seccomp_profile).unwrap(),
+        )
+        .unwrap();
+        config.seccomp_profile = Some(SeccompProfile::Localhost(seccomp_profile_path));
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let process = spec.process.unwrap();
+        let linux = spec.linux.unwrap();
+
+        assert_eq!(
+            process.selinux_label.as_deref(),
+            Some("system_u:system_r:container_t:s0")
+        );
+        assert_eq!(
+            linux.mount_label.as_deref(),
+            Some("system_u:system_r:container_t:s0")
+        );
+        assert!(linux.seccomp.is_some());
     }
 }

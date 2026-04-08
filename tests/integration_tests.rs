@@ -42,6 +42,8 @@ fn create_test_container_config(name: &str, image: &str) -> ContainerConfig {
         readonly_rootfs: false,
         no_new_privileges: None,
         apparmor_profile: None,
+        selinux_label: None,
+        seccomp_profile: None,
         capabilities: None,
         cgroup_parent: None,
         sysctls: HashMap::new(),
@@ -77,6 +79,8 @@ fn create_test_pod_config(name: &str, namespace: &str) -> PodSandboxConfig {
         readonly_rootfs: false,
         no_new_privileges: None,
         apparmor_profile: None,
+        selinux_label: None,
+        seccomp_profile: None,
         linux_resources: None,
     }
 }
