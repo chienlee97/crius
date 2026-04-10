@@ -29,6 +29,7 @@ use crate::proto::runtime::v1::{
     ImageSpec, LinuxPodSandboxStatus, ListContainerStatsRequest, ListContainerStatsResponse,
     ListContainersRequest, ListContainersResponse, ListMetricDescriptorsRequest,
     ListMetricDescriptorsResponse, ListPodSandboxMetricsRequest, ListPodSandboxMetricsResponse,
+    Metric, MetricDescriptor, MetricType,
     ListPodSandboxRequest, ListPodSandboxResponse, ListPodSandboxStatsRequest,
     ListPodSandboxStatsResponse, Namespace, NamespaceMode, NamespaceOption, PodIp,
     PodSandboxAttributes, PodSandboxMetadata, PodSandboxNetworkStatus, PodSandboxState, PodSandboxStats, PodSandboxStatsRequest,
@@ -4101,25 +4102,183 @@ impl RuntimeService for RuntimeServiceImpl {
         Ok(Response::new(stream))
     }
 
-    //
+    // 列出指标描述符
     async fn list_metric_descriptors(
         &self,
         _request: Request<ListMetricDescriptorsRequest>,
     ) -> Result<Response<ListMetricDescriptorsResponse>, Status> {
-        // 实现 list_metric_descriptors 的逻辑
-        Ok(Response::new(ListMetricDescriptorsResponse {
-            descriptors: Vec::new(),
-        }))
+        use crate::proto::runtime::v1::{MetricDescriptor, MetricType};
+
+        // 定义支持的指标描述符
+        let descriptors = vec![
+            MetricDescriptor {
+                name: "container_cpu_usage_seconds_total".to_string(),
+                help: "Total CPU usage in seconds".to_string(),
+                label_keys: vec!["container_id".to_string(), "pod_id".to_string()],
+            },
+            MetricDescriptor {
+                name: "container_memory_working_set_bytes".to_string(),
+                help: "Current working set memory in bytes".to_string(),
+                label_keys: vec!["container_id".to_string(), "pod_id".to_string()],
+            },
+            MetricDescriptor {
+                name: "container_memory_usage_bytes".to_string(),
+                help: "Total memory usage in bytes".to_string(),
+                label_keys: vec!["container_id".to_string(), "pod_id".to_string()],
+            },
+            MetricDescriptor {
+                name: "container_spec_cpu_quota".to_string(),
+                help: "CPU quota in microseconds".to_string(),
+                label_keys: vec!["container_id".to_string()],
+            },
+            MetricDescriptor {
+                name: "container_spec_cpu_period".to_string(),
+                help: "CPU period in microseconds".to_string(),
+                label_keys: vec!["container_id".to_string()],
+            },
+            MetricDescriptor {
+                name: "container_spec_memory_limit_bytes".to_string(),
+                help: "Memory limit in bytes".to_string(),
+                label_keys: vec!["container_id".to_string()],
+            },
+        ];
+
+        Ok(Response::new(ListMetricDescriptorsResponse { descriptors }))
     }
 
-    //
+    // 列出 Pod 沙箱指标
     async fn list_pod_sandbox_metrics(
         &self,
         _request: Request<ListPodSandboxMetricsRequest>,
     ) -> Result<Response<ListPodSandboxMetricsResponse>, Status> {
-        // 实现 list_pod_sandbox_metrics 的逻辑
+        use crate::proto::runtime::v1::{ContainerMetrics, Metric, MetricType, PodSandboxMetrics, UInt64Value};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let pods = self.pod_sandboxes.lock().await;
+        let containers = self.containers.lock().await;
+        let mut pod_metrics_list = Vec::new();
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        for (pod_id, pod) in pods.iter() {
+            let mut metrics = Vec::new();
+            let mut container_metrics_list = Vec::new();
+
+            // 获取 pod 的 UID 用于匹配容器
+            let pod_uid = pod.metadata.as_ref().map(|m| m.uid.clone());
+
+            // 聚合该 Pod 下所有容器的指标
+            let mut total_cpu_usage = 0u64;
+            let mut total_memory_usage = 0u64;
+            let mut total_memory_limit = 0u64;
+
+            for (container_id, container) in containers.iter() {
+                // 检查容器是否属于该 Pod
+                let belongs_to_pod = if let Some(ref uid) = pod_uid {
+                    container.annotations.get("io.kubernetes.pod.uid")
+                        .map(|container_uid| container_uid == uid)
+                        .unwrap_or(true)
+                } else {
+                    true
+                };
+
+                if belongs_to_pod {
+                    let container_state = Self::read_internal_state::<StoredContainerState>(
+                        &container.annotations,
+                        INTERNAL_CONTAINER_STATE_KEY,
+                    );
+
+                    let cgroup_parent = container_state
+                        .as_ref()
+                        .and_then(|s| s.cgroup_parent.as_ref())
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"));
+
+                    // 收集容器指标
+                    if let Ok(collector) = MetricsCollector::new() {
+                        if let Ok(stats) = collector.collect_container_stats(container_id, &cgroup_parent) {
+                            let container_cpu = stats.cpu.as_ref().map(|c| c.usage_total).unwrap_or(0);
+                            let container_mem = stats.memory.as_ref().map(|m| m.usage).unwrap_or(0);
+                            let container_mem_limit = stats.memory.as_ref().map(|m| m.limit).unwrap_or(0);
+
+                            total_cpu_usage += container_cpu;
+                            total_memory_usage += container_mem;
+                            total_memory_limit += container_mem_limit;
+
+                            // 容器级别指标
+                            let container_metric_list = vec![
+                                Metric {
+                                    name: "container_cpu_usage_seconds_total".to_string(),
+                                    timestamp,
+                                    metric_type: MetricType::Counter as i32,
+                                    label_values: vec![container_id.clone(), pod_id.clone()],
+                                    value: Some(UInt64Value { value: container_cpu }),
+                                },
+                                Metric {
+                                    name: "container_memory_working_set_bytes".to_string(),
+                                    timestamp,
+                                    metric_type: MetricType::Gauge as i32,
+                                    label_values: vec![container_id.clone(), pod_id.clone()],
+                                    value: Some(UInt64Value { value: container_mem }),
+                                },
+                            ];
+
+                            container_metrics_list.push(ContainerMetrics {
+                                container_id: container_id.clone(),
+                                metrics: container_metric_list,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Pod 级别聚合指标
+            if total_cpu_usage > 0 || total_memory_usage > 0 {
+                metrics.push(Metric {
+                    name: "container_cpu_usage_seconds_total".to_string(),
+                    timestamp,
+                    metric_type: MetricType::Counter as i32,
+                    label_values: vec![pod_id.clone()],
+                    value: Some(UInt64Value { value: total_cpu_usage }),
+                });
+
+                metrics.push(Metric {
+                    name: "container_memory_working_set_bytes".to_string(),
+                    timestamp,
+                    metric_type: MetricType::Gauge as i32,
+                    label_values: vec![pod_id.clone()],
+                    value: Some(UInt64Value { value: total_memory_usage }),
+                });
+
+                metrics.push(Metric {
+                    name: "container_memory_usage_bytes".to_string(),
+                    timestamp,
+                    metric_type: MetricType::Gauge as i32,
+                    label_values: vec![pod_id.clone()],
+                    value: Some(UInt64Value { value: total_memory_usage }),
+                });
+
+                metrics.push(Metric {
+                    name: "container_spec_memory_limit_bytes".to_string(),
+                    timestamp,
+                    metric_type: MetricType::Gauge as i32,
+                    label_values: vec![pod_id.clone()],
+                    value: Some(UInt64Value { value: total_memory_limit }),
+                });
+
+                pod_metrics_list.push(PodSandboxMetrics {
+                    pod_sandbox_id: pod_id.clone(),
+                    metrics,
+                    container_metrics: container_metrics_list,
+                });
+            }
+        }
+
         Ok(Response::new(ListPodSandboxMetricsResponse {
-            pod_metrics: Vec::new(),
+            pod_metrics: pod_metrics_list,
         }))
     }
 
