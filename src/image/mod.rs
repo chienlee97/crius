@@ -14,9 +14,10 @@ use tonic::{Request, Response, Status};
 
 use crate::error::Error;
 use crate::proto::runtime::v1::{
-    image_service_server::ImageService, Image, ImageFsInfoRequest, ImageFsInfoResponse,
+    image_service_server::ImageService, FilesystemIdentifier, FilesystemUsage, Image, ImageFsInfoRequest, ImageFsInfoResponse,
     ImageStatusRequest, ImageStatusResponse, ListImagesRequest, ListImagesResponse,
     PullImageRequest, PullImageResponse, RemoveImageRequest, RemoveImageResponse,
+    UInt64Value,
 };
 
 /// crius镜像
@@ -512,6 +513,66 @@ impl ImageServiceImpl {
 
         Ok((image_id, total_size, layer_data))
     }
+
+    // 计算目录大小（同步版本）
+    fn calculate_dir_size(path: &PathBuf) -> u64 {
+        use std::fs;
+
+        if !path.exists() {
+            return 0;
+        }
+
+        let mut total_size: u64 = 0;
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(_) => return 0,
+        };
+
+        for entry in entries.flatten() {
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            if metadata.is_file() {
+                total_size += metadata.len();
+            } else if metadata.is_dir() {
+                // 递归计算子目录
+                total_size += Self::calculate_dir_size(&entry.path());
+            }
+        }
+
+        total_size
+    }
+
+    // 估算 inode 数量（同步版本）
+    fn estimate_inode_count(path: &PathBuf) -> u64 {
+        use std::fs;
+
+        if !path.exists() {
+            return 0;
+        }
+
+        let mut count: u64 = 0;
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(_) => return 0,
+        };
+
+        for entry in entries.flatten() {
+            count += 1;
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            if metadata.is_dir() {
+                count += Self::estimate_inode_count(&entry.path());
+            }
+        }
+
+        count
+    }
 }
 
 #[tonic::async_trait]
@@ -770,9 +831,37 @@ impl ImageService for ImageServiceImpl {
         &self,
         _request: Request<ImageFsInfoRequest>,
     ) -> Result<Response<ImageFsInfoResponse>, Status> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // 获取镜像存储路径
+        let images_dir = self.storage_path.join("images");
+        let layers_dir = self.storage_path.join("layers");
+
+        // 计算镜像存储使用情况
+        let image_total_bytes = Self::calculate_dir_size(&images_dir);
+        let layer_total_bytes = Self::calculate_dir_size(&layers_dir);
+
+        // 获取系统信息
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // 计算 inode 信息（估算）
+        let used_inodes = Self::estimate_inode_count(&self.storage_path);
+
+        let image_fs = FilesystemUsage {
+            timestamp,
+            fs_id: Some(FilesystemIdentifier {
+                mountpoint: self.storage_path.to_string_lossy().to_string(),
+            }),
+            used_bytes: Some(UInt64Value { value: image_total_bytes.saturating_add(layer_total_bytes) }),
+            inodes_used: Some(UInt64Value { value: used_inodes }),
+        };
+
         Ok(Response::new(ImageFsInfoResponse {
-            image_filesystems: Vec::new(),
-            container_filesystems: Vec::new(),
+            image_filesystems: vec![image_fs],
+            container_filesystems: vec![], // 容器存储与镜像共享
         }))
     }
 }
