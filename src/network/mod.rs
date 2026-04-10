@@ -67,6 +67,22 @@ impl DefaultNetworkManager {
             || Path::new("/run/netns").join(ns).exists()
     }
 
+    async fn ensure_loopback_up(&self, netns: &str) -> Result<(), NetworkError> {
+        let status = Command::new("ip")
+            .args(["-n", netns, "link", "set", "lo", "up"])
+            .status()
+            .await?;
+
+        if !status.success() {
+            return Err(NetworkError::CommandExecutionError {
+                command: format!("ip -n {} link set lo up", netns),
+                status,
+            });
+        }
+
+        Ok(())
+    }
+
     /// 创建新的网络管理器实例
     pub fn new(
         cni_plugin_dirs: Option<Vec<String>>,
@@ -132,6 +148,12 @@ impl NetworkManager for DefaultNetworkManager {
         pod_name: &str,
         pod_namespace: &str,
     ) -> Result<NetworkStatus, NetworkError> {
+        let netns_name = Path::new(netns)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(netns);
+        self.ensure_loopback_up(netns_name).await?;
+
         // 这里将调用 CNI 插件来设置网络
         // 简化实现，实际实现中需要调用 CNI 插件
         Ok(NetworkStatus {
@@ -180,6 +202,38 @@ mod tests {
                 .exists();
         assert!(!ns_exists_after, "Network namespace should be deleted");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root privileges and iproute2"]
+    async fn test_setup_pod_network_brings_loopback_up() -> Result<(), Box<dyn std::error::Error>> {
+        let manager = DefaultNetworkManager::new(None, None, None);
+        let ns_name = "crius-test-loopback";
+
+        manager.create_network_namespace(ns_name).await?;
+        manager
+            .setup_pod_network(
+                "pod-1",
+                &format!("/var/run/netns/{}", ns_name),
+                "pod",
+                "default",
+            )
+            .await?;
+
+        let output = Command::new("ip")
+            .args(["-n", ns_name, "addr", "show", "lo"])
+            .output()
+            .await?;
+        assert!(
+            output.status.success(),
+            "expected ip addr show lo to succeed"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("127.0.0.1/8"));
+        assert!(stdout.contains("LOOPBACK,UP"));
+
+        manager.remove_network_namespace(ns_name).await?;
         Ok(())
     }
 }

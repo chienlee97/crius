@@ -451,6 +451,34 @@ impl<W: Write> SpdyWriter<W> {
         }
     }
 
+    pub fn write_syn_stream(
+        &mut self,
+        stream_id: StreamId,
+        associated_to_stream_id: StreamId,
+        headers: &[(String, String)],
+        fin: bool,
+    ) -> io::Result<()> {
+        let header_block = encode_header_block(headers);
+        let compressed = self.header_compressor.compress(&header_block)?;
+        let flags = if fin { 0x01 } else { 0x00 };
+        let length = 10 + compressed.len() as u32;
+        write_control_frame_header(
+            &mut self.writer,
+            ControlFrameHeader {
+                version: 3,
+                frame_type: ControlFrameType::SynStream as u16,
+                flags,
+                length,
+            },
+        )?;
+        write_u32(&mut self.writer, stream_id)?;
+        write_u32(&mut self.writer, associated_to_stream_id)?;
+        self.writer.write_all(&[0])?;
+        self.writer.write_all(&[0])?;
+        self.writer.write_all(&compressed)?;
+        self.writer.flush()
+    }
+
     pub fn into_inner(self) -> W {
         self.writer
     }

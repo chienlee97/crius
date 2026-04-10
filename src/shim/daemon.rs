@@ -225,9 +225,21 @@ impl Daemon {
                 .and_then(|process| process.terminal)
                 .unwrap_or(container_state.tty),
             attach_socket: Some(self.shim_dir().join("attach.sock")),
+            resize_socket: bundle_config
+                .process
+                .as_ref()
+                .and_then(|process| process.terminal)
+                .unwrap_or(container_state.tty)
+                .then(|| self.shim_dir().join("resize.sock")),
+            reopen_socket: container_state
+                .log_path
+                .as_ref()
+                .map(|_| self.shim_dir().join("reopen.sock")),
         };
         self.io_manager.configure(io_config)?;
         self.io_manager.start_attach_server()?;
+        self.io_manager.start_resize_server()?;
+        self.io_manager.start_reopen_log_server()?;
         info!("IO setup complete");
         Ok(())
     }
