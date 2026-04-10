@@ -28,7 +28,7 @@ use crate::proto::runtime::v1::{
     ListMetricDescriptorsResponse, ListPodSandboxMetricsRequest, ListPodSandboxMetricsResponse,
     ListPodSandboxRequest, ListPodSandboxResponse, ListPodSandboxStatsRequest,
     ListPodSandboxStatsResponse, Namespace, NamespaceMode, NamespaceOption, PodIp,
-    PodSandboxMetadata, PodSandboxNetworkStatus, PodSandboxState, PodSandboxStatsRequest,
+    PodSandboxAttributes, PodSandboxMetadata, PodSandboxNetworkStatus, PodSandboxState, PodSandboxStats, PodSandboxStatsRequest,
     PodSandboxStatsResponse, PodSandboxStatus, PodSandboxStatusRequest, PodSandboxStatusResponse,
     RemoveContainerRequest, RemoveContainerResponse, RemovePodSandboxRequest,
     RemovePodSandboxResponse, ReopenContainerLogRequest, ReopenContainerLogResponse,
@@ -1086,6 +1086,148 @@ impl RuntimeServiceImpl {
             writable_layer: None,
             swap: None,
         }
+    }
+
+    /// 辅助方法：收集 Pod 的统计信息
+    async fn collect_pod_stats(
+        &self,
+        pod_id: &str,
+        pod: &crate::proto::runtime::v1::PodSandbox,
+    ) -> Option<crate::proto::runtime::v1::PodSandboxStats> {
+        use crate::proto::runtime::v1::{ContainerAttributes, ContainerStats, CpuUsage, LinuxPodSandboxStats, MemoryUsage, NetworkInterfaceUsage, NetworkUsage, PodSandboxStats, PodSandboxAttributes, ProcessUsage, UInt64Value};
+
+        let containers = self.containers.lock().await;
+        
+        // 收集该 Pod 下所有容器的统计
+        let mut total_cpu_usage = 0u64;
+        let mut total_memory_usage = 0u64;
+        let mut total_memory_limit = 0u64;
+        let mut has_stats = false;
+        let mut container_stats_list = Vec::new();
+
+        let collector = MetricsCollector::new().ok()?;
+
+        // 获取 pod 的 UID 用于匹配容器
+        let pod_uid = pod.metadata.as_ref().map(|m| m.uid.clone());
+
+        for (container_id, container) in containers.iter() {
+            // 检查容器是否属于该 Pod
+            let belongs_to_pod = if let Some(ref uid) = pod_uid {
+                container.annotations.get("io.kubernetes.pod.uid")
+                    .map(|container_uid| container_uid == uid)
+                    .unwrap_or(true)
+            } else {
+                true
+            };
+
+            if belongs_to_pod {
+                let container_state = Self::read_internal_state::<StoredContainerState>(
+                    &container.annotations,
+                    INTERNAL_CONTAINER_STATE_KEY,
+                );
+
+                let cgroup_parent = container_state
+                    .as_ref()
+                    .and_then(|s| s.cgroup_parent.as_ref())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"));
+
+                if let Ok(stats) = collector.collect_container_stats(container_id, &cgroup_parent) {
+                    if let Some(ref cpu) = stats.cpu {
+                        total_cpu_usage += cpu.usage_total;
+                    }
+                    if let Some(ref mem) = stats.memory {
+                        total_memory_usage += mem.usage;
+                        total_memory_limit += mem.limit;
+                    }
+                    has_stats = true;
+
+                    // 添加容器级别统计
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    
+                    container_stats_list.push(ContainerStats {
+                        attributes: Some(ContainerAttributes {
+                            id: container_id.clone(),
+                            metadata: container.metadata.clone(),
+                            labels: container.labels.clone(),
+                            annotations: container.annotations.clone(),
+                        }),
+                        cpu: stats.cpu.map(|cpu| CpuUsage {
+                            timestamp,
+                            usage_core_nano_seconds: Some(UInt64Value { value: cpu.usage_total }),
+                            usage_nano_cores: Some(UInt64Value { value: cpu.usage_user.saturating_add(cpu.usage_kernel) }),
+                        }),
+                        memory: stats.memory.map(|mem| MemoryUsage {
+                            timestamp,
+                            working_set_bytes: Some(UInt64Value { value: mem.usage }),
+                            available_bytes: Some(UInt64Value { value: mem.limit.saturating_sub(mem.usage) }),
+                            usage_bytes: Some(UInt64Value { value: mem.usage }),
+                            rss_bytes: Some(UInt64Value { value: mem.usage }),
+                            page_faults: Some(UInt64Value { value: 0 }),
+                            major_page_faults: Some(UInt64Value { value: 0 }),
+                        }),
+                        writable_layer: None,
+                        swap: None,
+                    });
+                }
+            }
+        }
+
+        if !has_stats {
+            return None;
+        }
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let container_count = container_stats_list.len() as u64;
+
+        Some(PodSandboxStats {
+            attributes: Some(PodSandboxAttributes {
+                id: pod_id.to_string(),
+                metadata: pod.metadata.clone(),
+                labels: pod.labels.clone(),
+                annotations: pod.annotations.clone(),
+            }),
+            linux: Some(LinuxPodSandboxStats {
+                cpu: Some(CpuUsage {
+                    timestamp,
+                    usage_core_nano_seconds: Some(UInt64Value { value: total_cpu_usage }),
+                    usage_nano_cores: Some(UInt64Value { value: total_cpu_usage }),
+                }),
+                memory: Some(MemoryUsage {
+                    timestamp,
+                    working_set_bytes: Some(UInt64Value { value: total_memory_usage }),
+                    available_bytes: Some(UInt64Value { value: total_memory_limit.saturating_sub(total_memory_usage) }),
+                    usage_bytes: Some(UInt64Value { value: total_memory_usage }),
+                    rss_bytes: Some(UInt64Value { value: total_memory_usage }),
+                    page_faults: Some(UInt64Value { value: 0 }),
+                    major_page_faults: Some(UInt64Value { value: 0 }),
+                }),
+                containers: container_stats_list,
+                network: Some(NetworkUsage {
+                    timestamp,
+                    default_interface: Some(NetworkInterfaceUsage {
+                        name: "eth0".to_string(),
+                        rx_bytes: Some(UInt64Value { value: 0 }),
+                        rx_errors: Some(UInt64Value { value: 0 }),
+                        tx_bytes: Some(UInt64Value { value: 0 }),
+                        tx_errors: Some(UInt64Value { value: 0 }),
+                    }),
+                    interfaces: Vec::new(),
+                }),
+                process: Some(ProcessUsage {
+                    timestamp,
+                    process_count: Some(UInt64Value { value: container_count }),
+                }),
+            }),
+            windows: None,
+        })
     }
 }
 
@@ -2971,12 +3113,14 @@ impl RuntimeService for RuntimeServiceImpl {
         let pod_id = req.pod_sandbox_id;
 
         let pods = self.pod_sandboxes.lock().await;
-        let _pod = pods
+        let pod = pods
             .get(&pod_id)
             .ok_or_else(|| Status::not_found("Pod sandbox not found"))?;
 
-        // TODO: 从cgroup读取实际统计信息
-        Ok(Response::new(PodSandboxStatsResponse { stats: None }))
+        // 收集该 Pod 下所有容器的统计信息并聚合
+        let stats = self.collect_pod_stats(&pod_id, pod).await;
+
+        Ok(Response::new(PodSandboxStatsResponse { stats }))
     }
 
     // pod沙箱列表统计信息
@@ -2984,10 +3128,16 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<ListPodSandboxStatsRequest>,
     ) -> Result<Response<ListPodSandboxStatsResponse>, Status> {
-        // TODO: 实现完整的统计列表
-        Ok(Response::new(ListPodSandboxStatsResponse {
-            stats: Vec::new(),
-        }))
+        let pods = self.pod_sandboxes.lock().await;
+        let mut all_stats = Vec::new();
+
+        for (pod_id, pod) in pods.iter() {
+            if let Some(stats) = self.collect_pod_stats(pod_id, pod).await {
+                all_stats.push(stats);
+            }
+        }
+
+        Ok(Response::new(ListPodSandboxStatsResponse { stats: all_stats }))
     }
 
     // 更新运行时配置
