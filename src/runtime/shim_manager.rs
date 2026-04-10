@@ -9,6 +9,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+const DEFAULT_SHIM_WORK_DIR: &str = "/var/run/crius/shims";
+
+pub fn default_shim_work_dir() -> PathBuf {
+    std::env::var("CRIUS_SHIM_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_SHIM_WORK_DIR))
+}
+
 /// Shim配置
 #[derive(Debug, Clone)]
 pub struct ShimConfig {
@@ -26,7 +34,7 @@ impl Default for ShimConfig {
     fn default() -> Self {
         Self {
             shim_path: PathBuf::from("crius-shim"),
-            work_dir: PathBuf::from("/var/run/crius/shims"),
+            work_dir: default_shim_work_dir(),
             debug: false,
             runtime_path: PathBuf::from("runc"),
         }
@@ -68,6 +76,10 @@ impl ShimManager {
             config,
             processes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn socket_path(&self, container_id: &str, socket_name: &str) -> PathBuf {
+        self.config.work_dir.join(container_id).join(socket_name)
     }
 
     /// 启动shim进程来管理容器
@@ -283,6 +295,7 @@ mod tests {
     fn test_shim_config_default() {
         let config = ShimConfig::default();
         assert_eq!(config.shim_path, PathBuf::from("crius-shim"));
+        assert_eq!(config.work_dir, default_shim_work_dir());
         assert!(!config.debug);
     }
 

@@ -3,6 +3,7 @@ use log::{debug, error, info};
 use nix::sys::stat::{major, makedev, minor, mknod, stat, Mode, SFlag};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use crate::proto::runtime::v1::{
 };
 
 pub mod shim_manager;
-pub use shim_manager::{ShimConfig, ShimManager, ShimProcess};
+pub use shim_manager::{default_shim_work_dir, ShimConfig, ShimManager, ShimProcess};
 
 /// 容器运行时接口
 pub trait ContainerRuntime {
@@ -36,6 +37,9 @@ pub trait ContainerRuntime {
 
     /// 获取容器状态
     fn container_status(&self, container_id: &str) -> Result<ContainerStatus>;
+
+    /// 重新打开容器日志
+    fn reopen_container_log(&self, container_id: &str) -> Result<()>;
 
     /// 在容器中执行命令
     fn exec_in_container(&self, container_id: &str, command: &[String], tty: bool) -> Result<i32>;
@@ -912,6 +916,21 @@ impl RuncRuntime {
             pids: None,
         }
     }
+
+    fn notify_shim_to_reopen_log(&self, container_id: &str) -> Result<()> {
+        let shim_manager = self
+            .shim_manager
+            .as_ref()
+            .context("container log reopen requires shim-enabled runtime")?;
+        let socket_path = shim_manager.socket_path(container_id, "reopen.sock");
+        let _stream = StdUnixStream::connect(&socket_path).with_context(|| {
+            format!(
+                "Failed to connect reopen log socket {}",
+                socket_path.display()
+            )
+        })?;
+        Ok(())
+    }
 }
 
 impl ContainerRuntime for RuncRuntime {
@@ -1102,6 +1121,10 @@ impl ContainerRuntime for RuncRuntime {
         }
     }
 
+    fn reopen_container_log(&self, container_id: &str) -> Result<()> {
+        self.notify_shim_to_reopen_log(container_id)
+    }
+
     fn exec_in_container(&self, container_id: &str, command: &[String], tty: bool) -> Result<i32> {
         info!(
             "Executing command in container {}: {:?}",
@@ -1169,6 +1192,10 @@ impl ContainerRuntime for RuncRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+    use std::thread;
     use tempfile::tempdir;
 
     fn create_test_runtime() -> (RuncRuntime, tempfile::TempDir) {
@@ -1474,5 +1501,57 @@ mod tests {
         let memory = limits.memory.as_ref().unwrap();
         assert_eq!(memory.limit, None);
         assert_eq!(memory.swap, None);
+    }
+
+    #[test]
+    fn test_reopen_container_log_reports_missing_socket() {
+        let temp_dir = tempdir().unwrap();
+        let shim_dir = temp_dir.path().join("shims");
+        let container_id = "container-1";
+        let container_shim_dir = shim_dir.join(container_id);
+        fs::create_dir_all(&container_shim_dir).unwrap();
+
+        let runtime = RuncRuntime::with_shim(
+            PathBuf::from("runc"),
+            temp_dir.path().join("containers"),
+            ShimConfig {
+                work_dir: shim_dir,
+                ..Default::default()
+            },
+        );
+
+        let err = runtime.reopen_container_log(container_id).unwrap_err();
+        assert!(err.to_string().contains("reopen log socket"));
+    }
+
+    #[test]
+    #[ignore = "requires unix socket bind permissions in the current test environment"]
+    fn test_reopen_container_log_notifies_shim_control_socket() {
+        let temp_dir = tempdir().unwrap();
+        let shim_dir = temp_dir.path().join("shims");
+        let container_id = "container-1";
+        let container_shim_dir = shim_dir.join(container_id);
+        fs::create_dir_all(&container_shim_dir).unwrap();
+        let socket_path = container_shim_dir.join("reopen.sock");
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let _ = listener.accept().unwrap();
+            tx.send(()).unwrap();
+        });
+
+        let runtime = RuncRuntime::with_shim(
+            PathBuf::from("runc"),
+            temp_dir.path().join("containers"),
+            ShimConfig {
+                work_dir: shim_dir,
+                ..Default::default()
+            },
+        );
+
+        runtime.reopen_container_log(container_id).unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
     }
 }

@@ -1,10 +1,13 @@
 use log;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::Mutex;
@@ -19,11 +22,11 @@ use crate::proto::runtime::v1::{
     StopPodSandboxResponse, VersionRequest, VersionResponse,
 };
 use crate::proto::runtime::v1::{
-    AttachRequest, AttachResponse, CheckpointContainerRequest, CheckpointContainerResponse,
-    ContainerEventResponse, ContainerMetadata, ContainerResources, ContainerStatsRequest,
-    ContainerStatsResponse, ContainerStatusRequest, ContainerStatusResponse,
-    CreateContainerRequest, CreateContainerResponse, GetEventsRequest, ImageSpec,
-    LinuxPodSandboxStatus, ListContainerStatsRequest, ListContainerStatsResponse,
+    AttachRequest, AttachResponse, CgroupDriver, CheckpointContainerRequest,
+    CheckpointContainerResponse, ContainerEventResponse, ContainerEventType, ContainerMetadata,
+    ContainerResources, ContainerStatsRequest, ContainerStatsResponse, ContainerStatusRequest,
+    ContainerStatusResponse, CreateContainerRequest, CreateContainerResponse, GetEventsRequest,
+    ImageSpec, LinuxPodSandboxStatus, ListContainerStatsRequest, ListContainerStatsResponse,
     ListContainersRequest, ListContainersResponse, ListMetricDescriptorsRequest,
     ListMetricDescriptorsResponse, ListPodSandboxMetricsRequest, ListPodSandboxMetricsResponse,
     ListPodSandboxRequest, ListPodSandboxResponse, ListPodSandboxStatsRequest,
@@ -42,8 +45,8 @@ use crate::storage::persistence::{PersistenceConfig, PersistenceManager};
 use crate::network::{DefaultNetworkManager, NetworkManager};
 use crate::pod::{PodSandboxConfig, PodSandboxManager};
 use crate::runtime::{
-    ContainerConfig, ContainerRuntime, ContainerStatus, DeviceMapping, MountConfig, NamespacePaths,
-    RuncRuntime, SeccompProfile, ShimConfig,
+    default_shim_work_dir, ContainerConfig, ContainerRuntime, ContainerStatus, DeviceMapping,
+    MountConfig, NamespacePaths, RuncRuntime, SeccompProfile, ShimConfig,
 };
 use crate::streaming::StreamingServer;
 use crate::metrics::MetricsCollector;
@@ -65,6 +68,10 @@ pub struct RuntimeServiceImpl {
     persistence: Arc<Mutex<PersistenceManager>>,
     // 流式服务
     streaming: Arc<Mutex<Option<StreamingServer>>>,
+    // 持续事件广播
+    events: tokio::sync::broadcast::Sender<ContainerEventResponse>,
+    // shim 工作目录
+    shim_work_dir: PathBuf,
 }
 
 /// 运行时配置
@@ -266,6 +273,8 @@ struct StoredContainerState {
     cgroup_parent: Option<String>,
     network_namespace_path: Option<String>,
     linux_resources: Option<StoredLinuxResources>,
+    mounts: Vec<StoredMount>,
+    run_as_user: Option<String>,
     run_as_group: Option<u32>,
     supplemental_groups: Vec<u32>,
     no_new_privileges: Option<bool>,
@@ -275,6 +284,16 @@ struct StoredContainerState {
     started_at: Option<i64>,
     finished_at: Option<i64>,
     exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct StoredMount {
+    container_path: String,
+    host_path: String,
+    readonly: bool,
+    selinux_relabel: bool,
+    propagation: i32,
 }
 
 impl RuntimeServiceImpl {
@@ -324,6 +343,181 @@ impl RuntimeServiceImpl {
         annotations
             .get(key)
             .and_then(|value| serde_json::from_str(value).ok())
+    }
+
+    async fn persist_container_annotations(
+        &self,
+        container_id: &str,
+        annotations: &HashMap<String, String>,
+    ) -> Result<(), Status> {
+        let encoded_annotations = serde_json::to_string(annotations)
+            .map_err(|e| Status::internal(format!("Failed to encode annotations: {}", e)))?;
+
+        let mut persistence = self.persistence.lock().await;
+        let Some(mut record) = persistence
+            .storage()
+            .get_container(container_id)
+            .map_err(|e| Status::internal(format!("Failed to load container record: {}", e)))?
+        else {
+            return Ok(());
+        };
+
+        record.annotations = encoded_annotations;
+        persistence
+            .storage_mut()
+            .save_container(&record)
+            .map_err(|e| Status::internal(format!("Failed to persist container record: {}", e)))
+    }
+
+    async fn mutate_container_internal_state<F>(
+        &self,
+        container_id: &str,
+        mutator: F,
+    ) -> Result<Option<Container>, Status>
+    where
+        F: FnOnce(&mut StoredContainerState),
+    {
+        let updated = {
+            let mut containers = self.containers.lock().await;
+            let Some(container) = containers.get_mut(container_id) else {
+                return Ok(None);
+            };
+            let mut state = Self::read_internal_state::<StoredContainerState>(
+                &container.annotations,
+                INTERNAL_CONTAINER_STATE_KEY,
+            )
+            .unwrap_or_default();
+            mutator(&mut state);
+            Self::insert_internal_state(
+                &mut container.annotations,
+                INTERNAL_CONTAINER_STATE_KEY,
+                &state,
+            )?;
+            Some(container.clone())
+        };
+
+        if let Some(container) = &updated {
+            self.persist_container_annotations(container_id, &container.annotations)
+                .await?;
+        }
+
+        Ok(updated)
+    }
+
+    fn linux_resources_to_runtime_update_payload(
+        resources: &crate::proto::runtime::v1::LinuxContainerResources,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::Map::new();
+
+        let mut cpu = serde_json::Map::new();
+        if resources.cpu_shares > 0 {
+            cpu.insert("shares".to_string(), json!(resources.cpu_shares));
+        }
+        if resources.cpu_quota > 0 {
+            cpu.insert("quota".to_string(), json!(resources.cpu_quota));
+        }
+        if resources.cpu_period > 0 {
+            cpu.insert("period".to_string(), json!(resources.cpu_period));
+        }
+        if !resources.cpuset_cpus.is_empty() {
+            cpu.insert("cpus".to_string(), json!(resources.cpuset_cpus));
+        }
+        if !resources.cpuset_mems.is_empty() {
+            cpu.insert("mems".to_string(), json!(resources.cpuset_mems));
+        }
+        if !cpu.is_empty() {
+            payload.insert("cpu".to_string(), serde_json::Value::Object(cpu));
+        }
+
+        let mut memory = serde_json::Map::new();
+        if resources.memory_limit_in_bytes > 0 {
+            memory.insert("limit".to_string(), json!(resources.memory_limit_in_bytes));
+        }
+        if resources.memory_swap_limit_in_bytes > 0 {
+            memory.insert(
+                "swap".to_string(),
+                json!(resources.memory_swap_limit_in_bytes),
+            );
+        }
+        if !memory.is_empty() {
+            payload.insert("memory".to_string(), serde_json::Value::Object(memory));
+        }
+
+        if resources.oom_score_adj != 0 {
+            payload.insert("oomScoreAdj".to_string(), json!(resources.oom_score_adj));
+        }
+        if !resources.hugepage_limits.is_empty() {
+            payload.insert(
+                "hugepageLimits".to_string(),
+                serde_json::Value::Array(
+                    resources
+                        .hugepage_limits
+                        .iter()
+                        .map(|limit| {
+                            json!({
+                                "pageSize": limit.page_size,
+                                "limit": limit.limit,
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        if !resources.unified.is_empty() {
+            payload.insert("unified".to_string(), json!(resources.unified));
+        }
+
+        serde_json::Value::Object(payload)
+    }
+
+    async fn runtime_update_container_resources(
+        &self,
+        container_id: &str,
+        resources: &crate::proto::runtime::v1::LinuxContainerResources,
+    ) -> Result<(), Status> {
+        let mut resource_file = NamedTempFile::new_in(&self.config.root_dir)
+            .or_else(|_| NamedTempFile::new())
+            .map_err(|e| {
+                Status::internal(format!("Failed to create temporary resource file: {}", e))
+            })?;
+        let payload = Self::linux_resources_to_runtime_update_payload(resources);
+        serde_json::to_writer(resource_file.as_file_mut(), &payload)
+            .map_err(|e| Status::internal(format!("Failed to encode OCI resources: {}", e)))?;
+        resource_file
+            .as_file_mut()
+            .flush()
+            .map_err(|e| Status::internal(format!("Failed to flush OCI resources: {}", e)))?;
+
+        let runtime_path = self.config.runtime_path.clone();
+        let resource_path = resource_file.path().to_path_buf();
+        let container_id = container_id.to_string();
+        let error_container_id = container_id.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new(runtime_path)
+                .arg("update")
+                .arg("--resources")
+                .arg(&resource_path)
+                .arg(&container_id)
+                .output()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to spawn update task: {}", e)))?
+        .map_err(|e| Status::internal(format!("Failed to execute runtime update: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let message = if stderr.is_empty() {
+                format!("runtime update exited with status {}", output.status)
+            } else {
+                stderr
+            };
+            return Err(Status::internal(format!(
+                "Failed to update runtime resources for {}: {}",
+                error_container_id, message
+            )));
+        }
+
+        Ok(())
     }
 
     fn security_profile_name(
@@ -521,6 +715,59 @@ impl RuntimeServiceImpl {
         })
     }
 
+    fn runtime_state_name(runtime_state: i32) -> &'static str {
+        match runtime_state {
+            x if x == ContainerState::ContainerCreated as i32 => "created",
+            x if x == ContainerState::ContainerRunning as i32 => "running",
+            x if x == ContainerState::ContainerExited as i32 => "exited",
+            _ => "unknown",
+        }
+    }
+
+    fn container_reason_message(runtime_state: i32, exit_code: i32) -> (String, String) {
+        match runtime_state {
+            x if x == ContainerState::ContainerCreated as i32 => (
+                "Created".to_string(),
+                "container has been created but not started".to_string(),
+            ),
+            x if x == ContainerState::ContainerRunning as i32 => {
+                ("Running".to_string(), "container is running".to_string())
+            }
+            x if x == ContainerState::ContainerExited as i32 => {
+                let reason = if exit_code == 0 {
+                    "Completed"
+                } else if exit_code == 137 {
+                    "OOMKilled"
+                } else {
+                    "Error"
+                };
+                (
+                    reason.to_string(),
+                    format!("container exited with code {}", exit_code),
+                )
+            }
+            _ => (
+                "Unknown".to_string(),
+                "runtime state could not be determined".to_string(),
+            ),
+        }
+    }
+
+    fn stored_mounts_to_proto(mounts: &[StoredMount]) -> Vec<crate::proto::runtime::v1::Mount> {
+        mounts
+            .iter()
+            .map(|mount| crate::proto::runtime::v1::Mount {
+                container_path: mount.container_path.clone(),
+                host_path: mount.host_path.clone(),
+                readonly: mount.readonly,
+                selinux_relabel: mount.selinux_relabel,
+                propagation: mount.propagation,
+                uid_mappings: Vec::new(),
+                gid_mappings: Vec::new(),
+            })
+            .collect()
+    }
+
     fn build_container_status_snapshot(
         container: &Container,
         runtime_state: i32,
@@ -541,6 +788,13 @@ impl RuntimeServiceImpl {
             .as_ref()
             .and_then(|state| state.exit_code)
             .unwrap_or_default();
+        let (reason, message) = Self::container_reason_message(runtime_state, exit_code);
+        let mounts = Self::stored_mounts_to_proto(
+            container_state
+                .as_ref()
+                .map(|state| state.mounts.as_slice())
+                .unwrap_or(&[]),
+        );
 
         CriContainerStatus {
             id: container.id.clone(),
@@ -558,8 +812,11 @@ impl RuntimeServiceImpl {
                 ..Default::default()
             })),
             image_ref: container.image_ref.clone(),
+            reason,
+            message,
             labels: container.labels.clone(),
             annotations: Self::external_annotations(&container.annotations),
+            mounts,
             log_path: container_state
                 .as_ref()
                 .and_then(|state| state.log_path.clone())
@@ -574,6 +831,52 @@ impl RuntimeServiceImpl {
         }
     }
 
+    fn build_pod_sandbox_status_snapshot(
+        &self,
+        pod_sandbox: &crate::proto::runtime::v1::PodSandbox,
+    ) -> PodSandboxStatus {
+        let pod_state = Self::read_internal_state::<StoredPodState>(
+            &pod_sandbox.annotations,
+            INTERNAL_POD_STATE_KEY,
+        );
+
+        PodSandboxStatus {
+            id: pod_sandbox.id.clone(),
+            metadata: Some(pod_sandbox.metadata.clone().unwrap_or(PodSandboxMetadata {
+                name: pod_sandbox.id.clone(),
+                uid: pod_sandbox.id.clone(),
+                namespace: "default".to_string(),
+                attempt: 1,
+            })),
+            state: pod_sandbox.state,
+            created_at: Self::normalize_timestamp_nanos(pod_sandbox.created_at),
+            network: Self::pod_network_status_from_state(pod_state.as_ref()),
+            linux: Self::pod_linux_status_from_state(pod_state.as_ref()),
+            labels: pod_sandbox.labels.clone(),
+            annotations: Self::external_annotations(&pod_sandbox.annotations),
+            runtime_handler: if pod_sandbox.runtime_handler.is_empty() {
+                let restored = pod_state
+                    .as_ref()
+                    .map(|state| state.runtime_handler.clone())
+                    .filter(|handler| !handler.is_empty())
+                    .unwrap_or_else(|| self.config.runtime.clone());
+                if self
+                    .config
+                    .runtime_handlers
+                    .iter()
+                    .any(|handler| handler == &restored)
+                {
+                    restored
+                } else {
+                    self.config.runtime.clone()
+                }
+            } else {
+                pod_sandbox.runtime_handler.clone()
+            },
+            ..Default::default()
+        }
+    }
+
     fn map_runtime_container_state(status: crate::runtime::ContainerStatus) -> i32 {
         match status {
             ContainerStatus::Created => ContainerState::ContainerCreated as i32,
@@ -581,6 +884,232 @@ impl RuntimeServiceImpl {
             ContainerStatus::Stopped(_) => ContainerState::ContainerExited as i32,
             ContainerStatus::Unknown => ContainerState::ContainerUnknown as i32,
         }
+    }
+
+    fn cgroup_driver(&self) -> CgroupDriver {
+        match std::env::var("CRIUS_CGROUP_DRIVER")
+            .ok()
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("systemd") => CgroupDriver::Systemd,
+            Some("cgroupfs") => CgroupDriver::Cgroupfs,
+            _ => {
+                let systemd_active = std::path::Path::new("/run/systemd/system").exists()
+                    || std::fs::read_to_string("/proc/1/comm")
+                        .map(|content| content.trim() == "systemd")
+                        .unwrap_or(false);
+                let cgroup_v2 = std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
+                let systemd_cgroup_layout = std::path::Path::new("/sys/fs/cgroup/system.slice")
+                    .exists()
+                    || std::path::Path::new("/sys/fs/cgroup/user.slice").exists()
+                    || std::path::Path::new("/sys/fs/cgroup/systemd").exists();
+
+                if systemd_active && (cgroup_v2 || systemd_cgroup_layout) {
+                    CgroupDriver::Systemd
+                } else {
+                    CgroupDriver::Cgroupfs
+                }
+            }
+        }
+    }
+
+    fn runtime_feature_flags(&self) -> serde_json::Value {
+        json!({
+            "exec": true,
+            "execSync": true,
+            "attach": true,
+            "portForward": true,
+            "containerStats": false,
+            "podSandboxStats": false,
+            "containerEvents": true,
+            "reopenContainerLog": true,
+            "updateContainerResources": true,
+            "checkpointContainer": false,
+        })
+    }
+
+    fn network_health(&self) -> (bool, String, String) {
+        let config_dirs = ["/etc/cni/net.d", "/etc/kubernetes/cni/net.d"];
+        let mut discovered = Vec::new();
+
+        for dir in config_dirs {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let matches = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| matches!(ext, "conf" | "conflist" | "json"))
+                    .unwrap_or(false);
+                if matches {
+                    discovered.push(path.display().to_string());
+                }
+            }
+        }
+
+        if discovered.is_empty() {
+            (
+                false,
+                "CNIConfigMissing".to_string(),
+                "no CNI config file found in /etc/cni/net.d or /etc/kubernetes/cni/net.d"
+                    .to_string(),
+            )
+        } else {
+            (
+                true,
+                "CNINetworkConfigReady".to_string(),
+                format!("discovered {} CNI config file(s)", discovered.len()),
+            )
+        }
+    }
+
+    async fn runtime_container_status_checked(&self, container_id: &str) -> ContainerStatus {
+        let runtime = self.runtime.clone();
+        let container_id = container_id.to_string();
+        tokio::task::spawn_blocking(move || runtime.container_status(&container_id))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(ContainerStatus::Unknown)
+    }
+
+    fn runtime_container_status_name(status: &ContainerStatus) -> &'static str {
+        match status {
+            ContainerStatus::Created => "created",
+            ContainerStatus::Running => "running",
+            ContainerStatus::Stopped(_) => "stopped",
+            ContainerStatus::Unknown => "unknown",
+        }
+    }
+
+    async fn ensure_container_is_streamable(
+        &self,
+        container_id: &str,
+        operation: &str,
+    ) -> Result<(), Status> {
+        let runtime_status = self.runtime_container_status_checked(container_id).await;
+        if matches!(runtime_status, ContainerStatus::Created | ContainerStatus::Running) {
+            return Ok(());
+        }
+
+        Err(Status::failed_precondition(format!(
+            "container {} is not in a streamable state for {}: current runtime state is {}",
+            container_id,
+            operation,
+            Self::runtime_container_status_name(&runtime_status)
+        )))
+    }
+
+    fn attach_socket_path(&self, container_id: &str) -> PathBuf {
+        self.shim_work_dir.join(container_id).join("attach.sock")
+    }
+
+    async fn runtime_container_pid_checked(&self, container_id: &str) -> Option<i32> {
+        let runtime = self.runtime.clone();
+        let container_id = container_id.to_string();
+        tokio::task::spawn_blocking(move || runtime.container_pid(&container_id))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+    }
+
+    fn encode_info_payload(value: serde_json::Value) -> Result<HashMap<String, String>, Status> {
+        let encoded = serde_json::to_string(&value)
+            .map_err(|e| Status::internal(format!("Failed to encode info payload: {}", e)))?;
+        Ok(HashMap::from([("info".to_string(), encoded)]))
+    }
+
+    async fn build_container_verbose_info(
+        &self,
+        container: &Container,
+        runtime_state: i32,
+    ) -> Result<HashMap<String, String>, Status> {
+        let container_state = Self::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        );
+        let payload = json!({
+            "id": container.id.clone(),
+            "podSandboxId": container.pod_sandbox_id.clone(),
+            "runtimeState": Self::runtime_state_name(runtime_state),
+            "pid": self.runtime_container_pid_checked(&container.id).await,
+            "logPath": container_state.as_ref().and_then(|state| state.log_path.clone()),
+            "tty": container_state.as_ref().map(|state| state.tty).unwrap_or(false),
+            "stdin": container_state.as_ref().map(|state| state.stdin).unwrap_or(false),
+            "stdinOnce": container_state.as_ref().map(|state| state.stdin_once).unwrap_or(false),
+            "networkNamespacePath": container_state
+                .as_ref()
+                .and_then(|state| state.network_namespace_path.clone()),
+            "cgroupParent": container_state.as_ref().and_then(|state| state.cgroup_parent.clone()),
+            "user": container_state.as_ref().and_then(|state| state.run_as_user.clone()),
+            "runAsGroup": container_state.as_ref().and_then(|state| state.run_as_group),
+            "supplementalGroups": container_state
+                .as_ref()
+                .map(|state| state.supplemental_groups.clone())
+                .unwrap_or_default(),
+            "apparmorProfile": container_state
+                .as_ref()
+                .and_then(|state| state.apparmor_profile.clone()),
+            "noNewPrivileges": container_state
+                .as_ref()
+                .and_then(|state| state.no_new_privileges),
+            "mounts": container_state
+                .as_ref()
+                .map(|state| {
+                    state.mounts.iter().map(|mount| {
+                        json!({
+                            "containerPath": mount.container_path.clone(),
+                            "hostPath": mount.host_path.clone(),
+                            "readonly": mount.readonly,
+                            "selinuxRelabel": mount.selinux_relabel,
+                            "propagation": mount.propagation,
+                        })
+                    }).collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        });
+        Self::encode_info_payload(payload)
+    }
+
+    fn build_pod_verbose_info(
+        &self,
+        pod_sandbox: &crate::proto::runtime::v1::PodSandbox,
+    ) -> Result<HashMap<String, String>, Status> {
+        let pod_state = Self::read_internal_state::<StoredPodState>(
+            &pod_sandbox.annotations,
+            INTERNAL_POD_STATE_KEY,
+        );
+        let payload = json!({
+            "id": pod_sandbox.id.clone(),
+            "runtimeHandler": pod_sandbox.runtime_handler.clone(),
+            "netnsPath": pod_state.as_ref().and_then(|state| state.netns_path.clone()),
+            "logDirectory": pod_state.as_ref().and_then(|state| state.log_directory.clone()),
+            "pauseContainerId": pod_state.as_ref().and_then(|state| state.pause_container_id.clone()),
+            "ip": pod_state.as_ref().and_then(|state| state.ip.clone()),
+            "additionalIPs": pod_state
+                .as_ref()
+                .map(|state| state.additional_ips.clone())
+                .unwrap_or_default(),
+            "cgroupParent": pod_state.as_ref().and_then(|state| state.cgroup_parent.clone()),
+            "sysctls": pod_state
+                .as_ref()
+                .map(|state| state.sysctls.clone())
+                .unwrap_or_default(),
+            "selinuxLabel": pod_state.as_ref().and_then(|state| state.selinux_label.clone()),
+            "seccompProfile": pod_state.as_ref().map(|state| json!({
+                "profileType": state.seccomp_profile.as_ref().map(|profile| profile.profile_type),
+                "localhostRef": state
+                    .seccomp_profile
+                    .as_ref()
+                    .map(|profile| profile.localhost_ref.clone())
+                    .unwrap_or_default(),
+            })),
+        });
+        Self::encode_info_payload(payload)
     }
 
     async fn runtime_namespace_path_for_container(
@@ -665,6 +1194,28 @@ impl RuntimeServiceImpl {
         }
     }
 
+    async fn resolve_pod_sandbox_id_if_exists(
+        &self,
+        requested_id: &str,
+    ) -> Result<Option<String>, Status> {
+        match self.resolve_pod_sandbox_id(requested_id).await {
+            Ok(id) => Ok(Some(id)),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(status),
+        }
+    }
+
+    async fn resolve_container_id_if_exists(
+        &self,
+        requested_id: &str,
+    ) -> Result<Option<String>, Status> {
+        match self.resolve_container_id(requested_id).await {
+            Ok(id) => Ok(Some(id)),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(status),
+        }
+    }
+
     fn container_matches_filter(
         container: &Container,
         filter: &crate::proto::runtime::v1::ContainerFilter,
@@ -728,6 +1279,10 @@ impl RuntimeServiceImpl {
     }
 
     pub fn new(config: RuntimeConfig) -> Self {
+        Self::new_with_shim_work_dir(config, default_shim_work_dir())
+    }
+
+    fn new_with_shim_work_dir(config: RuntimeConfig, shim_work_dir: PathBuf) -> Self {
         let mut config = config;
         let mut handlers = Vec::new();
         for handler in &config.runtime_handlers {
@@ -744,6 +1299,7 @@ impl RuntimeServiceImpl {
 
         let mut shim_config = ShimConfig::default();
         shim_config.runtime_path = config.runtime_path.clone();
+        shim_config.work_dir = shim_work_dir;
         shim_config.debug = std::env::var("CRIUS_SHIM_DEBUG")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -757,6 +1313,7 @@ impl RuntimeServiceImpl {
                     PathBuf::from("crius-shim")
                 }
             });
+        let resolved_shim_work_dir = shim_config.work_dir.clone();
 
         let runtime = RuncRuntime::with_shim(
             config.runtime_path.clone(),
@@ -779,6 +1336,7 @@ impl RuntimeServiceImpl {
 
         let persistence = PersistenceManager::new(persistence_config)
             .expect("Failed to create persistence manager");
+        let (events, _) = tokio::sync::broadcast::channel(256);
 
         Self {
             containers: Arc::new(Mutex::new(HashMap::new())),
@@ -788,6 +1346,8 @@ impl RuntimeServiceImpl {
             pod_manager: tokio::sync::Mutex::new(pod_manager),
             persistence: Arc::new(Mutex::new(persistence)),
             streaming: Arc::new(Mutex::new(None)),
+            events,
+            shim_work_dir: resolved_shim_work_dir,
         }
     }
 
@@ -803,12 +1363,218 @@ impl RuntimeServiceImpl {
             .ok_or_else(|| Status::unavailable("streaming server is not initialized"))
     }
 
+    fn publish_event(&self, event: ContainerEventResponse) {
+        if let Err(err) = self.events.send(event) {
+            log::debug!("Dropping CRI event without subscribers: {}", err);
+        }
+    }
+
+    async fn current_container_snapshot(&self, container_id: &str) -> Option<CriContainerStatus> {
+        let container = {
+            let containers = self.containers.lock().await;
+            containers.get(container_id).cloned()
+        }?;
+        let runtime_state = Self::map_runtime_container_state(
+            self.runtime_container_status_checked(container_id).await,
+        );
+        Some(Self::build_container_status_snapshot(
+            &container,
+            runtime_state,
+        ))
+    }
+
+    async fn current_pod_status_snapshot(&self, pod_id: &str) -> Option<PodSandboxStatus> {
+        let pod = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes.get(pod_id).cloned()
+        }?;
+        Some(self.build_pod_sandbox_status_snapshot(&pod))
+    }
+
+    async fn current_pod_container_snapshots(&self, pod_id: &str) -> Vec<CriContainerStatus> {
+        let containers: Vec<Container> = {
+            let containers = self.containers.lock().await;
+            containers
+                .values()
+                .filter(|container| container.pod_sandbox_id == pod_id)
+                .cloned()
+                .collect()
+        };
+
+        let mut snapshots = Vec::with_capacity(containers.len());
+        for container in containers {
+            let runtime_state = Self::map_runtime_container_state(
+                self.runtime_container_status_checked(&container.id).await,
+            );
+            snapshots.push(Self::build_container_status_snapshot(
+                &container,
+                runtime_state,
+            ));
+        }
+        snapshots
+    }
+
+    async fn emit_container_event(
+        &self,
+        event_type: ContainerEventType,
+        container: &Container,
+        runtime_state: Option<i32>,
+    ) {
+        let pod_status = self
+            .current_pod_status_snapshot(&container.pod_sandbox_id)
+            .await;
+        let snapshot = Self::build_container_status_snapshot(
+            container,
+            runtime_state.unwrap_or_else(|| container.state),
+        );
+        self.publish_event(ContainerEventResponse {
+            container_id: container.id.clone(),
+            container_event_type: event_type as i32,
+            created_at: Self::now_nanos(),
+            pod_sandbox_status: pod_status,
+            containers_statuses: vec![snapshot],
+        });
+    }
+
+    async fn emit_pod_event(
+        &self,
+        event_type: ContainerEventType,
+        pod_sandbox: &crate::proto::runtime::v1::PodSandbox,
+        containers_statuses: Vec<CriContainerStatus>,
+    ) {
+        self.publish_event(ContainerEventResponse {
+            container_id: pod_sandbox.id.clone(),
+            container_event_type: event_type as i32,
+            created_at: Self::now_nanos(),
+            pod_sandbox_status: Some(self.build_pod_sandbox_status_snapshot(pod_sandbox)),
+            containers_statuses,
+        });
+    }
+
+    async fn reconcile_recovered_state(&self) -> Result<(), Status> {
+        let container_ids: Vec<String> = {
+            let containers = self.containers.lock().await;
+            containers.keys().cloned().collect()
+        };
+
+        for container_id in container_ids {
+            let runtime_status = self.runtime_container_status_checked(&container_id).await;
+            if matches!(runtime_status, ContainerStatus::Unknown) {
+                continue;
+            }
+
+            let runtime_state = Self::map_runtime_container_state(runtime_status.clone());
+            let persistence_status = match runtime_status {
+                ContainerStatus::Created => crate::runtime::ContainerStatus::Created,
+                ContainerStatus::Running => crate::runtime::ContainerStatus::Running,
+                ContainerStatus::Stopped(code) => crate::runtime::ContainerStatus::Stopped(code),
+                ContainerStatus::Unknown => crate::runtime::ContainerStatus::Unknown,
+            };
+
+            {
+                let mut containers = self.containers.lock().await;
+                if let Some(container) = containers.get_mut(&container_id) {
+                    container.state = runtime_state;
+                    if let Some(mut state) = Self::read_internal_state::<StoredContainerState>(
+                        &container.annotations,
+                        INTERNAL_CONTAINER_STATE_KEY,
+                    ) {
+                        match &persistence_status {
+                            crate::runtime::ContainerStatus::Running => {
+                                state.started_at.get_or_insert(Self::now_nanos());
+                                state.finished_at = None;
+                                state.exit_code = None;
+                            }
+                            crate::runtime::ContainerStatus::Stopped(code) => {
+                                state.finished_at.get_or_insert(Self::now_nanos());
+                                state.exit_code = Some(*code);
+                            }
+                            _ => {}
+                        }
+                        let _ = Self::insert_internal_state(
+                            &mut container.annotations,
+                            INTERNAL_CONTAINER_STATE_KEY,
+                            &state,
+                        );
+                    }
+                }
+            }
+
+            let mut persistence = self.persistence.lock().await;
+            if let Err(e) = persistence.update_container_state(&container_id, persistence_status) {
+                log::warn!(
+                    "Failed to reconcile container {} state in database: {}",
+                    container_id,
+                    e
+                );
+            }
+        }
+
+        let pod_ids: Vec<String> = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes.keys().cloned().collect()
+        };
+
+        for pod_id in pod_ids {
+            let pause_container_id = {
+                let pod_sandboxes = self.pod_sandboxes.lock().await;
+                pod_sandboxes.get(&pod_id).and_then(|pod| {
+                    Self::read_internal_state::<StoredPodState>(
+                        &pod.annotations,
+                        INTERNAL_POD_STATE_KEY,
+                    )
+                    .and_then(|state| state.pause_container_id)
+                })
+            };
+
+            let Some(pause_container_id) = pause_container_id else {
+                continue;
+            };
+
+            let pause_status = self
+                .runtime_container_status_checked(&pause_container_id)
+                .await;
+            let next_state = match pause_status {
+                ContainerStatus::Running => PodSandboxState::SandboxReady as i32,
+                _ => PodSandboxState::SandboxNotready as i32,
+            };
+
+            {
+                let mut pod_sandboxes = self.pod_sandboxes.lock().await;
+                if let Some(pod) = pod_sandboxes.get_mut(&pod_id) {
+                    pod.state = next_state;
+                }
+            }
+
+            let mut persistence = self.persistence.lock().await;
+            if let Err(e) = persistence.update_pod_state(
+                &pod_id,
+                if next_state == PodSandboxState::SandboxReady as i32 {
+                    "ready"
+                } else {
+                    "notready"
+                },
+            ) {
+                log::warn!(
+                    "Failed to reconcile pod {} state in database: {}",
+                    pod_id,
+                    e
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// 从持久化存储恢复状态
     pub async fn recover_state(&self) -> Result<(), Status> {
-        let mut persistence = self.persistence.lock().await;
+        let (recovered_containers, recovered_pods) = {
+            let persistence = self.persistence.lock().await;
+            (persistence.recover_containers(), persistence.recover_pods())
+        };
 
         // 恢复容器状态
-        match persistence.recover_containers() {
+        match recovered_containers {
             Ok(containers) => {
                 let mut memory_containers = self.containers.lock().await;
                 for (_id, status, record) in containers {
@@ -900,7 +1666,7 @@ impl RuntimeServiceImpl {
         }
 
         // 恢复Pod沙箱状态
-        match persistence.recover_pods() {
+        match recovered_pods {
             Ok(pods) => {
                 let mut memory_pods = self.pod_sandboxes.lock().await;
                 let mut pod_manager = self.pod_manager.lock().await;
@@ -1053,6 +1819,7 @@ impl RuntimeServiceImpl {
             }
         }
 
+        self.reconcile_recovered_state().await?;
         Ok(())
     }
 
@@ -1582,6 +2349,12 @@ impl RuntimeService for RuntimeServiceImpl {
         }
 
         log::info!("Pod sandbox {} created successfully", pod_id);
+        self.emit_pod_event(
+            ContainerEventType::ContainerStartedEvent,
+            &pod_sandbox,
+            Vec::new(),
+        )
+        .await;
         Ok(Response::new(RunPodSandboxResponse {
             pod_sandbox_id: pod_id,
         }))
@@ -1593,7 +2366,12 @@ impl RuntimeService for RuntimeServiceImpl {
         request: Request<StopPodSandboxRequest>,
     ) -> Result<Response<StopPodSandboxResponse>, Status> {
         let req = request.into_inner();
-        let pod_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
+        let Some(pod_id) = self
+            .resolve_pod_sandbox_id_if_exists(&req.pod_sandbox_id)
+            .await?
+        else {
+            return Ok(Response::new(StopPodSandboxResponse {}));
+        };
 
         log::info!("Stopping pod sandbox {}", pod_id);
 
@@ -1706,6 +2484,33 @@ impl RuntimeService for RuntimeServiceImpl {
         }
 
         log::info!("Pod sandbox {} stopped", pod_id);
+        let stopped_containers: Vec<Container> = {
+            let containers = self.containers.lock().await;
+            container_ids
+                .iter()
+                .filter_map(|container_id| containers.get(container_id).cloned())
+                .collect()
+        };
+        for container in stopped_containers {
+            self.emit_container_event(
+                ContainerEventType::ContainerStoppedEvent,
+                &container,
+                Some(container.state),
+            )
+            .await;
+        }
+        if let Some(pod) = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes.get(&pod_id).cloned()
+        } {
+            let container_statuses = self.current_pod_container_snapshots(&pod_id).await;
+            self.emit_pod_event(
+                ContainerEventType::ContainerStoppedEvent,
+                &pod,
+                container_statuses,
+            )
+            .await;
+        }
         Ok(Response::new(StopPodSandboxResponse {}))
     }
 
@@ -1715,44 +2520,29 @@ impl RuntimeService for RuntimeServiceImpl {
         request: Request<ContainerStatusRequest>,
     ) -> Result<Response<ContainerStatusResponse>, Status> {
         let req = request.into_inner();
-        let container_id = req.container_id;
-        let containers = self.containers.lock().await;
+        let actual_container_id = self.resolve_container_id(&req.container_id).await?;
+        let container = {
+            let containers = self.containers.lock().await;
+            containers.get(&actual_container_id).cloned()
+        }
+        .ok_or_else(|| Status::not_found("Container not found"))?;
 
-        // 支持短ID匹配
-        let found_container_id = if containers.contains_key(&container_id) {
-            Some(container_id.clone())
+        let runtime_state = Self::map_runtime_container_state(
+            self.runtime_container_status_checked(&actual_container_id)
+                .await,
+        );
+        let status = Self::build_container_status_snapshot(&container, runtime_state);
+        let info = if req.verbose {
+            self.build_container_verbose_info(&container, runtime_state)
+                .await?
         } else {
-            // 尝试前缀匹配（支持短ID）
-            containers
-                .keys()
-                .find(|full_id| full_id.starts_with(&container_id))
-                .cloned()
+            HashMap::new()
         };
 
-        if let Some(actual_container_id) = found_container_id {
-            if let Some(container) = containers.get(&actual_container_id) {
-                // 查询runtime获取实时状态
-                let runtime_state = match self.runtime.container_status(&actual_container_id) {
-                    Ok(status) => match status {
-                        ContainerStatus::Created => ContainerState::ContainerCreated,
-                        ContainerStatus::Running => ContainerState::ContainerRunning,
-                        ContainerStatus::Stopped(_) => ContainerState::ContainerExited,
-                        ContainerStatus::Unknown => ContainerState::ContainerUnknown,
-                    },
-                    Err(_) => ContainerState::ContainerUnknown,
-                };
-                let status = Self::build_container_status_snapshot(container, runtime_state as i32);
-
-                Ok(Response::new(ContainerStatusResponse {
-                    status: Some(status),
-                    ..Default::default()
-                }))
-            } else {
-                Err(Status::not_found("Container not found"))
-            }
-        } else {
-            Err(Status::not_found("Container not found"))
-        }
+        Ok(Response::new(ContainerStatusResponse {
+            status: Some(status),
+            info,
+        }))
     }
 
     // 列出容器
@@ -1846,6 +2636,8 @@ impl RuntimeService for RuntimeServiceImpl {
     async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ExecResponse>, Status> {
         let mut req = request.into_inner();
         req.container_id = self.resolve_container_id(&req.container_id).await?;
+        self.ensure_container_is_streamable(&req.container_id, "exec")
+            .await?;
         let streaming = self.get_streaming_server().await?;
         let response = streaming.get_exec(&req).await?;
         Ok(Response::new(response))
@@ -1867,7 +2659,10 @@ impl RuntimeService for RuntimeServiceImpl {
             return Err(Status::invalid_argument("cmd must not be empty"));
         }
 
-        let mut command = TokioCommand::new("runc");
+        self.ensure_container_is_streamable(&container_id, "exec_sync")
+            .await?;
+
+        let mut command = TokioCommand::new(&self.config.runtime_path);
         command.arg("exec");
         command.arg(&container_id);
         for arg in &cmd {
@@ -1942,43 +2737,136 @@ impl RuntimeService for RuntimeServiceImpl {
     // 端口转发
     async fn port_forward(
         &self,
-        _request: Request<PortForwardRequest>,
+        request: Request<PortForwardRequest>,
     ) -> Result<Response<PortForwardResponse>, Status> {
-        // 实现端口转发的逻辑
-        Ok(Response::new(PortForwardResponse {
-            url: "unix:///var/run/crius/crius.sock".to_string(),
-        }))
+        let req = request.into_inner();
+        if req.port.is_empty() {
+            return Err(Status::invalid_argument(
+                "port-forward requires at least one forwarded port",
+            ));
+        }
+        let pod_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
+        if req.port.iter().any(|port| *port <= 0 || *port > 65535) {
+            return Err(Status::invalid_argument(
+                "all forwarded ports must be in 1..=65535",
+            ));
+        }
+
+        let pod = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes.get(&pod_id).cloned()
+        }
+        .ok_or_else(|| Status::not_found("Pod sandbox not found"))?;
+        if pod.state != PodSandboxState::SandboxReady as i32 {
+            return Err(Status::failed_precondition(format!(
+                "pod sandbox {} is not ready",
+                pod_id
+            )));
+        }
+
+        let netns_path =
+            Self::read_internal_state::<StoredPodState>(&pod.annotations, INTERNAL_POD_STATE_KEY)
+                .and_then(|state| state.netns_path)
+                .or_else(|| {
+                    self.pod_manager
+                        .try_lock()
+                        .ok()
+                        .and_then(|manager| manager.get_pod_netns(&pod_id))
+                        .map(|path| path.to_string_lossy().to_string())
+                })
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "pod sandbox {} has no network namespace path",
+                        pod_id
+                    ))
+                })?;
+
+        if !std::path::Path::new(&netns_path).exists() {
+            return Err(Status::failed_precondition(format!(
+                "pod sandbox {} network namespace does not exist: {}",
+                pod_id, netns_path
+            )));
+        }
+
+        let streaming = self.get_streaming_server().await?;
+        let response = streaming
+            .get_port_forward(&req, PathBuf::from(netns_path))
+            .await?;
+        Ok(Response::new(response))
     }
 
     // 获取运行时状态
     async fn status(
         &self,
-        _request: Request<StatusRequest>,
+        request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        let mut info = HashMap::new();
-        info.insert("runtime_name".to_string(), "crius".to_string());
-        info.insert("runtime_version".to_string(), "0.1.0".to_string());
-        info.insert("runtime_api_version".to_string(), "v1".to_string());
-        info.insert(
-            "root_dir".to_string(),
-            self.config.root_dir.to_string_lossy().to_string(),
-        );
-        info.insert("runtime".to_string(), self.config.runtime.clone());
+        let req = request.into_inner();
+        let runtime_ready = self.config.runtime_path.exists();
+        let (network_ready, network_reason, network_message) = self.network_health();
+        let runtime_reason = if runtime_ready {
+            "RuntimeIsReady".to_string()
+        } else {
+            "RuntimeBinaryMissing".to_string()
+        };
+        let runtime_message = if runtime_ready {
+            format!(
+                "runtime binary is available at {}",
+                self.config.runtime_path.display()
+            )
+        } else {
+            format!(
+                "runtime binary does not exist at {}",
+                self.config.runtime_path.display()
+            )
+        };
+        let info = if req.verbose {
+            let payload = json!({
+                "runtimeName": "crius",
+                "runtimeVersion": env!("CARGO_PKG_VERSION"),
+                "runtimeApiVersion": "v1",
+                "rootDir": self.config.root_dir.display().to_string(),
+                "runtime": self.config.runtime.clone(),
+                "runtimePath": self.config.runtime_path.display().to_string(),
+                "runtimeRoot": self.config.runtime_root.display().to_string(),
+                "logDir": self.config.log_dir.display().to_string(),
+                "pauseImage": self.config.pause_image.clone(),
+                "runtimeHandlers": self.config.runtime_handlers.clone(),
+                "runtimeFeatures": self.runtime_feature_flags(),
+                "networkReady": network_ready,
+                "networkReason": network_reason.clone(),
+                "cgroupDriver": self.cgroup_driver().as_str_name(),
+                "recovery": {
+                    "enabled": true,
+                    "startupReconcile": true,
+                    "eventReplayOnRecovery": false,
+                },
+            });
+            let mut info = HashMap::new();
+            info.insert(
+                "config".to_string(),
+                serde_json::to_string(&payload).map_err(|e| {
+                    Status::internal(format!("Failed to encode runtime config info: {}", e))
+                })?,
+            );
+            info
+        } else {
+            HashMap::new()
+        };
 
         Ok(Response::new(StatusResponse {
             status: Some(RuntimeStatus {
                 conditions: vec![
                     RuntimeCondition {
                         r#type: "RuntimeReady".to_string(),
-                        status: true,
-                        reason: "RuntimeIsReady".to_string(),
-                        message: "runtime is ready".to_string(),
+                        status: runtime_ready,
+                        reason: runtime_reason,
+                        message: runtime_message,
                     },
                     RuntimeCondition {
                         r#type: "NetworkReady".to_string(),
-                        status: true,
-                        reason: "NetworkIsReady".to_string(),
-                        message: "network is ready".to_string(),
+                        status: network_ready,
+                        reason: network_reason,
+                        message: network_message,
                     },
                 ],
             }),
@@ -1992,9 +2880,19 @@ impl RuntimeService for RuntimeServiceImpl {
         request: Request<RemovePodSandboxRequest>,
     ) -> Result<Response<RemovePodSandboxResponse>, Status> {
         let req = request.into_inner();
-        let pod_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
+        let Some(pod_id) = self
+            .resolve_pod_sandbox_id_if_exists(&req.pod_sandbox_id)
+            .await?
+        else {
+            return Ok(Response::new(RemovePodSandboxResponse {}));
+        };
 
         log::info!("Removing pod sandbox {}", pod_id);
+        let existing_pod = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes.get(&pod_id).cloned()
+        };
+        let existing_container_statuses = self.current_pod_container_snapshots(&pod_id).await;
 
         // Keep a fallback netns name from CRI metadata, so rmp can clean netns
         // even when PodSandboxManager in-memory state was lost after restart.
@@ -2014,14 +2912,18 @@ impl RuntimeService for RuntimeServiceImpl {
             .map_err(|e| Status::internal(format!("Failed to remove pod sandbox: {}", e)))?;
 
         // 级联删除该Pod下的所有容器（匹配containerd/CRI-O期望行为）
-        let container_ids: Vec<String> = {
+        let removed_containers: Vec<Container> = {
             let containers = self.containers.lock().await;
             containers
                 .values()
                 .filter(|c| c.pod_sandbox_id == pod_id)
-                .map(|c| c.id.clone())
+                .cloned()
                 .collect()
         };
+        let container_ids: Vec<String> = removed_containers
+            .iter()
+            .map(|container| container.id.clone())
+            .collect();
 
         for container_id in &container_ids {
             let runtime = self.runtime.clone();
@@ -2081,6 +2983,22 @@ impl RuntimeService for RuntimeServiceImpl {
         }
 
         log::info!("Pod sandbox {} removed", pod_id);
+        for container in removed_containers {
+            self.emit_container_event(
+                ContainerEventType::ContainerDeletedEvent,
+                &container,
+                Some(container.state),
+            )
+            .await;
+        }
+        if let Some(pod) = existing_pod {
+            self.emit_pod_event(
+                ContainerEventType::ContainerDeletedEvent,
+                &pod,
+                existing_container_statuses,
+            )
+            .await;
+        }
         Ok(Response::new(RemovePodSandboxResponse {}))
     }
 
@@ -2091,131 +3009,25 @@ impl RuntimeService for RuntimeServiceImpl {
     ) -> Result<Response<PodSandboxStatusResponse>, Status> {
         let req = request.into_inner();
         let resolved_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
-        let pod_sandboxes = self.pod_sandboxes.lock().await;
-
-        if let Some(pod_sandbox) = pod_sandboxes.get(&resolved_id) {
-            let pod_state = Self::read_internal_state::<StoredPodState>(
-                &pod_sandbox.annotations,
-                INTERNAL_POD_STATE_KEY,
-            );
-            let mut info = HashMap::new();
-            if req.verbose {
-                info.insert("podSandboxId".to_string(), pod_sandbox.id.clone());
-                if let Some(metadata) = &pod_sandbox.metadata {
-                    info.insert("name".to_string(), metadata.name.clone());
-                }
-                if let Some(state) = &pod_state {
-                    if let Some(netns_path) = &state.netns_path {
-                        info.insert("netnsPath".to_string(), netns_path.clone());
-                    }
-                    if let Some(log_directory) = &state.log_directory {
-                        info.insert("logDirectory".to_string(), log_directory.clone());
-                    }
-                    if let Some(pause_container_id) = &state.pause_container_id {
-                        info.insert("pauseContainerId".to_string(), pause_container_id.clone());
-                    }
-                    if let Some(selinux_label) = &state.selinux_label {
-                        info.insert("selinuxLabel".to_string(), selinux_label.clone());
-                    }
-                    if let Some(seccomp_profile) = &state.seccomp_profile {
-                        let profile_desc = match seccomp_profile.profile_type {
-                            x if x
-                                == crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
-                                    as i32 =>
-                            {
-                                "RuntimeDefault".to_string()
-                            }
-                            x if x
-                                == crate::proto::runtime::v1::security_profile::ProfileType::Unconfined
-                                    as i32 =>
-                            {
-                                "Unconfined".to_string()
-                            }
-                            x if x
-                                == crate::proto::runtime::v1::security_profile::ProfileType::Localhost
-                                    as i32 =>
-                            {
-                                if seccomp_profile.localhost_ref.is_empty() {
-                                    "Localhost".to_string()
-                                } else {
-                                    format!("Localhost({})", seccomp_profile.localhost_ref)
-                                }
-                            }
-                            _ => format!("Unknown({})", seccomp_profile.profile_type),
-                        };
-                        info.insert("seccompProfile".to_string(), profile_desc);
-                    }
-                }
-            }
-
-            let container_statuses = {
-                let containers = self.containers.lock().await;
-                containers
-                    .values()
-                    .filter(|container| container.pod_sandbox_id == resolved_id)
-                    .map(|container| {
-                        let runtime_state = match self.runtime.container_status(&container.id) {
-                            Ok(status) => match status {
-                                ContainerStatus::Created => ContainerState::ContainerCreated,
-                                ContainerStatus::Running => ContainerState::ContainerRunning,
-                                ContainerStatus::Stopped(_) => ContainerState::ContainerExited,
-                                ContainerStatus::Unknown => ContainerState::ContainerUnknown,
-                            },
-                            Err(_) => ContainerState::ContainerUnknown,
-                        };
-                        Self::build_container_status_snapshot(container, runtime_state as i32)
-                    })
-                    .collect()
-            };
-
-            let status = PodSandboxStatus {
-                id: pod_sandbox.id.clone(),
-                metadata: Some(pod_sandbox.metadata.clone().unwrap_or(PodSandboxMetadata {
-                    name: pod_sandbox.id.clone(),
-                    uid: pod_sandbox.id.clone(),
-                    namespace: "default".to_string(),
-                    attempt: 1,
-                })),
-                state: pod_sandbox.state,
-                created_at: Self::normalize_timestamp_nanos(pod_sandbox.created_at),
-                network: Self::pod_network_status_from_state(pod_state.as_ref()),
-                linux: Self::pod_linux_status_from_state(pod_state.as_ref()),
-                labels: pod_sandbox.labels.clone(),
-                annotations: Self::external_annotations(&pod_sandbox.annotations),
-                runtime_handler: if pod_sandbox.runtime_handler.is_empty() {
-                    let restored = pod_state
-                        .as_ref()
-                        .map(|state| state.runtime_handler.clone())
-                        .filter(|handler| !handler.is_empty())
-                        .unwrap_or_else(|| self.config.runtime.clone());
-                    if self
-                        .config
-                        .runtime_handlers
-                        .iter()
-                        .any(|handler| handler == &restored)
-                    {
-                        restored
-                    } else {
-                        self.config.runtime.clone()
-                    }
-                } else {
-                    pod_sandbox.runtime_handler.clone()
-                },
-                ..Default::default()
-            };
-
-            Ok(Response::new(PodSandboxStatusResponse {
-                status: Some(status),
-                info,
-                containers_statuses: container_statuses,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64,
-            }))
-        } else {
-            Err(Status::not_found("Pod sandbox not found"))
+        let pod_sandbox = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes.get(&resolved_id).cloned()
         }
+        .ok_or_else(|| Status::not_found("Pod sandbox not found"))?;
+        let container_statuses = self.current_pod_container_snapshots(&resolved_id).await;
+        let status = self.build_pod_sandbox_status_snapshot(&pod_sandbox);
+        let info = if req.verbose {
+            self.build_pod_verbose_info(&pod_sandbox)?
+        } else {
+            HashMap::new()
+        };
+
+        Ok(Response::new(PodSandboxStatusResponse {
+            status: Some(status),
+            info,
+            containers_statuses: container_statuses,
+            timestamp: Self::now_nanos(),
+        }))
     }
 
     // 列出pod_sandbox
@@ -2448,6 +3260,34 @@ impl RuntimeService for RuntimeServiceImpl {
                 .as_ref()
                 .map(|path| path.to_string_lossy().to_string()),
             linux_resources: linux_resources.as_ref().map(StoredLinuxResources::from),
+            mounts: config
+                .mounts
+                .iter()
+                .map(|mount| StoredMount {
+                    container_path: mount.container_path.clone(),
+                    host_path: mount.host_path.clone(),
+                    readonly: mount.readonly,
+                    selinux_relabel: mount.selinux_relabel,
+                    propagation: mount.propagation,
+                })
+                .collect(),
+            run_as_user: config
+                .linux
+                .as_ref()
+                .and_then(|linux| linux.security_context.as_ref())
+                .and_then(|security| {
+                    security
+                        .run_as_user
+                        .as_ref()
+                        .map(|user| user.value.to_string())
+                        .or_else(|| {
+                            if security.run_as_username.is_empty() {
+                                None
+                            } else {
+                                Some(security.run_as_username.clone())
+                            }
+                        })
+                }),
             run_as_group,
             supplemental_groups: supplemental_groups.clone(),
             no_new_privileges: security.map(|security| security.no_new_privs),
@@ -2652,6 +3492,12 @@ impl RuntimeService for RuntimeServiceImpl {
         } else {
             log::info!("Container {} persisted to database", created_id);
         }
+        self.emit_container_event(
+            ContainerEventType::ContainerCreatedEvent,
+            &container,
+            Some(ContainerState::ContainerCreated as i32),
+        )
+        .await;
 
         Ok(Response::new(CreateContainerResponse {
             container_id: created_id,
@@ -2799,6 +3645,17 @@ impl RuntimeService for RuntimeServiceImpl {
         }
 
         log::info!("Container {} started", container_id);
+        if let Some(container) = {
+            let containers = self.containers.lock().await;
+            containers.get(&actual_container_id).cloned()
+        } {
+            self.emit_container_event(
+                ContainerEventType::ContainerStartedEvent,
+                &container,
+                Some(observed_state),
+            )
+            .await;
+        }
         Ok(Response::new(StartContainerResponse {}))
     }
 
@@ -2813,24 +3670,9 @@ impl RuntimeService for RuntimeServiceImpl {
 
         log::info!("Stopping container {}", container_id);
 
-        // 支持短ID匹配
-        let containers = self.containers.lock().await;
-        let found_container_id = if containers.contains_key(&container_id) {
-            Some(container_id.clone())
-        } else {
-            // 尝试前缀匹配（支持短ID）
-            containers
-                .keys()
-                .find(|full_id| full_id.starts_with(&container_id))
-                .cloned()
-        };
-        drop(containers);
-
-        let actual_container_id = match found_container_id {
-            Some(id) => id,
-            None => {
-                return Err(Status::not_found("Container not found"));
-            }
+        let Some(actual_container_id) = self.resolve_container_id_if_exists(&container_id).await?
+        else {
+            return Ok(Response::new(StopContainerResponse {}));
         };
 
         // 调用runtime停止容器
@@ -2920,6 +3762,17 @@ impl RuntimeService for RuntimeServiceImpl {
         }
 
         log::info!("Container {} stopped", actual_container_id);
+        if let Some(container) = {
+            let containers = self.containers.lock().await;
+            containers.get(&actual_container_id).cloned()
+        } {
+            self.emit_container_event(
+                ContainerEventType::ContainerStoppedEvent,
+                &container,
+                Some(container.state),
+            )
+            .await;
+        }
         Ok(Response::new(StopContainerResponse {}))
     }
 
@@ -2933,24 +3786,13 @@ impl RuntimeService for RuntimeServiceImpl {
 
         log::info!("Removing container {}", container_id);
 
-        // 支持短ID匹配
-        let containers = self.containers.lock().await;
-        let found_container_id = if containers.contains_key(&container_id) {
-            Some(container_id.clone())
-        } else {
-            // 尝试前缀匹配（支持短ID）
-            containers
-                .keys()
-                .find(|full_id| full_id.starts_with(&container_id))
-                .cloned()
+        let Some(actual_container_id) = self.resolve_container_id_if_exists(&container_id).await?
+        else {
+            return Ok(Response::new(RemoveContainerResponse {}));
         };
-        drop(containers);
-
-        let actual_container_id = match found_container_id {
-            Some(id) => id,
-            None => {
-                return Err(Status::not_found("Container not found"));
-            }
+        let deleted_container = {
+            let containers = self.containers.lock().await;
+            containers.get(&actual_container_id).cloned()
         };
 
         // 调用runtime删除容器
@@ -2979,15 +3821,65 @@ impl RuntimeService for RuntimeServiceImpl {
         }
 
         log::info!("Container {} removed", actual_container_id);
+        if let Some(container) = deleted_container {
+            self.emit_container_event(
+                ContainerEventType::ContainerDeletedEvent,
+                &container,
+                Some(container.state),
+            )
+            .await;
+        }
         Ok(Response::new(RemoveContainerResponse {}))
     }
 
     //重新打开容器日志
     async fn reopen_container_log(
         &self,
-        _request: Request<ReopenContainerLogRequest>,
+        request: Request<ReopenContainerLogRequest>,
     ) -> Result<Response<ReopenContainerLogResponse>, Status> {
-        // 实现重新打开容器日志的逻辑
+        let req = request.into_inner();
+        let container_id = self.resolve_container_id(&req.container_id).await?;
+        let container = {
+            let containers = self.containers.lock().await;
+            containers.get(&container_id).cloned()
+        }
+        .ok_or_else(|| Status::not_found("Container not found"))?;
+
+        let runtime_state = self.runtime_container_status_checked(&container_id).await;
+        if !matches!(runtime_state, ContainerStatus::Running) {
+            return Err(Status::failed_precondition(format!(
+                "container {} is not running",
+                container_id
+            )));
+        }
+
+        let log_path = Self::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        )
+        .and_then(|state| state.log_path)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "container {} does not have a configured log path",
+                container_id
+            ))
+        })?;
+
+        let log_path = PathBuf::from(log_path);
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                Status::internal(format!(
+                    "Failed to create log directory {}: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+        }
+        self.runtime
+            .reopen_container_log(&container_id)
+            .map_err(|e| Status::internal(format!("Failed to reopen container log: {}", e)))?;
+
         Ok(Response::new(ReopenContainerLogResponse {}))
     }
 
@@ -2998,6 +3890,16 @@ impl RuntimeService for RuntimeServiceImpl {
     ) -> Result<Response<AttachResponse>, Status> {
         let mut req = request.into_inner();
         req.container_id = self.resolve_container_id(&req.container_id).await?;
+        self.ensure_container_is_streamable(&req.container_id, "attach")
+            .await?;
+        let attach_socket_path = self.attach_socket_path(&req.container_id);
+        if !attach_socket_path.exists() {
+            return Err(Status::failed_precondition(format!(
+                "attach is not available for container {}: attach socket {} is missing; attach recovery after daemon restart is not supported",
+                req.container_id,
+                attach_socket_path.display()
+            )));
+        }
         let streaming = self.get_streaming_server().await?;
         let response = streaming.get_attach(&req).await?;
         Ok(Response::new(response))
@@ -3167,56 +4069,30 @@ impl RuntimeService for RuntimeServiceImpl {
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
         log::info!("Get container events");
 
-        // 创建channel用于事件流
         let (tx, rx) = tokio::sync::mpsc::channel(128);
-        let containers = self.containers.clone();
-        let pods = self.pod_sandboxes.clone();
-
-        // 在后台任务中读取当前状态并发送
+        let mut subscriber = self.events.subscribe();
         tokio::spawn(async move {
-            // 获取当前容器状态
-            let containers_map = containers.lock().await;
-            for (id, container) in containers_map.iter() {
-                let event = ContainerEventResponse {
-                    container_id: id.clone(),
-                    container_event_type: 0, // CONTAINER_CREATED_EVENT
-                    created_at: container.created_at,
-                    pod_sandbox_status: None,
-                    containers_statuses: vec![crate::proto::runtime::v1::ContainerStatus {
-                        id: id.clone(),
-                        metadata: container.metadata.clone(),
-                        state: container.state,
-                        created_at: container.created_at,
-                        ..Default::default()
-                    }],
-                };
-
-                if let Err(e) = tx.send(Ok(event)).await {
-                    log::error!("Failed to send container event: {}", e);
-                    break;
-                }
-            }
-            drop(containers_map);
-
-            // 获取当前Pod状态
-            let pods_map = pods.lock().await;
-            for (id, pod) in pods_map.iter() {
-                let event = ContainerEventResponse {
-                    container_id: id.clone(),
-                    container_event_type: 2, // POD_SANDBOX_CREATED_EVENT
-                    created_at: pod.created_at,
-                    pod_sandbox_status: Some(crate::proto::runtime::v1::PodSandboxStatus {
-                        id: id.clone(),
-                        state: pod.state,
-                        created_at: pod.created_at,
-                        ..Default::default()
-                    }),
-                    containers_statuses: vec![],
-                };
-
-                if let Err(e) = tx.send(Ok(event)).await {
-                    log::error!("Failed to send pod event: {}", e);
-                    break;
+            loop {
+                match subscriber.recv().await {
+                    Ok(event) => {
+                        if let Err(e) = tx.send(Ok(event)).await {
+                            log::debug!("Container events subscriber disconnected: {}", e);
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        if let Err(e) = tx
+                            .send(Err(Status::resource_exhausted(format!(
+                                "missed {} container events due to slow consumer",
+                                skipped
+                            ))))
+                            .await
+                        {
+                            log::debug!("Container events subscriber disconnected: {}", e);
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -3252,10 +4128,9 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<RuntimeConfigRequest>,
     ) -> Result<Response<RuntimeConfigResponse>, Status> {
-        // 返回当前运行时配置
         let config = RuntimeConfigResponse {
             linux: Some(crate::proto::runtime::v1::LinuxRuntimeConfiguration {
-                ..Default::default()
+                cgroup_driver: self.cgroup_driver() as i32,
             }),
             ..Default::default()
         };
@@ -3268,7 +4143,7 @@ impl RuntimeService for RuntimeServiceImpl {
         request: Request<UpdateContainerResourcesRequest>,
     ) -> Result<Response<UpdateContainerResourcesResponse>, Status> {
         let req = request.into_inner();
-        let container_id = req.container_id;
+        let container_id = self.resolve_container_id(&req.container_id).await?;
 
         // 检查容器是否存在
         let containers = self.containers.lock().await;
@@ -3290,20 +4165,24 @@ impl RuntimeService for RuntimeServiceImpl {
         let linux = req.linux;
         let _windows = req.windows;
 
+        let runtime_status = self.runtime_container_status_checked(&container_id).await;
+        if !matches!(
+            runtime_status,
+            ContainerStatus::Running | ContainerStatus::Created
+        ) {
+            return Err(Status::failed_precondition(format!(
+                "container {} is not in a mutable state",
+                container_id
+            )));
+        }
+
         if let Some(resources) = linux {
-            log::info!(
-                "Updating container {} resources: CPU shares={}, Memory limit={}",
-                container_id,
-                resources.cpu_shares,
-                resources.memory_limit_in_bytes
-            );
-
-            // 调用 runtime 更新容器资源
-            self.runtime
-                .update_container_resources(&container_id, &resources)
-                .map_err(|e| Status::internal(format!("Failed to update container resources: {}", e)))?;
-
-            log::info!("Container {} resources updated successfully", container_id);
+            self.runtime_update_container_resources(&container_id, &resources)
+                .await?;
+            self.mutate_container_internal_state(&container_id, |state| {
+                state.linux_resources = Some(StoredLinuxResources::from(&resources));
+            })
+            .await?;
         }
 
         Ok(Response::new(UpdateContainerResourcesResponse {}))
@@ -3313,7 +4192,199 @@ impl RuntimeService for RuntimeServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::ContainerRecord;
+    use crate::storage::PodSandboxRecord;
     use std::collections::HashMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tempfile::tempdir;
+    use tempfile::TempDir;
+    use tokio::time::timeout;
+    use tokio_stream::StreamExt;
+
+    fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
+        RuntimeConfig {
+            root_dir,
+            runtime: "runc".to_string(),
+            runtime_handlers: vec!["runc".to_string(), "kata".to_string()],
+            runtime_root: PathBuf::from("/tmp/crius-test-runtime-root"),
+            log_dir: PathBuf::from("/tmp/crius-test-logs"),
+            runtime_path: PathBuf::from("/definitely/missing/runc"),
+            pause_image: "registry.k8s.io/pause:3.9".to_string(),
+        }
+    }
+
+    fn test_service() -> RuntimeServiceImpl {
+        RuntimeServiceImpl::new(test_runtime_config(tempdir().unwrap().into_path()))
+    }
+
+    fn write_fake_runtime_script(dir: &Path) -> PathBuf {
+        let state_dir = dir.join("runtime-state");
+        fs::create_dir_all(&state_dir).unwrap();
+
+        let script_path = dir.join("fake-runc.sh");
+        let script = format!(
+            r#"#!/bin/bash
+set -eu
+STATE_DIR="{state_dir}"
+cmd="${{1:-}}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+case "$cmd" in
+  state)
+    id="${{1:-}}"
+    file="$STATE_DIR/$id.state"
+    if [ ! -f "$file" ]; then
+      exit 1
+    fi
+    status="$(cat "$file")"
+    pid=0
+    if [ -f "$STATE_DIR/$id.pid" ]; then
+      pid="$(cat "$STATE_DIR/$id.pid")"
+    fi
+    printf '{{"ociVersion":"1.0.2","id":"%s","status":"%s","pid":%s,"bundle":"%s","rootfs":"%s","created":"2024-01-01T00:00:00Z","owner":"root"}}\n' "$id" "$status" "$pid" "$STATE_DIR/bundle" "$STATE_DIR/rootfs"
+    ;;
+  kill)
+    id="${{1:-}}"
+    echo stopped > "$STATE_DIR/$id.state"
+    ;;
+  delete)
+    id="${{1:-}}"
+    if [ -f "$STATE_DIR/$id.state" ]; then
+      rm -f "$STATE_DIR/$id.state" "$STATE_DIR/$id.pid"
+      exit 0
+    fi
+    echo "container does not exist" >&2
+    exit 1
+    ;;
+  start)
+    id="${{1:-}}"
+    echo running > "$STATE_DIR/$id.state"
+    echo $$ > "$STATE_DIR/$id.pid"
+    ;;
+  update)
+    resource_file=""
+    id=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --resources)
+          resource_file="${{2:-}}"
+          shift 2
+          ;;
+        *)
+          id="$1"
+          shift
+          ;;
+      esac
+    done
+    if [ -n "$resource_file" ] && [ -n "$id" ]; then
+      cp "$resource_file" "$STATE_DIR/$id.update.json"
+    fi
+    ;;
+esac
+exit 0
+"#,
+            state_dir = state_dir.display()
+        );
+
+        fs::write(&script_path, script).unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).unwrap();
+        script_path
+    }
+
+    fn test_service_with_fake_runtime() -> (TempDir, RuntimeServiceImpl) {
+        let dir = tempdir().unwrap();
+        let runtime_path = write_fake_runtime_script(dir.path());
+        let shim_work_dir = dir.path().join("shims");
+        let config = RuntimeConfig {
+            root_dir: dir.path().join("root"),
+            runtime: "runc".to_string(),
+            runtime_handlers: vec!["runc".to_string()],
+            runtime_root: dir.path().join("runtime-root"),
+            log_dir: dir.path().join("logs"),
+            runtime_path,
+            pause_image: "registry.k8s.io/pause:3.9".to_string(),
+        };
+        let service = RuntimeServiceImpl::new_with_shim_work_dir(config, shim_work_dir);
+        (dir, service)
+    }
+
+    fn fake_runtime_state_path(dir: &TempDir, id: &str) -> PathBuf {
+        dir.path()
+            .join("runtime-state")
+            .join(format!("{}.state", id))
+    }
+
+    fn fake_runtime_update_path(dir: &TempDir, id: &str) -> PathBuf {
+        dir.path()
+            .join("runtime-state")
+            .join(format!("{}.update.json", id))
+    }
+
+    fn set_fake_runtime_state(dir: &TempDir, id: &str, state: &str) {
+        let state_path = fake_runtime_state_path(dir, id);
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        fs::write(&state_path, state).unwrap();
+        let pid_path = dir.path().join("runtime-state").join(format!("{}.pid", id));
+        if state == "running" {
+            fs::write(pid_path, format!("{}", std::process::id())).unwrap();
+        } else {
+            let _ = fs::remove_file(pid_path);
+        }
+    }
+
+    fn test_container(
+        id: &str,
+        pod_sandbox_id: &str,
+        annotations: HashMap<String, String>,
+    ) -> Container {
+        Container {
+            id: id.to_string(),
+            pod_sandbox_id: pod_sandbox_id.to_string(),
+            state: ContainerState::ContainerCreated as i32,
+            metadata: Some(ContainerMetadata {
+                name: format!("{}-name", id),
+                attempt: 1,
+            }),
+            image: Some(ImageSpec {
+                image: "busybox:latest".to_string(),
+                ..Default::default()
+            }),
+            image_ref: "busybox:latest".to_string(),
+            annotations,
+            created_at: RuntimeServiceImpl::now_nanos(),
+            ..Default::default()
+        }
+    }
+
+    fn test_pod(
+        id: &str,
+        annotations: HashMap<String, String>,
+    ) -> crate::proto::runtime::v1::PodSandbox {
+        crate::proto::runtime::v1::PodSandbox {
+            id: id.to_string(),
+            metadata: Some(PodSandboxMetadata {
+                name: format!("{}-pod", id),
+                uid: format!("{}-uid", id),
+                namespace: "default".to_string(),
+                attempt: 1,
+            }),
+            state: PodSandboxState::SandboxReady as i32,
+            created_at: RuntimeServiceImpl::now_nanos(),
+            labels: HashMap::new(),
+            annotations,
+            runtime_handler: "runc".to_string(),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn pod_network_status_keeps_primary_and_additional_ips() {
@@ -3356,6 +4427,13 @@ mod tests {
             started_at: Some(5),
             finished_at: Some(8),
             exit_code: Some(42),
+            mounts: vec![StoredMount {
+                container_path: "/data".to_string(),
+                host_path: "/host/data".to_string(),
+                readonly: true,
+                selinux_relabel: false,
+                propagation: crate::proto::runtime::v1::MountPropagation::PropagationPrivate as i32,
+            }],
             ..Default::default()
         };
         RuntimeServiceImpl::insert_internal_state(
@@ -3395,6 +4473,10 @@ mod tests {
             RuntimeServiceImpl::normalize_timestamp_nanos(8)
         );
         assert_eq!(status.exit_code, 42);
+        assert_eq!(status.reason, "Error");
+        assert_eq!(status.message, "container exited with code 42");
+        assert_eq!(status.mounts.len(), 1);
+        assert_eq!(status.mounts[0].container_path, "/data");
     }
 
     #[test]
@@ -3438,5 +4520,1636 @@ mod tests {
             unconfined_profile,
             Some(SeccompProfile::Unconfined)
         ));
+    }
+
+    #[tokio::test]
+    async fn resolve_container_id_handles_zero_single_and_multiple_matches() {
+        let service = test_service();
+        service.containers.lock().await.insert(
+            "abcdef123456".to_string(),
+            test_container("abcdef123456", "pod-1", HashMap::new()),
+        );
+        service.containers.lock().await.insert(
+            "abc999999999".to_string(),
+            test_container("abc999999999", "pod-1", HashMap::new()),
+        );
+
+        assert_eq!(
+            service.resolve_container_id("abcdef").await.unwrap(),
+            "abcdef123456"
+        );
+        assert_eq!(
+            service
+                .resolve_container_id("missing")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+        assert_eq!(
+            service
+                .resolve_container_id("abc")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_pod_sandbox_id_handles_zero_single_and_multiple_matches() {
+        let service = test_service();
+        service.pod_sandboxes.lock().await.insert(
+            "podabcdef123456".to_string(),
+            test_pod("podabcdef123456", HashMap::new()),
+        );
+        service.pod_sandboxes.lock().await.insert(
+            "podabc999999999".to_string(),
+            test_pod("podabc999999999", HashMap::new()),
+        );
+
+        assert_eq!(
+            service.resolve_pod_sandbox_id("podabcdef").await.unwrap(),
+            "podabcdef123456"
+        );
+        assert_eq!(
+            service
+                .resolve_pod_sandbox_id("missing")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+        assert_eq!(
+            service
+                .resolve_pod_sandbox_id("podabc")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_and_remove_container_are_idempotent_when_missing() {
+        let service = test_service();
+
+        let stop = RuntimeService::stop_container(
+            &service,
+            Request::new(StopContainerRequest {
+                container_id: "missing".to_string(),
+                timeout: 0,
+            }),
+        )
+        .await;
+        assert!(stop.is_ok());
+
+        let remove = RuntimeService::remove_container(
+            &service,
+            Request::new(RemoveContainerRequest {
+                container_id: "missing".to_string(),
+            }),
+        )
+        .await;
+        assert!(remove.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stop_and_remove_pod_are_idempotent_when_missing() {
+        let service = test_service();
+
+        let stop = RuntimeService::stop_pod_sandbox(
+            &service,
+            Request::new(StopPodSandboxRequest {
+                pod_sandbox_id: "missing".to_string(),
+            }),
+        )
+        .await;
+        assert!(stop.is_ok());
+
+        let remove = RuntimeService::remove_pod_sandbox(
+            &service,
+            Request::new(RemovePodSandboxRequest {
+                pod_sandbox_id: "missing".to_string(),
+            }),
+        )
+        .await;
+        assert!(remove.is_ok());
+    }
+
+    #[tokio::test]
+    async fn exec_validates_container_is_streamable() {
+        let (dir, service) = test_service_with_fake_runtime();
+        service
+            .set_streaming_server(crate::streaming::StreamingServer::for_test(
+                "http://127.0.0.1:12345",
+            ))
+            .await;
+
+        let missing = RuntimeService::exec(
+            &service,
+            Request::new(ExecRequest {
+                container_id: "missing".to_string(),
+                cmd: vec!["sh".to_string()],
+                stdin: false,
+                stdout: true,
+                stderr: true,
+                tty: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+
+        service.containers.lock().await.insert(
+            "container-stopped".to_string(),
+            test_container("container-stopped", "pod-1", HashMap::new()),
+        );
+        set_fake_runtime_state(&dir, "container-stopped", "stopped");
+        let stopped = RuntimeService::exec(
+            &service,
+            Request::new(ExecRequest {
+                container_id: "container-stopped".to_string(),
+                cmd: vec!["sh".to_string()],
+                stdin: false,
+                stdout: true,
+                stderr: true,
+                tty: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stopped.code(), tonic::Code::FailedPrecondition);
+
+        service.containers.lock().await.insert(
+            "container-created".to_string(),
+            test_container("container-created", "pod-1", HashMap::new()),
+        );
+        set_fake_runtime_state(&dir, "container-created", "created");
+        let response = RuntimeService::exec(
+            &service,
+            Request::new(ExecRequest {
+                container_id: "container-created".to_string(),
+                cmd: vec!["sh".to_string()],
+                stdin: false,
+                stdout: true,
+                stderr: true,
+                tty: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(response.url.contains("/exec/"));
+    }
+
+    #[tokio::test]
+    async fn exec_sync_validates_container_is_streamable() {
+        let (dir, service) = test_service_with_fake_runtime();
+
+        let missing = RuntimeService::exec_sync(
+            &service,
+            Request::new(ExecSyncRequest {
+                container_id: "missing".to_string(),
+                cmd: vec!["true".to_string()],
+                timeout: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+
+        service.containers.lock().await.insert(
+            "container-stopped".to_string(),
+            test_container("container-stopped", "pod-1", HashMap::new()),
+        );
+        set_fake_runtime_state(&dir, "container-stopped", "stopped");
+        let stopped = RuntimeService::exec_sync(
+            &service,
+            Request::new(ExecSyncRequest {
+                container_id: "container-stopped".to_string(),
+                cmd: vec!["true".to_string()],
+                timeout: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stopped.code(), tonic::Code::FailedPrecondition);
+
+        service.containers.lock().await.insert(
+            "container-running".to_string(),
+            test_container("container-running", "pod-1", HashMap::new()),
+        );
+        set_fake_runtime_state(&dir, "container-running", "running");
+        let response = RuntimeService::exec_sync(
+            &service,
+            Request::new(ExecSyncRequest {
+                container_id: "container-running".to_string(),
+                cmd: vec!["true".to_string()],
+                timeout: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(response.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn attach_validates_container_is_streamable() {
+        let (dir, service) = test_service_with_fake_runtime();
+        service
+            .set_streaming_server(crate::streaming::StreamingServer::for_test(
+                "http://127.0.0.1:12345",
+            ))
+            .await;
+
+        let missing = RuntimeService::attach(
+            &service,
+            Request::new(AttachRequest {
+                container_id: "missing".to_string(),
+                stdin: false,
+                stdout: true,
+                stderr: true,
+                tty: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+
+        service.containers.lock().await.insert(
+            "container-stopped".to_string(),
+            test_container("container-stopped", "pod-1", HashMap::new()),
+        );
+        set_fake_runtime_state(&dir, "container-stopped", "stopped");
+        let stopped = RuntimeService::attach(
+            &service,
+            Request::new(AttachRequest {
+                container_id: "container-stopped".to_string(),
+                stdin: false,
+                stdout: true,
+                stderr: true,
+                tty: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stopped.code(), tonic::Code::FailedPrecondition);
+
+        service.containers.lock().await.insert(
+            "container-running".to_string(),
+            test_container("container-running", "pod-1", HashMap::new()),
+        );
+        set_fake_runtime_state(&dir, "container-running", "running");
+        let attach_socket = dir
+            .path()
+            .join("shims")
+            .join("container-running")
+            .join("attach.sock");
+        fs::create_dir_all(attach_socket.parent().unwrap()).unwrap();
+        fs::write(&attach_socket, "").unwrap();
+        let response = RuntimeService::attach(
+            &service,
+            Request::new(AttachRequest {
+                container_id: "container-running".to_string(),
+                stdin: false,
+                stdout: true,
+                stderr: true,
+                tty: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(response.url.contains("/attach/"));
+    }
+
+    #[tokio::test]
+    async fn attach_returns_explicit_error_when_recovered_socket_is_missing() {
+        let (dir, service) = test_service_with_fake_runtime();
+        service
+            .set_streaming_server(crate::streaming::StreamingServer::for_test(
+                "http://127.0.0.1:12345",
+            ))
+            .await;
+
+        set_fake_runtime_state(&dir, "recover-container", "running");
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "recover-container",
+                "pod-1",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
+
+        service.recover_state().await.unwrap();
+
+        let err = RuntimeService::attach(
+            &service,
+            Request::new(AttachRequest {
+                container_id: "recover-container".to_string(),
+                stdin: false,
+                stdout: true,
+                stderr: true,
+                tty: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err
+            .message()
+            .contains("attach recovery after daemon restart is not supported"));
+    }
+
+    #[tokio::test]
+    async fn container_status_verbose_returns_json_info() {
+        let service = test_service();
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                log_path: Some("/var/log/pods/c1.log".to_string()),
+                tty: true,
+                mounts: vec![StoredMount {
+                    container_path: "/data".to_string(),
+                    host_path: "/host/data".to_string(),
+                    readonly: false,
+                    selinux_relabel: false,
+                    propagation: crate::proto::runtime::v1::MountPropagation::PropagationPrivate
+                        as i32,
+                }],
+                run_as_user: Some("1000".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service.containers.lock().await.insert(
+            "container-1".to_string(),
+            test_container("container-1", "pod-1", annotations),
+        );
+
+        let response = RuntimeService::container_status(
+            &service,
+            Request::new(ContainerStatusRequest {
+                container_id: "container-1".to_string(),
+                verbose: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(response.info.contains_key("info"));
+        let info: serde_json::Value =
+            serde_json::from_str(response.info.get("info").unwrap()).unwrap();
+        assert_eq!(info["id"], "container-1");
+        assert_eq!(info["user"], "1000");
+        assert_eq!(response.status.unwrap().mounts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pod_sandbox_status_verbose_returns_json_info() {
+        let service = test_service();
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                netns_path: Some("/var/run/netns/test-pod".to_string()),
+                pause_container_id: Some("pause-1".to_string()),
+                log_directory: Some("/var/log/pods/test-pod".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service
+            .pod_sandboxes
+            .lock()
+            .await
+            .insert("pod-1".to_string(), test_pod("pod-1", annotations));
+
+        let response = RuntimeService::pod_sandbox_status(
+            &service,
+            Request::new(PodSandboxStatusRequest {
+                pod_sandbox_id: "pod-1".to_string(),
+                verbose: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(response.info.contains_key("info"));
+        let info: serde_json::Value =
+            serde_json::from_str(response.info.get("info").unwrap()).unwrap();
+        assert_eq!(info["id"], "pod-1");
+        assert_eq!(info["pauseContainerId"], "pause-1");
+    }
+
+    #[tokio::test]
+    async fn status_verbose_returns_structured_config() {
+        let service = test_service();
+        let response =
+            RuntimeService::status(&service, Request::new(StatusRequest { verbose: true }))
+                .await
+                .unwrap()
+                .into_inner();
+
+        assert!(response.info.contains_key("config"));
+        let config: serde_json::Value =
+            serde_json::from_str(response.info.get("config").unwrap()).unwrap();
+        assert_eq!(config["runtimeName"], "crius");
+        assert!(config["runtimeHandlers"].as_array().unwrap().len() >= 1);
+        assert_eq!(config["recovery"]["startupReconcile"], true);
+        assert_eq!(config["recovery"]["eventReplayOnRecovery"], false);
+        assert_eq!(config["runtimeFeatures"]["updateContainerResources"], true);
+        assert_eq!(
+            response.status.unwrap().conditions.len(),
+            2,
+            "expected runtime and network conditions"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_config_reports_detected_cgroup_driver() {
+        let service = test_service();
+        let response =
+            RuntimeService::runtime_config(&service, Request::new(RuntimeConfigRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+
+        assert_eq!(
+            response.linux.unwrap().cgroup_driver,
+            service.cgroup_driver() as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_container_log_validates_running_state_and_log_path() {
+        let (dir, service) = test_service_with_fake_runtime();
+
+        let missing = RuntimeService::reopen_container_log(
+            &service,
+            Request::new(ReopenContainerLogRequest {
+                container_id: "missing".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+
+        let mut stopped_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut stopped_annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                log_path: Some(
+                    dir.path()
+                        .join("logs")
+                        .join("stopped.log")
+                        .display()
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service.containers.lock().await.insert(
+            "container-stopped".to_string(),
+            test_container("container-stopped", "pod-1", stopped_annotations),
+        );
+        set_fake_runtime_state(&dir, "container-stopped", "stopped");
+
+        let stopped = RuntimeService::reopen_container_log(
+            &service,
+            Request::new(ReopenContainerLogRequest {
+                container_id: "container-stopped".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stopped.code(), tonic::Code::FailedPrecondition);
+
+        let log_path = dir.path().join("logs").join("running.log");
+        let mut running_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut running_annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                log_path: Some(log_path.display().to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service.containers.lock().await.insert(
+            "container-running".to_string(),
+            test_container("container-running", "pod-1", running_annotations),
+        );
+        set_fake_runtime_state(&dir, "container-running", "running");
+
+        let running = RuntimeService::reopen_container_log(
+            &service,
+            Request::new(ReopenContainerLogRequest {
+                container_id: "container-running".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(running.code(), tonic::Code::Internal);
+        assert!(running.message().contains("reopen log socket"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires unix socket bind permissions in the current test environment"]
+    async fn reopen_container_log_notifies_shim_socket_when_available() {
+        let (dir, service) = test_service_with_fake_runtime();
+
+        let log_path = dir.path().join("logs").join("running.log");
+        let mut running_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut running_annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                log_path: Some(log_path.display().to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service.containers.lock().await.insert(
+            "container-running".to_string(),
+            test_container("container-running", "pod-1", running_annotations),
+        );
+        set_fake_runtime_state(&dir, "container-running", "running");
+
+        let reopen_socket = dir
+            .path()
+            .join("shims")
+            .join("container-running")
+            .join("reopen.sock");
+        fs::create_dir_all(reopen_socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&reopen_socket).unwrap();
+        let log_path_for_server = log_path.clone();
+        let (tx, rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let _ = listener.accept().unwrap();
+            fs::write(&log_path_for_server, "").unwrap();
+            tx.send(()).unwrap();
+        });
+
+        RuntimeService::reopen_container_log(
+            &service,
+            Request::new(ReopenContainerLogRequest {
+                container_id: "container-running".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
+        assert!(log_path.exists(), "expected reopen to touch the log file");
+    }
+
+    #[tokio::test]
+    async fn update_container_resources_validates_state_and_persists_resources() {
+        let (dir, service) = test_service_with_fake_runtime();
+
+        let missing = RuntimeService::update_container_resources(
+            &service,
+            Request::new(UpdateContainerResourcesRequest {
+                container_id: "missing".to_string(),
+                linux: Some(crate::proto::runtime::v1::LinuxContainerResources {
+                    cpu_shares: 2,
+                    ..Default::default()
+                }),
+                windows: None,
+                annotations: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+
+        service.containers.lock().await.insert(
+            "container-stopped".to_string(),
+            test_container("container-stopped", "pod-1", HashMap::new()),
+        );
+        set_fake_runtime_state(&dir, "container-stopped", "stopped");
+        let stopped = RuntimeService::update_container_resources(
+            &service,
+            Request::new(UpdateContainerResourcesRequest {
+                container_id: "container-stopped".to_string(),
+                linux: Some(crate::proto::runtime::v1::LinuxContainerResources {
+                    cpu_shares: 2,
+                    ..Default::default()
+                }),
+                windows: None,
+                annotations: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stopped.code(), tonic::Code::FailedPrecondition);
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+        service.containers.lock().await.insert(
+            "container-running".to_string(),
+            test_container("container-running", "pod-1", annotations.clone()),
+        );
+        set_fake_runtime_state(&dir, "container-running", "running");
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-running",
+                "pod-1",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+
+        let resources = crate::proto::runtime::v1::LinuxContainerResources {
+            cpu_shares: 256,
+            cpu_period: 100_000,
+            cpu_quota: 50_000,
+            memory_limit_in_bytes: 128 * 1024 * 1024,
+            cpuset_cpus: "0-1".to_string(),
+            cpuset_mems: "0".to_string(),
+            ..Default::default()
+        };
+
+        RuntimeService::update_container_resources(
+            &service,
+            Request::new(UpdateContainerResourcesRequest {
+                container_id: "container-running".to_string(),
+                linux: Some(resources.clone()),
+                windows: None,
+                annotations: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let status = RuntimeService::container_status(
+            &service,
+            Request::new(ContainerStatusRequest {
+                container_id: "container-running".to_string(),
+                verbose: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .unwrap();
+        let linux = status.resources.unwrap().linux.unwrap();
+        assert_eq!(linux.cpu_shares, 256);
+        assert_eq!(linux.memory_limit_in_bytes, 128 * 1024 * 1024);
+
+        let persisted = service
+            .persistence
+            .lock()
+            .await
+            .storage()
+            .get_container("container-running")
+            .unwrap()
+            .unwrap();
+        let persisted_annotations: HashMap<String, String> =
+            serde_json::from_str(&persisted.annotations).unwrap();
+        let persisted_state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+            &persisted_annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        )
+        .unwrap();
+        assert_eq!(
+            persisted_state
+                .linux_resources
+                .unwrap()
+                .memory_limit_in_bytes,
+            128 * 1024 * 1024
+        );
+
+        let update_payload: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(fake_runtime_update_path(&dir, "container-running")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(update_payload["cpu"]["shares"], 256);
+        assert_eq!(update_payload["memory"]["limit"], 128 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn inspect_and_info_endpoints_return_consistent_snapshots() {
+        let (dir, service) = test_service_with_fake_runtime();
+        let netns_path = dir.path().join("inspect.netns");
+        fs::write(&netns_path, "netns").unwrap();
+        let log_path = dir.path().join("logs").join("inspect.log");
+
+        let mut pod_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut pod_annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                runtime_handler: "runc".to_string(),
+                netns_path: Some(netns_path.display().to_string()),
+                pause_container_id: Some("pause-inspect".to_string()),
+                ip: Some("10.88.0.10".to_string()),
+                additional_ips: vec!["fd00::10".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service.pod_sandboxes.lock().await.insert(
+            "pod-inspect".to_string(),
+            test_pod("pod-inspect", pod_annotations),
+        );
+
+        let mut container_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut container_annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                log_path: Some(log_path.display().to_string()),
+                run_as_user: Some("1000".to_string()),
+                mounts: vec![StoredMount {
+                    container_path: "/data".to_string(),
+                    host_path: "/host/data".to_string(),
+                    readonly: false,
+                    selinux_relabel: false,
+                    propagation: crate::proto::runtime::v1::MountPropagation::PropagationPrivate
+                        as i32,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service.containers.lock().await.insert(
+            "container-inspect".to_string(),
+            test_container("container-inspect", "pod-inspect", container_annotations),
+        );
+        set_fake_runtime_state(&dir, "container-inspect", "running");
+
+        let status =
+            RuntimeService::status(&service, Request::new(StatusRequest { verbose: true }))
+                .await
+                .unwrap()
+                .into_inner();
+        let container = RuntimeService::container_status(
+            &service,
+            Request::new(ContainerStatusRequest {
+                container_id: "container-inspect".to_string(),
+                verbose: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let pod = RuntimeService::pod_sandbox_status(
+            &service,
+            Request::new(PodSandboxStatusRequest {
+                pod_sandbox_id: "pod-inspect".to_string(),
+                verbose: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let containers = RuntimeService::list_containers(
+            &service,
+            Request::new(ListContainersRequest::default()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let pods = RuntimeService::list_pod_sandbox(
+            &service,
+            Request::new(ListPodSandboxRequest::default()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let config: serde_json::Value =
+            serde_json::from_str(status.info.get("config").unwrap()).unwrap();
+        assert_eq!(config["runtimeFeatures"]["containerEvents"], true);
+        assert_eq!(container.status.as_ref().unwrap().reason, "Running");
+        assert_eq!(container.status.as_ref().unwrap().mounts.len(), 1);
+        assert!(container.info.contains_key("info"));
+        assert_eq!(
+            pod.status.as_ref().unwrap().network.as_ref().unwrap().ip,
+            "10.88.0.10"
+        );
+        assert_eq!(pod.containers_statuses.len(), 1);
+        assert_eq!(containers.containers.len(), 1);
+        assert_eq!(pods.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_container_events_streams_broadcast_events() {
+        let service = test_service();
+        let mut stream =
+            RuntimeService::get_container_events(&service, Request::new(GetEventsRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+
+        service.publish_event(ContainerEventResponse {
+            container_id: "container-1".to_string(),
+            container_event_type: ContainerEventType::ContainerCreatedEvent as i32,
+            created_at: 1,
+            pod_sandbox_status: None,
+            containers_statuses: Vec::new(),
+        });
+
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event.container_id, "container-1");
+        assert_eq!(
+            event.container_event_type,
+            ContainerEventType::ContainerCreatedEvent as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn get_container_events_broadcasts_to_multiple_subscribers() {
+        let service = test_service();
+        let mut stream_a =
+            RuntimeService::get_container_events(&service, Request::new(GetEventsRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+        let mut stream_b =
+            RuntimeService::get_container_events(&service, Request::new(GetEventsRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+
+        service.publish_event(ContainerEventResponse {
+            container_id: "shared".to_string(),
+            container_event_type: ContainerEventType::ContainerStartedEvent as i32,
+            created_at: 2,
+            pod_sandbox_status: None,
+            containers_statuses: Vec::new(),
+        });
+
+        let event_a = stream_a.next().await.unwrap().unwrap();
+        let event_b = stream_b.next().await.unwrap().unwrap();
+        assert_eq!(event_a.container_id, "shared");
+        assert_eq!(event_b.container_id, "shared");
+        assert_eq!(event_a.container_event_type, event_b.container_event_type);
+    }
+
+    #[tokio::test]
+    async fn get_container_events_preserves_publish_order() {
+        let service = test_service();
+        let mut stream =
+            RuntimeService::get_container_events(&service, Request::new(GetEventsRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+
+        for (id, event_type) in [
+            ("created", ContainerEventType::ContainerCreatedEvent),
+            ("started", ContainerEventType::ContainerStartedEvent),
+            ("stopped", ContainerEventType::ContainerStoppedEvent),
+            ("deleted", ContainerEventType::ContainerDeletedEvent),
+        ] {
+            service.publish_event(ContainerEventResponse {
+                container_id: id.to_string(),
+                container_event_type: event_type as i32,
+                created_at: RuntimeServiceImpl::now_nanos(),
+                pod_sandbox_status: None,
+                containers_statuses: Vec::new(),
+            });
+        }
+
+        let mut received = Vec::new();
+        for _ in 0..4 {
+            let event = stream.next().await.unwrap().unwrap();
+            received.push((event.container_id, event.container_event_type));
+        }
+
+        assert_eq!(
+            received,
+            vec![
+                (
+                    "created".to_string(),
+                    ContainerEventType::ContainerCreatedEvent as i32
+                ),
+                (
+                    "started".to_string(),
+                    ContainerEventType::ContainerStartedEvent as i32
+                ),
+                (
+                    "stopped".to_string(),
+                    ContainerEventType::ContainerStoppedEvent as i32
+                ),
+                (
+                    "deleted".to_string(),
+                    ContainerEventType::ContainerDeletedEvent as i32
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_event_without_subscribers_does_not_panic() {
+        let service = test_service();
+        service.publish_event(ContainerEventResponse {
+            container_id: "orphan".to_string(),
+            container_event_type: ContainerEventType::ContainerCreatedEvent as i32,
+            created_at: 1,
+            pod_sandbox_status: None,
+            containers_statuses: Vec::new(),
+        });
+    }
+
+    #[tokio::test]
+    async fn get_container_events_reports_lagged_consumers() {
+        let service = test_service();
+        let mut stream =
+            RuntimeService::get_container_events(&service, Request::new(GetEventsRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+
+        for idx in 0..600 {
+            service.publish_event(ContainerEventResponse {
+                container_id: format!("container-{}", idx),
+                container_event_type: ContainerEventType::ContainerCreatedEvent as i32,
+                created_at: idx,
+                pod_sandbox_status: None,
+                containers_statuses: Vec::new(),
+            });
+        }
+
+        let mut saw_lagged = false;
+        for _ in 0..260 {
+            match timeout(Duration::from_millis(200), stream.next()).await {
+                Ok(Some(Err(status))) if status.code() == tonic::Code::ResourceExhausted => {
+                    saw_lagged = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+
+        assert!(saw_lagged, "expected lagged consumer error");
+    }
+
+    #[tokio::test]
+    async fn port_forward_validates_pod_state() {
+        let service = test_service();
+        service
+            .pod_sandboxes
+            .lock()
+            .await
+            .insert("pod-1".to_string(), test_pod("pod-1", HashMap::new()));
+
+        let missing_ports = RuntimeService::port_forward(
+            &service,
+            Request::new(PortForwardRequest {
+                pod_sandbox_id: "pod-1".to_string(),
+                port: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_ports.code(), tonic::Code::InvalidArgument);
+
+        let mut not_ready_pod = test_pod("pod-2", HashMap::new());
+        not_ready_pod.state = PodSandboxState::SandboxNotready as i32;
+        service
+            .pod_sandboxes
+            .lock()
+            .await
+            .insert("pod-2".to_string(), not_ready_pod);
+        let not_ready = RuntimeService::port_forward(
+            &service,
+            Request::new(PortForwardRequest {
+                pod_sandbox_id: "pod-2".to_string(),
+                port: vec![80],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(not_ready.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn port_forward_requires_existing_netns_and_returns_stream_url() {
+        let service = test_service();
+        let mut missing_netns_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut missing_netns_annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                runtime_handler: "runc".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service.pod_sandboxes.lock().await.insert(
+            "pod-missing-netns".to_string(),
+            test_pod("pod-missing-netns", missing_netns_annotations),
+        );
+        let missing_netns = RuntimeService::port_forward(
+            &service,
+            Request::new(PortForwardRequest {
+                pod_sandbox_id: "pod-missing-netns".to_string(),
+                port: vec![80],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_netns.code(), tonic::Code::FailedPrecondition);
+
+        let netns_dir = tempdir().unwrap();
+        let netns_path = netns_dir.path().join("netns");
+        fs::write(&netns_path, "placeholder").unwrap();
+        let mut ready_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut ready_annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                netns_path: Some(netns_path.display().to_string()),
+                runtime_handler: "runc".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service.pod_sandboxes.lock().await.insert(
+            "pod-ready".to_string(),
+            test_pod("pod-ready", ready_annotations),
+        );
+        service
+            .set_streaming_server(crate::streaming::StreamingServer::for_test(
+                "http://127.0.0.1:12345",
+            ))
+            .await;
+        let response = RuntimeService::port_forward(
+            &service,
+            Request::new(PortForwardRequest {
+                pod_sandbox_id: "pod-ready".to_string(),
+                port: vec![80],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(response.url.contains("/portforward/"));
+    }
+
+    #[tokio::test]
+    async fn stop_and_remove_existing_container_support_repeat_calls() {
+        let (dir, service) = test_service_with_fake_runtime();
+        set_fake_runtime_state(&dir, "container-1", "running");
+        service.containers.lock().await.insert(
+            "container-1".to_string(),
+            test_container("container-1", "pod-1", HashMap::new()),
+        );
+
+        RuntimeService::stop_container(
+            &service,
+            Request::new(StopContainerRequest {
+                container_id: "container-1".to_string(),
+                timeout: 1,
+            }),
+        )
+        .await
+        .unwrap();
+        RuntimeService::stop_container(
+            &service,
+            Request::new(StopContainerRequest {
+                container_id: "container-1".to_string(),
+                timeout: 1,
+            }),
+        )
+        .await
+        .unwrap();
+
+        set_fake_runtime_state(&dir, "container-2", "running");
+        service.containers.lock().await.insert(
+            "container-2".to_string(),
+            test_container("container-2", "pod-1", HashMap::new()),
+        );
+        RuntimeService::remove_container(
+            &service,
+            Request::new(RemoveContainerRequest {
+                container_id: "container-2".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        RuntimeService::remove_container(
+            &service,
+            Request::new(RemoveContainerRequest {
+                container_id: "container-2".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_and_remove_existing_pod_support_repeat_calls() {
+        let (dir, service) = test_service_with_fake_runtime();
+
+        let pod = test_pod("pod-1", HashMap::new());
+        service
+            .pod_sandboxes
+            .lock()
+            .await
+            .insert("pod-1".to_string(), pod);
+        RuntimeService::stop_pod_sandbox(
+            &service,
+            Request::new(StopPodSandboxRequest {
+                pod_sandbox_id: "pod-1".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        RuntimeService::stop_pod_sandbox(
+            &service,
+            Request::new(StopPodSandboxRequest {
+                pod_sandbox_id: "pod-1".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        set_fake_runtime_state(&dir, "container-under-pod", "running");
+        service.containers.lock().await.insert(
+            "container-under-pod".to_string(),
+            test_container("container-under-pod", "pod-2", HashMap::new()),
+        );
+        service
+            .pod_sandboxes
+            .lock()
+            .await
+            .insert("pod-2".to_string(), test_pod("pod-2", HashMap::new()));
+        RuntimeService::remove_pod_sandbox(
+            &service,
+            Request::new(RemovePodSandboxRequest {
+                pod_sandbox_id: "pod-2".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        RuntimeService::remove_pod_sandbox(
+            &service,
+            Request::new(RemovePodSandboxRequest {
+                pod_sandbox_id: "pod-2".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recover_state_reconciles_running_container_to_exited() {
+        let (dir, service) = test_service_with_fake_runtime();
+        set_fake_runtime_state(&dir, "recover-container", "stopped");
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                metadata_name: Some("recover".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "recover-container",
+                "pod-1",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+
+        service.recover_state().await.unwrap();
+
+        let container = service
+            .containers
+            .lock()
+            .await
+            .get("recover-container")
+            .cloned()
+            .unwrap();
+        assert_eq!(container.state, ContainerState::ContainerExited as i32);
+        let state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        )
+        .unwrap();
+        assert_eq!(state.exit_code, Some(0));
+        assert!(state.finished_at.is_some());
+
+        let persisted = service
+            .persistence
+            .lock()
+            .await
+            .storage()
+            .get_container("recover-container")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.state, "stopped");
+    }
+
+    #[tokio::test]
+    async fn recover_state_marks_ready_pod_notready_when_pause_is_stopped() {
+        let (dir, service) = test_service_with_fake_runtime();
+        set_fake_runtime_state(&dir, "pause-1", "stopped");
+        let netns_path = dir.path().join("pause-netns");
+        fs::write(&netns_path, "netns").unwrap();
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                runtime_handler: "runc".to_string(),
+                netns_path: Some(netns_path.display().to_string()),
+                pause_container_id: Some("pause-1".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        service
+            .persistence
+            .lock()
+            .await
+            .storage_mut()
+            .save_pod_sandbox(&PodSandboxRecord {
+                id: "pod-recover".to_string(),
+                state: "ready".to_string(),
+                name: "pod-recover".to_string(),
+                namespace: "default".to_string(),
+                uid: "uid-1".to_string(),
+                created_at: RuntimeServiceImpl::now_nanos(),
+                netns_path: netns_path.display().to_string(),
+                labels: "{}".to_string(),
+                annotations: serde_json::to_string(&annotations).unwrap(),
+                pause_container_id: Some("pause-1".to_string()),
+                ip: None,
+            })
+            .unwrap();
+
+        service.recover_state().await.unwrap();
+
+        let pod = service
+            .pod_sandboxes
+            .lock()
+            .await
+            .get("pod-recover")
+            .cloned()
+            .unwrap();
+        assert_eq!(pod.state, PodSandboxState::SandboxNotready as i32);
+        let persisted = service
+            .persistence
+            .lock()
+            .await
+            .storage()
+            .get_pod_sandbox("pod-recover")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.state, "notready");
+    }
+
+    #[tokio::test]
+    async fn recover_state_does_not_replay_historical_events() {
+        let (dir, service) = test_service_with_fake_runtime();
+        set_fake_runtime_state(&dir, "recover-container", "stopped");
+
+        service
+            .persistence
+            .lock()
+            .await
+            .storage_mut()
+            .save_container(&ContainerRecord {
+                id: "recover-container".to_string(),
+                pod_id: "pod-1".to_string(),
+                state: "running".to_string(),
+                image: "busybox:latest".to_string(),
+                command: String::new(),
+                created_at: RuntimeServiceImpl::now_nanos(),
+                labels: "{}".to_string(),
+                annotations: "{}".to_string(),
+                exit_code: None,
+                exit_time: None,
+            })
+            .unwrap();
+
+        let mut stream =
+            RuntimeService::get_container_events(&service, Request::new(GetEventsRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+
+        service.recover_state().await.unwrap();
+
+        assert!(
+            timeout(Duration::from_millis(100), stream.next())
+                .await
+                .is_err(),
+            "recover_state should not replay historical events"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_state_supports_inspect_and_list_after_restart() {
+        let (dir, service) = test_service_with_fake_runtime();
+        set_fake_runtime_state(&dir, "recover-container", "running");
+        set_fake_runtime_state(&dir, "pause-recover", "running");
+        let netns_path = dir.path().join("recover.netns");
+        fs::write(&netns_path, "netns").unwrap();
+
+        let mut pod_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut pod_annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                runtime_handler: "runc".to_string(),
+                netns_path: Some(netns_path.display().to_string()),
+                pause_container_id: Some("pause-recover".to_string()),
+                ip: Some("10.88.0.20".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service
+            .persistence
+            .lock()
+            .await
+            .storage_mut()
+            .save_pod_sandbox(&PodSandboxRecord {
+                id: "pod-recover".to_string(),
+                state: "ready".to_string(),
+                name: "pod-recover".to_string(),
+                namespace: "default".to_string(),
+                uid: "uid-recover".to_string(),
+                created_at: RuntimeServiceImpl::now_nanos(),
+                netns_path: netns_path.display().to_string(),
+                labels: "{}".to_string(),
+                annotations: serde_json::to_string(&pod_annotations).unwrap(),
+                pause_container_id: Some("pause-recover".to_string()),
+                ip: Some("10.88.0.20".to_string()),
+            })
+            .unwrap();
+
+        let mut container_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut container_annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                metadata_name: Some("recover-container".to_string()),
+                log_path: Some(
+                    dir.path()
+                        .join("logs")
+                        .join("recover.log")
+                        .display()
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "recover-container",
+                "pod-recover",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &container_annotations,
+            )
+            .unwrap();
+
+        service.recover_state().await.unwrap();
+
+        let container_status = RuntimeService::container_status(
+            &service,
+            Request::new(ContainerStatusRequest {
+                container_id: "recover-container".to_string(),
+                verbose: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let pod_status = RuntimeService::pod_sandbox_status(
+            &service,
+            Request::new(PodSandboxStatusRequest {
+                pod_sandbox_id: "pod-recover".to_string(),
+                verbose: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let containers = RuntimeService::list_containers(
+            &service,
+            Request::new(ListContainersRequest::default()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let pods = RuntimeService::list_pod_sandbox(
+            &service,
+            Request::new(ListPodSandboxRequest::default()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            container_status.status.unwrap().state,
+            ContainerState::ContainerRunning as i32
+        );
+        assert_eq!(
+            pod_status.status.unwrap().state,
+            PodSandboxState::SandboxReady as i32
+        );
+        assert_eq!(containers.containers.len(), 1);
+        assert_eq!(pods.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recover_state_supports_stop_and_remove_after_restart() {
+        let (dir, service) = test_service_with_fake_runtime();
+        set_fake_runtime_state(&dir, "recover-container", "running");
+        set_fake_runtime_state(&dir, "pause-recover", "running");
+        let netns_path = dir.path().join("recover-remove.netns");
+        fs::write(&netns_path, "netns").unwrap();
+
+        let mut pod_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut pod_annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                runtime_handler: "runc".to_string(),
+                netns_path: Some(netns_path.display().to_string()),
+                pause_container_id: Some("pause-recover".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service
+            .persistence
+            .lock()
+            .await
+            .storage_mut()
+            .save_pod_sandbox(&PodSandboxRecord {
+                id: "pod-recover".to_string(),
+                state: "ready".to_string(),
+                name: "pod-recover".to_string(),
+                namespace: "default".to_string(),
+                uid: "uid-recover".to_string(),
+                created_at: RuntimeServiceImpl::now_nanos(),
+                netns_path: netns_path.display().to_string(),
+                labels: "{}".to_string(),
+                annotations: serde_json::to_string(&pod_annotations).unwrap(),
+                pause_container_id: Some("pause-recover".to_string()),
+                ip: None,
+            })
+            .unwrap();
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "recover-container",
+                "pod-recover",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
+
+        service.recover_state().await.unwrap();
+
+        RuntimeService::stop_container(
+            &service,
+            Request::new(StopContainerRequest {
+                container_id: "recover-container".to_string(),
+                timeout: 1,
+            }),
+        )
+        .await
+        .unwrap();
+        RuntimeService::remove_container(
+            &service,
+            Request::new(RemoveContainerRequest {
+                container_id: "recover-container".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        RuntimeService::stop_pod_sandbox(
+            &service,
+            Request::new(StopPodSandboxRequest {
+                pod_sandbox_id: "pod-recover".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        RuntimeService::remove_pod_sandbox(
+            &service,
+            Request::new(RemovePodSandboxRequest {
+                pod_sandbox_id: "pod-recover".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(service
+            .persistence
+            .lock()
+            .await
+            .storage()
+            .get_container("recover-container")
+            .unwrap()
+            .is_none());
+        assert!(service
+            .persistence
+            .lock()
+            .await
+            .storage()
+            .get_pod_sandbox("pod-recover")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn recover_state_ignores_stale_shim_metadata_artifacts() {
+        let (dir, service) = test_service_with_fake_runtime();
+        set_fake_runtime_state(&dir, "recover-container", "running");
+
+        let stale_dir = dir.path().join("root").join("stale-shims").join("orphan");
+        fs::create_dir_all(&stale_dir).unwrap();
+        fs::write(stale_dir.join("attach.sock"), "stale").unwrap();
+        fs::write(stale_dir.join("shim.json"), "{}").unwrap();
+
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "recover-container",
+                "pod-1",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
+
+        service.recover_state().await.unwrap();
+
+        let containers = RuntimeService::list_containers(
+            &service,
+            Request::new(ListContainersRequest::default()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(containers.containers.len(), 1);
     }
 }
