@@ -260,11 +260,6 @@ impl StreamingServer {
                 "missing required pod_sandbox_id",
             ));
         }
-        if req.port.is_empty() {
-            return Err(tonic::Status::invalid_argument(
-                "port-forward requires at least one forwarded port",
-            ));
-        }
         if let Some(port) = req
             .port
             .iter()
@@ -3979,8 +3974,7 @@ mod tests {
             pod_sandbox_id: "pod-1".to_string(),
             port: Vec::new(),
         };
-        let err = StreamingServer::validate_port_forward_request(&missing_ports).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        StreamingServer::validate_port_forward_request(&missing_ports).unwrap();
 
         let invalid_port = PortForwardRequest {
             pod_sandbox_id: "pod-1".to_string(),

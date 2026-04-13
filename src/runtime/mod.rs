@@ -172,6 +172,70 @@ pub struct RuncRuntime {
 }
 
 impl RuncRuntime {
+    fn restore_rootfs_snapshot(&self, container_id: &str, image_path: &Path) -> Result<()> {
+        let snapshot_path = image_path.join("rootfs.tar");
+        if !snapshot_path.exists() {
+            return Ok(());
+        }
+
+        let config = self.load_bundle_config_value(container_id)?;
+        let rootfs_path = config
+            .get("root")
+            .and_then(|root| root.get("path"))
+            .and_then(|path| path.as_str())
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "container {} bundle config is missing root.path for restore",
+                    container_id
+                )
+            })?;
+
+        if rootfs_path.exists() {
+            std::fs::remove_dir_all(&rootfs_path).with_context(|| {
+                format!(
+                    "Failed to clear restore rootfs directory {}",
+                    rootfs_path.display()
+                )
+            })?;
+        }
+        std::fs::create_dir_all(&rootfs_path).with_context(|| {
+            format!(
+                "Failed to recreate restore rootfs directory {}",
+                rootfs_path.display()
+            )
+        })?;
+
+        let output = Command::new("tar")
+            .arg("-xf")
+            .arg(&snapshot_path)
+            .arg("-C")
+            .arg(&rootfs_path)
+            .output()
+            .with_context(|| {
+                format!(
+                    "Failed to restore rootfs snapshot from {}",
+                    snapshot_path.display()
+                )
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("status={}", output.status)
+            } else {
+                stderr
+            };
+            return Err(anyhow::anyhow!(
+                "Failed to extract rootfs snapshot {}: {}",
+                snapshot_path.display(),
+                detail
+            ));
+        }
+
+        Ok(())
+    }
+
     fn load_bundle_config_value(&self, container_id: &str) -> Result<Value> {
         let config_path = self.config_path(container_id);
         let raw = std::fs::read(&config_path)
@@ -740,6 +804,7 @@ impl RuncRuntime {
 
         self.runc_exec(&[
             "checkpoint",
+            "--file-locks",
             "--image-path",
             &image_path.to_string_lossy(),
             "--work-path",
@@ -747,6 +812,32 @@ impl RuncRuntime {
             "--leave-running",
             container_id,
         ])
+    }
+
+    pub fn pause_container(&self, container_id: &str) -> Result<()> {
+        match self.get_runc_state(container_id)? {
+            Some(state) if state.status == "paused" => Ok(()),
+            Some(state) if state.status == "running" => self.runc_exec(&["pause", container_id]),
+            Some(state) => Err(anyhow::anyhow!(
+                "container {} cannot be paused from state {}",
+                container_id,
+                state.status
+            )),
+            None => Err(anyhow::anyhow!("container {} not found", container_id)),
+        }
+    }
+
+    pub fn resume_container(&self, container_id: &str) -> Result<()> {
+        match self.get_runc_state(container_id)? {
+            Some(state) if state.status == "running" => Ok(()),
+            Some(state) if state.status == "paused" => self.runc_exec(&["resume", container_id]),
+            Some(state) => Err(anyhow::anyhow!(
+                "container {} cannot be resumed from state {}",
+                container_id,
+                state.status
+            )),
+            None => Err(anyhow::anyhow!("container {} not found", container_id)),
+        }
     }
 
     pub fn restore_container_from_checkpoint(
@@ -762,6 +853,8 @@ impl RuncRuntime {
             )
         })?;
         let bundle_path = self.bundle_path(container_id);
+
+        self.restore_rootfs_snapshot(container_id, image_path)?;
 
         self.runc_exec(&[
             "restore",
@@ -982,9 +1075,15 @@ impl RuncRuntime {
             })
             .collect();
 
+        let keep_hugepages_mount = std::env::var("CRIUS_ENABLE_HUGEPAGES_MOUNT")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let mut all_mounts: Vec<Mount> = default_mounts
             .into_iter()
-            .filter(|m| m.destination != "/sys/fs/cgroup")
+            .filter(|m| {
+                m.destination != "/sys/fs/cgroup"
+                    && (keep_hugepages_mount || m.destination != "/dev/hugepages")
+            })
             .collect();
         all_mounts.extend(custom_mounts);
         spec.mounts = Some(all_mounts);
@@ -1565,6 +1664,17 @@ mod tests {
         // Should have default mounts + 1 custom mount
         assert!(mounts.len() > 1);
         assert!(mounts.iter().any(|m| m.destination == "/container/path"));
+    }
+
+    #[test]
+    fn test_spec_excludes_hugepages_mount_by_default() {
+        let (runtime, _temp) = create_test_runtime();
+        let config = create_test_config();
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let mounts = spec.mounts.unwrap();
+
+        assert!(!mounts.iter().any(|m| m.destination == "/dev/hugepages"));
     }
 
     #[test]

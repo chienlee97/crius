@@ -2,7 +2,7 @@
 //!
 //! 提供容器网络功能，包括网络命名空间管理、CNI 接口等。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use tokio::process::Command;
@@ -21,6 +21,101 @@ pub use multi::{
 };
 pub use port_mapping::{PortMapping, PortMappingBackend, PortMappingManager, Protocol};
 pub use types::*;
+
+/// 共享的 CNI 路径配置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CniConfig {
+    config_dirs: Vec<PathBuf>,
+    plugin_dirs: Vec<PathBuf>,
+    cache_dir: PathBuf,
+}
+
+impl Default for CniConfig {
+    fn default() -> Self {
+        Self {
+            config_dirs: vec![
+                PathBuf::from("/etc/cni/net.d"),
+                PathBuf::from("/etc/kubernetes/cni/net.d"),
+            ],
+            plugin_dirs: vec![
+                PathBuf::from("/opt/cni/bin"),
+                PathBuf::from("/usr/lib/cni"),
+                PathBuf::from("/usr/libexec/cni"),
+            ],
+            cache_dir: PathBuf::from("/var/lib/cni/cache"),
+        }
+    }
+}
+
+impl CniConfig {
+    fn parse_dirs(raw: &str) -> Vec<PathBuf> {
+        raw.split(':')
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    /// 从环境变量解析 CNI 目录配置。
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+
+        let config_dirs = std::env::var("CRIUS_CNI_CONFIG_DIRS")
+            .ok()
+            .map(|raw| Self::parse_dirs(&raw))
+            .filter(|dirs| !dirs.is_empty())
+            .unwrap_or_else(|| defaults.config_dirs.clone());
+
+        let plugin_dirs = std::env::var("CRIUS_CNI_PLUGIN_DIRS")
+            .ok()
+            .or_else(|| std::env::var("CNI_PATH").ok())
+            .map(|raw| Self::parse_dirs(&raw))
+            .filter(|dirs| !dirs.is_empty())
+            .unwrap_or_else(|| defaults.plugin_dirs.clone());
+
+        let cache_dir = std::env::var("CRIUS_CNI_CACHE_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| defaults.cache_dir.clone());
+
+        Self {
+            config_dirs,
+            plugin_dirs,
+            cache_dir,
+        }
+    }
+
+    pub fn config_dirs(&self) -> &[PathBuf] {
+        &self.config_dirs
+    }
+
+    pub fn plugin_dirs(&self) -> &[PathBuf] {
+        &self.plugin_dirs
+    }
+
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    fn config_dir_strings(&self) -> Vec<String> {
+        self.config_dirs
+            .iter()
+            .map(|dir| dir.to_string_lossy().to_string())
+            .collect()
+    }
+
+    fn plugin_dir_strings(&self) -> Vec<String> {
+        self.plugin_dirs
+            .iter()
+            .map(|dir| dir.to_string_lossy().to_string())
+            .collect()
+    }
+
+    fn cache_dir_string(&self) -> String {
+        self.cache_dir.to_string_lossy().to_string()
+    }
+}
 
 /// 网络管理器接口
 #[async_trait]
@@ -92,10 +187,25 @@ impl DefaultNetworkManager {
         cni_config_dirs: Option<Vec<String>>,
         cni_cache_dir: Option<String>,
     ) -> Self {
+        let mut cni = CniConfig::default();
+        if let Some(plugin_dirs) = cni_plugin_dirs {
+            cni.plugin_dirs = plugin_dirs.into_iter().map(PathBuf::from).collect();
+        }
+        if let Some(config_dirs) = cni_config_dirs {
+            cni.config_dirs = config_dirs.into_iter().map(PathBuf::from).collect();
+        }
+        if let Some(cache_dir) = cni_cache_dir {
+            cni.cache_dir = PathBuf::from(cache_dir);
+        }
+
+        Self::from_cni_config(cni)
+    }
+
+    pub fn from_cni_config(cni: CniConfig) -> Self {
         Self {
-            cni_plugin_dirs: cni_plugin_dirs.unwrap_or_else(|| vec!["/opt/cni/bin".to_string()]),
-            cni_config_dirs: cni_config_dirs.unwrap_or_else(|| vec!["/etc/cni/net.d".to_string()]),
-            cni_cache_dir: cni_cache_dir.unwrap_or_else(|| "/var/lib/cni/cache".to_string()),
+            cni_plugin_dirs: cni.plugin_dir_strings(),
+            cni_config_dirs: cni.config_dir_strings(),
+            cni_cache_dir: cni.cache_dir_string(),
         }
     }
 }

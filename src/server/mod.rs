@@ -44,7 +44,7 @@ use crate::proto::runtime::v1::{
 use crate::storage::persistence::{PersistenceConfig, PersistenceManager};
 
 use crate::metrics::MetricsCollector;
-use crate::network::{DefaultNetworkManager, NetworkManager};
+use crate::network::{CniConfig, DefaultNetworkManager, NetworkManager};
 use crate::pod::{PodSandboxConfig, PodSandboxManager};
 use crate::runtime::{
     default_shim_work_dir, ContainerConfig, ContainerRuntime, ContainerStatus, DeviceMapping,
@@ -89,6 +89,7 @@ pub struct RuntimeConfig {
     pub log_dir: PathBuf,
     pub runtime_path: PathBuf,
     pub pause_image: String,
+    pub cni_config: CniConfig,
 }
 
 const INTERNAL_ANNOTATION_PREFIX: &str = "io.crius.internal/";
@@ -445,6 +446,45 @@ impl RuntimeServiceImpl {
             .storage_mut()
             .save_container(&record)
             .map_err(|e| Status::internal(format!("Failed to persist container record: {}", e)))
+    }
+
+    fn persist_bundle_annotations(
+        &self,
+        container_id: &str,
+        annotations: &HashMap<String, String>,
+    ) -> Result<(), Status> {
+        let config_path = self.checkpoint_config_path(container_id);
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).map_err(|e| {
+                Status::internal(format!(
+                    "Failed to read container bundle config {}: {}",
+                    config_path.display(),
+                    e
+                ))
+            })?)
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to parse container bundle config {}: {}",
+                    config_path.display(),
+                    e
+                ))
+            })?;
+        config["annotations"] = serde_json::to_value(annotations).map_err(|e| {
+            Status::internal(format!("Failed to encode container annotations: {}", e))
+        })?;
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&config).map_err(|e| {
+                Status::internal(format!("Failed to encode updated bundle config: {}", e))
+            })?,
+        )
+        .map_err(|e| {
+            Status::internal(format!(
+                "Failed to write container bundle config {}: {}",
+                config_path.display(),
+                e
+            ))
+        })
     }
 
     async fn mutate_container_internal_state<F>(
@@ -846,10 +886,191 @@ impl RuntimeServiceImpl {
         }
     }
 
+    fn checkpoint_location_is_json(location: &Path) -> bool {
+        location
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("json"))
+            .unwrap_or(false)
+    }
+
+    fn checkpoint_location_is_archive(location: &Path) -> bool {
+        location.extension().is_some() && !Self::checkpoint_location_is_json(location)
+    }
+
+    fn write_checkpoint_metadata_dir(
+        dir: &Path,
+        manifest: &serde_json::Value,
+        config_payload: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create checkpoint directory {}", dir.display()))?;
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec_pretty(manifest)?,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to write checkpoint manifest {}",
+                dir.join("manifest.json").display()
+            )
+        })?;
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec_pretty(config_payload)?,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to write checkpoint OCI config {}",
+                dir.join("config.json").display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn checkpoint_tar(dir: &Path, archive_path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = archive_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create checkpoint archive parent directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        if archive_path.exists() {
+            std::fs::remove_file(archive_path).with_context(|| {
+                format!(
+                    "Failed to remove existing checkpoint archive {}",
+                    archive_path.display()
+                )
+            })?;
+        }
+
+        let output = Command::new("tar")
+            .arg("-cf")
+            .arg(archive_path)
+            .arg("-C")
+            .arg(dir)
+            .arg(".")
+            .output()
+            .context("Failed to execute tar for checkpoint export")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("status={}", output.status)
+            } else {
+                stderr
+            };
+            return Err(anyhow::anyhow!(
+                "Failed to create checkpoint archive {}: {}",
+                archive_path.display(),
+                detail
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(archive_path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(archive_path, perms)?;
+        }
+
+        Ok(())
+    }
+
+    fn checkpoint_rootfs_snapshot(rootfs_path: &Path, snapshot_path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = snapshot_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create checkpoint rootfs snapshot parent {}",
+                    parent.display()
+                )
+            })?;
+        }
+        if snapshot_path.exists() {
+            std::fs::remove_file(snapshot_path).with_context(|| {
+                format!(
+                    "Failed to remove existing checkpoint rootfs snapshot {}",
+                    snapshot_path.display()
+                )
+            })?;
+        }
+
+        let output = Command::new("tar")
+            .arg("-cf")
+            .arg(snapshot_path)
+            .arg("-C")
+            .arg(rootfs_path)
+            .arg(".")
+            .output()
+            .with_context(|| {
+                format!(
+                    "Failed to create rootfs snapshot from {}",
+                    rootfs_path.display()
+                )
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("status={}", output.status)
+            } else {
+                stderr
+            };
+            return Err(anyhow::anyhow!(
+                "Failed to create checkpoint rootfs snapshot {}: {}",
+                snapshot_path.display(),
+                detail
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn extract_checkpoint_archive(archive_path: &Path, target_dir: &Path) -> anyhow::Result<()> {
+        if target_dir.exists() {
+            std::fs::remove_dir_all(target_dir).with_context(|| {
+                format!(
+                    "Failed to clear extracted checkpoint directory {}",
+                    target_dir.display()
+                )
+            })?;
+        }
+        std::fs::create_dir_all(target_dir).with_context(|| {
+            format!(
+                "Failed to create extracted checkpoint directory {}",
+                target_dir.display()
+            )
+        })?;
+
+        let output = Command::new("tar")
+            .arg("-xf")
+            .arg(archive_path)
+            .arg("-C")
+            .arg(target_dir)
+            .output()
+            .context("Failed to execute tar for checkpoint import")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("status={}", output.status)
+            } else {
+                stderr
+            };
+            return Err(anyhow::anyhow!(
+                "Failed to extract checkpoint archive {}: {}",
+                archive_path.display(),
+                detail
+            ));
+        }
+
+        Ok(())
+    }
+
     fn load_checkpoint_artifact(
         location: &Path,
     ) -> anyhow::Result<(serde_json::Value, serde_json::Value)> {
-        if location.extension().is_some() {
+        if Self::checkpoint_location_is_json(location) {
             let payload: serde_json::Value = serde_json::from_slice(&std::fs::read(location)?)
                 .with_context(|| {
                     format!("Failed to parse checkpoint artifact {}", location.display())
@@ -865,8 +1086,20 @@ impl RuntimeServiceImpl {
             return Ok((manifest, oci_config));
         }
 
-        let manifest_path = location.join("manifest.json");
-        let config_path = location.join("config.json");
+        let artifact_dir = if Self::checkpoint_location_is_archive(location) {
+            let extracted_dir = Self::checkpoint_runtime_image_path(location);
+            let manifest_path = extracted_dir.join("manifest.json");
+            let config_path = extracted_dir.join("config.json");
+            if !manifest_path.exists() || !config_path.exists() {
+                Self::extract_checkpoint_archive(location, &extracted_dir)?;
+            }
+            extracted_dir
+        } else {
+            location.to_path_buf()
+        };
+
+        let manifest_path = artifact_dir.join("manifest.json");
+        let config_path = artifact_dir.join("config.json");
         let manifest =
             serde_json::from_slice(&std::fs::read(&manifest_path)?).with_context(|| {
                 format!(
@@ -887,10 +1120,12 @@ impl RuntimeServiceImpl {
     fn write_checkpoint_artifact(
         &self,
         location: &Path,
+        checkpoint_image_path: &Path,
         manifest: &serde_json::Value,
         config_payload: &serde_json::Value,
     ) -> anyhow::Result<()> {
-        if location.extension().is_some() {
+        if Self::checkpoint_location_is_json(location) {
+            Self::write_checkpoint_metadata_dir(checkpoint_image_path, manifest, config_payload)?;
             if let Some(parent) = location.parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!(
@@ -910,32 +1145,19 @@ impl RuntimeServiceImpl {
             return Ok(());
         }
 
+        if Self::checkpoint_location_is_archive(location) {
+            Self::write_checkpoint_metadata_dir(checkpoint_image_path, manifest, config_payload)?;
+            Self::checkpoint_tar(checkpoint_image_path, location)?;
+            return Ok(());
+        }
+
         std::fs::create_dir_all(location).with_context(|| {
             format!(
                 "Failed to create checkpoint artifact directory {}",
                 location.display()
             )
         })?;
-        std::fs::write(
-            location.join("manifest.json"),
-            serde_json::to_vec_pretty(manifest)?,
-        )
-        .with_context(|| {
-            format!(
-                "Failed to write checkpoint manifest {}",
-                location.join("manifest.json").display()
-            )
-        })?;
-        std::fs::write(
-            location.join("config.json"),
-            serde_json::to_vec_pretty(config_payload)?,
-        )
-        .with_context(|| {
-            format!(
-                "Failed to write checkpoint OCI config {}",
-                location.join("config.json").display()
-            )
-        })?;
+        Self::write_checkpoint_metadata_dir(location, manifest, config_payload)?;
         Ok(())
     }
 
@@ -1157,46 +1379,6 @@ impl RuntimeServiceImpl {
         )
     }
 
-    fn cni_config_dirs() -> Vec<PathBuf> {
-        std::env::var("CRIUS_CNI_CONFIG_DIRS")
-            .ok()
-            .map(|raw| {
-                raw.split(':')
-                    .map(str::trim)
-                    .filter(|dir| !dir.is_empty())
-                    .map(PathBuf::from)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|dirs| !dirs.is_empty())
-            .unwrap_or_else(|| {
-                vec![
-                    PathBuf::from("/etc/cni/net.d"),
-                    PathBuf::from("/etc/kubernetes/cni/net.d"),
-                ]
-            })
-    }
-
-    fn cni_plugin_dirs() -> Vec<PathBuf> {
-        std::env::var("CRIUS_CNI_PLUGIN_DIRS")
-            .ok()
-            .or_else(|| std::env::var("CNI_PATH").ok())
-            .map(|raw| {
-                raw.split(':')
-                    .map(str::trim)
-                    .filter(|dir| !dir.is_empty())
-                    .map(PathBuf::from)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|dirs| !dirs.is_empty())
-            .unwrap_or_else(|| {
-                vec![
-                    PathBuf::from("/opt/cni/bin"),
-                    PathBuf::from("/usr/lib/cni"),
-                    PathBuf::from("/usr/libexec/cni"),
-                ]
-            })
-    }
-
     fn cni_plugin_types(config: &serde_json::Value) -> Vec<String> {
         let mut plugin_types = Vec::new();
         if let Some(plugin_type) = config.get("type").and_then(|value| value.as_str()) {
@@ -1252,14 +1434,14 @@ impl RuntimeServiceImpl {
     }
 
     fn network_health(&self) -> (bool, String, String) {
-        let config_dirs = Self::cni_config_dirs();
-        let plugin_dirs = Self::cni_plugin_dirs();
+        let config_dirs = self.config.cni_config.config_dirs();
+        let plugin_dirs = self.config.cni_config.plugin_dirs();
         let mut discovered_files = Vec::new();
         let mut invalid_files = Vec::new();
         let mut declared_plugins = HashSet::new();
 
         for dir in config_dirs {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
+            let Ok(entries) = std::fs::read_dir(dir) else {
                 continue;
             };
             for entry in entries.flatten() {
@@ -1953,6 +2135,7 @@ impl RuntimeServiceImpl {
             runtime.clone(),
             config.root_dir.join("pods"),
             config.pause_image.clone(),
+            config.cni_config.clone(),
         );
 
         // 初始化持久化管理器
@@ -4321,11 +4504,6 @@ impl RuntimeService for RuntimeServiceImpl {
     ) -> Result<Response<PortForwardResponse>, Status> {
         self.best_effort_refresh_runtime_state().await;
         let req = request.into_inner();
-        if req.port.is_empty() {
-            return Err(Status::invalid_argument(
-                "port-forward requires at least one forwarded port",
-            ));
-        }
         let pod_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
         if req.port.iter().any(|port| *port <= 0 || *port > 65535) {
             return Err(Status::invalid_argument(
@@ -4537,7 +4715,8 @@ impl RuntimeService for RuntimeServiceImpl {
 
         // Best-effort fallback cleanup for stale netns.
         if let Some(netns_name) = fallback_netns_name {
-            let network_manager = DefaultNetworkManager::new(None, None, None);
+            let network_manager =
+                DefaultNetworkManager::from_cni_config(self.config.cni_config.clone());
             if let Err(e) = network_manager.remove_network_namespace(&netns_name).await {
                 log::warn!("Fallback netns cleanup failed for {}: {}", netns_name, e);
             }
@@ -5259,41 +5438,29 @@ impl RuntimeService for RuntimeServiceImpl {
             ));
         }
 
-        // 更新容器状态到内存
-        let mut containers = self.containers.lock().await;
-        if let Some(container) = containers.get_mut(&actual_container_id) {
-            container.state = observed_state;
-            if let Some(mut state) = Self::read_internal_state::<StoredContainerState>(
-                &container.annotations,
-                INTERNAL_CONTAINER_STATE_KEY,
-            ) {
-                match observed_state {
-                    x if x == ContainerState::ContainerRunning as i32 => {
-                        state.started_at = Some(Self::now_nanos());
-                        state.finished_at = None;
-                        state.exit_code = None;
-                    }
-                    x if x == ContainerState::ContainerExited as i32 => {
-                        state.finished_at = Some(Self::now_nanos());
-                        state.exit_code.get_or_insert(0);
-                    }
-                    _ => {}
-                }
-
-                if let Err(e) = Self::insert_internal_state(
-                    &mut container.annotations,
-                    INTERNAL_CONTAINER_STATE_KEY,
-                    &state,
-                ) {
-                    log::warn!(
-                        "Failed to persist in-memory container state for {}: {}",
-                        actual_container_id,
-                        e
-                    );
-                }
+        {
+            let mut containers = self.containers.lock().await;
+            if let Some(container) = containers.get_mut(&actual_container_id) {
+                container.state = observed_state;
             }
         }
-        drop(containers);
+        let updated_container = self
+            .mutate_container_internal_state(&actual_container_id, |state| match observed_state {
+                x if x == ContainerState::ContainerRunning as i32 => {
+                    state.started_at = Some(Self::now_nanos());
+                    state.finished_at = None;
+                    state.exit_code = None;
+                }
+                x if x == ContainerState::ContainerExited as i32 => {
+                    state.finished_at = Some(Self::now_nanos());
+                    state.exit_code.get_or_insert(0);
+                }
+                _ => {}
+            })
+            .await?;
+        if let Some(container) = updated_container.as_ref() {
+            self.persist_bundle_annotations(&actual_container_id, &container.annotations)?;
+        }
 
         // 更新持久化状态
         let mut persistence = self.persistence.lock().await;
@@ -5332,6 +5499,7 @@ impl RuntimeService for RuntimeServiceImpl {
             if let Some(updated_annotations) = updated_annotations {
                 self.persist_container_annotations(&actual_container_id, &updated_annotations)
                     .await?;
+                self.persist_bundle_annotations(&actual_container_id, &updated_annotations)?;
             }
         }
 
@@ -5905,6 +6073,12 @@ impl RuntimeService for RuntimeServiceImpl {
                 container_id
             )));
         }
+        if !matches!(runtime_status, ContainerStatus::Running) {
+            return Err(Status::failed_precondition(format!(
+                "container {} must be running to be checkpointed",
+                container_id
+            )));
+        }
 
         let runtime_state = Self::map_runtime_container_state(runtime_status);
         let container_state = Self::read_internal_state::<StoredContainerState>(
@@ -5938,6 +6112,32 @@ impl RuntimeService for RuntimeServiceImpl {
 
         let checkpoint_location = PathBuf::from(&req.location);
         let checkpoint_image_path = Self::checkpoint_runtime_image_path(&checkpoint_location);
+        let rootfs_path = config_payload
+            .get("root")
+            .and_then(|root| root.get("path"))
+            .and_then(|path| path.as_str())
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "container {} checkpoint config is missing root.path",
+                    container_id
+                ))
+            })?;
+        let runtime_for_pause = self.runtime.clone();
+        let container_id_for_pause = container_id.clone();
+        tokio::task::spawn_blocking(move || {
+            runtime_for_pause.pause_container(&container_id_for_pause)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to join pause task: {}", e)))?
+        .map_err(|e| {
+            Status::internal(format!(
+                "Failed to pause container before checkpoint: {}",
+                e
+            ))
+        })?;
+
         let runtime = self.runtime.clone();
         let container_id_for_checkpoint = container_id.clone();
         let checkpoint_image_path_for_runtime = checkpoint_image_path.clone();
@@ -5959,9 +6159,46 @@ impl RuntimeService for RuntimeServiceImpl {
         } else {
             checkpoint_future.await
         };
-        checkpoint_result
+        let checkpoint_result = checkpoint_result
             .map_err(|e| Status::internal(format!("Failed to join checkpoint task: {}", e)))?
-            .map_err(|e| Status::internal(format!("Failed to checkpoint container: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Failed to checkpoint container: {}", e)));
+
+        let runtime_for_resume = self.runtime.clone();
+        let container_id_for_resume = container_id.clone();
+        let resume_result = tokio::task::spawn_blocking(move || {
+            runtime_for_resume.resume_container(&container_id_for_resume)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to join resume task: {}", e)))?;
+
+        if let Err(checkpoint_err) = checkpoint_result {
+            if let Err(resume_err) = resume_result {
+                return Err(Status::internal(format!(
+                    "{}; additionally failed to resume container after checkpoint attempt: {}",
+                    checkpoint_err.message(),
+                    resume_err
+                )));
+            }
+            return Err(checkpoint_err);
+        }
+
+        resume_result.map_err(|e| {
+            Status::internal(format!(
+                "Failed to resume container after checkpoint: {}",
+                e
+            ))
+        })?;
+
+        let post_checkpoint_status = self.runtime_container_status_checked(&container_id).await;
+        if !matches!(post_checkpoint_status, ContainerStatus::Running) {
+            return Err(Status::internal(format!(
+                "container {} is not running after checkpoint",
+                container_id
+            )));
+        }
+
+        Self::checkpoint_rootfs_snapshot(&rootfs_path, &checkpoint_image_path.join("rootfs.tar"))
+            .map_err(|e| Status::internal(format!("Failed to snapshot checkpoint rootfs: {}", e)))?;
 
         let manifest = json!({
             "containerId": container_id,
@@ -6004,8 +6241,13 @@ impl RuntimeService for RuntimeServiceImpl {
             }
         });
 
-        self.write_checkpoint_artifact(&checkpoint_location, &manifest, &config_payload)
-            .map_err(|e| Status::internal(format!("Failed to write checkpoint artifact: {}", e)))?;
+        self.write_checkpoint_artifact(
+            &checkpoint_location,
+            &checkpoint_image_path,
+            &manifest,
+            &config_payload,
+        )
+        .map_err(|e| Status::internal(format!("Failed to write checkpoint artifact: {}", e)))?;
 
         Ok(Response::new(CheckpointContainerResponse {}))
     }
@@ -6428,11 +6670,18 @@ mod tests {
             log_dir: PathBuf::from("/tmp/crius-test-logs"),
             runtime_path: PathBuf::from("/definitely/missing/runc"),
             pause_image: "registry.k8s.io/pause:3.9".to_string(),
+            cni_config: crate::network::CniConfig::default(),
         }
     }
 
     fn test_service() -> RuntimeServiceImpl {
         RuntimeServiceImpl::new(test_runtime_config(tempdir().unwrap().keep()))
+    }
+
+    fn test_service_with_env_cni() -> RuntimeServiceImpl {
+        let mut config = test_runtime_config(tempdir().unwrap().keep());
+        config.cni_config = crate::network::CniConfig::from_env();
+        RuntimeServiceImpl::new(config)
     }
 
     fn env_lock() -> &'static StdMutex<()> {
@@ -6485,6 +6734,18 @@ case "$cmd" in
     echo running > "$STATE_DIR/$id.state"
     echo $$ > "$STATE_DIR/$id.pid"
     ;;
+  pause)
+    id="${{1:-}}"
+    if [ -n "$id" ]; then
+      echo paused > "$STATE_DIR/$id.state"
+    fi
+    ;;
+  resume)
+    id="${{1:-}}"
+    if [ -n "$id" ]; then
+      echo running > "$STATE_DIR/$id.state"
+    fi
+    ;;
   update)
     resource_file=""
     id=""
@@ -6509,6 +6770,9 @@ case "$cmd" in
     id=""
     while [ "$#" -gt 0 ]; do
       case "$1" in
+        --file-locks)
+          shift
+          ;;
         --image-path|--work-path)
           if [ "$1" = "--image-path" ]; then
             image_path="${{2:-}}"
@@ -6576,6 +6840,7 @@ exit 0
             log_dir: dir.path().join("logs"),
             runtime_path,
             pause_image: "registry.k8s.io/pause:3.9".to_string(),
+            cni_config: crate::network::CniConfig::default(),
         };
         let service = RuntimeServiceImpl::new_with_shim_work_dir(config, shim_work_dir);
         (dir, service)
@@ -7245,6 +7510,7 @@ sleep 1
                 log_dir: dir.path().join("logs"),
                 runtime_path,
                 pause_image: "registry.k8s.io/pause:3.9".to_string(),
+                cni_config: crate::network::CniConfig::default(),
             },
             shim_work_dir.clone(),
         );
@@ -7696,7 +7962,7 @@ exit 0
 
         std::env::set_var("CRIUS_CNI_CONFIG_DIRS", config_dir.display().to_string());
         std::env::set_var("CRIUS_CNI_PLUGIN_DIRS", plugin_dir.display().to_string());
-        let service = test_service();
+        let service = test_service_with_env_cni();
         let (ready, reason, message) = service.network_health();
         std::env::remove_var("CRIUS_CNI_CONFIG_DIRS");
         std::env::remove_var("CRIUS_CNI_PLUGIN_DIRS");
@@ -7727,7 +7993,7 @@ exit 0
 
         std::env::set_var("CRIUS_CNI_CONFIG_DIRS", config_dir.display().to_string());
         std::env::set_var("CRIUS_CNI_PLUGIN_DIRS", plugin_dir.display().to_string());
-        let service = test_service();
+        let service = test_service_with_env_cni();
         let (ready, reason, message) = service.network_health();
         std::env::remove_var("CRIUS_CNI_CONFIG_DIRS");
         std::env::remove_var("CRIUS_CNI_PLUGIN_DIRS");
@@ -7763,12 +8029,14 @@ exit 0
 
         let bundle_dir = dir.path().join("runtime-root").join("container-running");
         fs::create_dir_all(&bundle_dir).unwrap();
+        let rootfs_dir = dir.path().join("checkpoint-rootfs-json");
+        fs::create_dir_all(&rootfs_dir).unwrap();
         fs::write(
             bundle_dir.join("config.json"),
             serde_json::json!({
                 "ociVersion": "1.0.2",
                 "root": {
-                    "path": "/tmp/rootfs"
+                    "path": rootfs_dir.display().to_string()
                 },
             })
             .to_string(),
@@ -7793,13 +8061,78 @@ exit 0
         assert_eq!(artifact["manifest"]["runtimeState"], "running");
         assert_eq!(artifact["manifest"]["metadata"]["name"], "checkpointed");
         assert_eq!(artifact["manifest"]["metadata"]["attempt"], 2);
-        assert_eq!(artifact["ociConfig"]["root"]["path"], "/tmp/rootfs");
+        assert_eq!(
+            artifact["ociConfig"]["root"]["path"],
+            rootfs_dir.display().to_string()
+        );
         let checkpoint_image_path = PathBuf::from(
             artifact["manifest"]["checkpointImagePath"]
                 .as_str()
                 .expect("checkpoint image path should be recorded"),
         );
         assert!(checkpoint_image_path.join("checkpoint.json").exists());
+        assert!(checkpoint_image_path.join("rootfs.tar").exists());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_container_writes_tar_export_when_location_is_archive() {
+        let (dir, service) = test_service_with_fake_runtime();
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                metadata_name: Some("checkpointed-tar".to_string()),
+                metadata_attempt: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        service.containers.lock().await.insert(
+            "container-running".to_string(),
+            test_container("container-running", "pod-1", annotations),
+        );
+        set_fake_runtime_state(&dir, "container-running", "running");
+
+        let bundle_dir = dir.path().join("runtime-root").join("container-running");
+        fs::create_dir_all(&bundle_dir).unwrap();
+        let rootfs_dir = dir.path().join("checkpoint-rootfs-tar");
+        fs::create_dir_all(&rootfs_dir).unwrap();
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::json!({
+                "ociVersion": "1.0.2",
+                "root": {
+                    "path": rootfs_dir.display().to_string()
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let artifact_path = dir.path().join("checkpoint.tar");
+        RuntimeService::checkpoint_container(
+            &service,
+            Request::new(CheckpointContainerRequest {
+                container_id: "container-running".to_string(),
+                location: artifact_path.display().to_string(),
+                timeout: 30,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let tar_output = Command::new("tar")
+            .args(["-tf", artifact_path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(tar_output.status.success());
+        let stdout = String::from_utf8_lossy(&tar_output.stdout);
+        assert!(stdout.contains("manifest.json"));
+        assert!(stdout.contains("config.json"));
+        assert!(stdout.contains("checkpoint.json"));
+        assert!(stdout.contains("rootfs.tar"));
     }
 
     #[tokio::test]
@@ -7875,6 +8208,21 @@ exit 0
             )
             .unwrap();
 
+        let bundle_dir = dir.path().join("runtime-root").join("restore-container");
+        fs::create_dir_all(&bundle_dir).unwrap();
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::json!({
+                "ociVersion": "1.0.2",
+                "annotations": annotations,
+                "root": {
+                    "path": "/tmp/rootfs"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
         RuntimeService::start_container(
             &service,
             Request::new(StartContainerRequest {
@@ -7892,6 +8240,12 @@ exit 0
             .cloned()
             .unwrap();
         assert_eq!(container.state, ContainerState::ContainerRunning as i32);
+        let internal_state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        )
+        .expect("started_at should be persisted after restore");
+        assert!(internal_state.started_at.is_some());
         assert!(
             !container
                 .annotations
@@ -7913,6 +8267,31 @@ exit 0
             !persisted_annotations.contains_key(INTERNAL_CHECKPOINT_RESTORE_KEY),
             "restore marker should be cleared from persistence after successful restore"
         );
+
+        let bundle_config: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                dir.path()
+                    .join("runtime-root")
+                    .join("restore-container")
+                    .join("config.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let bundle_annotations = bundle_config
+            .get("annotations")
+            .and_then(|value| value.as_object())
+            .cloned()
+            .unwrap_or_default();
+        assert!(!bundle_annotations.contains_key(INTERNAL_CHECKPOINT_RESTORE_KEY));
+        let bundle_container_state: StoredContainerState = serde_json::from_str(
+            bundle_annotations
+                .get(INTERNAL_CONTAINER_STATE_KEY)
+                .and_then(|value| value.as_str())
+                .expect("bundle should persist internal container state"),
+        )
+        .unwrap();
+        assert!(bundle_container_state.started_at.is_some());
 
         let exit_code_path = dir
             .path()
@@ -8966,17 +9345,6 @@ exit 0
             .await
             .insert("pod-1".to_string(), test_pod("pod-1", HashMap::new()));
 
-        let missing_ports = RuntimeService::port_forward(
-            &service,
-            Request::new(PortForwardRequest {
-                pod_sandbox_id: "pod-1".to_string(),
-                port: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(missing_ports.code(), tonic::Code::InvalidArgument);
-
         let mut not_ready_pod = test_pod("pod-2", HashMap::new());
         not_ready_pod.state = PodSandboxState::SandboxNotready as i32;
         service
@@ -8988,7 +9356,7 @@ exit 0
             &service,
             Request::new(PortForwardRequest {
                 pod_sandbox_id: "pod-2".to_string(),
-                port: vec![80],
+                port: Vec::new(),
             }),
         )
         .await

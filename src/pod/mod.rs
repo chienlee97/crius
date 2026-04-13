@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
-use crate::network::{DefaultNetworkManager, NetworkInterface, NetworkManager, NetworkStatus};
+use crate::network::{
+    CniConfig, DefaultNetworkManager, NetworkInterface, NetworkManager, NetworkStatus,
+};
 use crate::proto::runtime::v1::{LinuxContainerResources, NamespaceOption};
 use crate::runtime::{
     ContainerConfig, ContainerRuntime, ContainerStatus, NamespacePaths, SeccompProfile,
@@ -212,8 +214,8 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
     }
 
     /// 创建新的Pod沙箱管理器
-    pub fn new(runtime: R, root_dir: PathBuf, pause_image: String) -> Self {
-        let network_manager = DefaultNetworkManager::new(None, None, None);
+    pub fn new(runtime: R, root_dir: PathBuf, pause_image: String, cni_config: CniConfig) -> Self {
+        let network_manager = DefaultNetworkManager::from_cni_config(cni_config);
 
         Self {
             runtime,
@@ -529,6 +531,7 @@ mod tests {
             runtime,
             temp_dir.path().join("pods"),
             "registry.k8s.io/pause:3.9".to_string(),
+            CniConfig::default(),
         );
 
         let config = PodSandboxConfig {

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Error;
 use clap::Parser;
 use crius::image::ImageServiceImpl;
+use crius::network::CniConfig;
 use crius::proto::runtime::v1::{
     image_service_server::ImageServiceServer, runtime_service_server::RuntimeServiceServer,
 };
@@ -77,6 +78,7 @@ async fn main() -> Result<(), Error> {
         runtime_path: PathBuf::from("/usr/bin/runc"),
         pause_image: std::env::var("CRIUS_PAUSE_IMAGE")
             .unwrap_or_else(|_| "registry.k8s.io/pause:3.9".to_string()),
+        cni_config: CniConfig::from_env(),
     };
 
     // 创建服务实例
