@@ -368,15 +368,20 @@ impl Daemon {
                 let mut buffer = [0u8; 8192];
                 loop {
                     match std::io::Read::read(&mut stdout, &mut buffer) {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            let _ = io_manager.finish_stdout();
+                            break;
+                        }
                         Ok(n) => {
                             if let Err(e) = io_manager.write_stdout(&buffer[..n]) {
                                 debug!("stdout pump stopped: {}", e);
+                                let _ = io_manager.finish_stdout();
                                 break;
                             }
                         }
                         Err(e) => {
                             debug!("stdout pump stopped: {}", e);
+                            let _ = io_manager.finish_stdout();
                             break;
                         }
                     }
@@ -393,15 +398,20 @@ impl Daemon {
                 let mut buffer = [0u8; 8192];
                 loop {
                     match std::io::Read::read(&mut stderr, &mut buffer) {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            let _ = io_manager.finish_stderr();
+                            break;
+                        }
                         Ok(n) => {
                             if let Err(e) = io_manager.write_stderr(&buffer[..n]) {
                                 debug!("stderr pump stopped: {}", e);
+                                let _ = io_manager.finish_stderr();
                                 break;
                             }
                         }
                         Err(e) => {
                             debug!("stderr pump stopped: {}", e);
+                            let _ = io_manager.finish_stderr();
                             break;
                         }
                     }

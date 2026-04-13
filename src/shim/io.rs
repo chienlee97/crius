@@ -4,42 +4,31 @@
 //! 1. 重定向容器IO流到文件或socket
 //! 2. 支持attach功能（多客户端连接）
 //! 3. 支持TTY模式
-//! 4. 日志持久化（CRI JSON格式）
+//! 4. 日志持久化（CRI text log格式）
 
 use crate::attach::{encode_attach_output_frame, ATTACH_PIPE_STDERR, ATTACH_PIPE_STDOUT};
 use anyhow::{Context, Result};
 use log::{debug, error, info};
-use serde::{Deserialize, Serialize};
-use std::fs::File;
+use serde::Deserialize;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-/// CRI 日志条目格式
-#[derive(Debug, Serialize)]
-struct CrictlLogEntry {
-    time: String,
-    stream: String,
-    log: String,
-}
+const CRI_LOG_STREAM_STDOUT: &str = "stdout";
+const CRI_LOG_STREAM_STDERR: &str = "stderr";
+const CRI_LOG_TAG_FULL: &str = "F";
+const CRI_LOG_TAG_PARTIAL: &str = "P";
+// Match containerd/cri-o's default CRI logger buffer so long lines split
+// into `P` / `F` records at the same boundary `crictl logs` expects.
+const CRI_LOG_LINE_BUFFER_SIZE: usize = 4096;
 
-impl CrictlLogEntry {
-    fn new(stream: &str, data: &[u8]) -> Self {
-        Self {
-            time: chrono::Utc::now().to_rfc3339(),
-            stream: stream.to_string(),
-            log: String::from_utf8_lossy(data).to_string(),
-        }
-    }
-
-    fn to_json_line(&self) -> Result<Vec<u8>> {
-        let json = serde_json::to_vec(self)?;
-        let mut line = json;
-        line.push(b'\n');
-        Ok(line)
-    }
+#[derive(Debug, Default)]
+struct PendingLogBytes {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 /// IO配置
@@ -83,6 +72,8 @@ pub struct IoManager {
     clients: Arc<Mutex<Vec<ClientConnection>>>,
     /// 日志文件
     log_file: Arc<Mutex<Option<File>>>,
+    /// 尚未形成完整 CRI 记录的 stdout/stderr 缓冲
+    pending_logs: Arc<Mutex<PendingLogBytes>>,
     /// 当前TTY控制台文件，用于resize
     console_file: Arc<Mutex<Option<File>>>,
 }
@@ -103,6 +94,117 @@ struct TerminalResizeRequest {
 }
 
 impl IoManager {
+    fn open_output_file(path: &PathBuf) -> Result<File> {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("Failed to open log file {}", path.display()))
+    }
+
+    fn pending_buffer_mut<'a>(
+        pending_logs: &'a mut PendingLogBytes,
+        stream: &str,
+    ) -> &'a mut Vec<u8> {
+        match stream {
+            CRI_LOG_STREAM_STDOUT => &mut pending_logs.stdout,
+            CRI_LOG_STREAM_STDERR => &mut pending_logs.stderr,
+            _ => unreachable!("unsupported log stream {}", stream),
+        }
+    }
+
+    fn encode_cri_log_record(stream: &str, tag: &str, content: &[u8]) -> Vec<u8> {
+        let mut record = chrono::Local::now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            .into_bytes();
+        record.push(b' ');
+        record.extend_from_slice(stream.as_bytes());
+        record.push(b' ');
+        record.extend_from_slice(tag.as_bytes());
+        record.push(b' ');
+        record.extend_from_slice(content);
+        record.push(b'\n');
+        record
+    }
+
+    fn drain_cri_log_records(
+        pending: &mut Vec<u8>,
+        stream: &str,
+        data: &[u8],
+        flush_partial: bool,
+    ) -> Vec<Vec<u8>> {
+        pending.extend_from_slice(data);
+        let mut records = Vec::new();
+
+        loop {
+            let search_len = pending.len().min(CRI_LOG_LINE_BUFFER_SIZE);
+            if let Some(pos) = pending[..search_len].iter().position(|byte| *byte == b'\n') {
+                let mut content = pending.drain(..=pos).collect::<Vec<u8>>();
+                content.pop();
+                if matches!(content.last(), Some(b'\r')) {
+                    content.pop();
+                }
+                records.push(Self::encode_cri_log_record(
+                    stream,
+                    CRI_LOG_TAG_FULL,
+                    &content,
+                ));
+                continue;
+            }
+
+            if pending.len() < CRI_LOG_LINE_BUFFER_SIZE {
+                break;
+            }
+
+            let mut split_at = CRI_LOG_LINE_BUFFER_SIZE;
+            if matches!(pending.get(split_at - 1), Some(b'\r')) {
+                split_at -= 1;
+            }
+            if split_at == 0 {
+                break;
+            }
+
+            let content = pending.drain(..split_at).collect::<Vec<u8>>();
+            records.push(Self::encode_cri_log_record(
+                stream,
+                CRI_LOG_TAG_PARTIAL,
+                &content,
+            ));
+        }
+
+        if flush_partial && !pending.is_empty() {
+            let content = std::mem::take(pending);
+            records.push(Self::encode_cri_log_record(
+                stream,
+                CRI_LOG_TAG_PARTIAL,
+                &content,
+            ));
+        }
+
+        records
+    }
+
+    fn take_log_records(&self, stream: &str, data: &[u8], flush_partial: bool) -> Vec<Vec<u8>> {
+        let mut pending_logs = self.pending_logs.lock().unwrap();
+        let pending = Self::pending_buffer_mut(&mut pending_logs, stream);
+        Self::drain_cri_log_records(pending, stream, data, flush_partial)
+    }
+
+    fn write_log_records(&self, records: &[Vec<u8>]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(file) = &mut *self.log_file.lock().unwrap() {
+            for record in records {
+                file.write_all(record)?;
+            }
+            file.flush()?;
+        }
+
+        Ok(())
+    }
+
     fn remove_clients(&self, disconnected_ids: &[usize]) {
         if disconnected_ids.is_empty() {
             return;
@@ -161,6 +263,7 @@ impl IoManager {
             config: IoConfig::default(),
             clients: Arc::new(Mutex::new(Vec::new())),
             log_file: Arc::new(Mutex::new(None)),
+            pending_logs: Arc::new(Mutex::new(PendingLogBytes::default())),
             console_file: Arc::new(Mutex::new(None)),
         }
     }
@@ -174,7 +277,7 @@ impl IoManager {
             let parent = stdout.parent().context("Invalid stdout path")?;
             std::fs::create_dir_all(parent)?;
             let mut log_file = self.log_file.lock().unwrap();
-            *log_file = Some(File::create(stdout)?);
+            *log_file = Some(Self::open_output_file(stdout)?);
             info!("Log file configured: {:?}", stdout);
         }
 
@@ -286,9 +389,20 @@ impl IoManager {
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     match stream {
-                        Ok(_stream) => {
-                            if let Err(e) = io_manager.reopen_log_file() {
-                                debug!("Failed to reopen log file on control request: {}", e);
+                        Ok(mut stream) => {
+                            let response = match io_manager.reopen_log_file() {
+                                Ok(()) => "OK\n".to_string(),
+                                Err(e) => {
+                                    debug!("Failed to reopen log file on control request: {}", e);
+                                    format!("ERR {}\n", e)
+                                }
+                            };
+                            if let Err(e) = stream.write_all(response.as_bytes()) {
+                                debug!("Failed to write reopen-log response: {}", e);
+                                continue;
+                            }
+                            if let Err(e) = stream.flush() {
+                                debug!("Failed to flush reopen-log response: {}", e);
                             }
                         }
                         Err(e) => {
@@ -347,22 +461,34 @@ impl IoManager {
         let parent = stdout.parent().context("Invalid stdout path")?;
         std::fs::create_dir_all(parent)?;
 
-        let reopened = File::create(stdout)?;
+        let reopened = Self::open_output_file(stdout)?;
         let mut log_file = self.log_file.lock().unwrap();
         *log_file = Some(reopened);
         info!("Reopened log file: {:?}", stdout);
         Ok(())
     }
 
+    pub fn finish_stdout(&self) -> Result<()> {
+        if self.config.stdout.is_some() {
+            let records = self.take_log_records(CRI_LOG_STREAM_STDOUT, &[], true);
+            self.write_log_records(&records)?;
+        }
+        Ok(())
+    }
+
+    pub fn finish_stderr(&self) -> Result<()> {
+        if self.config.stdout.is_some() {
+            let records = self.take_log_records(CRI_LOG_STREAM_STDERR, &[], true);
+            self.write_log_records(&records)?;
+        }
+        Ok(())
+    }
+
     /// 写入stdout
     pub fn write_stdout(&self, data: &[u8]) -> Result<()> {
-        // 写入日志文件（CRI JSON格式）
-        if let Some(file) = &mut *self.log_file.lock().unwrap() {
-            let log_entry = CrictlLogEntry::new("stdout", data);
-            if let Ok(json_line) = log_entry.to_json_line() {
-                file.write_all(&json_line)?;
-                file.flush()?;
-            }
+        if self.config.stdout.is_some() {
+            let records = self.take_log_records(CRI_LOG_STREAM_STDOUT, data, false);
+            self.write_log_records(&records)?;
         }
 
         // 发送到所有attach客户端
@@ -373,13 +499,9 @@ impl IoManager {
 
     /// 写入stderr
     pub fn write_stderr(&self, data: &[u8]) -> Result<()> {
-        // 写入日志文件（CRI JSON格式）
-        if let Some(file) = &mut *self.log_file.lock().unwrap() {
-            let log_entry = CrictlLogEntry::new("stderr", data);
-            if let Ok(json_line) = log_entry.to_json_line() {
-                file.write_all(&json_line)?;
-                file.flush()?;
-            }
+        if self.config.stdout.is_some() {
+            let records = self.take_log_records(CRI_LOG_STREAM_STDERR, data, false);
+            self.write_log_records(&records)?;
         }
 
         self.broadcast_output(ATTACH_PIPE_STDERR, data)
@@ -416,7 +538,10 @@ impl IoManager {
             let mut buffer = [0u8; 8192];
             loop {
                 match reader.read(&mut buffer) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        let _ = io_for_output.finish_stdout();
+                        break;
+                    }
                     Ok(n) => {
                         if let Err(e) = io_for_output.write_stdout(&buffer[..n]) {
                             error!("Failed to forward console output: {}", e);
@@ -424,6 +549,7 @@ impl IoManager {
                     }
                     Err(e) => {
                         debug!("Console output pump stopped: {}", e);
+                        let _ = io_for_output.finish_stdout();
                         break;
                     }
                 }
@@ -470,7 +596,7 @@ impl IoManager {
         let stdout = if let Some(stdout) = &self.config.stdout {
             let parent = stdout.parent().context("Invalid stdout path")?;
             std::fs::create_dir_all(parent)?;
-            let file = File::create(stdout)?;
+            let file = Self::open_output_file(stdout)?;
             Some(file)
         } else {
             None
@@ -480,7 +606,7 @@ impl IoManager {
         let stderr = if let Some(stderr) = &self.config.stderr {
             let parent = stderr.parent().context("Invalid stderr path")?;
             std::fs::create_dir_all(parent)?;
-            let file = File::create(stderr)?;
+            let file = Self::open_output_file(stderr)?;
             Some(file)
         } else {
             None
@@ -512,6 +638,21 @@ mod tests {
     use std::os::unix::net::UnixStream as StdUnixStream;
     use tempfile::tempdir;
 
+    fn parse_cri_log_lines(contents: &str) -> Vec<(String, String, String, String)> {
+        contents
+            .lines()
+            .map(|line| {
+                let mut parts = line.splitn(4, ' ');
+                (
+                    parts.next().unwrap_or_default().to_string(),
+                    parts.next().unwrap_or_default().to_string(),
+                    parts.next().unwrap_or_default().to_string(),
+                    parts.next().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn test_io_manager_creation() {
         let manager = IoManager::new();
@@ -542,6 +683,133 @@ mod tests {
     }
 
     #[test]
+    fn test_write_stdout_emits_cri_full_record() {
+        let temp_dir = tempdir().unwrap();
+        let log_path = temp_dir.path().join("stdout.log");
+        let mut manager = IoManager::new();
+        manager
+            .configure(IoConfig {
+                stdout: Some(log_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        manager.write_stdout(b"hello world\n").unwrap();
+
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        let records = parse_cri_log_lines(&contents);
+        assert_eq!(records.len(), 1);
+        assert!(chrono::DateTime::parse_from_rfc3339(&records[0].0).is_ok());
+        assert_eq!(records[0].1, "stdout");
+        assert_eq!(records[0].2, "F");
+        assert_eq!(records[0].3, "hello world");
+    }
+
+    #[test]
+    fn test_write_stdout_flushes_partial_record_on_finish() {
+        let temp_dir = tempdir().unwrap();
+        let log_path = temp_dir.path().join("stdout.log");
+        let mut manager = IoManager::new();
+        manager
+            .configure(IoConfig {
+                stdout: Some(log_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        manager.write_stdout(b"partial line").unwrap();
+        manager.finish_stdout().unwrap();
+
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        let records = parse_cri_log_lines(&contents);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1, "stdout");
+        assert_eq!(records[0].2, "P");
+        assert_eq!(records[0].3, "partial line");
+    }
+
+    #[test]
+    fn test_write_stdout_splits_multiline_chunk_into_multiple_records() {
+        let temp_dir = tempdir().unwrap();
+        let log_path = temp_dir.path().join("stdout.log");
+        let mut manager = IoManager::new();
+        manager
+            .configure(IoConfig {
+                stdout: Some(log_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        manager.write_stdout(b"first line\nsecond line\n").unwrap();
+
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        let records = parse_cri_log_lines(&contents);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].2, "F");
+        assert_eq!(records[0].3, "first line");
+        assert_eq!(records[1].2, "F");
+        assert_eq!(records[1].3, "second line");
+    }
+
+    #[test]
+    fn test_write_stdout_buffers_short_partial_across_multiple_writes() {
+        let temp_dir = tempdir().unwrap();
+        let log_path = temp_dir.path().join("stdout.log");
+        let mut manager = IoManager::new();
+        manager
+            .configure(IoConfig {
+                stdout: Some(log_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        manager.write_stdout(b"hello ").unwrap();
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "");
+
+        manager.write_stdout(b"world\n").unwrap();
+
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        let records = parse_cri_log_lines(&contents);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1, "stdout");
+        assert_eq!(records[0].2, "F");
+        assert_eq!(records[0].3, "hello world");
+    }
+
+    #[test]
+    fn test_write_stdout_splits_long_line_on_cri_buffer_boundary() {
+        let temp_dir = tempdir().unwrap();
+        let log_path = temp_dir.path().join("stdout.log");
+        let mut manager = IoManager::new();
+        manager
+            .configure(IoConfig {
+                stdout: Some(log_path.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let long_prefix = "a".repeat(CRI_LOG_LINE_BUFFER_SIZE);
+        manager.write_stdout(long_prefix.as_bytes()).unwrap();
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let records = parse_cri_log_lines(&contents);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1, "stdout");
+        assert_eq!(records[0].2, "P");
+        assert_eq!(records[0].3.len(), CRI_LOG_LINE_BUFFER_SIZE);
+
+        manager.write_stdout(b"tail\n").unwrap();
+
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        let records = parse_cri_log_lines(&contents);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].2, "P");
+        assert_eq!(records[0].3.len(), CRI_LOG_LINE_BUFFER_SIZE);
+        assert_eq!(records[1].2, "F");
+        assert_eq!(records[1].3, "tail");
+    }
+
+    #[test]
     fn test_reopen_log_file_keeps_logging_available() {
         let temp_dir = tempdir().unwrap();
         let log_path = temp_dir.path().join("stdout.log");
@@ -553,12 +821,15 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        manager.write_stdout(b"before").unwrap();
+        manager.write_stdout(b"before\n").unwrap();
         manager.reopen_log_file().unwrap();
-        manager.write_stdout(b"after").unwrap();
+        manager.write_stdout(b"after\n").unwrap();
 
-        let content = std::fs::read_to_string(log_path).unwrap();
-        assert!(content.contains("after"));
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        let records = parse_cri_log_lines(&contents);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].3, "before");
+        assert_eq!(records[1].3, "after");
     }
 
     #[test]

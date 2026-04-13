@@ -10,7 +10,6 @@
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use nix::mount::{mount, umount, MsFlags};
-use nix::sys::stat::Mode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -364,7 +363,7 @@ impl VolumeManager {
 
     /// 挂载tmpfs
     fn mount_tmpfs(&self, target: &Path, config: &VolumeConfig) -> Result<()> {
-        let mut flags = MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+        let flags = MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
 
         // 构建挂载选项字符串
         let mut options = vec![];

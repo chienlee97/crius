@@ -114,7 +114,7 @@ impl Default for PersistenceConfig {
 #[derive(Debug)]
 pub struct PersistenceManager {
     storage: StorageManager,
-    config: PersistenceConfig,
+    _config: PersistenceConfig,
 }
 
 impl PersistenceManager {
@@ -122,7 +122,10 @@ impl PersistenceManager {
     pub fn new(config: PersistenceConfig) -> Result<Self> {
         let storage = StorageManager::new(&config.db_path)?;
 
-        Ok(Self { storage, config })
+        Ok(Self {
+            storage,
+            _config: config,
+        })
     }
 
     /// 获取存储管理器的可变引用

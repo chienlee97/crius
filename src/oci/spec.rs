@@ -5,7 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 /// OCI运行时配置
 #[derive(Debug, Clone, Serialize, Deserialize)]

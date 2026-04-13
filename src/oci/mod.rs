@@ -5,5 +5,3 @@
 //! - Bundle管理
 
 pub mod spec;
-
-pub use spec::*;

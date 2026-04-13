@@ -2,14 +2,16 @@ use anyhow::{Context, Result};
 use log::{debug, error, info};
 use nix::sys::stat::{major, makedev, minor, mknod, stat, Mode, SFlag};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Read;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::cgroups::{CgroupManager, to_oci_resources, CpuLimit, MemoryLimit, ResourceLimits};
+use crate::cgroups::{to_oci_resources, CgroupManager, CpuLimit, MemoryLimit, ResourceLimits};
 use crate::oci::spec::{
     Device as OciDevice, Linux, LinuxCapabilities, LinuxDeviceCgroup, LinuxResources, Mount,
     Namespace as OciNamespace, Process, Root, Spec, User,
@@ -20,6 +22,9 @@ use crate::proto::runtime::v1::{
 
 pub mod shim_manager;
 pub use shim_manager::{default_shim_work_dir, ShimConfig, ShimManager, ShimProcess};
+
+const INTERNAL_CHECKPOINT_RESTORE_KEY: &str = "io.crius.internal/checkpoint-restore";
+const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";
 
 /// 容器运行时接口
 pub trait ContainerRuntime {
@@ -121,6 +126,19 @@ pub struct DeviceMapping {
     pub permissions: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RestoreCheckpointMetadata {
+    checkpoint_location: String,
+    checkpoint_image_path: String,
+    oci_config: serde_json::Value,
+    image_ref: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RuntimeStoredContainerState {
+    tty: bool,
+}
+
 /// 容器状态
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContainerStatus {
@@ -149,10 +167,48 @@ struct RuncState {
 pub struct RuncRuntime {
     runtime_path: PathBuf,
     root: PathBuf,
+    image_storage_root: PathBuf,
     shim_manager: Option<Arc<ShimManager>>,
 }
 
 impl RuncRuntime {
+    fn load_bundle_config_value(&self, container_id: &str) -> Result<Value> {
+        let config_path = self.config_path(container_id);
+        let raw = std::fs::read(&config_path)
+            .with_context(|| format!("Failed to read OCI config {}", config_path.display()))?;
+        serde_json::from_slice(&raw)
+            .with_context(|| format!("Failed to parse OCI config {}", config_path.display()))
+    }
+
+    fn container_uses_terminal(&self, container_id: &str) -> Result<bool> {
+        let config = self.load_bundle_config_value(container_id)?;
+        let from_process = config
+            .get("process")
+            .and_then(|process| process.get("terminal"))
+            .and_then(|value| value.as_bool());
+        if let Some(tty) = from_process {
+            return Ok(tty);
+        }
+
+        let from_internal_state = config
+            .get("annotations")
+            .and_then(|annotations| annotations.get(INTERNAL_CONTAINER_STATE_KEY))
+            .and_then(|value| value.as_str())
+            .and_then(|raw| serde_json::from_str::<RuntimeStoredContainerState>(raw).ok())
+            .map(|state| state.tty)
+            .unwrap_or(false);
+        Ok(from_internal_state)
+    }
+
+    fn checkpoint_restore_from_annotations(
+        annotations: &[(String, String)],
+    ) -> Option<RestoreCheckpointMetadata> {
+        annotations
+            .iter()
+            .find(|(key, _)| key == INTERNAL_CHECKPOINT_RESTORE_KEY)
+            .and_then(|(_, value)| serde_json::from_str::<RestoreCheckpointMetadata>(value).ok())
+    }
+
     fn normalize_capability_name(name: &str) -> String {
         let upper = name.trim().to_ascii_uppercase();
         if upper.starts_with("CAP_") {
@@ -484,7 +540,7 @@ impl RuncRuntime {
     }
 
     fn resolve_image_dir(&self, image_ref: &str) -> Result<PathBuf> {
-        let images_dir = PathBuf::from("/var/lib/crius/storage/images");
+        let images_dir = self.image_storage_root.join("images");
         let entries = std::fs::read_dir(&images_dir)
             .with_context(|| format!("Failed to read images directory: {:?}", images_dir))?;
 
@@ -534,10 +590,10 @@ impl RuncRuntime {
 
     fn prepare_rootfs_from_image(
         &self,
-        config: &ContainerConfig,
+        image_ref: &str,
+        rootfs_dir: &Path,
         container_id: &str,
     ) -> Result<()> {
-        let rootfs_dir = config.rootfs.clone();
         if rootfs_dir.exists() {
             std::fs::remove_dir_all(&rootfs_dir)
                 .with_context(|| format!("Failed to clean rootfs directory: {:?}", rootfs_dir))?;
@@ -545,7 +601,7 @@ impl RuncRuntime {
         std::fs::create_dir_all(&rootfs_dir)
             .with_context(|| format!("Failed to create rootfs directory: {:?}", rootfs_dir))?;
 
-        let image_dir = self.resolve_image_dir(&config.image)?;
+        let image_dir = self.resolve_image_dir(image_ref)?;
         let mut layer_files: Vec<PathBuf> = std::fs::read_dir(&image_dir)?
             .filter_map(|e| e.ok().map(|v| v.path()))
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("gz"))
@@ -562,7 +618,7 @@ impl RuncRuntime {
             return Err(anyhow::anyhow!(
                 "No image layers found in {:?} for image {}",
                 image_dir,
-                config.image
+                image_ref
             ));
         }
 
@@ -593,25 +649,192 @@ impl RuncRuntime {
 
         info!(
             "Prepared rootfs for container {} from image {}",
-            container_id, config.image
+            container_id, image_ref
         );
         Ok(())
     }
 
+    fn spec_from_restore_template(
+        &self,
+        config: &ContainerConfig,
+        restore: &RestoreCheckpointMetadata,
+    ) -> Result<Spec> {
+        let mut spec: Spec = serde_json::from_value(restore.oci_config.clone())
+            .context("Failed to parse OCI config from checkpoint artifact")?;
+
+        spec.root = Some(Root {
+            path: config.rootfs.to_string_lossy().to_string(),
+            readonly: Some(config.readonly_rootfs),
+        });
+        spec.hostname = config.hostname.clone().or(spec.hostname);
+
+        if let Some(process) = spec.process.as_mut() {
+            process.terminal = Some(config.tty);
+            process.apparmor_profile = config.apparmor_profile.clone();
+            process.selinux_label = config.selinux_label.clone();
+            process.no_new_privileges =
+                Some(config.no_new_privileges.unwrap_or(!config.privileged));
+            if let Some(working_dir) = config.working_dir.as_ref() {
+                process.cwd = working_dir.to_string_lossy().to_string();
+            }
+            if !config.command.is_empty() {
+                let mut args = config.command.clone();
+                args.extend(config.args.clone());
+                process.args = args;
+            }
+            if !config.env.is_empty() {
+                process.env = Some(
+                    config
+                        .env
+                        .iter()
+                        .map(|(key, value)| format!("{}={}", key, value))
+                        .collect(),
+                );
+            }
+        }
+
+        if let Some(linux) = spec.linux.as_mut() {
+            linux.namespaces = Some(self.build_namespaces(config));
+            linux.cgroups_path = config.cgroup_parent.clone();
+            linux.seccomp = self.load_seccomp_profile(config.seccomp_profile.as_ref())?;
+            linux.mount_label = config.selinux_label.clone();
+            if !config.sysctls.is_empty() {
+                linux.sysctl = Some(config.sysctls.clone());
+            }
+            if let Some(resources) = config
+                .linux_resources
+                .as_ref()
+                .map(Self::linux_resources_to_oci)
+            {
+                linux.resources = Some(resources);
+            }
+        }
+
+        let mut annotations = spec.annotations.unwrap_or_default();
+        annotations.insert(
+            "org.opencontainers.image.ref.name".to_string(),
+            restore.image_ref.clone(),
+        );
+        for (key, value) in &config.annotations {
+            annotations.insert(key.clone(), value.clone());
+        }
+        spec.annotations = Some(annotations);
+
+        Ok(spec)
+    }
+
+    pub fn checkpoint_container(&self, container_id: &str, image_path: &Path) -> Result<()> {
+        let work_path = image_path.join("work");
+        std::fs::create_dir_all(image_path).with_context(|| {
+            format!(
+                "Failed to create checkpoint image directory {}",
+                image_path.display()
+            )
+        })?;
+        std::fs::create_dir_all(&work_path).with_context(|| {
+            format!(
+                "Failed to create checkpoint work directory {}",
+                work_path.display()
+            )
+        })?;
+
+        self.runc_exec(&[
+            "checkpoint",
+            "--image-path",
+            &image_path.to_string_lossy(),
+            "--work-path",
+            &work_path.to_string_lossy(),
+            "--leave-running",
+            container_id,
+        ])
+    }
+
+    pub fn restore_container_from_checkpoint(
+        &self,
+        container_id: &str,
+        image_path: &Path,
+    ) -> Result<()> {
+        let work_path = image_path.join("work");
+        std::fs::create_dir_all(&work_path).with_context(|| {
+            format!(
+                "Failed to create restore work directory {}",
+                work_path.display()
+            )
+        })?;
+        let bundle_path = self.bundle_path(container_id);
+
+        self.runc_exec(&[
+            "restore",
+            "-d",
+            "--image-path",
+            &image_path.to_string_lossy(),
+            "--work-path",
+            &work_path.to_string_lossy(),
+            "--bundle",
+            &bundle_path.to_string_lossy(),
+            "--no-pivot",
+            container_id,
+        ])
+    }
+
+    pub fn restore_attach_shim(&self, container_id: &str) -> Result<()> {
+        let shim_manager = self
+            .shim_manager
+            .as_ref()
+            .context("attach recovery requires shim-enabled runtime")?;
+        if !self.container_uses_terminal(container_id)? {
+            return Err(anyhow::anyhow!(
+                "attach recovery is only supported for tty containers"
+            ));
+        }
+
+        let bundle_path = self.bundle_path(container_id);
+        if !bundle_path.exists() {
+            return Err(anyhow::anyhow!(
+                "bundle path is missing for attach recovery: {}",
+                bundle_path.display()
+            ));
+        }
+
+        shim_manager
+            .start_shim(container_id, &bundle_path)
+            .context("failed to restore shim for attach recovery")?;
+        Ok(())
+    }
+
     pub fn new(runtime_path: PathBuf, root: PathBuf) -> Self {
+        let image_storage_root = root
+            .parent()
+            .map(|parent| parent.join("storage"))
+            .unwrap_or_else(|| root.join("storage"));
         Self {
             runtime_path,
             root,
+            image_storage_root,
             shim_manager: None,
         }
     }
 
     /// 创建带shim支持的运行时
     pub fn with_shim(runtime_path: PathBuf, root: PathBuf, shim_config: ShimConfig) -> Self {
+        let image_storage_root = root
+            .parent()
+            .map(|parent| parent.join("storage"))
+            .unwrap_or_else(|| root.join("storage"));
+        Self::with_shim_and_image_storage(runtime_path, root, image_storage_root, shim_config)
+    }
+
+    pub fn with_shim_and_image_storage(
+        runtime_path: PathBuf,
+        root: PathBuf,
+        image_storage_root: PathBuf,
+        shim_config: ShimConfig,
+    ) -> Self {
         let shim_manager = Arc::new(ShimManager::new(shim_config));
         Self {
             runtime_path,
             root,
+            image_storage_root,
             shim_manager: Some(shim_manager),
         }
     }
@@ -629,11 +852,6 @@ impl RuncRuntime {
     /// 获取容器的bundle目录
     fn bundle_path(&self, container_id: &str) -> PathBuf {
         self.root.join(container_id)
-    }
-
-    /// 获取容器的rootfs目录
-    fn rootfs_path(&self, container_id: &str) -> PathBuf {
-        self.bundle_path(container_id).join("rootfs")
     }
 
     /// 获取容器的config.json路径
@@ -923,13 +1141,49 @@ impl RuncRuntime {
             .as_ref()
             .context("container log reopen requires shim-enabled runtime")?;
         let socket_path = shim_manager.socket_path(container_id, "reopen.sock");
-        let _stream = StdUnixStream::connect(&socket_path).with_context(|| {
+        let mut stream = StdUnixStream::connect(&socket_path).with_context(|| {
             format!(
                 "Failed to connect reopen log socket {}",
                 socket_path.display()
             )
         })?;
-        Ok(())
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .with_context(|| {
+                format!(
+                    "Failed to configure reopen log socket timeout {}",
+                    socket_path.display()
+                )
+            })?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).with_context(|| {
+            format!(
+                "Failed to read reopen log response from {}",
+                socket_path.display()
+            )
+        })?;
+
+        let response = response.trim();
+        if response == "OK" {
+            Ok(())
+        } else if response.is_empty() {
+            Err(anyhow::anyhow!(
+                "reopen log socket {} closed without acknowledgement",
+                socket_path.display()
+            ))
+        } else if let Some(reason) = response.strip_prefix("ERR ") {
+            Err(anyhow::anyhow!(
+                "shim failed to reopen log file for {}: {}",
+                container_id,
+                reason
+            ))
+        } else {
+            Err(anyhow::anyhow!(
+                "unexpected reopen log response from {}: {}",
+                socket_path.display(),
+                response
+            ))
+        }
     }
 }
 
@@ -937,20 +1191,29 @@ impl ContainerRuntime for RuncRuntime {
     fn create_container(&self, config: &ContainerConfig) -> Result<String> {
         // 生成容器ID
         let container_id = Uuid::new_v4().to_simple().to_string();
+        let checkpoint_restore = Self::checkpoint_restore_from_annotations(&config.annotations);
+        let image_ref = checkpoint_restore
+            .as_ref()
+            .map(|restore| restore.image_ref.as_str())
+            .unwrap_or(config.image.as_str());
 
         info!(
             "Creating container {} with image {}",
-            container_id, config.image
+            container_id, image_ref
         );
 
         // 先从镜像构建rootfs，再生成OCI配置
-        self.prepare_rootfs_from_image(config, &container_id)
+        self.prepare_rootfs_from_image(image_ref, &config.rootfs, &container_id)
             .context("Failed to prepare rootfs from image")?;
 
         // 创建OCI配置
-        let spec = self
-            .create_spec(config, &container_id)
-            .context("Failed to create OCI spec")?;
+        let spec = if let Some(checkpoint_restore) = checkpoint_restore.as_ref() {
+            self.spec_from_restore_template(config, checkpoint_restore)
+                .context("Failed to create OCI spec from checkpoint artifact")?
+        } else {
+            self.create_spec(config, &container_id)
+                .context("Failed to create OCI spec")?
+        };
 
         // 创建bundle
         self.create_bundle(&container_id, &config.rootfs, &spec)?;
@@ -1193,6 +1456,7 @@ impl ContainerRuntime for RuncRuntime {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
     use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
     use std::thread;
@@ -1258,6 +1522,31 @@ mod tests {
         let (runtime, _temp) = create_test_runtime();
         let path = runtime.bundle_path("test-container");
         assert!(path.to_string_lossy().contains("test-container"));
+    }
+
+    #[test]
+    fn test_resolve_image_dir_uses_runtime_configured_storage_root() {
+        let temp_dir = tempdir().unwrap();
+        let storage_root = temp_dir
+            .path()
+            .join("storage")
+            .join("images")
+            .join("sha256:test-image");
+        fs::create_dir_all(&storage_root).unwrap();
+        fs::write(
+            storage_root.join("metadata.json"),
+            serde_json::json!({
+                "id": "sha256:test-image",
+                "repo_tags": ["busybox:latest"],
+                "size": 123,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let runtime = RuncRuntime::new(PathBuf::from("runc"), temp_dir.path().join("containers"));
+        let resolved = runtime.resolve_image_dir("busybox:latest").unwrap();
+        assert_eq!(resolved, storage_root);
     }
 
     #[test]
@@ -1537,7 +1826,8 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         let (tx, rx) = mpsc::channel();
         let server = thread::spawn(move || {
-            let _ = listener.accept().unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"OK\n").unwrap();
             tx.send(()).unwrap();
         });
 
@@ -1552,6 +1842,40 @@ mod tests {
 
         runtime.reopen_container_log(container_id).unwrap();
         rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires unix socket bind permissions in the current test environment"]
+    fn test_reopen_container_log_surfaces_shim_error() {
+        let temp_dir = tempdir().unwrap();
+        let shim_dir = temp_dir.path().join("shims");
+        let container_id = "container-1";
+        let container_shim_dir = shim_dir.join(container_id);
+        fs::create_dir_all(&container_shim_dir).unwrap();
+        let socket_path = container_shim_dir.join("reopen.sock");
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(b"ERR failed to reopen underlying log file\n")
+                .unwrap();
+        });
+
+        let runtime = RuncRuntime::with_shim(
+            PathBuf::from("runc"),
+            temp_dir.path().join("containers"),
+            ShimConfig {
+                work_dir: shim_dir,
+                ..Default::default()
+            },
+        );
+
+        let err = runtime.reopen_container_log(container_id).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("failed to reopen underlying log file"));
         server.join().unwrap();
     }
 }

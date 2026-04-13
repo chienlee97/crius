@@ -3,7 +3,7 @@
 //! 提供容器端口到主机端口的映射功能，支持iptables和nftables
 
 use anyhow::{Context, Result};
-use log::{debug, error, info};
+use log::{debug, info};
 use std::net::IpAddr;
 use std::process::Command;
 
@@ -288,7 +288,7 @@ impl PortMappingManager {
     }
 
     /// 删除nftables规则
-    fn remove_nftables_rule(&self, mapping: &PortMapping) -> Result<()> {
+    fn remove_nftables_rule(&self, _mapping: &PortMapping) -> Result<()> {
         // nftables通过table管理，删除整个table或特定规则
         // 简化实现：删除crius table（如果存在）
         let output = Command::new("nft")

@@ -8,10 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
-use crate::network::{
-    DefaultNetworkManager, NetworkInterface, NetworkManager, NetworkStatus,
-    PortMapping as NetworkPortMapping, PortMappingBackend, PortMappingManager, Protocol,
-};
+use crate::network::{DefaultNetworkManager, NetworkInterface, NetworkManager, NetworkStatus};
 use crate::proto::runtime::v1::{LinuxContainerResources, NamespaceOption};
 use crate::runtime::{
     ContainerConfig, ContainerRuntime, ContainerStatus, NamespacePaths, SeccompProfile,
@@ -258,6 +255,10 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
                 &netns_path.to_string_lossy(),
                 &config.name,
                 &config.namespace,
+                config
+                    .network_config
+                    .as_ref()
+                    .map(|network| network.pod_cidr.as_str()),
             )
             .await?;
         let discovered_interfaces = self.discover_netns_interfaces(&netns_name).await;
@@ -400,7 +401,12 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
             debug!("Tearing down pod network for {}", pod_id);
             let _ = self
                 .network_manager
-                .teardown_pod_network(pod_id, &pod.netns_path.to_string_lossy())
+                .teardown_pod_network(
+                    pod_id,
+                    &pod.netns_path.to_string_lossy(),
+                    &pod.config.namespace,
+                    &pod.config.name,
+                )
                 .await;
 
             // 3. 删除网络命名空间
@@ -509,7 +515,7 @@ pub struct PodSandboxStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{ContainerConfig, RuncRuntime};
+    use crate::runtime::RuncRuntime;
     use tempfile::tempdir;
 
     // 注意：这些测试需要root权限和runc环境
