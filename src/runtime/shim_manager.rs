@@ -4,12 +4,14 @@
 
 use anyhow::{Context, Result};
 use log::{debug, info};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 const DEFAULT_SHIM_WORK_DIR: &str = "/var/run/crius/shims";
+const SHIM_METADATA_FILE: &str = "shim.json";
 
 pub fn default_shim_work_dir() -> PathBuf {
     std::env::var("CRIUS_SHIM_DIR")
@@ -42,7 +44,7 @@ impl Default for ShimConfig {
 }
 
 /// Shim进程信息
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShimProcess {
     /// 容器ID
     pub container_id: String,
@@ -67,14 +69,92 @@ pub struct ShimManager {
 }
 
 impl ShimManager {
+    fn metadata_path(&self, container_id: &str) -> PathBuf {
+        self.config
+            .work_dir
+            .join(container_id)
+            .join(SHIM_METADATA_FILE)
+    }
+
+    fn process_exists(pid: u32) -> bool {
+        PathBuf::from("/proc").join(pid.to_string()).exists()
+    }
+
+    fn persist_process_metadata(&self, process: &ShimProcess) -> Result<()> {
+        let metadata_path = self.metadata_path(&process.container_id);
+        if let Some(parent) = metadata_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&metadata_path, serde_json::to_vec_pretty(process)?)?;
+        Ok(())
+    }
+
+    fn remove_process_metadata(&self, container_id: &str) -> Result<()> {
+        let metadata_path = self.metadata_path(container_id);
+        if metadata_path.exists() {
+            fs::remove_file(metadata_path)?;
+        }
+        Ok(())
+    }
+
+    fn restore_processes_from_disk(config: &ShimConfig) -> Vec<ShimProcess> {
+        let mut restored = Vec::new();
+        let Ok(entries) = fs::read_dir(&config.work_dir) else {
+            return restored;
+        };
+
+        for entry in entries.flatten() {
+            let metadata_path = entry.path().join(SHIM_METADATA_FILE);
+            if !metadata_path.exists() {
+                continue;
+            }
+
+            let raw = match fs::read(&metadata_path) {
+                Ok(raw) => raw,
+                Err(err) => {
+                    debug!(
+                        "Ignoring unreadable shim metadata {}: {}",
+                        metadata_path.display(),
+                        err
+                    );
+                    continue;
+                }
+            };
+            let process: ShimProcess = match serde_json::from_slice(&raw) {
+                Ok(process) => process,
+                Err(err) => {
+                    debug!(
+                        "Ignoring invalid shim metadata {}: {}",
+                        metadata_path.display(),
+                        err
+                    );
+                    continue;
+                }
+            };
+
+            if Self::process_exists(process.shim_pid) || process.exit_code_file.exists() {
+                restored.push(process);
+            } else {
+                debug!(
+                    "Ignoring stale shim metadata for container {} from {}",
+                    process.container_id,
+                    metadata_path.display()
+                );
+            }
+        }
+
+        restored
+    }
+
     /// 创建新的ShimManager
     pub fn new(config: ShimConfig) -> Self {
         // 确保工作目录存在
         let _ = fs::create_dir_all(&config.work_dir);
+        let restored = Self::restore_processes_from_disk(&config);
 
         Self {
             config,
-            processes: Arc::new(Mutex::new(Vec::new())),
+            processes: Arc::new(Mutex::new(restored)),
         }
     }
 
@@ -145,7 +225,10 @@ impl ShimManager {
 
         // 添加到进程列表
         let mut processes = self.processes.lock().unwrap();
+        processes.retain(|existing| existing.container_id != container_id);
         processes.push(process.clone());
+        drop(processes);
+        self.persist_process_metadata(&process)?;
 
         Ok(process)
     }
@@ -192,6 +275,7 @@ impl ShimManager {
 
             // 清理socket文件
             let _ = fs::remove_file(&process.socket_path);
+            let _ = self.remove_process_metadata(container_id);
 
             info!("Shim for container {} stopped", container_id);
         }
@@ -213,12 +297,7 @@ impl ShimManager {
             // 检查进程是否存在
             #[cfg(unix)]
             {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-
-                let pid = Pid::from_raw(process.shim_pid as i32);
-                // 发送信号0检查进程是否存在
-                signal::kill(pid, Signal::SIGCHLD).is_ok()
+                Self::process_exists(process.shim_pid)
             }
             #[cfg(not(unix))]
             {
@@ -239,11 +318,7 @@ impl ShimManager {
             let is_running = {
                 #[cfg(unix)]
                 {
-                    use nix::sys::signal::{self, Signal};
-                    use nix::unistd::Pid;
-
-                    let pid = Pid::from_raw(process.shim_pid as i32);
-                    signal::kill(pid, Signal::SIGCHLD).is_ok()
+                    Self::process_exists(process.shim_pid)
                 }
                 #[cfg(not(unix))]
                 {
@@ -258,6 +333,7 @@ impl ShimManager {
                 );
                 // 清理socket文件
                 let _ = fs::remove_file(&process.socket_path);
+                let _ = self.remove_process_metadata(&process.container_id);
             }
 
             is_running
@@ -289,6 +365,7 @@ impl ShimManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -310,5 +387,63 @@ mod tests {
         let manager = ShimManager::new(config);
         let shims = manager.list_shims();
         assert!(shims.is_empty());
+    }
+
+    #[test]
+    fn test_shim_manager_restores_live_metadata_from_disk() {
+        let temp_dir = tempdir().unwrap();
+        let work_dir = temp_dir.path().join("shims");
+        let container_dir = work_dir.join("container-1");
+        fs::create_dir_all(&container_dir).unwrap();
+
+        let process = ShimProcess {
+            container_id: "container-1".to_string(),
+            shim_pid: std::process::id(),
+            exit_code_file: container_dir.join("exit_code"),
+            log_file: container_dir.join("shim.log"),
+            socket_path: container_dir.join("attach.sock"),
+            bundle_path: temp_dir.path().join("bundle"),
+        };
+        fs::write(
+            container_dir.join(SHIM_METADATA_FILE),
+            serde_json::to_vec_pretty(&process).unwrap(),
+        )
+        .unwrap();
+
+        let manager = ShimManager::new(ShimConfig {
+            work_dir,
+            ..Default::default()
+        });
+        let shims = manager.list_shims();
+        assert_eq!(shims.len(), 1);
+        assert_eq!(shims[0].container_id, "container-1");
+    }
+
+    #[test]
+    fn test_shim_manager_ignores_stale_metadata_from_disk() {
+        let temp_dir = tempdir().unwrap();
+        let work_dir = temp_dir.path().join("shims");
+        let container_dir = work_dir.join("stale-container");
+        fs::create_dir_all(&container_dir).unwrap();
+
+        let process = ShimProcess {
+            container_id: "stale-container".to_string(),
+            shim_pid: 999_999,
+            exit_code_file: container_dir.join("exit_code"),
+            log_file: container_dir.join("shim.log"),
+            socket_path: container_dir.join("attach.sock"),
+            bundle_path: temp_dir.path().join("bundle"),
+        };
+        fs::write(
+            container_dir.join(SHIM_METADATA_FILE),
+            serde_json::to_vec_pretty(&process).unwrap(),
+        )
+        .unwrap();
+
+        let manager = ShimManager::new(ShimConfig {
+            work_dir,
+            ..Default::default()
+        });
+        assert!(manager.list_shims().is_empty());
     }
 }

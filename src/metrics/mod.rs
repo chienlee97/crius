@@ -8,9 +8,8 @@
 //! - 进程数统计
 
 use anyhow::{Context, Result};
-use log::{debug, warn};
+use log::debug;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -174,12 +173,12 @@ impl MetricsCollector {
     pub fn collect_container_stats(
         &self,
         container_id: &str,
-        _cgroup_path: &Path,
+        cgroup_path: &Path,
     ) -> Result<ContainerStats> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_nanos() as u64;
 
         let mut stats = ContainerStats {
             container_id: container_id.to_string(),
@@ -188,14 +187,8 @@ impl MetricsCollector {
         };
 
         // 尝试找到容器的cgroup路径
-        let cgroup_base = if self.cgroup_v2 {
-            PathBuf::from("/sys/fs/cgroup")
-        } else {
-            PathBuf::from("/sys/fs/cgroup")
-        };
-
-        // 采集CPU统计 - 尝试找到正确的cgroup路径
-        let cpu_path = self.find_cgroup_path(&cgroup_base, container_id, "cpu,cpuacct");
+        // 采集CPU统计 - 优先使用调用方提供的 cgroup 路径提示
+        let cpu_path = self.find_cgroup_path(cgroup_path, container_id, "cpu,cpuacct");
         if let Some(ref path) = cpu_path {
             if let Ok(cpu) = self.collect_cpu_stats(path) {
                 stats.cpu = Some(cpu);
@@ -203,7 +196,7 @@ impl MetricsCollector {
         }
 
         // 采集内存统计
-        let memory_path = self.find_cgroup_path(&cgroup_base, container_id, "memory");
+        let memory_path = self.find_cgroup_path(cgroup_path, container_id, "memory");
         if let Some(ref path) = memory_path {
             if let Ok(memory) = self.collect_memory_stats(path) {
                 stats.memory = Some(memory);
@@ -211,7 +204,7 @@ impl MetricsCollector {
         }
 
         // 采集块IO统计
-        let blkio_path = self.find_cgroup_path(&cgroup_base, container_id, "blkio");
+        let blkio_path = self.find_cgroup_path(cgroup_path, container_id, "blkio");
         if let Some(ref path) = blkio_path {
             if let Ok(blkio) = self.collect_blkio_stats(path) {
                 stats.blkio = Some(blkio);
@@ -219,7 +212,7 @@ impl MetricsCollector {
         }
 
         // 采集PIDs统计
-        let pids_path = self.find_cgroup_path(&cgroup_base, container_id, "pids");
+        let pids_path = self.find_cgroup_path(cgroup_path, container_id, "pids");
         if let Some(ref path) = pids_path {
             if let Ok(pids) = self.collect_pids_stats(path) {
                 stats.pids = Some(pids);
@@ -237,23 +230,61 @@ impl MetricsCollector {
     }
 
     /// 查找容器的cgroup路径
-    fn find_cgroup_path(&self, base: &Path, container_id: &str, subsystem: &str) -> Option<PathBuf> {
-        // 尝试直接路径: /sys/fs/cgroup/SUBSYSTEM/CONTAINER_ID
-        let direct_path = base.join(subsystem).join(container_id);
-        if direct_path.exists() {
-            return Some(direct_path);
+    fn find_cgroup_path(
+        &self,
+        hint: &Path,
+        container_id: &str,
+        subsystem: &str,
+    ) -> Option<PathBuf> {
+        let mut search_roots = Vec::new();
+
+        if !hint.as_os_str().is_empty() && hint != Path::new("/sys/fs/cgroup") {
+            if hint.exists() {
+                search_roots.push(hint.to_path_buf());
+            }
+
+            if self.cgroup_v2 {
+                if hint.is_absolute() {
+                    if let Ok(stripped) = hint.strip_prefix(&self.cgroup_base) {
+                        search_roots.push(self.cgroup_base.join(stripped));
+                    }
+                } else {
+                    search_roots.push(self.cgroup_base.join(hint));
+                }
+            } else {
+                let subsystem_root = self.cgroup_base.join(subsystem);
+                if hint.is_absolute() {
+                    if let Ok(stripped) = hint.strip_prefix(&self.cgroup_base) {
+                        search_roots.push(subsystem_root.join(stripped));
+                    }
+                } else {
+                    search_roots.push(subsystem_root.join(hint));
+                }
+            }
         }
 
-        // 递归查找所有子目录
-        let subsystem_path = base.join(subsystem);
-        if let Ok(entries) = fs::read_dir(&subsystem_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(found) = self.find_in_directory(&path, container_id) {
-                        return Some(found);
-                    }
-                }
+        if self.cgroup_v2 {
+            search_roots.push(self.cgroup_base.clone());
+        } else {
+            search_roots.push(self.cgroup_base.join(subsystem));
+        }
+
+        for root in search_roots {
+            if !root.exists() {
+                continue;
+            }
+
+            if root.file_name().and_then(|name| name.to_str()) == Some(container_id) {
+                return Some(root);
+            }
+
+            let direct_path = root.join(container_id);
+            if direct_path.exists() {
+                return Some(direct_path);
+            }
+
+            if let Some(found) = self.find_in_directory(&root, container_id) {
+                return Some(found);
             }
         }
 

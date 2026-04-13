@@ -3,14 +3,14 @@
 //! 提供OCI镜像层的存储、复用和垃圾回收功能
 //! 使用内容寻址存储(CAS)实现层复用
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
-use log::{debug, error, info, warn};
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// 镜像层信息
@@ -35,7 +35,7 @@ pub struct ImageLayer {
 /// 层存储管理器
 pub struct LayerStore {
     /// 层存储根目录
-    root_dir: PathBuf,
+    _root_dir: PathBuf,
     /// 层索引 (layer_id -> ImageLayer)
     layers: HashMap<String, ImageLayer>,
     /// 镜像层映射 (image_id -> Vec<layer_id>)
@@ -184,7 +184,7 @@ impl LayerStore {
 
         let index_path = root_dir.join("layers.json");
         let mut store = Self {
-            root_dir,
+            _root_dir: root_dir,
             layers: HashMap::new(),
             image_layers: HashMap::new(),
             index_path,

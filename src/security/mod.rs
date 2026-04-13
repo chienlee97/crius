@@ -7,9 +7,8 @@
 //! - Capabilities能力管理
 
 use anyhow::{Context, Result};
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::path::Path;
 
 /// 安全配置
@@ -168,7 +167,7 @@ pub struct SecurityManager {
     /// Seccomp是否可用
     seccomp_available: bool,
     /// 默认安全配置
-    default_config: SecurityConfig,
+    _default_config: SecurityConfig,
 }
 
 impl SecurityManager {
@@ -187,7 +186,7 @@ impl SecurityManager {
             selinux_available,
             apparmor_available,
             seccomp_available,
-            default_config: SecurityConfig::default(),
+            _default_config: SecurityConfig::default(),
         }
     }
 

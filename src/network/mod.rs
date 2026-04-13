@@ -2,13 +2,9 @@
 //!
 //! 提供容器网络功能，包括网络命名空间管理、CNI 接口等。
 
-use std::collections::HashMap;
-use std::net::IpAddr;
 use std::path::Path;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tokio::process::Command;
 
 pub mod cni;
@@ -45,10 +41,17 @@ pub trait NetworkManager: Send + Sync + 'static {
         netns: &str,
         pod_name: &str,
         pod_namespace: &str,
+        pod_cidr: Option<&str>,
     ) -> Result<NetworkStatus, NetworkError>;
 
     /// 清理 Pod 网络
-    async fn teardown_pod_network(&self, pod_id: &str, netns: &str) -> Result<(), NetworkError>;
+    async fn teardown_pod_network(
+        &self,
+        pod_id: &str,
+        netns: &str,
+        pod_namespace: &str,
+        pod_name: &str,
+    ) -> Result<(), NetworkError>;
 }
 
 /// 默认网络管理器实现
@@ -147,6 +150,7 @@ impl NetworkManager for DefaultNetworkManager {
         netns: &str,
         pod_name: &str,
         pod_namespace: &str,
+        pod_cidr: Option<&str>,
     ) -> Result<NetworkStatus, NetworkError> {
         let netns_name = Path::new(netns)
             .file_name()
@@ -154,18 +158,40 @@ impl NetworkManager for DefaultNetworkManager {
             .unwrap_or(netns);
         self.ensure_loopback_up(netns_name).await?;
 
-        // 这里将调用 CNI 插件来设置网络
-        // 简化实现，实际实现中需要调用 CNI 插件
-        Ok(NetworkStatus {
-            name: "default".to_string(),
-            ip: None,
-            mac: None,
-            interfaces: vec![],
-        })
+        let mut cni = CniManager::new(
+            self.cni_plugin_dirs.clone(),
+            self.cni_config_dirs.clone(),
+            self.cni_cache_dir.clone(),
+        )
+        .map_err(|e| NetworkError::Other(e.to_string()))?;
+        cni.load_network_configs()
+            .await
+            .map_err(|e| NetworkError::Other(e.to_string()))?;
+
+        cni.setup_pod_network(pod_id, netns, pod_name, pod_namespace, pod_cidr)
+            .await
+            .map_err(|e| NetworkError::Other(e.to_string()))
     }
 
-    async fn teardown_pod_network(&self, _pod_id: &str, _netns: &str) -> Result<(), NetworkError> {
-        // 这里将调用 CNI 插件来清理网络
+    async fn teardown_pod_network(
+        &self,
+        pod_id: &str,
+        netns: &str,
+        pod_namespace: &str,
+        pod_name: &str,
+    ) -> Result<(), NetworkError> {
+        let mut cni = CniManager::new(
+            self.cni_plugin_dirs.clone(),
+            self.cni_config_dirs.clone(),
+            self.cni_cache_dir.clone(),
+        )
+        .map_err(|e| NetworkError::Other(e.to_string()))?;
+        cni.load_network_configs()
+            .await
+            .map_err(|e| NetworkError::Other(e.to_string()))?;
+        let _ = cni
+            .teardown_pod_network(pod_id, netns, pod_namespace, pod_name)
+            .await;
         Ok(())
     }
 }
@@ -173,7 +199,6 @@ impl NetworkManager for DefaultNetworkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[tokio::test]
     #[ignore = "requires root privileges and iproute2"] // 需要root权限运行ip netns
@@ -218,6 +243,7 @@ mod tests {
                 &format!("/var/run/netns/{}", ns_name),
                 "pod",
                 "default",
+                None,
             )
             .await?;
 

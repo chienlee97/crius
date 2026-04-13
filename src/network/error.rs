@@ -1,4 +1,3 @@
-use std::fmt;
 use std::io;
 use std::process::ExitStatus;
 
@@ -50,6 +49,3 @@ impl NetworkError {
         Self::InvalidArgument(msg.into())
     }
 }
-
-/// 结果类型别名
-pub type Result<T> = std::result::Result<T, NetworkError>;

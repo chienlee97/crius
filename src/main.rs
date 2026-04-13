@@ -5,32 +5,18 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Error;
 use clap::Parser;
+use crius::image::ImageServiceImpl;
+use crius::proto::runtime::v1::{
+    image_service_server::ImageServiceServer, runtime_service_server::RuntimeServiceServer,
+};
+use crius::server::{RuntimeConfig, RuntimeServiceImpl};
+use crius::streaming::StreamingServer;
 use tokio::net::UnixListener as TokioUnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 use tonic_reflection::server::Builder as ReflectionBuilder;
 use tracing::{debug, info};
 use tracing_subscriber::{fmt, EnvFilter};
-
-use crate::image::ImageServiceImpl;
-use crate::proto::runtime::v1::{
-    image_service_server::ImageServiceServer, runtime_service_server::RuntimeServiceServer,
-};
-use crate::server::{RuntimeConfig, RuntimeServiceImpl};
-
-mod attach;
-mod cgroups;
-mod error;
-mod image;
-mod metrics;
-mod network;
-mod oci;
-mod pod;
-mod proto;
-mod runtime;
-mod server;
-mod storage;
-mod streaming;
 
 /// crius - OCI-based implementation of Kubernetes Container Runtime Interface
 #[derive(Parser, Debug)]
@@ -95,11 +81,8 @@ async fn main() -> Result<(), Error> {
 
     // 创建服务实例
     let runtime_service = RuntimeServiceImpl::new(runtime_config.clone());
-    let streaming_server = crate::streaming::StreamingServer::start(
-        "127.0.0.1:0",
-        runtime_config.runtime_path.clone(),
-    )
-    .await?;
+    let streaming_server =
+        StreamingServer::start("127.0.0.1:0", runtime_config.runtime_path.clone()).await?;
     runtime_service
         .set_streaming_server(streaming_server.clone())
         .await;
@@ -170,6 +153,7 @@ fn init_logging() -> Result<(), Error> {
         .add_directive("tower_http=info".parse()?);
 
     fmt()
+        .with_env_filter(filter)
         .with_file(true)
         .with_line_number(true)
         .with_writer(std::io::stderr)

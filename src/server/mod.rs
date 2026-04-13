@@ -1,10 +1,11 @@
+use anyhow::Context;
 use log;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
@@ -29,10 +30,9 @@ use crate::proto::runtime::v1::{
     ImageSpec, LinuxPodSandboxStatus, ListContainerStatsRequest, ListContainerStatsResponse,
     ListContainersRequest, ListContainersResponse, ListMetricDescriptorsRequest,
     ListMetricDescriptorsResponse, ListPodSandboxMetricsRequest, ListPodSandboxMetricsResponse,
-    Metric, MetricDescriptor, MetricType,
     ListPodSandboxRequest, ListPodSandboxResponse, ListPodSandboxStatsRequest,
     ListPodSandboxStatsResponse, Namespace, NamespaceMode, NamespaceOption, PodIp,
-    PodSandboxAttributes, PodSandboxMetadata, PodSandboxNetworkStatus, PodSandboxState, PodSandboxStats, PodSandboxStatsRequest,
+    PodSandboxMetadata, PodSandboxNetworkStatus, PodSandboxState, PodSandboxStatsRequest,
     PodSandboxStatsResponse, PodSandboxStatus, PodSandboxStatusRequest, PodSandboxStatusResponse,
     RemoveContainerRequest, RemoveContainerResponse, RemovePodSandboxRequest,
     RemovePodSandboxResponse, ReopenContainerLogRequest, ReopenContainerLogResponse,
@@ -43,14 +43,14 @@ use crate::proto::runtime::v1::{
 };
 use crate::storage::persistence::{PersistenceConfig, PersistenceManager};
 
+use crate::metrics::MetricsCollector;
 use crate::network::{DefaultNetworkManager, NetworkManager};
 use crate::pod::{PodSandboxConfig, PodSandboxManager};
 use crate::runtime::{
     default_shim_work_dir, ContainerConfig, ContainerRuntime, ContainerStatus, DeviceMapping,
-    MountConfig, NamespacePaths, RuncRuntime, SeccompProfile, ShimConfig,
+    MountConfig, NamespacePaths, RuncRuntime, SeccompProfile, ShimConfig, ShimProcess,
 };
 use crate::streaming::StreamingServer;
-use crate::metrics::MetricsCollector;
 
 /// 运行时服务实现
 #[derive(Debug)]
@@ -73,6 +73,10 @@ pub struct RuntimeServiceImpl {
     events: tokio::sync::broadcast::Sender<ContainerEventResponse>,
     // shim 工作目录
     shim_work_dir: PathBuf,
+    // UpdateRuntimeConfig 下发的运行时网络配置
+    runtime_network_config: Arc<Mutex<Option<crate::proto::runtime::v1::NetworkConfig>>>,
+    // 已注册的退出监控任务，避免重复启动
+    exit_monitors: Arc<Mutex<HashSet<String>>>,
 }
 
 /// 运行时配置
@@ -90,6 +94,8 @@ pub struct RuntimeConfig {
 const INTERNAL_ANNOTATION_PREFIX: &str = "io.crius.internal/";
 const INTERNAL_POD_STATE_KEY: &str = "io.crius.internal/pod-state";
 const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";
+const INTERNAL_CHECKPOINT_RESTORE_KEY: &str = "io.crius.internal/checkpoint-restore";
+const CHECKPOINT_LOCATION_ANNOTATION_KEY: &str = "io.crius.checkpoint.location";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -244,6 +250,7 @@ impl From<&crate::proto::runtime::v1::SecurityProfile> for StoredSecurityProfile
 struct StoredPodState {
     log_directory: Option<String>,
     runtime_handler: String,
+    runtime_pod_cidr: Option<String>,
     netns_path: Option<String>,
     pause_container_id: Option<String>,
     ip: Option<String>,
@@ -270,6 +277,7 @@ struct StoredContainerState {
     tty: bool,
     stdin: bool,
     stdin_once: bool,
+    privileged: bool,
     readonly_rootfs: bool,
     cgroup_parent: Option<String>,
     network_namespace_path: Option<String>,
@@ -287,6 +295,20 @@ struct StoredContainerState {
     exit_code: Option<i32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredCheckpointRestore {
+    checkpoint_location: String,
+    checkpoint_image_path: String,
+    oci_config: serde_json::Value,
+    image_ref: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct StoredRuntimeNetworkConfig {
+    pod_cidr: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct StoredMount {
@@ -298,6 +320,61 @@ struct StoredMount {
 }
 
 impl RuntimeServiceImpl {
+    fn runtime_network_config_path(root_dir: &Path) -> PathBuf {
+        root_dir.join("runtime_network_config.json")
+    }
+
+    fn load_runtime_network_config(
+        root_dir: &Path,
+    ) -> anyhow::Result<Option<crate::proto::runtime::v1::NetworkConfig>> {
+        let path = Self::runtime_network_config_path(root_dir);
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let raw = std::fs::read(&path)
+            .with_context(|| format!("Failed to read runtime network config {}", path.display()))?;
+        let stored: StoredRuntimeNetworkConfig =
+            serde_json::from_slice(&raw).with_context(|| {
+                format!("Failed to parse runtime network config {}", path.display())
+            })?;
+        if stored.pod_cidr.trim().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(crate::proto::runtime::v1::NetworkConfig {
+                pod_cidr: stored.pod_cidr,
+            }))
+        }
+    }
+
+    fn persist_runtime_network_config(
+        root_dir: &Path,
+        config: Option<&crate::proto::runtime::v1::NetworkConfig>,
+    ) -> anyhow::Result<()> {
+        let path = Self::runtime_network_config_path(root_dir);
+        if let Some(config) = config {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "Failed to create runtime config directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            let stored = StoredRuntimeNetworkConfig {
+                pod_cidr: config.pod_cidr.clone(),
+            };
+            std::fs::write(&path, serde_json::to_vec_pretty(&stored)?).with_context(|| {
+                format!("Failed to write runtime network config {}", path.display())
+            })?;
+        } else if path.exists() {
+            std::fs::remove_file(&path).with_context(|| {
+                format!("Failed to remove runtime network config {}", path.display())
+            })?;
+        }
+        Ok(())
+    }
+
     fn normalize_timestamp_nanos(ts: i64) -> i64 {
         // Backward-compatible normalization: old records may still be seconds.
         if ts > 0 && ts < 1_000_000_000_000 {
@@ -546,6 +623,33 @@ impl RuntimeServiceImpl {
         }
     }
 
+    #[allow(deprecated)]
+    fn legacy_linux_sandbox_seccomp_profile_path(
+        security: Option<&crate::proto::runtime::v1::LinuxSandboxSecurityContext>,
+    ) -> &str {
+        security
+            .map(|security| security.seccomp_profile_path.as_str())
+            .unwrap_or("")
+    }
+
+    #[allow(deprecated)]
+    fn legacy_linux_container_apparmor_profile(
+        security: Option<&crate::proto::runtime::v1::LinuxContainerSecurityContext>,
+    ) -> &str {
+        security
+            .map(|security| security.apparmor_profile.as_str())
+            .unwrap_or("")
+    }
+
+    #[allow(deprecated)]
+    fn legacy_linux_container_seccomp_profile_path(
+        security: Option<&crate::proto::runtime::v1::LinuxContainerSecurityContext>,
+    ) -> &str {
+        security
+            .map(|ctx| ctx.seccomp_profile_path.as_str())
+            .unwrap_or("")
+    }
+
     fn selinux_label_from_proto(
         options: Option<&crate::proto::runtime::v1::SeLinuxOption>,
     ) -> Option<String> {
@@ -725,6 +829,116 @@ impl RuntimeServiceImpl {
         }
     }
 
+    fn checkpoint_bundle_path(&self, container_id: &str) -> PathBuf {
+        self.config.runtime_root.join(container_id)
+    }
+
+    fn checkpoint_config_path(&self, container_id: &str) -> PathBuf {
+        self.checkpoint_bundle_path(container_id)
+            .join("config.json")
+    }
+
+    fn checkpoint_runtime_image_path(location: &Path) -> PathBuf {
+        if location.extension().is_some() {
+            location.with_extension("checkpoint")
+        } else {
+            location.join("checkpoint")
+        }
+    }
+
+    fn load_checkpoint_artifact(
+        location: &Path,
+    ) -> anyhow::Result<(serde_json::Value, serde_json::Value)> {
+        if location.extension().is_some() {
+            let payload: serde_json::Value = serde_json::from_slice(&std::fs::read(location)?)
+                .with_context(|| {
+                    format!("Failed to parse checkpoint artifact {}", location.display())
+                })?;
+            let manifest = payload
+                .get("manifest")
+                .cloned()
+                .context("checkpoint artifact is missing manifest")?;
+            let oci_config = payload
+                .get("ociConfig")
+                .cloned()
+                .context("checkpoint artifact is missing ociConfig")?;
+            return Ok((manifest, oci_config));
+        }
+
+        let manifest_path = location.join("manifest.json");
+        let config_path = location.join("config.json");
+        let manifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path)?).with_context(|| {
+                format!(
+                    "Failed to parse checkpoint manifest {}",
+                    manifest_path.display()
+                )
+            })?;
+        let oci_config =
+            serde_json::from_slice(&std::fs::read(&config_path)?).with_context(|| {
+                format!(
+                    "Failed to parse checkpoint OCI config {}",
+                    config_path.display()
+                )
+            })?;
+        Ok((manifest, oci_config))
+    }
+
+    fn write_checkpoint_artifact(
+        &self,
+        location: &Path,
+        manifest: &serde_json::Value,
+        config_payload: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        if location.extension().is_some() {
+            if let Some(parent) = location.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "Failed to create checkpoint artifact directory {}",
+                        parent.display()
+                    )
+                })?;
+            }
+
+            let payload = json!({
+                "manifest": manifest,
+                "ociConfig": config_payload,
+            });
+            std::fs::write(location, serde_json::to_vec_pretty(&payload)?).with_context(|| {
+                format!("Failed to write checkpoint artifact {}", location.display())
+            })?;
+            return Ok(());
+        }
+
+        std::fs::create_dir_all(location).with_context(|| {
+            format!(
+                "Failed to create checkpoint artifact directory {}",
+                location.display()
+            )
+        })?;
+        std::fs::write(
+            location.join("manifest.json"),
+            serde_json::to_vec_pretty(manifest)?,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to write checkpoint manifest {}",
+                location.join("manifest.json").display()
+            )
+        })?;
+        std::fs::write(
+            location.join("config.json"),
+            serde_json::to_vec_pretty(config_payload)?,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to write checkpoint OCI config {}",
+                location.join("config.json").display()
+            )
+        })?;
+        Ok(())
+    }
+
     fn container_reason_message(runtime_state: i32, exit_code: i32) -> (String, String) {
         match runtime_state {
             x if x == ContainerState::ContainerCreated as i32 => (
@@ -836,46 +1050,7 @@ impl RuntimeServiceImpl {
         &self,
         pod_sandbox: &crate::proto::runtime::v1::PodSandbox,
     ) -> PodSandboxStatus {
-        let pod_state = Self::read_internal_state::<StoredPodState>(
-            &pod_sandbox.annotations,
-            INTERNAL_POD_STATE_KEY,
-        );
-
-        PodSandboxStatus {
-            id: pod_sandbox.id.clone(),
-            metadata: Some(pod_sandbox.metadata.clone().unwrap_or(PodSandboxMetadata {
-                name: pod_sandbox.id.clone(),
-                uid: pod_sandbox.id.clone(),
-                namespace: "default".to_string(),
-                attempt: 1,
-            })),
-            state: pod_sandbox.state,
-            created_at: Self::normalize_timestamp_nanos(pod_sandbox.created_at),
-            network: Self::pod_network_status_from_state(pod_state.as_ref()),
-            linux: Self::pod_linux_status_from_state(pod_state.as_ref()),
-            labels: pod_sandbox.labels.clone(),
-            annotations: Self::external_annotations(&pod_sandbox.annotations),
-            runtime_handler: if pod_sandbox.runtime_handler.is_empty() {
-                let restored = pod_state
-                    .as_ref()
-                    .map(|state| state.runtime_handler.clone())
-                    .filter(|handler| !handler.is_empty())
-                    .unwrap_or_else(|| self.config.runtime.clone());
-                if self
-                    .config
-                    .runtime_handlers
-                    .iter()
-                    .any(|handler| handler == &restored)
-                {
-                    restored
-                } else {
-                    self.config.runtime.clone()
-                }
-            } else {
-                pod_sandbox.runtime_handler.clone()
-            },
-            ..Default::default()
-        }
+        Self::build_pod_sandbox_status_snapshot_with_config(&self.config, pod_sandbox)
     }
 
     fn map_runtime_container_state(status: crate::runtime::ContainerStatus) -> i32 {
@@ -915,27 +1090,176 @@ impl RuntimeServiceImpl {
         }
     }
 
+    fn runtime_binary_version(&self) -> Option<String> {
+        if !self.config.runtime_path.exists() {
+            return None;
+        }
+
+        let output = Command::new(&self.config.runtime_path)
+            .arg("--version")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        String::from_utf8(output.stdout)
+            .ok()?
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim().to_string())
+    }
+
+    fn runtime_readiness(&self) -> (bool, String, String) {
+        let path = &self.config.runtime_path;
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                return (
+                    false,
+                    "RuntimeBinaryMissing".to_string(),
+                    format!("runtime binary does not exist at {}", path.display()),
+                );
+            }
+        };
+
+        if !metadata.is_file() {
+            return (
+                false,
+                "RuntimeBinaryInvalid".to_string(),
+                format!("runtime path is not a regular file: {}", path.display()),
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return (
+                    false,
+                    "RuntimeBinaryNotExecutable".to_string(),
+                    format!("runtime binary is not executable: {}", path.display()),
+                );
+            }
+        }
+
+        let version = self
+            .runtime_binary_version()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        (
+            true,
+            "RuntimeIsReady".to_string(),
+            format!(
+                "runtime binary is available at {} ({})",
+                path.display(),
+                version
+            ),
+        )
+    }
+
+    fn cni_config_dirs() -> Vec<PathBuf> {
+        std::env::var("CRIUS_CNI_CONFIG_DIRS")
+            .ok()
+            .map(|raw| {
+                raw.split(':')
+                    .map(str::trim)
+                    .filter(|dir| !dir.is_empty())
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|dirs| !dirs.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    PathBuf::from("/etc/cni/net.d"),
+                    PathBuf::from("/etc/kubernetes/cni/net.d"),
+                ]
+            })
+    }
+
+    fn cni_plugin_dirs() -> Vec<PathBuf> {
+        std::env::var("CRIUS_CNI_PLUGIN_DIRS")
+            .ok()
+            .or_else(|| std::env::var("CNI_PATH").ok())
+            .map(|raw| {
+                raw.split(':')
+                    .map(str::trim)
+                    .filter(|dir| !dir.is_empty())
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|dirs| !dirs.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    PathBuf::from("/opt/cni/bin"),
+                    PathBuf::from("/usr/lib/cni"),
+                    PathBuf::from("/usr/libexec/cni"),
+                ]
+            })
+    }
+
+    fn cni_plugin_types(config: &serde_json::Value) -> Vec<String> {
+        let mut plugin_types = Vec::new();
+        if let Some(plugin_type) = config.get("type").and_then(|value| value.as_str()) {
+            if !plugin_type.trim().is_empty() {
+                plugin_types.push(plugin_type.to_string());
+            }
+        }
+        if let Some(plugins) = config.get("plugins").and_then(|value| value.as_array()) {
+            for plugin in plugins {
+                if let Some(plugin_type) = plugin.get("type").and_then(|value| value.as_str()) {
+                    if !plugin_type.trim().is_empty() {
+                        plugin_types.push(plugin_type.to_string());
+                    }
+                }
+            }
+        }
+        plugin_types
+    }
+
+    fn path_is_executable(path: &Path) -> bool {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
     fn runtime_feature_flags(&self) -> serde_json::Value {
         json!({
             "exec": true,
             "execSync": true,
             "attach": true,
             "portForward": true,
-            "containerStats": false,
-            "podSandboxStats": false,
+            "containerStats": true,
+            "podSandboxStats": true,
+            "podSandboxMetrics": true,
             "containerEvents": true,
             "reopenContainerLog": true,
             "updateContainerResources": true,
-            "checkpointContainer": false,
+            "checkpointContainer": true,
         })
     }
 
     fn network_health(&self) -> (bool, String, String) {
-        let config_dirs = ["/etc/cni/net.d", "/etc/kubernetes/cni/net.d"];
-        let mut discovered = Vec::new();
+        let config_dirs = Self::cni_config_dirs();
+        let plugin_dirs = Self::cni_plugin_dirs();
+        let mut discovered_files = Vec::new();
+        let mut invalid_files = Vec::new();
+        let mut declared_plugins = HashSet::new();
 
         for dir in config_dirs {
-            let Ok(entries) = std::fs::read_dir(dir) else {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
             for entry in entries.flatten() {
@@ -945,24 +1269,76 @@ impl RuntimeServiceImpl {
                     .and_then(|ext| ext.to_str())
                     .map(|ext| matches!(ext, "conf" | "conflist" | "json"))
                     .unwrap_or(false);
-                if matches {
-                    discovered.push(path.display().to_string());
+                if !matches {
+                    continue;
+                }
+
+                discovered_files.push(path.display().to_string());
+                match std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                {
+                    Some(config) => {
+                        for plugin_type in Self::cni_plugin_types(&config) {
+                            declared_plugins.insert(plugin_type);
+                        }
+                    }
+                    None => invalid_files.push(path.display().to_string()),
                 }
             }
         }
 
-        if discovered.is_empty() {
+        if discovered_files.is_empty() {
             (
                 false,
                 "CNIConfigMissing".to_string(),
-                "no CNI config file found in /etc/cni/net.d or /etc/kubernetes/cni/net.d"
-                    .to_string(),
+                "no CNI config file found in configured CNI config directories".to_string(),
             )
+        } else if !invalid_files.is_empty() && declared_plugins.is_empty() {
+            (
+                false,
+                "CNIConfigInvalid".to_string(),
+                format!(
+                    "failed to parse {} CNI config file(s): {}",
+                    invalid_files.len(),
+                    invalid_files.join(", ")
+                ),
+            )
+        } else if !declared_plugins.is_empty() {
+            let missing_plugins: Vec<String> = declared_plugins
+                .iter()
+                .filter(|plugin_type| {
+                    !plugin_dirs
+                        .iter()
+                        .any(|dir| Self::path_is_executable(&dir.join(plugin_type.as_str())))
+                })
+                .cloned()
+                .collect();
+            if !missing_plugins.is_empty() {
+                (
+                    false,
+                    "CNIPluginMissing".to_string(),
+                    format!(
+                        "missing or non-executable CNI plugin binary/binaries: {}",
+                        missing_plugins.join(", ")
+                    ),
+                )
+            } else {
+                (
+                    true,
+                    "CNINetworkConfigReady".to_string(),
+                    format!(
+                        "discovered {} CNI config file(s) and {} plugin type(s)",
+                        discovered_files.len(),
+                        declared_plugins.len()
+                    ),
+                )
+            }
         } else {
             (
                 true,
                 "CNINetworkConfigReady".to_string(),
-                format!("discovered {} CNI config file(s)", discovered.len()),
+                format!("discovered {} CNI config file(s)", discovered_files.len()),
             )
         }
     }
@@ -992,7 +1368,10 @@ impl RuntimeServiceImpl {
         operation: &str,
     ) -> Result<(), Status> {
         let runtime_status = self.runtime_container_status_checked(container_id).await;
-        if matches!(runtime_status, ContainerStatus::Created | ContainerStatus::Running) {
+        if matches!(
+            runtime_status,
+            ContainerStatus::Created | ContainerStatus::Running
+        ) {
             return Ok(());
         }
 
@@ -1018,10 +1397,158 @@ impl RuntimeServiceImpl {
             .flatten()
     }
 
+    async fn runtime_cgroup_hint_checked(&self, container_id: &str) -> Option<PathBuf> {
+        let pid = self.runtime_container_pid_checked(container_id).await?;
+        let raw = tokio::fs::read_to_string(format!("/proc/{}/cgroup", pid))
+            .await
+            .ok()?;
+
+        Self::parse_cgroup_hint_from_procfs(&raw)
+    }
+
+    fn parse_cgroup_hint_from_procfs(raw: &str) -> Option<PathBuf> {
+        for line in raw.lines() {
+            let mut parts = line.splitn(3, ':');
+            let _hierarchy = parts.next();
+            let controllers = parts.next().unwrap_or_default();
+            let path = parts.next().unwrap_or_default();
+            if path.is_empty() {
+                continue;
+            }
+
+            if controllers.is_empty()
+                || controllers
+                    .split(',')
+                    .any(|controller| matches!(controller, "cpu" | "cpuacct" | "memory" | "pids"))
+            {
+                return Some(PathBuf::from(path));
+            }
+        }
+
+        None
+    }
+
+    async fn container_cgroup_hint(&self, container_id: &str, container: &Container) -> PathBuf {
+        if let Some(hint) = self.runtime_cgroup_hint_checked(container_id).await {
+            return hint;
+        }
+
+        Self::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        )
+        .as_ref()
+        .and_then(|state| state.cgroup_parent.as_ref())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"))
+    }
+
+    fn collect_path_usage(path: &Path) -> std::io::Result<(u64, u64)> {
+        if !path.exists() {
+            return Ok((0, 0));
+        }
+
+        let mut used_bytes = 0u64;
+        let mut inodes_used = 0u64;
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            inodes_used += 1;
+            if metadata.is_dir() {
+                let (child_bytes, child_inodes) = Self::collect_path_usage(&entry.path())?;
+                used_bytes = used_bytes.saturating_add(child_bytes);
+                inodes_used = inodes_used.saturating_add(child_inodes);
+            } else {
+                used_bytes = used_bytes.saturating_add(metadata.len());
+            }
+        }
+
+        Ok((used_bytes, inodes_used))
+    }
+
+    fn container_writable_layer_usage(
+        &self,
+        container_id: &str,
+    ) -> Option<crate::proto::runtime::v1::FilesystemUsage> {
+        use crate::proto::runtime::v1::{FilesystemIdentifier, FilesystemUsage, UInt64Value};
+
+        let rootfs_path = self
+            .config
+            .root_dir
+            .join("containers")
+            .join(container_id)
+            .join("rootfs");
+        let (used_bytes, inodes_used) = Self::collect_path_usage(&rootfs_path).ok()?;
+
+        Some(FilesystemUsage {
+            timestamp: Self::now_nanos(),
+            fs_id: Some(FilesystemIdentifier {
+                mountpoint: rootfs_path.display().to_string(),
+            }),
+            used_bytes: Some(UInt64Value { value: used_bytes }),
+            inodes_used: Some(UInt64Value { value: inodes_used }),
+        })
+    }
+
+    async fn container_network_stats(
+        &self,
+        container_id: &str,
+    ) -> Option<crate::metrics::NetworkStats> {
+        let pid = self.runtime_container_pid_checked(container_id).await?;
+        let contents = tokio::fs::read_to_string(format!("/proc/{}/net/dev", pid))
+            .await
+            .ok()?;
+        Self::parse_network_stats_from_procfs(&contents)
+    }
+
+    fn parse_network_stats_from_procfs(contents: &str) -> Option<crate::metrics::NetworkStats> {
+        let mut aggregated = crate::metrics::NetworkStats {
+            name: "pod".to_string(),
+            ..Default::default()
+        };
+        let mut saw_interface = false;
+
+        for line in contents.lines().skip(2) {
+            let Some((iface, payload)) = line.split_once(':') else {
+                continue;
+            };
+            if iface.trim() == "lo" {
+                continue;
+            }
+
+            let values: Vec<u64> = payload
+                .split_whitespace()
+                .filter_map(|value| value.parse::<u64>().ok())
+                .collect();
+            if values.len() < 16 {
+                continue;
+            }
+
+            saw_interface = true;
+            aggregated.rx_bytes = aggregated.rx_bytes.saturating_add(values[0]);
+            aggregated.rx_packets = aggregated.rx_packets.saturating_add(values[1]);
+            aggregated.rx_errors = aggregated.rx_errors.saturating_add(values[2]);
+            aggregated.rx_dropped = aggregated.rx_dropped.saturating_add(values[3]);
+            aggregated.tx_bytes = aggregated.tx_bytes.saturating_add(values[8]);
+            aggregated.tx_packets = aggregated.tx_packets.saturating_add(values[9]);
+            aggregated.tx_errors = aggregated.tx_errors.saturating_add(values[10]);
+            aggregated.tx_dropped = aggregated.tx_dropped.saturating_add(values[11]);
+        }
+
+        saw_interface.then_some(aggregated)
+    }
+
     fn encode_info_payload(value: serde_json::Value) -> Result<HashMap<String, String>, Status> {
         let encoded = serde_json::to_string(&value)
             .map_err(|e| Status::internal(format!("Failed to encode info payload: {}", e)))?;
         Ok(HashMap::from([("info".to_string(), encoded)]))
+    }
+
+    fn runtime_spec_snapshot(&self, container_id: &str) -> Option<serde_json::Value> {
+        let config_path = self.checkpoint_config_path(container_id);
+        std::fs::read(&config_path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
     }
 
     async fn build_container_verbose_info(
@@ -1033,15 +1560,23 @@ impl RuntimeServiceImpl {
             &container.annotations,
             INTERNAL_CONTAINER_STATE_KEY,
         );
+        let runtime_spec = self.runtime_spec_snapshot(&container.id);
         let payload = json!({
             "id": container.id.clone(),
+            "sandboxID": container.pod_sandbox_id.clone(),
             "podSandboxId": container.pod_sandbox_id.clone(),
             "runtimeState": Self::runtime_state_name(runtime_state),
             "pid": self.runtime_container_pid_checked(&container.id).await,
+            "runtimeSpec": runtime_spec,
+            "privileged": container_state.as_ref().map(|state| state.privileged).unwrap_or(false),
             "logPath": container_state.as_ref().and_then(|state| state.log_path.clone()),
             "tty": container_state.as_ref().map(|state| state.tty).unwrap_or(false),
             "stdin": container_state.as_ref().map(|state| state.stdin).unwrap_or(false),
             "stdinOnce": container_state.as_ref().map(|state| state.stdin_once).unwrap_or(false),
+            "readonlyRootfs": container_state
+                .as_ref()
+                .map(|state| state.readonly_rootfs)
+                .unwrap_or(false),
             "networkNamespacePath": container_state
                 .as_ref()
                 .and_then(|state| state.network_namespace_path.clone()),
@@ -1076,7 +1611,7 @@ impl RuntimeServiceImpl {
         Self::encode_info_payload(payload)
     }
 
-    fn build_pod_verbose_info(
+    async fn build_pod_verbose_info(
         &self,
         pod_sandbox: &crate::proto::runtime::v1::PodSandbox,
     ) -> Result<HashMap<String, String>, Status> {
@@ -1084,12 +1619,33 @@ impl RuntimeServiceImpl {
             &pod_sandbox.annotations,
             INTERNAL_POD_STATE_KEY,
         );
+        let pause_container_id = pod_state
+            .as_ref()
+            .and_then(|state| state.pause_container_id.clone());
+        let pause_pid = if let Some(pause_container_id) = pause_container_id.as_deref() {
+            self.runtime_container_pid_checked(pause_container_id).await
+        } else {
+            None
+        };
+        let runtime_spec = pause_container_id
+            .as_deref()
+            .and_then(|pause_container_id| self.runtime_spec_snapshot(pause_container_id));
+        let pause_image = pod_sandbox
+            .annotations
+            .get("io.kubernetes.cri.sandbox-image")
+            .filter(|image| !image.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| self.config.pause_image.clone());
         let payload = json!({
             "id": pod_sandbox.id.clone(),
+            "image": pause_image,
+            "pid": pause_pid,
+            "runtimeSpec": runtime_spec,
             "runtimeHandler": pod_sandbox.runtime_handler.clone(),
+            "runtimePodCIDR": pod_state.as_ref().and_then(|state| state.runtime_pod_cidr.clone()),
             "netnsPath": pod_state.as_ref().and_then(|state| state.netns_path.clone()),
             "logDirectory": pod_state.as_ref().and_then(|state| state.log_directory.clone()),
-            "pauseContainerId": pod_state.as_ref().and_then(|state| state.pause_container_id.clone()),
+            "pauseContainerId": pause_container_id,
             "ip": pod_state.as_ref().and_then(|state| state.ip.clone()),
             "additionalIPs": pod_state
                 .as_ref()
@@ -1100,6 +1656,11 @@ impl RuntimeServiceImpl {
                 .as_ref()
                 .map(|state| state.sysctls.clone())
                 .unwrap_or_default(),
+            "privileged": pod_state.as_ref().map(|state| state.privileged).unwrap_or(false),
+            "readonlyRootfs": pod_state
+                .as_ref()
+                .map(|state| state.readonly_rootfs)
+                .unwrap_or(false),
             "selinuxLabel": pod_state.as_ref().and_then(|state| state.selinux_label.clone()),
             "seccompProfile": pod_state.as_ref().map(|state| json!({
                 "profileType": state.seccomp_profile.as_ref().map(|profile| profile.profile_type),
@@ -1217,6 +1778,20 @@ impl RuntimeServiceImpl {
         }
     }
 
+    async fn resolve_container_id_for_filter(&self, requested_id: &str) -> Option<String> {
+        self.resolve_container_id_if_exists(requested_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn resolve_pod_sandbox_id_for_filter(&self, requested_id: &str) -> Option<String> {
+        self.resolve_pod_sandbox_id_if_exists(requested_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
     fn container_matches_filter(
         container: &Container,
         filter: &crate::proto::runtime::v1::ContainerFilter,
@@ -1245,6 +1820,57 @@ impl RuntimeServiceImpl {
 
         for (k, v) in &filter.label_selector {
             if container.labels.get(k) != Some(v) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn id_matches_filter_value(actual: &str, requested: &str) -> bool {
+        actual == requested || actual.starts_with(requested) || requested.starts_with(actual)
+    }
+
+    fn container_matches_stats_filter(
+        container: &Container,
+        filter: &crate::proto::runtime::v1::ContainerStatsFilter,
+    ) -> bool {
+        if !filter.id.is_empty()
+            && !Self::id_matches_filter_value(container.id.as_str(), filter.id.as_str())
+        {
+            return false;
+        }
+
+        if !filter.pod_sandbox_id.is_empty()
+            && !Self::id_matches_filter_value(
+                container.pod_sandbox_id.as_str(),
+                filter.pod_sandbox_id.as_str(),
+            )
+        {
+            return false;
+        }
+
+        for (k, v) in &filter.label_selector {
+            if container.labels.get(k) != Some(v) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn pod_sandbox_matches_stats_filter(
+        pod: &crate::proto::runtime::v1::PodSandbox,
+        filter: &crate::proto::runtime::v1::PodSandboxStatsFilter,
+    ) -> bool {
+        if !filter.id.is_empty()
+            && !Self::id_matches_filter_value(pod.id.as_str(), filter.id.as_str())
+        {
+            return false;
+        }
+
+        for (k, v) in &filter.label_selector {
+            if pod.labels.get(k) != Some(v) {
                 return false;
             }
         }
@@ -1316,9 +1942,10 @@ impl RuntimeServiceImpl {
             });
         let resolved_shim_work_dir = shim_config.work_dir.clone();
 
-        let runtime = RuncRuntime::with_shim(
+        let runtime = RuncRuntime::with_shim_and_image_storage(
             config.runtime_path.clone(),
             config.runtime_root.clone(),
+            config.root_dir.join("storage"),
             shim_config,
         );
 
@@ -1338,8 +1965,17 @@ impl RuntimeServiceImpl {
         let persistence = PersistenceManager::new(persistence_config)
             .expect("Failed to create persistence manager");
         let (events, _) = tokio::sync::broadcast::channel(256);
+        let runtime_network_config = Self::load_runtime_network_config(&config.root_dir)
+            .unwrap_or_else(|e| {
+                log::warn!(
+                    "Failed to load runtime network config from {}: {}",
+                    config.root_dir.display(),
+                    e
+                );
+                None
+            });
 
-        Self {
+        let service = Self {
             containers: Arc::new(Mutex::new(HashMap::new())),
             pod_sandboxes: Arc::new(Mutex::new(HashMap::new())),
             config,
@@ -1349,7 +1985,11 @@ impl RuntimeServiceImpl {
             streaming: Arc::new(Mutex::new(None)),
             events,
             shim_work_dir: resolved_shim_work_dir,
-        }
+            runtime_network_config: Arc::new(Mutex::new(runtime_network_config)),
+            exit_monitors: Arc::new(Mutex::new(HashSet::new())),
+        };
+
+        service
     }
 
     pub async fn set_streaming_server(&self, streaming_server: StreamingServer) {
@@ -1364,12 +2004,320 @@ impl RuntimeServiceImpl {
             .ok_or_else(|| Status::unavailable("streaming server is not initialized"))
     }
 
+    fn maybe_start_exit_monitor_task(
+        monitor_key: String,
+        container_id: String,
+        exit_code_path: PathBuf,
+        config: RuntimeConfig,
+        containers: Arc<Mutex<HashMap<String, Container>>>,
+        pod_sandboxes: Arc<Mutex<HashMap<String, crate::proto::runtime::v1::PodSandbox>>>,
+        persistence: Arc<Mutex<PersistenceManager>>,
+        events: tokio::sync::broadcast::Sender<ContainerEventResponse>,
+        exit_monitors: Arc<Mutex<HashSet<String>>>,
+    ) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+
+        handle.spawn(async move {
+            let exit_code = loop {
+                let current_state = {
+                    let containers = containers.lock().await;
+                    containers
+                        .get(&container_id)
+                        .map(|container| container.state)
+                };
+
+                match current_state {
+                    Some(state)
+                        if state == ContainerState::ContainerCreated as i32
+                            || state == ContainerState::ContainerRunning as i32 => {}
+                    _ => break None,
+                }
+
+                match tokio::fs::read_to_string(&exit_code_path).await {
+                    Ok(raw) => match raw.trim().parse::<i32>() {
+                        Ok(exit_code) => break Some(exit_code),
+                        Err(err) => {
+                            log::warn!(
+                                "Ignoring invalid exit code file {} for container {}: {}",
+                                exit_code_path.display(),
+                                container_id,
+                                err
+                            );
+                        }
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        log::debug!(
+                            "Exit monitor could not read {} for {}: {}",
+                            exit_code_path.display(),
+                            container_id,
+                            err
+                        );
+                    }
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            };
+
+            if let Some(exit_code) = exit_code {
+                Self::record_container_exit_from_monitor(
+                    &container_id,
+                    exit_code,
+                    &config,
+                    &containers,
+                    &pod_sandboxes,
+                    &persistence,
+                    &events,
+                )
+                .await;
+            }
+
+            let mut exit_monitors = exit_monitors.lock().await;
+            exit_monitors.remove(&monitor_key);
+        });
+    }
+
     fn publish_event(&self, event: ContainerEventResponse) {
         if let Err(err) = self.events.send(event) {
             log::debug!("Dropping CRI event without subscribers: {}", err);
         }
     }
 
+    fn exit_code_path(&self, container_id: &str) -> PathBuf {
+        self.shim_work_dir.join(container_id).join("exit_code")
+    }
+
+    fn ensure_exit_monitor_registered(&self, container_id: &str) {
+        let container_id = container_id.to_string();
+        let monitor_key = format!("ctr:{}", container_id);
+        let exit_code_path = self.exit_code_path(&container_id);
+        let config = self.config.clone();
+        let containers = self.containers.clone();
+        let pod_sandboxes = self.pod_sandboxes.clone();
+        let persistence = self.persistence.clone();
+        let events = self.events.clone();
+        let exit_monitors = self.exit_monitors.clone();
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+
+        handle.spawn(async move {
+            let should_start = {
+                let mut exit_monitors = exit_monitors.lock().await;
+                exit_monitors.insert(monitor_key.clone())
+            };
+
+            if !should_start {
+                return;
+            }
+
+            Self::maybe_start_exit_monitor_task(
+                monitor_key,
+                container_id,
+                exit_code_path,
+                config,
+                containers,
+                pod_sandboxes,
+                persistence,
+                events,
+                exit_monitors,
+            );
+        });
+    }
+
+    fn ensure_pod_exit_monitor_registered(&self, pod_id: &str, pause_container_id: &str) {
+        let pod_id = pod_id.to_string();
+        let pause_container_id = pause_container_id.to_string();
+        let monitor_key = format!("pod:{}", pod_id);
+        let exit_code_path = self.exit_code_path(&pause_container_id);
+        let config = self.config.clone();
+        let containers = self.containers.clone();
+        let pod_sandboxes = self.pod_sandboxes.clone();
+        let persistence = self.persistence.clone();
+        let events = self.events.clone();
+        let exit_monitors = self.exit_monitors.clone();
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+
+        handle.spawn(async move {
+            let should_start = {
+                let mut exit_monitors = exit_monitors.lock().await;
+                exit_monitors.insert(monitor_key.clone())
+            };
+
+            if !should_start {
+                return;
+            }
+
+            let maybe_exit_code = loop {
+                let current_state = {
+                    let pod_sandboxes = pod_sandboxes.lock().await;
+                    pod_sandboxes.get(&pod_id).map(|pod| pod.state)
+                };
+
+                match current_state {
+                    Some(state) if state == PodSandboxState::SandboxReady as i32 => {}
+                    _ => break None,
+                }
+
+                match tokio::fs::read_to_string(&exit_code_path).await {
+                    Ok(raw) => match raw.trim().parse::<i32>() {
+                        Ok(exit_code) => break Some(exit_code),
+                        Err(err) => {
+                            log::warn!(
+                                "Ignoring invalid pause exit code file {} for pod {}: {}",
+                                exit_code_path.display(),
+                                pod_id,
+                                err
+                            );
+                        }
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        log::debug!(
+                            "Pause exit monitor could not read {} for pod {}: {}",
+                            exit_code_path.display(),
+                            pod_id,
+                            err
+                        );
+                    }
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            };
+
+            if let Some(exit_code) = maybe_exit_code {
+                Self::record_pod_exit_from_monitor(
+                    &pod_id,
+                    exit_code,
+                    &config,
+                    &containers,
+                    &pod_sandboxes,
+                    &persistence,
+                    &events,
+                )
+                .await;
+            }
+
+            let mut exit_monitors = exit_monitors.lock().await;
+            exit_monitors.remove(&monitor_key);
+        });
+    }
+
+    async fn ensure_exit_monitors_for_active_containers(&self) {
+        let active_container_ids: Vec<String> = {
+            let containers = self.containers.lock().await;
+            containers
+                .values()
+                .filter(|container| {
+                    container.state == ContainerState::ContainerCreated as i32
+                        || container.state == ContainerState::ContainerRunning as i32
+                })
+                .map(|container| container.id.clone())
+                .collect()
+        };
+
+        for container_id in active_container_ids {
+            self.ensure_exit_monitor_registered(&container_id);
+        }
+
+        let active_pods: Vec<(String, String)> = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes
+                .values()
+                .filter(|pod| pod.state == PodSandboxState::SandboxReady as i32)
+                .filter_map(|pod| {
+                    Self::read_internal_state::<StoredPodState>(
+                        &pod.annotations,
+                        INTERNAL_POD_STATE_KEY,
+                    )
+                    .and_then(|state| state.pause_container_id)
+                    .filter(|pause_container_id| !pause_container_id.is_empty())
+                    .map(|pause_container_id| (pod.id.clone(), pause_container_id))
+                })
+                .collect()
+        };
+
+        for (pod_id, pause_container_id) in active_pods {
+            self.ensure_pod_exit_monitor_registered(&pod_id, &pause_container_id);
+        }
+    }
+
+    async fn cleanup_orphaned_shim_artifacts(&self) {
+        let known_container_ids: HashSet<String> =
+            self.containers.lock().await.keys().cloned().collect();
+        let known_pause_ids: HashSet<String> = self
+            .pod_sandboxes
+            .lock()
+            .await
+            .values()
+            .filter_map(|pod| {
+                Self::read_internal_state::<StoredPodState>(
+                    &pod.annotations,
+                    INTERNAL_POD_STATE_KEY,
+                )
+                .and_then(|state| state.pause_container_id)
+            })
+            .collect();
+
+        let Ok(entries) = std::fs::read_dir(&self.shim_work_dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+
+            if known_container_ids.contains(id) || known_pause_ids.contains(id) {
+                continue;
+            }
+
+            let metadata = std::fs::read(path.join("shim.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<ShimProcess>(&raw).ok());
+            let live_process = metadata
+                .as_ref()
+                .map(|process| {
+                    PathBuf::from("/proc")
+                        .join(process.shim_pid.to_string())
+                        .exists()
+                })
+                .unwrap_or(false);
+
+            if live_process {
+                log::warn!(
+                    "Keeping orphaned shim directory {} because shim pid {} still appears live",
+                    path.display(),
+                    metadata
+                        .as_ref()
+                        .map(|process| process.shim_pid)
+                        .unwrap_or_default()
+                );
+                continue;
+            }
+
+            if let Err(err) = std::fs::remove_dir_all(&path) {
+                log::warn!(
+                    "Failed to remove orphaned shim directory {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     async fn current_container_snapshot(&self, container_id: &str) -> Option<CriContainerStatus> {
         let container = {
             let containers = self.containers.lock().await;
@@ -1415,6 +2363,16 @@ impl RuntimeServiceImpl {
         snapshots
     }
 
+    fn pod_event_container_id(pod_sandbox: &crate::proto::runtime::v1::PodSandbox) -> String {
+        Self::read_internal_state::<StoredPodState>(
+            &pod_sandbox.annotations,
+            INTERNAL_POD_STATE_KEY,
+        )
+        .and_then(|state| state.pause_container_id)
+        .filter(|container_id| !container_id.is_empty())
+        .unwrap_or_else(|| pod_sandbox.id.clone())
+    }
+
     async fn emit_container_event(
         &self,
         event_type: ContainerEventType,
@@ -1444,12 +2402,519 @@ impl RuntimeServiceImpl {
         containers_statuses: Vec<CriContainerStatus>,
     ) {
         self.publish_event(ContainerEventResponse {
-            container_id: pod_sandbox.id.clone(),
+            container_id: Self::pod_event_container_id(pod_sandbox),
             container_event_type: event_type as i32,
             created_at: Self::now_nanos(),
             pod_sandbox_status: Some(self.build_pod_sandbox_status_snapshot(pod_sandbox)),
             containers_statuses,
         });
+    }
+
+    fn publish_event_via_sender(
+        events: &tokio::sync::broadcast::Sender<ContainerEventResponse>,
+        event: ContainerEventResponse,
+    ) {
+        if let Err(err) = events.send(event) {
+            log::debug!("Dropping CRI event without subscribers: {}", err);
+        }
+    }
+
+    async fn record_container_exit_from_monitor(
+        container_id: &str,
+        exit_code: i32,
+        config: &RuntimeConfig,
+        containers: &Arc<Mutex<HashMap<String, Container>>>,
+        pod_sandboxes: &Arc<Mutex<HashMap<String, crate::proto::runtime::v1::PodSandbox>>>,
+        persistence: &Arc<Mutex<PersistenceManager>>,
+        events: &tokio::sync::broadcast::Sender<ContainerEventResponse>,
+    ) {
+        let now = Self::now_nanos();
+        let updated_container = {
+            let mut containers = containers.lock().await;
+            let Some(container) = containers.get_mut(container_id) else {
+                return;
+            };
+
+            if container.state == ContainerState::ContainerExited as i32 {
+                return;
+            }
+
+            container.state = ContainerState::ContainerExited as i32;
+            if let Some(mut state) = Self::read_internal_state::<StoredContainerState>(
+                &container.annotations,
+                INTERNAL_CONTAINER_STATE_KEY,
+            ) {
+                state.finished_at.get_or_insert(now);
+                state.exit_code = Some(exit_code);
+                let _ = Self::insert_internal_state(
+                    &mut container.annotations,
+                    INTERNAL_CONTAINER_STATE_KEY,
+                    &state,
+                );
+            }
+
+            container.clone()
+        };
+
+        {
+            let mut persistence = persistence.lock().await;
+            if let Err(err) = persistence.update_container_state(
+                container_id,
+                crate::runtime::ContainerStatus::Stopped(exit_code),
+            ) {
+                log::warn!(
+                    "Exit monitor failed to persist container {} state: {}",
+                    container_id,
+                    err
+                );
+            }
+        }
+
+        let mut updated_pod = None;
+        {
+            let mut pod_sandboxes = pod_sandboxes.lock().await;
+            if let Some(pod) = pod_sandboxes.get_mut(&updated_container.pod_sandbox_id) {
+                let is_pause_container = Self::read_internal_state::<StoredPodState>(
+                    &pod.annotations,
+                    INTERNAL_POD_STATE_KEY,
+                )
+                .and_then(|state| state.pause_container_id)
+                .as_deref()
+                    == Some(container_id);
+
+                if is_pause_container && pod.state != PodSandboxState::SandboxNotready as i32 {
+                    pod.state = PodSandboxState::SandboxNotready as i32;
+                    updated_pod = Some(pod.clone());
+                }
+            }
+        }
+
+        if updated_pod.is_some() {
+            let mut persistence = persistence.lock().await;
+            if let Err(err) =
+                persistence.update_pod_state(&updated_container.pod_sandbox_id, "notready")
+            {
+                log::warn!(
+                    "Exit monitor failed to persist pod {} state: {}",
+                    updated_container.pod_sandbox_id,
+                    err
+                );
+            }
+        }
+
+        let pod_status = {
+            let pod_sandboxes = pod_sandboxes.lock().await;
+            pod_sandboxes
+                .get(&updated_container.pod_sandbox_id)
+                .cloned()
+        }
+        .map(|pod| Self::build_pod_sandbox_status_snapshot_with_config(config, &pod));
+
+        let snapshot = Self::build_container_status_snapshot(
+            &updated_container,
+            ContainerState::ContainerExited as i32,
+        );
+        Self::publish_event_via_sender(
+            events,
+            ContainerEventResponse {
+                container_id: updated_container.id.clone(),
+                container_event_type: ContainerEventType::ContainerStoppedEvent as i32,
+                created_at: now,
+                pod_sandbox_status: pod_status,
+                containers_statuses: vec![snapshot],
+            },
+        );
+
+        if let Some(updated_pod) = updated_pod {
+            let container_snapshots = {
+                let containers = containers.lock().await;
+                containers
+                    .values()
+                    .filter(|container| container.pod_sandbox_id == updated_pod.id)
+                    .cloned()
+                    .map(|container| {
+                        Self::build_container_status_snapshot(&container, container.state)
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            Self::publish_event_via_sender(
+                events,
+                ContainerEventResponse {
+                    container_id: Self::pod_event_container_id(&updated_pod),
+                    container_event_type: ContainerEventType::ContainerStoppedEvent as i32,
+                    created_at: now,
+                    pod_sandbox_status: Some(Self::build_pod_sandbox_status_snapshot_with_config(
+                        config,
+                        &updated_pod,
+                    )),
+                    containers_statuses: container_snapshots,
+                },
+            );
+        }
+    }
+
+    async fn record_pod_exit_from_monitor(
+        pod_id: &str,
+        _exit_code: i32,
+        config: &RuntimeConfig,
+        containers: &Arc<Mutex<HashMap<String, Container>>>,
+        pod_sandboxes: &Arc<Mutex<HashMap<String, crate::proto::runtime::v1::PodSandbox>>>,
+        persistence: &Arc<Mutex<PersistenceManager>>,
+        events: &tokio::sync::broadcast::Sender<ContainerEventResponse>,
+    ) {
+        let now = Self::now_nanos();
+        let updated_pod = {
+            let mut pod_sandboxes = pod_sandboxes.lock().await;
+            let Some(pod) = pod_sandboxes.get_mut(pod_id) else {
+                return;
+            };
+
+            if pod.state == PodSandboxState::SandboxNotready as i32 {
+                return;
+            }
+
+            pod.state = PodSandboxState::SandboxNotready as i32;
+            pod.clone()
+        };
+
+        {
+            let mut persistence = persistence.lock().await;
+            if let Err(err) = persistence.update_pod_state(pod_id, "notready") {
+                log::warn!(
+                    "Pause exit monitor failed to persist pod {} state: {}",
+                    pod_id,
+                    err
+                );
+            }
+        }
+
+        let container_snapshots = {
+            let containers = containers.lock().await;
+            containers
+                .values()
+                .filter(|container| container.pod_sandbox_id == pod_id)
+                .cloned()
+                .map(|container| Self::build_container_status_snapshot(&container, container.state))
+                .collect::<Vec<_>>()
+        };
+
+        Self::publish_event_via_sender(
+            events,
+            ContainerEventResponse {
+                container_id: Self::pod_event_container_id(&updated_pod),
+                container_event_type: ContainerEventType::ContainerStoppedEvent as i32,
+                created_at: now,
+                pod_sandbox_status: Some(Self::build_pod_sandbox_status_snapshot_with_config(
+                    config,
+                    &updated_pod,
+                )),
+                containers_statuses: container_snapshots,
+            },
+        );
+    }
+
+    fn build_pod_sandbox_status_snapshot_with_config(
+        config: &RuntimeConfig,
+        pod_sandbox: &crate::proto::runtime::v1::PodSandbox,
+    ) -> PodSandboxStatus {
+        let pod_state = Self::read_internal_state::<StoredPodState>(
+            &pod_sandbox.annotations,
+            INTERNAL_POD_STATE_KEY,
+        );
+
+        PodSandboxStatus {
+            id: pod_sandbox.id.clone(),
+            metadata: Some(pod_sandbox.metadata.clone().unwrap_or(PodSandboxMetadata {
+                name: pod_sandbox.id.clone(),
+                uid: pod_sandbox.id.clone(),
+                namespace: "default".to_string(),
+                attempt: 1,
+            })),
+            state: pod_sandbox.state,
+            created_at: Self::normalize_timestamp_nanos(pod_sandbox.created_at),
+            network: Self::pod_network_status_from_state(pod_state.as_ref()),
+            linux: Self::pod_linux_status_from_state(pod_state.as_ref()),
+            labels: pod_sandbox.labels.clone(),
+            annotations: Self::external_annotations(&pod_sandbox.annotations),
+            runtime_handler: if pod_sandbox.runtime_handler.is_empty() {
+                let restored = pod_state
+                    .as_ref()
+                    .map(|state| state.runtime_handler.clone())
+                    .filter(|handler| !handler.is_empty())
+                    .unwrap_or_else(|| config.runtime.clone());
+                if config
+                    .runtime_handlers
+                    .iter()
+                    .any(|handler| handler == &restored)
+                {
+                    restored
+                } else {
+                    config.runtime.clone()
+                }
+            } else {
+                pod_sandbox.runtime_handler.clone()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[allow(dead_code)]
+    async fn refresh_runtime_state_and_publish_events(
+        runtime: &RuncRuntime,
+        config: &RuntimeConfig,
+        containers: &Arc<Mutex<HashMap<String, Container>>>,
+        pod_sandboxes: &Arc<Mutex<HashMap<String, crate::proto::runtime::v1::PodSandbox>>>,
+        persistence: &Arc<Mutex<PersistenceManager>>,
+        events: &tokio::sync::broadcast::Sender<ContainerEventResponse>,
+    ) {
+        let container_ids: Vec<String> = {
+            let containers = containers.lock().await;
+            containers.keys().cloned().collect()
+        };
+
+        for container_id in container_ids {
+            let runtime_clone = runtime.clone();
+            let container_id_for_status = container_id.clone();
+            let runtime_status = match tokio::task::spawn_blocking(move || {
+                runtime_clone.container_status(&container_id_for_status)
+            })
+            .await
+            {
+                Ok(Ok(status)) => status,
+                Ok(Err(err)) => {
+                    log::debug!(
+                        "Background state refresh failed to read runtime status for {}: {}",
+                        container_id,
+                        err
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    log::debug!(
+                        "Background state refresh join error for {}: {}",
+                        container_id,
+                        err
+                    );
+                    continue;
+                }
+            };
+
+            if matches!(runtime_status, ContainerStatus::Unknown) {
+                continue;
+            }
+
+            let next_state = Self::map_runtime_container_state(runtime_status.clone());
+            let mut previous_container = None;
+            let mut next_container = None;
+            let mut emitted_event = None;
+            {
+                let mut containers = containers.lock().await;
+                if let Some(container) = containers.get_mut(&container_id) {
+                    if container.state == next_state {
+                        continue;
+                    }
+                    previous_container = Some(container.clone());
+                    container.state = next_state;
+                    if let Some(mut state) = Self::read_internal_state::<StoredContainerState>(
+                        &container.annotations,
+                        INTERNAL_CONTAINER_STATE_KEY,
+                    ) {
+                        match runtime_status {
+                            ContainerStatus::Running => {
+                                state.started_at.get_or_insert(Self::now_nanos());
+                                state.finished_at = None;
+                                state.exit_code = None;
+                            }
+                            ContainerStatus::Stopped(code) => {
+                                state.finished_at.get_or_insert(Self::now_nanos());
+                                state.exit_code = Some(code);
+                            }
+                            ContainerStatus::Created => {}
+                            ContainerStatus::Unknown => {}
+                        }
+                        let _ = Self::insert_internal_state(
+                            &mut container.annotations,
+                            INTERNAL_CONTAINER_STATE_KEY,
+                            &state,
+                        );
+                    }
+                    next_container = Some(container.clone());
+                    emitted_event = Some(match next_state {
+                        x if x == ContainerState::ContainerRunning as i32 => {
+                            ContainerEventType::ContainerStartedEvent
+                        }
+                        x if x == ContainerState::ContainerExited as i32 => {
+                            ContainerEventType::ContainerStoppedEvent
+                        }
+                        x if x == ContainerState::ContainerCreated as i32 => {
+                            ContainerEventType::ContainerCreatedEvent
+                        }
+                        _ => ContainerEventType::ContainerStoppedEvent,
+                    });
+                }
+            }
+
+            let Some(container_after_update) = next_container else {
+                continue;
+            };
+
+            {
+                let mut persistence = persistence.lock().await;
+                if let Err(err) = persistence.update_container_state(
+                    &container_id,
+                    match runtime_status {
+                        ContainerStatus::Created => crate::runtime::ContainerStatus::Created,
+                        ContainerStatus::Running => crate::runtime::ContainerStatus::Running,
+                        ContainerStatus::Stopped(code) => {
+                            crate::runtime::ContainerStatus::Stopped(code)
+                        }
+                        ContainerStatus::Unknown => crate::runtime::ContainerStatus::Unknown,
+                    },
+                ) {
+                    log::warn!(
+                        "Background state refresh failed to persist container {}: {}",
+                        container_id,
+                        err
+                    );
+                }
+            }
+
+            if let Some(event_type) = emitted_event {
+                let pod_status = {
+                    let pod_sandboxes = pod_sandboxes.lock().await;
+                    pod_sandboxes
+                        .get(&container_after_update.pod_sandbox_id)
+                        .cloned()
+                        .map(|pod| {
+                            Self::build_pod_sandbox_status_snapshot_with_config(config, &pod)
+                        })
+                };
+                let snapshot =
+                    Self::build_container_status_snapshot(&container_after_update, next_state);
+                Self::publish_event_via_sender(
+                    events,
+                    ContainerEventResponse {
+                        container_id: container_after_update.id.clone(),
+                        container_event_type: event_type as i32,
+                        created_at: Self::now_nanos(),
+                        pod_sandbox_status: pod_status,
+                        containers_statuses: vec![snapshot],
+                    },
+                );
+            }
+
+            let _ = previous_container;
+        }
+
+        let pod_ids: Vec<String> = {
+            let pods = pod_sandboxes.lock().await;
+            pods.keys().cloned().collect()
+        };
+
+        for pod_id in pod_ids {
+            let current_pod = {
+                let pods = pod_sandboxes.lock().await;
+                pods.get(&pod_id).cloned()
+            };
+            let Some(current_pod) = current_pod else {
+                continue;
+            };
+            let pause_container_id = Self::read_internal_state::<StoredPodState>(
+                &current_pod.annotations,
+                INTERNAL_POD_STATE_KEY,
+            )
+            .and_then(|state| state.pause_container_id);
+            let Some(pause_container_id) = pause_container_id else {
+                continue;
+            };
+
+            let runtime_clone = runtime.clone();
+            let pause_id_for_status = pause_container_id.clone();
+            let pause_status = match tokio::task::spawn_blocking(move || {
+                runtime_clone.container_status(&pause_id_for_status)
+            })
+            .await
+            {
+                Ok(Ok(status)) => status,
+                _ => continue,
+            };
+
+            let next_pod_state = match pause_status {
+                ContainerStatus::Running => PodSandboxState::SandboxReady as i32,
+                _ => PodSandboxState::SandboxNotready as i32,
+            };
+            if next_pod_state == current_pod.state {
+                continue;
+            }
+
+            let updated_pod = {
+                let mut pods = pod_sandboxes.lock().await;
+                if let Some(pod) = pods.get_mut(&pod_id) {
+                    pod.state = next_pod_state;
+                    Some(pod.clone())
+                } else {
+                    None
+                }
+            };
+            let Some(updated_pod) = updated_pod else {
+                continue;
+            };
+
+            {
+                let mut persistence = persistence.lock().await;
+                let target_state = if next_pod_state == PodSandboxState::SandboxReady as i32 {
+                    "ready"
+                } else {
+                    "notready"
+                };
+                if let Err(err) = persistence.update_pod_state(&pod_id, target_state) {
+                    log::warn!(
+                        "Background state refresh failed to persist pod {}: {}",
+                        pod_id,
+                        err
+                    );
+                }
+            }
+
+            let container_snapshots = {
+                let containers_snapshot: Vec<Container> = {
+                    let containers = containers.lock().await;
+                    containers
+                        .values()
+                        .filter(|container| container.pod_sandbox_id == pod_id)
+                        .cloned()
+                        .collect()
+                };
+                let mut snapshots = Vec::with_capacity(containers_snapshot.len());
+                for container in containers_snapshot {
+                    snapshots.push(Self::build_container_status_snapshot(
+                        &container,
+                        container.state,
+                    ));
+                }
+                snapshots
+            };
+
+            Self::publish_event_via_sender(
+                events,
+                ContainerEventResponse {
+                    container_id: Self::pod_event_container_id(&updated_pod),
+                    container_event_type: if next_pod_state == PodSandboxState::SandboxReady as i32
+                    {
+                        ContainerEventType::ContainerStartedEvent as i32
+                    } else {
+                        ContainerEventType::ContainerStoppedEvent as i32
+                    },
+                    created_at: Self::now_nanos(),
+                    pod_sandbox_status: Some(Self::build_pod_sandbox_status_snapshot_with_config(
+                        config,
+                        &updated_pod,
+                    )),
+                    containers_statuses: container_snapshots,
+                },
+            );
+        }
     }
 
     async fn reconcile_recovered_state(&self) -> Result<(), Status> {
@@ -1565,6 +3030,12 @@ impl RuntimeServiceImpl {
         }
 
         Ok(())
+    }
+
+    async fn best_effort_refresh_runtime_state(&self) {
+        if let Err(err) = self.reconcile_recovered_state().await {
+            log::warn!("Best-effort runtime state refresh failed: {}", err);
+        }
     }
 
     /// 从持久化存储恢复状态
@@ -1821,14 +3292,26 @@ impl RuntimeServiceImpl {
         }
 
         self.reconcile_recovered_state().await?;
+        self.ensure_exit_monitors_for_active_containers().await;
+        self.cleanup_orphaned_shim_artifacts().await;
         Ok(())
     }
 
     /// 将内部 ContainerStats 转换为 proto 格式
     fn convert_to_proto_container_stats(
+        &self,
         stats: crate::metrics::ContainerStats,
     ) -> crate::proto::runtime::v1::ContainerStats {
-        use crate::proto::runtime::v1::{ContainerStats, CpuUsage, MemoryUsage, UInt64Value};
+        use crate::proto::runtime::v1::{
+            ContainerStats, CpuUsage, MemoryUsage, SwapUsage, UInt64Value,
+        };
+
+        let writable_layer = self.container_writable_layer_usage(&stats.container_id);
+        let swap = stats.memory.as_ref().map(|mem| SwapUsage {
+            timestamp: stats.timestamp as i64,
+            swap_available_bytes: None,
+            swap_usage_bytes: Some(UInt64Value { value: mem.swap }),
+        });
 
         ContainerStats {
             attributes: Some(crate::proto::runtime::v1::ContainerAttributes {
@@ -1839,20 +3322,39 @@ impl RuntimeServiceImpl {
             }),
             cpu: stats.cpu.map(|cpu| CpuUsage {
                 timestamp: stats.timestamp as i64,
-                usage_core_nano_seconds: Some(UInt64Value { value: cpu.usage_total }),
-                usage_nano_cores: Some(UInt64Value { value: cpu.usage_user.saturating_add(cpu.usage_kernel) }),
+                usage_core_nano_seconds: Some(UInt64Value {
+                    value: cpu.usage_total,
+                }),
+                usage_nano_cores: Some(UInt64Value {
+                    value: cpu.usage_user.saturating_add(cpu.usage_kernel),
+                }),
             }),
             memory: stats.memory.map(|mem| MemoryUsage {
                 timestamp: stats.timestamp as i64,
                 working_set_bytes: Some(UInt64Value { value: mem.usage }),
-                available_bytes: Some(UInt64Value { value: mem.limit.saturating_sub(mem.usage) }),
+                available_bytes: Some(UInt64Value {
+                    value: mem.limit.saturating_sub(mem.usage),
+                }),
                 usage_bytes: Some(UInt64Value { value: mem.usage }),
-                rss_bytes: Some(UInt64Value { value: mem.usage }), // 简化处理
-                page_faults: Some(UInt64Value { value: 0 }),
-                major_page_faults: Some(UInt64Value { value: 0 }),
+                rss_bytes: Some(UInt64Value { value: mem.rss }),
+                page_faults: Some(UInt64Value { value: mem.pgfault }),
+                major_page_faults: Some(UInt64Value {
+                    value: mem.pgmajfault,
+                }),
             }),
-            writable_layer: None,
-            swap: None,
+            writable_layer,
+            swap,
+        }
+    }
+
+    fn populate_container_stats_attributes(
+        proto_stats: &mut crate::proto::runtime::v1::ContainerStats,
+        container: &Container,
+    ) {
+        if let Some(attributes) = proto_stats.attributes.as_mut() {
+            attributes.metadata = container.metadata.clone();
+            attributes.labels = container.labels.clone();
+            attributes.annotations = Self::external_annotations(&container.annotations);
         }
     }
 
@@ -1862,14 +3364,22 @@ impl RuntimeServiceImpl {
         pod_id: &str,
         pod: &crate::proto::runtime::v1::PodSandbox,
     ) -> Option<crate::proto::runtime::v1::PodSandboxStats> {
-        use crate::proto::runtime::v1::{ContainerAttributes, ContainerStats, CpuUsage, LinuxPodSandboxStats, MemoryUsage, NetworkInterfaceUsage, NetworkUsage, PodSandboxStats, PodSandboxAttributes, ProcessUsage, UInt64Value};
+        use crate::proto::runtime::v1::{
+            CpuUsage, LinuxPodSandboxStats, MemoryUsage, NetworkInterfaceUsage, NetworkUsage,
+            PodSandboxAttributes, PodSandboxStats, ProcessUsage, UInt64Value,
+        };
 
         let containers = self.containers.lock().await;
-        
+
         // 收集该 Pod 下所有容器的统计
         let mut total_cpu_usage = 0u64;
         let mut total_memory_usage = 0u64;
         let mut total_memory_limit = 0u64;
+        let mut total_pids = 0u64;
+        let mut total_rx_bytes = 0u64;
+        let mut total_rx_errors = 0u64;
+        let mut total_tx_bytes = 0u64;
+        let mut total_tx_errors = 0u64;
         let mut has_stats = false;
         let mut container_stats_list = Vec::new();
 
@@ -1880,25 +3390,19 @@ impl RuntimeServiceImpl {
 
         for (container_id, container) in containers.iter() {
             // 检查容器是否属于该 Pod
-            let belongs_to_pod = if let Some(ref uid) = pod_uid {
-                container.annotations.get("io.kubernetes.pod.uid")
-                    .map(|container_uid| container_uid == uid)
-                    .unwrap_or(true)
-            } else {
-                true
-            };
+            let belongs_to_pod = container.pod_sandbox_id == pod_id
+                || pod_uid
+                    .as_ref()
+                    .and_then(|uid| {
+                        container
+                            .annotations
+                            .get("io.kubernetes.pod.uid")
+                            .map(|container_uid| container_uid == uid)
+                    })
+                    .unwrap_or(false);
 
             if belongs_to_pod {
-                let container_state = Self::read_internal_state::<StoredContainerState>(
-                    &container.annotations,
-                    INTERNAL_CONTAINER_STATE_KEY,
-                );
-
-                let cgroup_parent = container_state
-                    .as_ref()
-                    .and_then(|s| s.cgroup_parent.as_ref())
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"));
+                let cgroup_parent = self.container_cgroup_hint(container_id, container).await;
 
                 if let Ok(stats) = collector.collect_container_stats(container_id, &cgroup_parent) {
                     if let Some(ref cpu) = stats.cpu {
@@ -1908,38 +3412,20 @@ impl RuntimeServiceImpl {
                         total_memory_usage += mem.usage;
                         total_memory_limit += mem.limit;
                     }
+                    if let Some(ref pids) = stats.pids {
+                        total_pids += pids.current;
+                    }
+                    if let Some(network) = self.container_network_stats(container_id).await {
+                        total_rx_bytes = total_rx_bytes.saturating_add(network.rx_bytes);
+                        total_rx_errors = total_rx_errors.saturating_add(network.rx_errors);
+                        total_tx_bytes = total_tx_bytes.saturating_add(network.tx_bytes);
+                        total_tx_errors = total_tx_errors.saturating_add(network.tx_errors);
+                    }
                     has_stats = true;
 
-                    // 添加容器级别统计
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
-                    
-                    container_stats_list.push(ContainerStats {
-                        attributes: Some(ContainerAttributes {
-                            id: container_id.clone(),
-                            metadata: container.metadata.clone(),
-                            labels: container.labels.clone(),
-                            annotations: container.annotations.clone(),
-                        }),
-                        cpu: stats.cpu.map(|cpu| CpuUsage {
-                            timestamp,
-                            usage_core_nano_seconds: Some(UInt64Value { value: cpu.usage_total }),
-                            usage_nano_cores: Some(UInt64Value { value: cpu.usage_user.saturating_add(cpu.usage_kernel) }),
-                        }),
-                        memory: stats.memory.map(|mem| MemoryUsage {
-                            timestamp,
-                            working_set_bytes: Some(UInt64Value { value: mem.usage }),
-                            available_bytes: Some(UInt64Value { value: mem.limit.saturating_sub(mem.usage) }),
-                            usage_bytes: Some(UInt64Value { value: mem.usage }),
-                            rss_bytes: Some(UInt64Value { value: mem.usage }),
-                            page_faults: Some(UInt64Value { value: 0 }),
-                            major_page_faults: Some(UInt64Value { value: 0 }),
-                        }),
-                        writable_layer: None,
-                        swap: None,
-                    });
+                    let mut proto_stats = self.convert_to_proto_container_stats(stats);
+                    Self::populate_container_stats_attributes(&mut proto_stats, container);
+                    container_stats_list.push(proto_stats);
                 }
             }
         }
@@ -1948,10 +3434,22 @@ impl RuntimeServiceImpl {
             return None;
         }
 
+        if let Some(pause_container_id) =
+            Self::read_internal_state::<StoredPodState>(&pod.annotations, INTERNAL_POD_STATE_KEY)
+                .and_then(|state| state.pause_container_id)
+        {
+            if let Some(network) = self.container_network_stats(&pause_container_id).await {
+                total_rx_bytes = network.rx_bytes;
+                total_rx_errors = network.rx_errors;
+                total_tx_bytes = network.tx_bytes;
+                total_tx_errors = network.tx_errors;
+            }
+        }
+
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
+            .as_nanos() as i64;
 
         let container_count = container_stats_list.len() as u64;
 
@@ -1960,20 +3458,32 @@ impl RuntimeServiceImpl {
                 id: pod_id.to_string(),
                 metadata: pod.metadata.clone(),
                 labels: pod.labels.clone(),
-                annotations: pod.annotations.clone(),
+                annotations: Self::external_annotations(&pod.annotations),
             }),
             linux: Some(LinuxPodSandboxStats {
                 cpu: Some(CpuUsage {
                     timestamp,
-                    usage_core_nano_seconds: Some(UInt64Value { value: total_cpu_usage }),
-                    usage_nano_cores: Some(UInt64Value { value: total_cpu_usage }),
+                    usage_core_nano_seconds: Some(UInt64Value {
+                        value: total_cpu_usage,
+                    }),
+                    usage_nano_cores: Some(UInt64Value {
+                        value: total_cpu_usage,
+                    }),
                 }),
                 memory: Some(MemoryUsage {
                     timestamp,
-                    working_set_bytes: Some(UInt64Value { value: total_memory_usage }),
-                    available_bytes: Some(UInt64Value { value: total_memory_limit.saturating_sub(total_memory_usage) }),
-                    usage_bytes: Some(UInt64Value { value: total_memory_usage }),
-                    rss_bytes: Some(UInt64Value { value: total_memory_usage }),
+                    working_set_bytes: Some(UInt64Value {
+                        value: total_memory_usage,
+                    }),
+                    available_bytes: Some(UInt64Value {
+                        value: total_memory_limit.saturating_sub(total_memory_usage),
+                    }),
+                    usage_bytes: Some(UInt64Value {
+                        value: total_memory_usage,
+                    }),
+                    rss_bytes: Some(UInt64Value {
+                        value: total_memory_usage,
+                    }),
                     page_faults: Some(UInt64Value { value: 0 }),
                     major_page_faults: Some(UInt64Value { value: 0 }),
                 }),
@@ -1981,17 +3491,27 @@ impl RuntimeServiceImpl {
                 network: Some(NetworkUsage {
                     timestamp,
                     default_interface: Some(NetworkInterfaceUsage {
-                        name: "eth0".to_string(),
-                        rx_bytes: Some(UInt64Value { value: 0 }),
-                        rx_errors: Some(UInt64Value { value: 0 }),
-                        tx_bytes: Some(UInt64Value { value: 0 }),
-                        tx_errors: Some(UInt64Value { value: 0 }),
+                        name: "pod".to_string(),
+                        rx_bytes: Some(UInt64Value {
+                            value: total_rx_bytes,
+                        }),
+                        rx_errors: Some(UInt64Value {
+                            value: total_rx_errors,
+                        }),
+                        tx_bytes: Some(UInt64Value {
+                            value: total_tx_bytes,
+                        }),
+                        tx_errors: Some(UInt64Value {
+                            value: total_tx_errors,
+                        }),
                     }),
                     interfaces: Vec::new(),
                 }),
                 process: Some(ProcessUsage {
                     timestamp,
-                    process_count: Some(UInt64Value { value: container_count }),
+                    process_count: Some(UInt64Value {
+                        value: total_pids.max(container_count),
+                    }),
                 }),
             }),
             windows: None,
@@ -2006,10 +3526,13 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<VersionRequest>,
     ) -> Result<Response<VersionResponse>, Status> {
+        let runtime_version = self
+            .runtime_binary_version()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
         Ok(Response::new(VersionResponse {
-            version: "0.1.0".to_string(),
-            runtime_name: "crius".to_string(),
-            runtime_version: "0.1.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            runtime_name: self.config.runtime.clone(),
+            runtime_version,
             runtime_api_version: "v1".to_string(),
         }))
     }
@@ -2036,16 +3559,16 @@ impl RuntimeService for RuntimeServiceImpl {
         );
         let pod_seccomp_profile = Self::seccomp_profile_from_proto(
             sandbox_security.and_then(|security| security.seccomp.as_ref()),
-            sandbox_security
-                .map(|security| security.seccomp_profile_path.as_str())
-                .unwrap_or(""),
+            Self::legacy_linux_sandbox_seccomp_profile_path(sandbox_security),
         );
         let stored_seccomp_profile = Self::stored_seccomp_profile_from_proto(
             sandbox_security.and_then(|security| security.seccomp.as_ref()),
-            sandbox_security
-                .map(|security| security.seccomp_profile_path.as_str())
-                .unwrap_or(""),
+            Self::legacy_linux_sandbox_seccomp_profile_path(sandbox_security),
         );
+        let runtime_network_config = self.runtime_network_config.lock().await.clone();
+        let runtime_pod_cidr = runtime_network_config
+            .as_ref()
+            .map(|cfg| cfg.pod_cidr.clone());
 
         // 构建Pod沙箱配置
         let sandbox_config = PodSandboxConfig {
@@ -2106,7 +3629,24 @@ impl RuntimeService for RuntimeServiceImpl {
                     }
                 })
                 .collect(),
-            network_config: None,
+            network_config: runtime_network_config
+                .as_ref()
+                .map(|cfg| crate::pod::NetworkConfig {
+                    network_namespace: format!(
+                        "crius-{}-{}",
+                        pod_config
+                            .metadata
+                            .as_ref()
+                            .map(|m| m.namespace.as_str())
+                            .unwrap_or("default"),
+                        pod_config
+                            .metadata
+                            .as_ref()
+                            .map(|m| m.name.as_str())
+                            .unwrap_or("pod"),
+                    ),
+                    pod_cidr: cfg.pod_cidr.clone(),
+                }),
             cgroup_parent: linux_config
                 .as_ref()
                 .and_then(|linux| {
@@ -2168,6 +3708,7 @@ impl RuntimeService for RuntimeServiceImpl {
                     Some(pod_config.log_directory.clone())
                 },
                 runtime_handler: runtime_handler.clone(),
+                runtime_pod_cidr: runtime_pod_cidr.clone(),
                 netns_path: Some(pod.netns_path.to_string_lossy().to_string()),
                 pause_container_id: Some(pod.pause_container_id.clone()),
                 ip: if pod.ip.is_empty() {
@@ -2235,6 +3776,7 @@ impl RuntimeService for RuntimeServiceImpl {
                     Some(pod_config.log_directory.clone())
                 },
                 runtime_handler: runtime_handler.clone(),
+                runtime_pod_cidr: runtime_pod_cidr,
                 cgroup_parent: linux_config.as_ref().and_then(|linux| {
                     (!linux.cgroup_parent.is_empty()).then(|| linux.cgroup_parent.clone())
                 }),
@@ -2350,6 +3892,15 @@ impl RuntimeService for RuntimeServiceImpl {
         }
 
         log::info!("Pod sandbox {} created successfully", pod_id);
+        if let Some(pause_container_id) = pod_state.pause_container_id.as_deref() {
+            self.ensure_pod_exit_monitor_registered(&pod_id, pause_container_id);
+        }
+        self.emit_pod_event(
+            ContainerEventType::ContainerCreatedEvent,
+            &pod_sandbox,
+            Vec::new(),
+        )
+        .await;
         self.emit_pod_event(
             ContainerEventType::ContainerStartedEvent,
             &pod_sandbox,
@@ -2520,6 +4071,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<ContainerStatusRequest>,
     ) -> Result<Response<ContainerStatusResponse>, Status> {
+        self.best_effort_refresh_runtime_state().await;
         let req = request.into_inner();
         let actual_container_id = self.resolve_container_id(&req.container_id).await?;
         let container = {
@@ -2551,8 +4103,35 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<ListContainersRequest>,
     ) -> Result<Response<ListContainersResponse>, Status> {
+        self.best_effort_refresh_runtime_state().await;
         let req = request.into_inner();
-        let filter = req.filter;
+        let filter = if let Some(mut filter) = req.filter {
+            if !filter.id.is_empty() {
+                let Some(resolved_id) = self.resolve_container_id_for_filter(&filter.id).await
+                else {
+                    return Ok(Response::new(ListContainersResponse {
+                        containers: Vec::new(),
+                    }));
+                };
+                filter.id = resolved_id;
+            }
+
+            if !filter.pod_sandbox_id.is_empty() {
+                let Some(resolved_pod_id) = self
+                    .resolve_pod_sandbox_id_for_filter(&filter.pod_sandbox_id)
+                    .await
+                else {
+                    return Ok(Response::new(ListContainersResponse {
+                        containers: Vec::new(),
+                    }));
+                };
+                filter.pod_sandbox_id = resolved_pod_id;
+            }
+
+            Some(filter)
+        } else {
+            None
+        };
         let containers = self.containers.lock().await;
         let pod_meta_by_id: HashMap<String, (String, String, String)> = {
             let pod_sandboxes = self.pod_sandboxes.lock().await;
@@ -2740,6 +4319,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<PortForwardRequest>,
     ) -> Result<Response<PortForwardResponse>, Status> {
+        self.best_effort_refresh_runtime_state().await;
         let req = request.into_inner();
         if req.port.is_empty() {
             return Err(Status::invalid_argument(
@@ -2801,29 +4381,17 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
+        self.best_effort_refresh_runtime_state().await;
         let req = request.into_inner();
-        let runtime_ready = self.config.runtime_path.exists();
+        let (runtime_ready, runtime_reason, runtime_message) = self.runtime_readiness();
         let (network_ready, network_reason, network_message) = self.network_health();
-        let runtime_reason = if runtime_ready {
-            "RuntimeIsReady".to_string()
-        } else {
-            "RuntimeBinaryMissing".to_string()
-        };
-        let runtime_message = if runtime_ready {
-            format!(
-                "runtime binary is available at {}",
-                self.config.runtime_path.display()
-            )
-        } else {
-            format!(
-                "runtime binary does not exist at {}",
-                self.config.runtime_path.display()
-            )
-        };
         let info = if req.verbose {
+            let runtime_network_config = self.runtime_network_config.lock().await.clone();
             let payload = json!({
                 "runtimeName": "crius",
-                "runtimeVersion": env!("CARGO_PKG_VERSION"),
+                "runtimeVersion": self
+                    .runtime_binary_version()
+                    .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
                 "runtimeApiVersion": "v1",
                 "rootDir": self.config.root_dir.display().to_string(),
                 "runtime": self.config.runtime.clone(),
@@ -2833,6 +4401,11 @@ impl RuntimeService for RuntimeServiceImpl {
                 "pauseImage": self.config.pause_image.clone(),
                 "runtimeHandlers": self.config.runtime_handlers.clone(),
                 "runtimeFeatures": self.runtime_feature_flags(),
+                "runtimeNetworkConfig": runtime_network_config.as_ref().map(|cfg| {
+                    json!({
+                        "podCIDR": cfg.pod_cidr,
+                    })
+                }),
                 "networkReady": network_ready,
                 "networkReason": network_reason.clone(),
                 "cgroupDriver": self.cgroup_driver().as_str_name(),
@@ -3008,6 +4581,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<PodSandboxStatusRequest>,
     ) -> Result<Response<PodSandboxStatusResponse>, Status> {
+        self.best_effort_refresh_runtime_state().await;
         let req = request.into_inner();
         let resolved_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
         let pod_sandbox = {
@@ -3018,7 +4592,7 @@ impl RuntimeService for RuntimeServiceImpl {
         let container_statuses = self.current_pod_container_snapshots(&resolved_id).await;
         let status = self.build_pod_sandbox_status_snapshot(&pod_sandbox);
         let info = if req.verbose {
-            self.build_pod_verbose_info(&pod_sandbox)?
+            self.build_pod_verbose_info(&pod_sandbox).await?
         } else {
             HashMap::new()
         };
@@ -3036,8 +4610,21 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<ListPodSandboxRequest>,
     ) -> Result<Response<ListPodSandboxResponse>, Status> {
+        self.best_effort_refresh_runtime_state().await;
         let req = request.into_inner();
-        let filter = req.filter;
+        let filter = if let Some(mut filter) = req.filter {
+            if !filter.id.is_empty() {
+                let Some(resolved_id) = self.resolve_pod_sandbox_id_for_filter(&filter.id).await
+                else {
+                    return Ok(Response::new(ListPodSandboxResponse { items: Vec::new() }));
+                };
+                filter.id = resolved_id;
+            }
+
+            Some(filter)
+        } else {
+            None
+        };
         let pod_sandboxes = self.pod_sandboxes.lock().await;
         let items = pod_sandboxes
             .values()
@@ -3208,18 +4795,76 @@ impl RuntimeService for RuntimeServiceImpl {
 
         let apparmor_profile = Self::security_profile_name(
             security.and_then(|security| security.apparmor.as_ref()),
-            security
-                .map(|security| security.apparmor_profile.as_str())
-                .unwrap_or(""),
+            Self::legacy_linux_container_apparmor_profile(security),
         );
         let selinux_label =
             Self::selinux_label_from_proto(security.and_then(|ctx| ctx.selinux_options.as_ref()));
         let seccomp_profile = Self::seccomp_profile_from_proto(
             security.and_then(|ctx| ctx.seccomp.as_ref()),
-            security
-                .map(|ctx| ctx.seccomp_profile_path.as_str())
-                .unwrap_or(""),
+            Self::legacy_linux_container_seccomp_profile_path(security),
         );
+        let checkpoint_location = config
+            .image
+            .as_ref()
+            .map(|image| image.image.trim().to_string())
+            .filter(|image| !image.is_empty())
+            .and_then(|image| {
+                let path = PathBuf::from(&image);
+                path.exists().then_some(path)
+            })
+            .or_else(|| {
+                config
+                    .annotations
+                    .get(CHECKPOINT_LOCATION_ANNOTATION_KEY)
+                    .filter(|location| !location.trim().is_empty())
+                    .map(PathBuf::from)
+            });
+
+        let checkpoint_restore = checkpoint_location
+            .as_ref()
+            .map(|checkpoint_location| {
+                let checkpoint_image_path =
+                    Self::checkpoint_runtime_image_path(checkpoint_location);
+                let (manifest, oci_config) = Self::load_checkpoint_artifact(checkpoint_location)
+                    .map_err(|e| {
+                        Status::failed_precondition(format!(
+                            "Failed to load checkpoint artifact {}: {}",
+                            checkpoint_location.display(),
+                            e
+                        ))
+                    })?;
+                let image_ref = manifest
+                    .get("imageRef")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string())
+                    .or_else(|| {
+                        config
+                            .annotations
+                            .get(CHECKPOINT_LOCATION_ANNOTATION_KEY)
+                            .and_then(|_| {
+                                config
+                                    .image
+                                    .as_ref()
+                                    .map(|image| image.user_specified_image.clone())
+                            })
+                            .filter(|image| !image.is_empty())
+                    })
+                    .ok_or_else(|| {
+                        Status::failed_precondition(format!(
+                            "Checkpoint artifact {} is missing imageRef",
+                            checkpoint_location.display()
+                        ))
+                    })?;
+
+                Ok::<StoredCheckpointRestore, Status>(StoredCheckpointRestore {
+                    checkpoint_location: checkpoint_location.display().to_string(),
+                    checkpoint_image_path: checkpoint_image_path.display().to_string(),
+                    oci_config,
+                    image_ref,
+                })
+            })
+            .transpose()?;
 
         let linux_resources = config
             .linux
@@ -3237,6 +4882,11 @@ impl RuntimeService for RuntimeServiceImpl {
                     .collect()
             })
             .unwrap_or_default();
+        let container_image_ref = checkpoint_restore
+            .as_ref()
+            .map(|restore| restore.image_ref.clone())
+            .or_else(|| config.image.as_ref().map(|image| image.image.clone()))
+            .unwrap_or_default();
         let mut stored_annotations = config.annotations.clone();
         let container_state = StoredContainerState {
             log_path: log_path
@@ -3245,6 +4895,9 @@ impl RuntimeService for RuntimeServiceImpl {
             tty: config.tty,
             stdin: config.stdin,
             stdin_once: config.stdin_once,
+            privileged: security
+                .map(|security| security.privileged)
+                .unwrap_or(false),
             readonly_rootfs: security
                 .map(|security| security.readonly_rootfs)
                 .unwrap_or(false),
@@ -3307,6 +4960,13 @@ impl RuntimeService for RuntimeServiceImpl {
             INTERNAL_CONTAINER_STATE_KEY,
             &container_state,
         )?;
+        if let Some(checkpoint_restore) = checkpoint_restore.as_ref() {
+            Self::insert_internal_state(
+                &mut stored_annotations,
+                INTERNAL_CHECKPOINT_RESTORE_KEY,
+                checkpoint_restore,
+            )?;
+        }
 
         // 构建容器配置
         let container_config = ContainerConfig {
@@ -3315,11 +4975,7 @@ impl RuntimeService for RuntimeServiceImpl {
                 .as_ref()
                 .map(|m| m.name.clone())
                 .unwrap_or_else(|| container_id.clone()),
-            image: config
-                .image
-                .as_ref()
-                .map(|i| i.image.clone())
-                .unwrap_or_default(),
+            image: container_image_ref.clone(),
             command: config.command.clone(),
             args: config.args.clone(),
             env: config
@@ -3456,12 +5112,14 @@ impl RuntimeService for RuntimeServiceImpl {
             labels: config.labels.clone(),
             metadata: config.metadata.clone(),
             annotations: stored_annotations.clone(),
-            image: config.image.clone(),
-            image_ref: config
-                .image
-                .as_ref()
-                .map(|i| i.image.clone())
-                .unwrap_or_default(),
+            image: config.image.clone().or_else(|| {
+                (!container_image_ref.is_empty()).then(|| ImageSpec {
+                    image: container_image_ref.clone(),
+                    user_specified_image: container_image_ref.clone(),
+                    ..Default::default()
+                })
+            }),
+            image_ref: container_image_ref.clone(),
             ..Default::default()
         };
 
@@ -3480,11 +5138,7 @@ impl RuntimeService for RuntimeServiceImpl {
             &created_id,
             &pod_sandbox_id,
             crate::runtime::ContainerStatus::Created,
-            &config
-                .image
-                .as_ref()
-                .map(|i| i.image.clone())
-                .unwrap_or_default(),
+            &container_image_ref,
             &container_config.command,
             &config.labels,
             &stored_annotations,
@@ -3546,13 +5200,33 @@ impl RuntimeService for RuntimeServiceImpl {
         };
         drop(containers);
 
+        let checkpoint_restore = {
+            let containers = self.containers.lock().await;
+            containers.get(&actual_container_id).and_then(|container| {
+                Self::read_internal_state::<StoredCheckpointRestore>(
+                    &container.annotations,
+                    INTERNAL_CHECKPOINT_RESTORE_KEY,
+                )
+            })
+        };
+
         // 调用runtime启动容器
         let runtime = self.runtime.clone();
         let actual_container_id_clone = actual_container_id.clone();
-        tokio::task::spawn_blocking(move || runtime.start_container(&actual_container_id_clone))
-            .await
-            .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-            .map_err(|e| Status::internal(format!("Failed to start container: {}", e)))?;
+        let checkpoint_restore_for_runtime = checkpoint_restore.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(checkpoint_restore) = checkpoint_restore_for_runtime.as_ref() {
+                runtime.restore_container_from_checkpoint(
+                    &actual_container_id_clone,
+                    Path::new(&checkpoint_restore.checkpoint_image_path),
+                )
+            } else {
+                runtime.start_container(&actual_container_id_clone)
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(|e| Status::internal(format!("Failed to start container: {}", e)))?;
 
         // 等待运行时状态收敛，避免 shim 异步启动失败时仍然误报成功。
         let mut observed_state = ContainerState::ContainerUnknown as i32;
@@ -3644,8 +5318,29 @@ impl RuntimeService for RuntimeServiceImpl {
                 e
             );
         }
+        drop(persistence);
+        if checkpoint_restore.is_some() {
+            let updated_annotations = {
+                let mut containers = self.containers.lock().await;
+                containers.get_mut(&actual_container_id).map(|container| {
+                    container
+                        .annotations
+                        .remove(INTERNAL_CHECKPOINT_RESTORE_KEY);
+                    container.annotations.clone()
+                })
+            };
+            if let Some(updated_annotations) = updated_annotations {
+                self.persist_container_annotations(&actual_container_id, &updated_annotations)
+                    .await?;
+            }
+        }
 
         log::info!("Container {} started", container_id);
+        if observed_state == ContainerState::ContainerCreated as i32
+            || observed_state == ContainerState::ContainerRunning as i32
+        {
+            self.ensure_exit_monitor_registered(&actual_container_id);
+        }
         if let Some(container) = {
             let containers = self.containers.lock().await;
             containers.get(&actual_container_id).cloned()
@@ -3895,8 +5590,63 @@ impl RuntimeService for RuntimeServiceImpl {
             .await?;
         let attach_socket_path = self.attach_socket_path(&req.container_id);
         if !attach_socket_path.exists() {
+            let should_try_restore = {
+                let containers = self.containers.lock().await;
+                containers
+                    .get(&req.container_id)
+                    .and_then(|container| {
+                        Self::read_internal_state::<StoredContainerState>(
+                            &container.annotations,
+                            INTERNAL_CONTAINER_STATE_KEY,
+                        )
+                    })
+                    .map(|state| state.tty)
+                    .unwrap_or(false)
+            };
+
+            if should_try_restore {
+                let runtime = self.runtime.clone();
+                let container_id = req.container_id.clone();
+                if tokio::task::spawn_blocking(move || runtime.restore_attach_shim(&container_id))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .is_some()
+                {
+                    for _ in 0..20 {
+                        if attach_socket_path.exists() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
+        if !attach_socket_path.exists() {
+            let log_path = {
+                let containers = self.containers.lock().await;
+                containers
+                    .get(&req.container_id)
+                    .and_then(|container| {
+                        Self::read_internal_state::<StoredContainerState>(
+                            &container.annotations,
+                            INTERNAL_CONTAINER_STATE_KEY,
+                        )
+                        .and_then(|state| state.log_path)
+                    })
+                    .filter(|path| !path.is_empty())
+            };
+
+            if !req.stdin && log_path.is_some() {
+                let streaming = self.get_streaming_server().await?;
+                let response = streaming
+                    .get_attach_log(&req, PathBuf::from(log_path.unwrap()))
+                    .await?;
+                return Ok(Response::new(response));
+            }
+
             return Err(Status::failed_precondition(format!(
-                "attach is not available for container {}: attach socket {} is missing; attach recovery after daemon restart is not supported",
+                "attach is not available for container {}: attach socket {} is missing and no interactive recovery path is available",
                 req.container_id,
                 attach_socket_path.display()
             )));
@@ -3911,46 +5661,43 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<ContainerStatsRequest>,
     ) -> Result<Response<ContainerStatsResponse>, Status> {
+        self.best_effort_refresh_runtime_state().await;
         let req = request.into_inner();
-        let container_id = req.container_id;
+        let container_id = self.resolve_container_id(&req.container_id).await?;
 
         log::info!("ContainerStats request for container: {}", container_id);
 
         let containers = self.containers.lock().await;
-        
-        log::debug!("Total containers in memory: {}", containers.len());
-        
-        let container = containers
-            .get(&container_id)
-            .ok_or_else(|| {
-                log::warn!("Container {} not found in memory", container_id);
-                Status::not_found("Container not found")
-            })?;
-        
-        log::info!("Found container {} in memory, collecting stats...", container_id);
 
-        // 从容器注解中读取 cgroup_parent
-        let container_state = Self::read_internal_state::<StoredContainerState>(
-            &container.annotations,
-            INTERNAL_CONTAINER_STATE_KEY,
+        log::debug!("Total containers in memory: {}", containers.len());
+
+        let container = containers.get(&container_id).ok_or_else(|| {
+            log::warn!("Container {} not found in memory", container_id);
+            Status::not_found("Container not found")
+        })?;
+
+        log::info!(
+            "Found container {} in memory, collecting stats...",
+            container_id
         );
 
-        let cgroup_parent = container_state
-            .as_ref()
-            .and_then(|s| s.cgroup_parent.as_ref())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"));
+        let cgroup_parent = self.container_cgroup_hint(&container_id, container).await;
 
         // 创建指标采集器并收集容器统计信息
         let stats = match MetricsCollector::new() {
             Ok(collector) => {
                 match collector.collect_container_stats(&container_id, &cgroup_parent) {
                     Ok(stats) => {
-                        // 转换为 proto 格式
-                        Some(Self::convert_to_proto_container_stats(stats))
+                        let mut proto_stats = self.convert_to_proto_container_stats(stats);
+                        Self::populate_container_stats_attributes(&mut proto_stats, container);
+                        Some(proto_stats)
                     }
                     Err(e) => {
-                        log::warn!("Failed to collect stats for container {}: {}", container_id, e);
+                        log::warn!(
+                            "Failed to collect stats for container {}: {}",
+                            container_id,
+                            e
+                        );
                         None
                     }
                 }
@@ -3967,8 +5714,37 @@ impl RuntimeService for RuntimeServiceImpl {
     // 容器列表统计信息
     async fn list_container_stats(
         &self,
-        _request: Request<ListContainerStatsRequest>,
+        request: Request<ListContainerStatsRequest>,
     ) -> Result<Response<ListContainerStatsResponse>, Status> {
+        self.best_effort_refresh_runtime_state().await;
+        let req = request.into_inner();
+        let filter = if let Some(mut filter) = req.filter {
+            if !filter.id.is_empty() {
+                let Some(resolved_id) = self.resolve_container_id_for_filter(&filter.id).await
+                else {
+                    return Ok(Response::new(ListContainerStatsResponse {
+                        stats: Vec::new(),
+                    }));
+                };
+                filter.id = resolved_id;
+            }
+
+            if !filter.pod_sandbox_id.is_empty() {
+                let Some(resolved_pod_id) = self
+                    .resolve_pod_sandbox_id_for_filter(&filter.pod_sandbox_id)
+                    .await
+                else {
+                    return Ok(Response::new(ListContainerStatsResponse {
+                        stats: Vec::new(),
+                    }));
+                };
+                filter.pod_sandbox_id = resolved_pod_id;
+            }
+
+            Some(filter)
+        } else {
+            None
+        };
         let containers = self.containers.lock().await;
         let mut all_stats = Vec::new();
 
@@ -3985,26 +5761,33 @@ impl RuntimeService for RuntimeServiceImpl {
 
         // 为每个容器收集统计信息
         for (container_id, container) in containers.iter() {
-            // 从容器注解中读取 cgroup_parent
-            let container_state = Self::read_internal_state::<StoredContainerState>(
-                &container.annotations,
-                INTERNAL_CONTAINER_STATE_KEY,
-            );
+            if matches!(
+                container.state,
+                x if x == ContainerState::ContainerExited as i32
+                    || x == ContainerState::ContainerUnknown as i32
+            ) {
+                continue;
+            }
 
-            let cgroup_parent = container_state
-                .as_ref()
-                .and_then(|s| s.cgroup_parent.as_ref())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"));
+            if let Some(filter) = &filter {
+                if !Self::container_matches_stats_filter(container, filter) {
+                    continue;
+                }
+            }
+
+            let cgroup_parent = self.container_cgroup_hint(container_id, container).await;
 
             // 收集容器统计信息
             if let Ok(stats) = collector.collect_container_stats(container_id, &cgroup_parent) {
-                let proto_stats = Self::convert_to_proto_container_stats(stats);
+                let mut proto_stats = self.convert_to_proto_container_stats(stats);
+                Self::populate_container_stats_attributes(&mut proto_stats, container);
                 all_stats.push(proto_stats);
             }
         }
 
-        Ok(Response::new(ListContainerStatsResponse { stats: all_stats }))
+        Ok(Response::new(ListContainerStatsResponse {
+            stats: all_stats,
+        }))
     }
 
     // pod沙箱统计信息
@@ -4012,8 +5795,9 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<PodSandboxStatsRequest>,
     ) -> Result<Response<PodSandboxStatsResponse>, Status> {
+        self.best_effort_refresh_runtime_state().await;
         let req = request.into_inner();
-        let pod_id = req.pod_sandbox_id;
+        let pod_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
 
         let pods = self.pod_sandboxes.lock().await;
         let pod = pods
@@ -4029,35 +5813,200 @@ impl RuntimeService for RuntimeServiceImpl {
     // pod沙箱列表统计信息
     async fn list_pod_sandbox_stats(
         &self,
-        _request: Request<ListPodSandboxStatsRequest>,
+        request: Request<ListPodSandboxStatsRequest>,
     ) -> Result<Response<ListPodSandboxStatsResponse>, Status> {
-        let pods = self.pod_sandboxes.lock().await;
+        self.best_effort_refresh_runtime_state().await;
+        let req = request.into_inner();
+        let filter = if let Some(mut filter) = req.filter {
+            if !filter.id.is_empty() {
+                let Some(resolved_id) = self.resolve_pod_sandbox_id_for_filter(&filter.id).await
+                else {
+                    return Ok(Response::new(ListPodSandboxStatsResponse {
+                        stats: Vec::new(),
+                    }));
+                };
+                filter.id = resolved_id;
+            }
+
+            Some(filter)
+        } else {
+            None
+        };
+        let pods: Vec<(String, crate::proto::runtime::v1::PodSandbox)> = {
+            let pods = self.pod_sandboxes.lock().await;
+            pods.iter()
+                .map(|(pod_id, pod)| (pod_id.clone(), pod.clone()))
+                .collect()
+        };
         let mut all_stats = Vec::new();
 
-        for (pod_id, pod) in pods.iter() {
-            if let Some(stats) = self.collect_pod_stats(pod_id, pod).await {
+        for (pod_id, pod) in pods {
+            if let Some(filter) = &filter {
+                if !Self::pod_sandbox_matches_stats_filter(&pod, filter) {
+                    continue;
+                }
+            }
+
+            if let Some(stats) = self.collect_pod_stats(&pod_id, &pod).await {
                 all_stats.push(stats);
             }
         }
 
-        Ok(Response::new(ListPodSandboxStatsResponse { stats: all_stats }))
+        Ok(Response::new(ListPodSandboxStatsResponse {
+            stats: all_stats,
+        }))
     }
 
     // 更新运行时配置
     async fn update_runtime_config(
         &self,
-        _request: Request<UpdateRuntimeConfigRequest>,
+        request: Request<UpdateRuntimeConfigRequest>,
     ) -> Result<Response<UpdateRuntimeConfigResponse>, Status> {
-        // 实现 update_runtime_config 的逻辑
+        let req = request.into_inner();
+        let next_network_config = req
+            .runtime_config
+            .and_then(|runtime_config| runtime_config.network_config)
+            .filter(|network_config| !network_config.pod_cidr.trim().is_empty());
+
+        Self::persist_runtime_network_config(&self.config.root_dir, next_network_config.as_ref())
+            .map_err(|e| Status::internal(format!("Failed to persist runtime config: {}", e)))?;
+
+        let mut stored = self.runtime_network_config.lock().await;
+        *stored = next_network_config;
         Ok(Response::new(UpdateRuntimeConfigResponse {}))
     }
 
     //
     async fn checkpoint_container(
         &self,
-        _request: Request<CheckpointContainerRequest>,
+        request: Request<CheckpointContainerRequest>,
     ) -> Result<Response<CheckpointContainerResponse>, Status> {
-        // 实现 checkpoint_container 的逻辑
+        let req = request.into_inner();
+        if req.container_id.trim().is_empty() {
+            return Err(Status::invalid_argument("container_id must not be empty"));
+        }
+        if req.location.trim().is_empty() {
+            return Err(Status::invalid_argument("location must not be empty"));
+        }
+
+        let container_id = self.resolve_container_id(&req.container_id).await?;
+        let container = {
+            let containers = self.containers.lock().await;
+            containers
+                .get(&container_id)
+                .cloned()
+                .ok_or_else(|| Status::not_found("Container not found"))?
+        };
+
+        let runtime_status = self.runtime_container_status_checked(&container_id).await;
+        if matches!(runtime_status, ContainerStatus::Unknown) {
+            return Err(Status::failed_precondition(format!(
+                "container {} has no known runtime state",
+                container_id
+            )));
+        }
+
+        let runtime_state = Self::map_runtime_container_state(runtime_status);
+        let container_state = Self::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        );
+        let config_path = self.checkpoint_config_path(&container_id);
+        if !config_path.exists() {
+            return Err(Status::failed_precondition(format!(
+                "container {} bundle config is missing at {}",
+                container_id,
+                config_path.display()
+            )));
+        }
+
+        let config_payload: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).map_err(|e| {
+                Status::internal(format!(
+                    "Failed to read checkpoint config {}: {}",
+                    config_path.display(),
+                    e
+                ))
+            })?)
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to parse checkpoint config {}: {}",
+                    config_path.display(),
+                    e
+                ))
+            })?;
+
+        let checkpoint_location = PathBuf::from(&req.location);
+        let checkpoint_image_path = Self::checkpoint_runtime_image_path(&checkpoint_location);
+        let runtime = self.runtime.clone();
+        let container_id_for_checkpoint = container_id.clone();
+        let checkpoint_image_path_for_runtime = checkpoint_image_path.clone();
+        let checkpoint_future = tokio::task::spawn_blocking(move || {
+            runtime.checkpoint_container(
+                &container_id_for_checkpoint,
+                &checkpoint_image_path_for_runtime,
+            )
+        });
+        let checkpoint_result = if req.timeout > 0 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(req.timeout as u64),
+                checkpoint_future,
+            )
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded(format!("checkpoint timed out after {}s", req.timeout))
+            })?
+        } else {
+            checkpoint_future.await
+        };
+        checkpoint_result
+            .map_err(|e| Status::internal(format!("Failed to join checkpoint task: {}", e)))?
+            .map_err(|e| Status::internal(format!("Failed to checkpoint container: {}", e)))?;
+
+        let manifest = json!({
+            "containerId": container_id,
+            "podSandboxId": container.pod_sandbox_id,
+            "imageRef": container.image_ref,
+            "runtimeState": Self::runtime_state_name(runtime_state),
+            "checkpointedAt": Self::now_nanos(),
+            "timeoutSeconds": req.timeout,
+            "bundlePath": self.checkpoint_bundle_path(&container.id).display().to_string(),
+            "configPath": config_path.display().to_string(),
+            "checkpointImagePath": checkpoint_image_path.display().to_string(),
+            "createdAt": container.created_at,
+            "startedAt": container_state.as_ref().and_then(|state| state.started_at),
+            "finishedAt": container_state.as_ref().and_then(|state| state.finished_at),
+            "exitCode": container_state.as_ref().and_then(|state| state.exit_code),
+            "logPath": container_state.as_ref().and_then(|state| state.log_path.clone()),
+            "metadata": {
+                "name": container
+                    .annotations
+                    .get(INTERNAL_CONTAINER_STATE_KEY)
+                    .and_then(|_| container_state.as_ref().and_then(|state| state.metadata_name.clone()))
+                    .or_else(|| {
+                        container
+                            .metadata
+                            .as_ref()
+                            .map(|metadata| metadata.name.clone())
+                    })
+                    .unwrap_or_default(),
+                "attempt": container
+                    .annotations
+                    .get(INTERNAL_CONTAINER_STATE_KEY)
+                    .and_then(|_| container_state.as_ref().and_then(|state| state.metadata_attempt))
+                    .or_else(|| {
+                        container
+                            .metadata
+                            .as_ref()
+                            .map(|metadata| metadata.attempt)
+                    })
+                    .unwrap_or(1),
+            }
+        });
+
+        self.write_checkpoint_artifact(&checkpoint_location, &manifest, &config_payload)
+            .map_err(|e| Status::internal(format!("Failed to write checkpoint artifact: {}", e)))?;
+
         Ok(Response::new(CheckpointContainerResponse {}))
     }
 
@@ -4107,7 +6056,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<ListMetricDescriptorsRequest>,
     ) -> Result<Response<ListMetricDescriptorsResponse>, Status> {
-        use crate::proto::runtime::v1::{MetricDescriptor, MetricType};
+        use crate::proto::runtime::v1::MetricDescriptor;
 
         // 定义支持的指标描述符
         let descriptors = vec![
@@ -4127,19 +6076,29 @@ impl RuntimeService for RuntimeServiceImpl {
                 label_keys: vec!["container_id".to_string(), "pod_id".to_string()],
             },
             MetricDescriptor {
-                name: "container_spec_cpu_quota".to_string(),
-                help: "CPU quota in microseconds".to_string(),
-                label_keys: vec!["container_id".to_string()],
-            },
-            MetricDescriptor {
-                name: "container_spec_cpu_period".to_string(),
-                help: "CPU period in microseconds".to_string(),
-                label_keys: vec!["container_id".to_string()],
-            },
-            MetricDescriptor {
                 name: "container_spec_memory_limit_bytes".to_string(),
                 help: "Memory limit in bytes".to_string(),
                 label_keys: vec!["container_id".to_string()],
+            },
+            MetricDescriptor {
+                name: "container_pids_current".to_string(),
+                help: "Current number of processes in the container cgroup".to_string(),
+                label_keys: vec!["container_id".to_string(), "pod_id".to_string()],
+            },
+            MetricDescriptor {
+                name: "container_filesystem_usage_bytes".to_string(),
+                help: "Writable layer usage in bytes".to_string(),
+                label_keys: vec!["container_id".to_string(), "pod_id".to_string()],
+            },
+            MetricDescriptor {
+                name: "pod_network_receive_bytes_total".to_string(),
+                help: "Total received bytes across pod interfaces".to_string(),
+                label_keys: vec!["pod_id".to_string()],
+            },
+            MetricDescriptor {
+                name: "pod_network_transmit_bytes_total".to_string(),
+                help: "Total transmitted bytes across pod interfaces".to_string(),
+                label_keys: vec!["pod_id".to_string()],
             },
         ];
 
@@ -4151,7 +6110,9 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<ListPodSandboxMetricsRequest>,
     ) -> Result<Response<ListPodSandboxMetricsResponse>, Status> {
-        use crate::proto::runtime::v1::{ContainerMetrics, Metric, MetricType, PodSandboxMetrics, UInt64Value};
+        use crate::proto::runtime::v1::{
+            ContainerMetrics, Metric, MetricType, PodSandboxMetrics, UInt64Value,
+        };
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let pods = self.pod_sandboxes.lock().await;
@@ -4161,7 +6122,7 @@ impl RuntimeService for RuntimeServiceImpl {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
+            .as_nanos() as i64;
 
         for (pod_id, pod) in pods.iter() {
             let mut metrics = Vec::new();
@@ -4174,16 +6135,23 @@ impl RuntimeService for RuntimeServiceImpl {
             let mut total_cpu_usage = 0u64;
             let mut total_memory_usage = 0u64;
             let mut total_memory_limit = 0u64;
+            let mut total_pids = 0u64;
+            let mut total_filesystem_usage = 0u64;
+            let mut total_rx_bytes = 0u64;
+            let mut total_tx_bytes = 0u64;
 
             for (container_id, container) in containers.iter() {
                 // 检查容器是否属于该 Pod
-                let belongs_to_pod = if let Some(ref uid) = pod_uid {
-                    container.annotations.get("io.kubernetes.pod.uid")
-                        .map(|container_uid| container_uid == uid)
-                        .unwrap_or(true)
-                } else {
-                    true
-                };
+                let belongs_to_pod = container.pod_sandbox_id == *pod_id
+                    || pod_uid
+                        .as_ref()
+                        .and_then(|uid| {
+                            container
+                                .annotations
+                                .get("io.kubernetes.pod.uid")
+                                .map(|container_uid| container_uid == uid)
+                        })
+                        .unwrap_or(false);
 
                 if belongs_to_pod {
                     let container_state = Self::read_internal_state::<StoredContainerState>(
@@ -4199,14 +6167,32 @@ impl RuntimeService for RuntimeServiceImpl {
 
                     // 收集容器指标
                     if let Ok(collector) = MetricsCollector::new() {
-                        if let Ok(stats) = collector.collect_container_stats(container_id, &cgroup_parent) {
-                            let container_cpu = stats.cpu.as_ref().map(|c| c.usage_total).unwrap_or(0);
+                        if let Ok(stats) =
+                            collector.collect_container_stats(container_id, &cgroup_parent)
+                        {
+                            let container_cpu =
+                                stats.cpu.as_ref().map(|c| c.usage_total).unwrap_or(0);
                             let container_mem = stats.memory.as_ref().map(|m| m.usage).unwrap_or(0);
-                            let container_mem_limit = stats.memory.as_ref().map(|m| m.limit).unwrap_or(0);
+                            let container_mem_limit =
+                                stats.memory.as_ref().map(|m| m.limit).unwrap_or(0);
+                            let container_pids =
+                                stats.pids.as_ref().map(|p| p.current).unwrap_or(0);
+                            let container_fs_usage = self
+                                .container_writable_layer_usage(container_id)
+                                .and_then(|usage| usage.used_bytes.map(|bytes| bytes.value))
+                                .unwrap_or(0);
+                            let container_network =
+                                self.container_network_stats(container_id).await;
 
                             total_cpu_usage += container_cpu;
                             total_memory_usage += container_mem;
                             total_memory_limit += container_mem_limit;
+                            total_pids += container_pids;
+                            total_filesystem_usage += container_fs_usage;
+                            if let Some(network) = container_network {
+                                total_rx_bytes += network.rx_bytes;
+                                total_tx_bytes += network.tx_bytes;
+                            }
 
                             // 容器级别指标
                             let container_metric_list = vec![
@@ -4215,14 +6201,36 @@ impl RuntimeService for RuntimeServiceImpl {
                                     timestamp,
                                     metric_type: MetricType::Counter as i32,
                                     label_values: vec![container_id.clone(), pod_id.clone()],
-                                    value: Some(UInt64Value { value: container_cpu }),
+                                    value: Some(UInt64Value {
+                                        value: container_cpu,
+                                    }),
                                 },
                                 Metric {
                                     name: "container_memory_working_set_bytes".to_string(),
                                     timestamp,
                                     metric_type: MetricType::Gauge as i32,
                                     label_values: vec![container_id.clone(), pod_id.clone()],
-                                    value: Some(UInt64Value { value: container_mem }),
+                                    value: Some(UInt64Value {
+                                        value: container_mem,
+                                    }),
+                                },
+                                Metric {
+                                    name: "container_pids_current".to_string(),
+                                    timestamp,
+                                    metric_type: MetricType::Gauge as i32,
+                                    label_values: vec![container_id.clone(), pod_id.clone()],
+                                    value: Some(UInt64Value {
+                                        value: container_pids,
+                                    }),
+                                },
+                                Metric {
+                                    name: "container_filesystem_usage_bytes".to_string(),
+                                    timestamp,
+                                    metric_type: MetricType::Gauge as i32,
+                                    label_values: vec![container_id.clone(), pod_id.clone()],
+                                    value: Some(UInt64Value {
+                                        value: container_fs_usage,
+                                    }),
                                 },
                             ];
 
@@ -4236,13 +6244,15 @@ impl RuntimeService for RuntimeServiceImpl {
             }
 
             // Pod 级别聚合指标
-            if total_cpu_usage > 0 || total_memory_usage > 0 {
+            if !container_metrics_list.is_empty() {
                 metrics.push(Metric {
                     name: "container_cpu_usage_seconds_total".to_string(),
                     timestamp,
                     metric_type: MetricType::Counter as i32,
                     label_values: vec![pod_id.clone()],
-                    value: Some(UInt64Value { value: total_cpu_usage }),
+                    value: Some(UInt64Value {
+                        value: total_cpu_usage,
+                    }),
                 });
 
                 metrics.push(Metric {
@@ -4250,7 +6260,9 @@ impl RuntimeService for RuntimeServiceImpl {
                     timestamp,
                     metric_type: MetricType::Gauge as i32,
                     label_values: vec![pod_id.clone()],
-                    value: Some(UInt64Value { value: total_memory_usage }),
+                    value: Some(UInt64Value {
+                        value: total_memory_usage,
+                    }),
                 });
 
                 metrics.push(Metric {
@@ -4258,7 +6270,9 @@ impl RuntimeService for RuntimeServiceImpl {
                     timestamp,
                     metric_type: MetricType::Gauge as i32,
                     label_values: vec![pod_id.clone()],
-                    value: Some(UInt64Value { value: total_memory_usage }),
+                    value: Some(UInt64Value {
+                        value: total_memory_usage,
+                    }),
                 });
 
                 metrics.push(Metric {
@@ -4266,7 +6280,47 @@ impl RuntimeService for RuntimeServiceImpl {
                     timestamp,
                     metric_type: MetricType::Gauge as i32,
                     label_values: vec![pod_id.clone()],
-                    value: Some(UInt64Value { value: total_memory_limit }),
+                    value: Some(UInt64Value {
+                        value: total_memory_limit,
+                    }),
+                });
+
+                metrics.push(Metric {
+                    name: "container_pids_current".to_string(),
+                    timestamp,
+                    metric_type: MetricType::Gauge as i32,
+                    label_values: vec![pod_id.clone()],
+                    value: Some(UInt64Value { value: total_pids }),
+                });
+
+                metrics.push(Metric {
+                    name: "container_filesystem_usage_bytes".to_string(),
+                    timestamp,
+                    metric_type: MetricType::Gauge as i32,
+                    label_values: vec![pod_id.clone()],
+                    value: Some(UInt64Value {
+                        value: total_filesystem_usage,
+                    }),
+                });
+
+                metrics.push(Metric {
+                    name: "pod_network_receive_bytes_total".to_string(),
+                    timestamp,
+                    metric_type: MetricType::Counter as i32,
+                    label_values: vec![pod_id.clone()],
+                    value: Some(UInt64Value {
+                        value: total_rx_bytes,
+                    }),
+                });
+
+                metrics.push(Metric {
+                    name: "pod_network_transmit_bytes_total".to_string(),
+                    timestamp,
+                    metric_type: MetricType::Counter as i32,
+                    label_values: vec![pod_id.clone()],
+                    value: Some(UInt64Value {
+                        value: total_tx_bytes,
+                    }),
                 });
 
                 pod_metrics_list.push(PodSandboxMetrics {
@@ -4304,20 +6358,11 @@ impl RuntimeService for RuntimeServiceImpl {
         let req = request.into_inner();
         let container_id = self.resolve_container_id(&req.container_id).await?;
 
-        // 检查容器是否存在
-        let containers = self.containers.lock().await;
-        let container = containers
-            .get(&container_id)
-            .ok_or_else(|| Status::not_found("Container not found"))?;
-
-        // 检查容器状态，只有 running 状态的容器才能更新资源
-        let is_running = container.state == ContainerState::ContainerRunning as i32;
-        drop(containers);
-
-        if !is_running {
-            return Err(Status::failed_precondition(
-                "Container must be in RUNNING state to update resources",
-            ));
+        {
+            let containers = self.containers.lock().await;
+            if !containers.contains_key(&container_id) {
+                return Err(Status::not_found("Container not found"));
+            }
         }
 
         // 获取资源限制
@@ -4333,6 +6378,14 @@ impl RuntimeService for RuntimeServiceImpl {
                 "container {} is not in a mutable state",
                 container_id
             )));
+        }
+
+        let observed_state = Self::map_runtime_container_state(runtime_status);
+        {
+            let mut containers = self.containers.lock().await;
+            if let Some(container) = containers.get_mut(&container_id) {
+                container.state = observed_state;
+            }
         }
 
         if let Some(resources) = linux {
@@ -4359,7 +6412,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::Path;
     use std::path::PathBuf;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Mutex as StdMutex, OnceLock};
     use std::time::Duration;
     use tempfile::tempdir;
     use tempfile::TempDir;
@@ -4379,7 +6432,12 @@ mod tests {
     }
 
     fn test_service() -> RuntimeServiceImpl {
-        RuntimeServiceImpl::new(test_runtime_config(tempdir().unwrap().into_path()))
+        RuntimeServiceImpl::new(test_runtime_config(tempdir().unwrap().keep()))
+    }
+
+    fn env_lock() -> &'static StdMutex<()> {
+        static ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| StdMutex::new(()))
     }
 
     fn write_fake_runtime_script(dir: &Path) -> PathBuf {
@@ -4444,6 +6502,53 @@ case "$cmd" in
     done
     if [ -n "$resource_file" ] && [ -n "$id" ]; then
       cp "$resource_file" "$STATE_DIR/$id.update.json"
+    fi
+    ;;
+  checkpoint)
+    image_path=""
+    id=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --image-path|--work-path)
+          if [ "$1" = "--image-path" ]; then
+            image_path="${{2:-}}"
+          fi
+          shift 2
+          ;;
+        --leave-running)
+          shift
+          ;;
+        *)
+          id="$1"
+          shift
+          ;;
+      esac
+    done
+    if [ -n "$image_path" ] && [ -n "$id" ]; then
+      mkdir -p "$image_path"
+      printf '{{"id":"%s","checkpointed":true}}\n' "$id" > "$image_path/checkpoint.json"
+    fi
+    ;;
+  restore)
+    id=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -d|--image-path|--work-path|--bundle|--no-pivot)
+          if [ "$1" = "-d" ] || [ "$1" = "--no-pivot" ]; then
+            shift
+          else
+            shift 2
+          fi
+          ;;
+        *)
+          id="$1"
+          shift
+          ;;
+      esac
+    done
+    if [ -n "$id" ]; then
+      echo running > "$STATE_DIR/$id.state"
+      echo $$ > "$STATE_DIR/$id.pid"
     fi
     ;;
 esac
@@ -4985,7 +7090,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn attach_returns_explicit_error_when_recovered_socket_is_missing() {
+    async fn attach_uses_log_stream_fallback_when_recovered_socket_is_missing() {
         let (dir, service) = test_service_with_fake_runtime();
         service
             .set_streaming_server(crate::streaming::StreamingServer::for_test(
@@ -4994,6 +7099,22 @@ exit 0
             .await;
 
         set_fake_runtime_state(&dir, "recover-container", "running");
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                log_path: Some(
+                    dir.path()
+                        .join("logs")
+                        .join("recover.log")
+                        .display()
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         service
             .persistence
             .lock()
@@ -5005,13 +7126,17 @@ exit 0
                 "busybox:latest",
                 &Vec::new(),
                 &HashMap::new(),
-                &HashMap::new(),
+                &annotations,
             )
             .unwrap();
+        service.containers.lock().await.insert(
+            "recover-container".to_string(),
+            test_container("recover-container", "pod-1", annotations),
+        );
 
         service.recover_state().await.unwrap();
 
-        let err = RuntimeService::attach(
+        let response = RuntimeService::attach(
             &service,
             Request::new(AttachRequest {
                 container_id: "recover-container".to_string(),
@@ -5022,16 +7147,201 @@ exit 0
             }),
         )
         .await
+        .unwrap()
+        .into_inner();
+        assert!(response.url.contains("/attach/"));
+    }
+
+    #[tokio::test]
+    async fn attach_uses_log_stream_fallback_for_read_only_tty_when_socket_is_missing() {
+        let (dir, service) = test_service_with_fake_runtime();
+        service
+            .set_streaming_server(crate::streaming::StreamingServer::for_test(
+                "http://127.0.0.1:12345",
+            ))
+            .await;
+
+        set_fake_runtime_state(&dir, "recover-container-tty", "running");
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                log_path: Some(
+                    dir.path()
+                        .join("logs")
+                        .join("recover-tty.log")
+                        .display()
+                        .to_string(),
+                ),
+                tty: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service.containers.lock().await.insert(
+            "recover-container-tty".to_string(),
+            test_container("recover-container-tty", "pod-1", annotations),
+        );
+
+        let response = RuntimeService::attach(
+            &service,
+            Request::new(AttachRequest {
+                container_id: "recover-container-tty".to_string(),
+                stdin: false,
+                stdout: true,
+                stderr: false,
+                tty: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(response.url.contains("/attach/"));
+    }
+
+    #[tokio::test]
+    async fn attach_recreates_tty_shim_when_socket_is_missing() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let runtime_path = write_fake_runtime_script(dir.path());
+        let shim_work_dir = dir.path().join("shims");
+        let fake_shim_path = dir.path().join("fake-shim.sh");
+        fs::write(
+            &fake_shim_path,
+            r#"#!/bin/sh
+set -eu
+exit_code_file=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --exit-code-file)
+      exit_code_file="${2:-}"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+shim_dir="$(dirname "$exit_code_file")"
+mkdir -p "$shim_dir"
+: > "$shim_dir/attach.sock"
+: > "$shim_dir/resize.sock"
+sleep 1
+"#,
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&fake_shim_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_shim_path, perms).unwrap();
+
+        std::env::set_var("CRIUS_SHIM_PATH", &fake_shim_path);
+        let service = RuntimeServiceImpl::new_with_shim_work_dir(
+            RuntimeConfig {
+                root_dir: dir.path().join("root"),
+                runtime: "runc".to_string(),
+                runtime_handlers: vec!["runc".to_string()],
+                runtime_root: dir.path().join("runtime-root"),
+                log_dir: dir.path().join("logs"),
+                runtime_path,
+                pause_image: "registry.k8s.io/pause:3.9".to_string(),
+            },
+            shim_work_dir.clone(),
+        );
+        std::env::remove_var("CRIUS_SHIM_PATH");
+        service
+            .set_streaming_server(crate::streaming::StreamingServer::for_test(
+                "http://127.0.0.1:12345",
+            ))
+            .await;
+
+        set_fake_runtime_state(&dir, "tty-restore", "running");
+        let bundle_dir = dir.path().join("runtime-root").join("tty-restore");
+        fs::create_dir_all(&bundle_dir).unwrap();
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::json!({
+                "ociVersion": "1.0.2",
+                "process": {
+                    "terminal": true
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                tty: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service.containers.lock().await.insert(
+            "tty-restore".to_string(),
+            Container {
+                state: ContainerState::ContainerRunning as i32,
+                ..test_container("tty-restore", "pod-1", annotations)
+            },
+        );
+
+        let response = RuntimeService::attach(
+            &service,
+            Request::new(AttachRequest {
+                container_id: "tty-restore".to_string(),
+                stdin: true,
+                stdout: true,
+                stderr: false,
+                tty: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(response.url.contains("/attach/"));
+        assert!(shim_work_dir
+            .join("tty-restore")
+            .join("attach.sock")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn attach_returns_error_when_socket_missing_and_interactive_recovery_is_requested() {
+        let (dir, service) = test_service_with_fake_runtime();
+        service
+            .set_streaming_server(crate::streaming::StreamingServer::for_test(
+                "http://127.0.0.1:12345",
+            ))
+            .await;
+
+        set_fake_runtime_state(&dir, "recover-container", "running");
+        service.containers.lock().await.insert(
+            "recover-container".to_string(),
+            test_container("recover-container", "pod-1", HashMap::new()),
+        );
+
+        let err = RuntimeService::attach(
+            &service,
+            Request::new(AttachRequest {
+                container_id: "recover-container".to_string(),
+                stdin: true,
+                stdout: true,
+                stderr: false,
+                tty: true,
+            }),
+        )
+        .await
         .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err
-            .message()
-            .contains("attach recovery after daemon restart is not supported"));
+        assert!(err.message().contains("interactive recovery"));
     }
 
     #[tokio::test]
     async fn container_status_verbose_returns_json_info() {
-        let service = test_service();
+        let (dir, service) = test_service_with_fake_runtime();
         let mut annotations = HashMap::new();
         RuntimeServiceImpl::insert_internal_state(
             &mut annotations,
@@ -5039,6 +7349,7 @@ exit 0
             &StoredContainerState {
                 log_path: Some("/var/log/pods/c1.log".to_string()),
                 tty: true,
+                privileged: true,
                 mounts: vec![StoredMount {
                     container_path: "/data".to_string(),
                     host_path: "/host/data".to_string(),
@@ -5056,6 +7367,21 @@ exit 0
             "container-1".to_string(),
             test_container("container-1", "pod-1", annotations),
         );
+        set_fake_runtime_state(&dir, "container-1", "running");
+        let bundle_dir = dir.path().join("runtime-root").join("container-1");
+        fs::create_dir_all(&bundle_dir).unwrap();
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::json!({
+                "ociVersion": "1.0.2",
+                "process": {
+                    "terminal": true,
+                    "cwd": "/"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         let response = RuntimeService::container_status(
             &service,
@@ -5072,14 +7398,21 @@ exit 0
         let info: serde_json::Value =
             serde_json::from_str(response.info.get("info").unwrap()).unwrap();
         assert_eq!(info["id"], "container-1");
+        assert_eq!(info["sandboxID"], "pod-1");
+        assert_eq!(info["privileged"], true);
         assert_eq!(info["user"], "1000");
+        assert_eq!(info["runtimeSpec"]["process"]["cwd"], "/");
         assert_eq!(response.status.unwrap().mounts.len(), 1);
     }
 
     #[tokio::test]
     async fn pod_sandbox_status_verbose_returns_json_info() {
-        let service = test_service();
+        let (dir, service) = test_service_with_fake_runtime();
         let mut annotations = HashMap::new();
+        annotations.insert(
+            "io.kubernetes.cri.sandbox-image".to_string(),
+            "registry.k8s.io/pause:3.10".to_string(),
+        );
         RuntimeServiceImpl::insert_internal_state(
             &mut annotations,
             INTERNAL_POD_STATE_KEY,
@@ -5096,6 +7429,20 @@ exit 0
             .lock()
             .await
             .insert("pod-1".to_string(), test_pod("pod-1", annotations));
+        set_fake_runtime_state(&dir, "pause-1", "running");
+        let bundle_dir = dir.path().join("runtime-root").join("pause-1");
+        fs::create_dir_all(&bundle_dir).unwrap();
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::json!({
+                "ociVersion": "1.0.2",
+                "root": {
+                    "path": "rootfs"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         let response = RuntimeService::pod_sandbox_status(
             &service,
@@ -5112,7 +7459,10 @@ exit 0
         let info: serde_json::Value =
             serde_json::from_str(response.info.get("info").unwrap()).unwrap();
         assert_eq!(info["id"], "pod-1");
+        assert_eq!(info["image"], "registry.k8s.io/pause:3.10");
         assert_eq!(info["pauseContainerId"], "pause-1");
+        assert!(info["pid"].is_number());
+        assert_eq!(info["runtimeSpec"]["root"]["path"], "rootfs");
     }
 
     #[tokio::test]
@@ -5132,11 +7482,94 @@ exit 0
         assert_eq!(config["recovery"]["startupReconcile"], true);
         assert_eq!(config["recovery"]["eventReplayOnRecovery"], false);
         assert_eq!(config["runtimeFeatures"]["updateContainerResources"], true);
+        assert_eq!(config["runtimeFeatures"]["containerStats"], true);
+        assert_eq!(config["runtimeFeatures"]["podSandboxStats"], true);
+        assert_eq!(config["runtimeFeatures"]["podSandboxMetrics"], true);
         assert_eq!(
             response.status.unwrap().conditions.len(),
             2,
             "expected runtime and network conditions"
         );
+    }
+
+    #[tokio::test]
+    async fn version_reports_runtime_binary_version_when_available() {
+        let dir = tempdir().unwrap();
+        let runtime_path = dir.path().join("fake-runtime-version.sh");
+        fs::write(
+            &runtime_path,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "runc version 1.2.3"
+  exit 0
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&runtime_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&runtime_path, perms).unwrap();
+
+        let service = RuntimeServiceImpl::new(RuntimeConfig {
+            runtime_path: runtime_path.clone(),
+            ..test_runtime_config(dir.path().join("root"))
+        });
+        let response = RuntimeService::version(
+            &service,
+            Request::new(VersionRequest {
+                version: "0.1.0".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(response.runtime_name, "runc");
+        assert_eq!(response.runtime_version, "runc version 1.2.3");
+    }
+
+    #[test]
+    fn parse_cgroup_hint_from_procfs_prefers_relevant_controller_or_unified_line() {
+        let v1 = "11:hugetlb:/\n10:memory:/kubepods.slice/pod123/container.scope\n9:cpuset:/\n";
+        assert_eq!(
+            RuntimeServiceImpl::parse_cgroup_hint_from_procfs(v1),
+            Some(PathBuf::from("/kubepods.slice/pod123/container.scope"))
+        );
+
+        let v2 = "0::/user.slice/user-0.slice/session-1.scope\n";
+        assert_eq!(
+            RuntimeServiceImpl::parse_cgroup_hint_from_procfs(v2),
+            Some(PathBuf::from("/user.slice/user-0.slice/session-1.scope"))
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_runtime_not_ready_when_binary_is_not_executable() {
+        let dir = tempdir().unwrap();
+        let runtime_path = dir.path().join("fake-runtime");
+        fs::write(&runtime_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = fs::metadata(&runtime_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&runtime_path, perms).unwrap();
+
+        let service = RuntimeServiceImpl::new(RuntimeConfig {
+            runtime_path: runtime_path.clone(),
+            ..test_runtime_config(dir.path().join("root"))
+        });
+        let response =
+            RuntimeService::status(&service, Request::new(StatusRequest { verbose: false }))
+                .await
+                .unwrap()
+                .into_inner();
+        let runtime_condition = response
+            .status
+            .unwrap()
+            .conditions
+            .into_iter()
+            .find(|condition| condition.r#type == "RuntimeReady")
+            .unwrap();
+        assert!(!runtime_condition.status);
+        assert_eq!(runtime_condition.reason, "RuntimeBinaryNotExecutable");
     }
 
     #[tokio::test]
@@ -5152,6 +7585,343 @@ exit 0
             response.linux.unwrap().cgroup_driver,
             service.cgroup_driver() as i32
         );
+    }
+
+    #[tokio::test]
+    async fn update_runtime_config_persists_network_config_and_exposes_it_via_status() {
+        let root_dir = tempdir().unwrap().keep();
+        let service = RuntimeServiceImpl::new(test_runtime_config(root_dir.clone()));
+
+        RuntimeService::update_runtime_config(
+            &service,
+            Request::new(UpdateRuntimeConfigRequest {
+                runtime_config: Some(crate::proto::runtime::v1::RuntimeConfig {
+                    network_config: Some(crate::proto::runtime::v1::NetworkConfig {
+                        pod_cidr: "10.244.0.0/16".to_string(),
+                    }),
+                }),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let status =
+            RuntimeService::status(&service, Request::new(StatusRequest { verbose: true }))
+                .await
+                .unwrap()
+                .into_inner();
+        let config: serde_json::Value =
+            serde_json::from_str(status.info.get("config").unwrap()).unwrap();
+        assert_eq!(config["runtimeNetworkConfig"]["podCIDR"], "10.244.0.0/16");
+
+        let reloaded = RuntimeServiceImpl::new(test_runtime_config(root_dir));
+        let reloaded_status =
+            RuntimeService::status(&reloaded, Request::new(StatusRequest { verbose: true }))
+                .await
+                .unwrap()
+                .into_inner();
+        let reloaded_config: serde_json::Value =
+            serde_json::from_str(reloaded_status.info.get("config").unwrap()).unwrap();
+        assert_eq!(
+            reloaded_config["runtimeNetworkConfig"]["podCIDR"],
+            "10.244.0.0/16"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_pod_sandbox_persists_runtime_pod_cidr_in_verbose_info() {
+        let (dir, service) = test_service_with_fake_runtime();
+        RuntimeService::update_runtime_config(
+            &service,
+            Request::new(UpdateRuntimeConfigRequest {
+                runtime_config: Some(crate::proto::runtime::v1::RuntimeConfig {
+                    network_config: Some(crate::proto::runtime::v1::NetworkConfig {
+                        pod_cidr: "10.88.0.0/16".to_string(),
+                    }),
+                }),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let netns_path = dir.path().join("pod-runtime-cidr.netns");
+        fs::write(&netns_path, "netns").unwrap();
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                runtime_handler: "runc".to_string(),
+                runtime_pod_cidr: Some("10.88.0.0/16".to_string()),
+                netns_path: Some(netns_path.display().to_string()),
+                pause_container_id: Some("pause-runtime-cidr".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        service.pod_sandboxes.lock().await.insert(
+            "pod-runtime-cidr".to_string(),
+            test_pod("pod-runtime-cidr", annotations),
+        );
+
+        let response = RuntimeService::pod_sandbox_status(
+            &service,
+            Request::new(PodSandboxStatusRequest {
+                pod_sandbox_id: "pod-runtime-cidr".to_string(),
+                verbose: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let info: serde_json::Value =
+            serde_json::from_str(response.info.get("info").unwrap()).unwrap();
+        assert_eq!(info["runtimePodCIDR"], "10.88.0.0/16");
+    }
+
+    #[test]
+    fn network_health_requires_declared_plugin_binary() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let config_dir = dir.path().join("cni-conf");
+        let plugin_dir = dir.path().join("cni-bin");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            config_dir.join("10-test.conflist"),
+            r#"{"cniVersion":"0.4.0","name":"test","plugins":[{"type":"bridge"}]}"#,
+        )
+        .unwrap();
+
+        std::env::set_var("CRIUS_CNI_CONFIG_DIRS", config_dir.display().to_string());
+        std::env::set_var("CRIUS_CNI_PLUGIN_DIRS", plugin_dir.display().to_string());
+        let service = test_service();
+        let (ready, reason, message) = service.network_health();
+        std::env::remove_var("CRIUS_CNI_CONFIG_DIRS");
+        std::env::remove_var("CRIUS_CNI_PLUGIN_DIRS");
+
+        assert!(!ready);
+        assert_eq!(reason, "CNIPluginMissing");
+        assert!(message.contains("bridge"));
+    }
+
+    #[test]
+    fn network_health_requires_plugin_to_be_executable() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let config_dir = dir.path().join("cni-conf");
+        let plugin_dir = dir.path().join("cni-bin");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            config_dir.join("10-test.conflist"),
+            r#"{"cniVersion":"0.4.0","name":"test","plugins":[{"type":"bridge"}]}"#,
+        )
+        .unwrap();
+        let plugin_path = plugin_dir.join("bridge");
+        fs::write(&plugin_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&plugin_path, perms).unwrap();
+
+        std::env::set_var("CRIUS_CNI_CONFIG_DIRS", config_dir.display().to_string());
+        std::env::set_var("CRIUS_CNI_PLUGIN_DIRS", plugin_dir.display().to_string());
+        let service = test_service();
+        let (ready, reason, message) = service.network_health();
+        std::env::remove_var("CRIUS_CNI_CONFIG_DIRS");
+        std::env::remove_var("CRIUS_CNI_PLUGIN_DIRS");
+
+        assert!(!ready);
+        assert_eq!(reason, "CNIPluginMissing");
+        assert!(message.contains("bridge"));
+        assert!(message.contains("non-executable"));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_container_writes_checkpoint_artifact() {
+        let (dir, service) = test_service_with_fake_runtime();
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                log_path: Some(dir.path().join("logs").join("c1.log").display().to_string()),
+                metadata_name: Some("checkpointed".to_string()),
+                metadata_attempt: Some(2),
+                started_at: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        service.containers.lock().await.insert(
+            "container-running".to_string(),
+            test_container("container-running", "pod-1", annotations),
+        );
+        set_fake_runtime_state(&dir, "container-running", "running");
+
+        let bundle_dir = dir.path().join("runtime-root").join("container-running");
+        fs::create_dir_all(&bundle_dir).unwrap();
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::json!({
+                "ociVersion": "1.0.2",
+                "root": {
+                    "path": "/tmp/rootfs"
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let artifact_path = dir.path().join("checkpoint.json");
+        RuntimeService::checkpoint_container(
+            &service,
+            Request::new(CheckpointContainerRequest {
+                container_id: "container-running".to_string(),
+                location: artifact_path.display().to_string(),
+                timeout: 30,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let artifact: serde_json::Value =
+            serde_json::from_slice(&fs::read(&artifact_path).unwrap()).unwrap();
+        assert_eq!(artifact["manifest"]["containerId"], "container-running");
+        assert_eq!(artifact["manifest"]["runtimeState"], "running");
+        assert_eq!(artifact["manifest"]["metadata"]["name"], "checkpointed");
+        assert_eq!(artifact["manifest"]["metadata"]["attempt"], 2);
+        assert_eq!(artifact["ociConfig"]["root"]["path"], "/tmp/rootfs");
+        let checkpoint_image_path = PathBuf::from(
+            artifact["manifest"]["checkpointImagePath"]
+                .as_str()
+                .expect("checkpoint image path should be recorded"),
+        );
+        assert!(checkpoint_image_path.join("checkpoint.json").exists());
+    }
+
+    #[tokio::test]
+    async fn start_container_restores_from_checkpoint_artifact_and_clears_pending_marker() {
+        let (dir, service) = test_service_with_fake_runtime();
+
+        let checkpoint_location = dir.path().join("restore-artifact.json");
+        let checkpoint_image_path =
+            RuntimeServiceImpl::checkpoint_runtime_image_path(&checkpoint_location);
+        fs::create_dir_all(&checkpoint_image_path).unwrap();
+        fs::write(checkpoint_image_path.join("checkpoint.json"), "{}").unwrap();
+        fs::write(
+            &checkpoint_location,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "manifest": {
+                    "imageRef": "busybox:latest",
+                    "checkpointImagePath": checkpoint_image_path.display().to_string(),
+                },
+                "ociConfig": {
+                    "ociVersion": "1.0.2",
+                    "root": {
+                        "path": "/tmp/rootfs"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CHECKPOINT_RESTORE_KEY,
+            &StoredCheckpointRestore {
+                checkpoint_location: checkpoint_location.display().to_string(),
+                checkpoint_image_path: checkpoint_image_path.display().to_string(),
+                oci_config: serde_json::json!({
+                    "ociVersion": "1.0.2",
+                    "root": {
+                        "path": "/tmp/rootfs"
+                    }
+                }),
+                image_ref: "busybox:latest".to_string(),
+            },
+        )
+        .unwrap();
+
+        service.containers.lock().await.insert(
+            "restore-container".to_string(),
+            Container {
+                state: ContainerState::ContainerCreated as i32,
+                ..test_container("restore-container", "pod-1", annotations.clone())
+            },
+        );
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "restore-container",
+                "pod-1",
+                crate::runtime::ContainerStatus::Created,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+
+        RuntimeService::start_container(
+            &service,
+            Request::new(StartContainerRequest {
+                container_id: "restore-container".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let container = service
+            .containers
+            .lock()
+            .await
+            .get("restore-container")
+            .cloned()
+            .unwrap();
+        assert_eq!(container.state, ContainerState::ContainerRunning as i32);
+        assert!(
+            !container
+                .annotations
+                .contains_key(INTERNAL_CHECKPOINT_RESTORE_KEY),
+            "restore marker should be cleared after successful restore"
+        );
+
+        let persisted = service
+            .persistence
+            .lock()
+            .await
+            .storage()
+            .get_container("restore-container")
+            .unwrap()
+            .unwrap();
+        let persisted_annotations: HashMap<String, String> =
+            serde_json::from_str(&persisted.annotations).unwrap();
+        assert!(
+            !persisted_annotations.contains_key(INTERNAL_CHECKPOINT_RESTORE_KEY),
+            "restore marker should be cleared from persistence after successful restore"
+        );
+
+        let exit_code_path = dir
+            .path()
+            .join("shims")
+            .join("restore-container")
+            .join("exit_code");
+        fs::create_dir_all(exit_code_path.parent().unwrap()).unwrap();
+        fs::write(&exit_code_path, "0").unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
     #[tokio::test]
@@ -5261,8 +8031,9 @@ exit 0
         let log_path_for_server = log_path.clone();
         let (tx, rx) = mpsc::channel();
         let server = std::thread::spawn(move || {
-            let _ = listener.accept().unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
             fs::write(&log_path_for_server, "").unwrap();
+            stream.write_all(b"OK\n").unwrap();
             tx.send(()).unwrap();
         });
 
@@ -5523,6 +8294,403 @@ exit 0
     }
 
     #[tokio::test]
+    async fn list_container_stats_applies_id_pod_and_label_filters() {
+        let (dir, service) = test_service_with_fake_runtime();
+
+        let mut container_a = test_container("container-alpha-123", "pod-alpha", HashMap::new());
+        container_a
+            .labels
+            .insert("app".to_string(), "api".to_string());
+        let mut container_b = test_container("container-bravo-456", "pod-bravo", HashMap::new());
+        container_b
+            .labels
+            .insert("app".to_string(), "worker".to_string());
+
+        {
+            let mut pods = service.pod_sandboxes.lock().await;
+            pods.insert(
+                "pod-alpha".to_string(),
+                test_pod("pod-alpha", HashMap::new()),
+            );
+            pods.insert(
+                "pod-bravo".to_string(),
+                test_pod("pod-bravo", HashMap::new()),
+            );
+        }
+        {
+            let mut containers = service.containers.lock().await;
+            containers.insert(container_a.id.clone(), container_a);
+            containers.insert(container_b.id.clone(), container_b);
+        }
+        set_fake_runtime_state(&dir, "container-alpha-123", "running");
+        set_fake_runtime_state(&dir, "container-bravo-456", "running");
+
+        let mut selector = HashMap::new();
+        selector.insert("app".to_string(), "api".to_string());
+        let response = RuntimeService::list_container_stats(
+            &service,
+            Request::new(ListContainerStatsRequest {
+                filter: Some(crate::proto::runtime::v1::ContainerStatsFilter {
+                    id: "container-alpha".to_string(),
+                    pod_sandbox_id: "pod-alpha".to_string(),
+                    label_selector: selector,
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.stats.len(), 1);
+        assert_eq!(
+            response.stats[0]
+                .attributes
+                .as_ref()
+                .expect("container stats should include attributes")
+                .id,
+            "container-alpha-123"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_containers_returns_empty_when_short_id_filter_is_ambiguous() {
+        let service = test_service();
+
+        {
+            let mut containers = service.containers.lock().await;
+            containers.insert(
+                "container-ambiguous-a".to_string(),
+                test_container("container-ambiguous-a", "pod-a", HashMap::new()),
+            );
+            containers.insert(
+                "container-ambiguous-b".to_string(),
+                test_container("container-ambiguous-b", "pod-b", HashMap::new()),
+            );
+        }
+
+        let response = RuntimeService::list_containers(
+            &service,
+            Request::new(ListContainersRequest {
+                filter: Some(crate::proto::runtime::v1::ContainerFilter {
+                    id: "container-ambiguous".to_string(),
+                    ..Default::default()
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(
+            response.containers.is_empty(),
+            "ambiguous short container ids should behave like cri-o filters and return no entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_stats_resolves_short_id_and_list_container_stats_skips_exited() {
+        let (dir, service) = test_service_with_fake_runtime();
+
+        {
+            let mut containers = service.containers.lock().await;
+            containers.insert(
+                "container-running-123".to_string(),
+                test_container("container-running-123", "pod-1", HashMap::new()),
+            );
+            containers.insert(
+                "container-stopped-456".to_string(),
+                test_container("container-stopped-456", "pod-1", HashMap::new()),
+            );
+        }
+        set_fake_runtime_state(&dir, "container-running-123", "running");
+        set_fake_runtime_state(&dir, "container-stopped-456", "stopped");
+
+        let stats = RuntimeService::container_stats(
+            &service,
+            Request::new(ContainerStatsRequest {
+                container_id: "container-running".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .stats
+        .expect("short container id should resolve to stats");
+        assert_eq!(
+            stats
+                .attributes
+                .as_ref()
+                .expect("container stats should include attributes")
+                .id,
+            "container-running-123"
+        );
+
+        let list = RuntimeService::list_container_stats(
+            &service,
+            Request::new(ListContainerStatsRequest { filter: None }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let ids = list
+            .stats
+            .iter()
+            .filter_map(|stat| {
+                stat.attributes
+                    .as_ref()
+                    .map(|attributes| attributes.id.clone())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            ids.iter().any(|id| id == "container-running-123"),
+            "running containers should remain visible in list stats"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "container-stopped-456"),
+            "exited containers should be filtered out from list stats by default"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pod_sandbox_stats_applies_id_and_label_filters() {
+        let service = test_service();
+
+        let mut pod_alpha = test_pod("pod-alpha", HashMap::new());
+        pod_alpha
+            .labels
+            .insert("tier".to_string(), "frontend".to_string());
+        let pod_alpha_uid = pod_alpha
+            .metadata
+            .as_ref()
+            .expect("test pod should include metadata")
+            .uid
+            .clone();
+
+        let mut pod_bravo = test_pod("pod-bravo", HashMap::new());
+        pod_bravo
+            .labels
+            .insert("tier".to_string(), "backend".to_string());
+        let pod_bravo_uid = pod_bravo
+            .metadata
+            .as_ref()
+            .expect("test pod should include metadata")
+            .uid
+            .clone();
+
+        {
+            let mut pods = service.pod_sandboxes.lock().await;
+            pods.insert("pod-alpha".to_string(), pod_alpha);
+            pods.insert("pod-bravo".to_string(), pod_bravo);
+        }
+
+        let mut container_alpha_annotations = HashMap::new();
+        container_alpha_annotations.insert("io.kubernetes.pod.uid".to_string(), pod_alpha_uid);
+        let mut container_bravo_annotations = HashMap::new();
+        container_bravo_annotations.insert("io.kubernetes.pod.uid".to_string(), pod_bravo_uid);
+        {
+            let mut containers = service.containers.lock().await;
+            containers.insert(
+                "container-alpha".to_string(),
+                test_container("container-alpha", "pod-alpha", container_alpha_annotations),
+            );
+            containers.insert(
+                "container-bravo".to_string(),
+                test_container("container-bravo", "pod-bravo", container_bravo_annotations),
+            );
+        }
+
+        let mut selector = HashMap::new();
+        selector.insert("tier".to_string(), "frontend".to_string());
+        let response = RuntimeService::list_pod_sandbox_stats(
+            &service,
+            Request::new(ListPodSandboxStatsRequest {
+                filter: Some(crate::proto::runtime::v1::PodSandboxStatsFilter {
+                    id: "pod-al".to_string(),
+                    label_selector: selector,
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.stats.len(), 1);
+        assert_eq!(
+            response.stats[0]
+                .attributes
+                .as_ref()
+                .expect("pod stats should include attributes")
+                .id,
+            "pod-alpha"
+        );
+    }
+
+    #[tokio::test]
+    async fn pod_sandbox_stats_resolves_short_id_and_hides_internal_annotations() {
+        let (dir, service) = test_service_with_fake_runtime();
+
+        let mut pod_annotations = HashMap::new();
+        pod_annotations.insert("visible".to_string(), "true".to_string());
+        RuntimeServiceImpl::insert_internal_state(
+            &mut pod_annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                pause_container_id: Some("pause-pod-short-123".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        service.pod_sandboxes.lock().await.insert(
+            "pod-short-123".to_string(),
+            test_pod("pod-short-123", pod_annotations),
+        );
+        service.containers.lock().await.insert(
+            "container-pod-short-123".to_string(),
+            test_container("container-pod-short-123", "pod-short-123", HashMap::new()),
+        );
+        set_fake_runtime_state(&dir, "container-pod-short-123", "running");
+        set_fake_runtime_state(&dir, "pause-pod-short-123", "running");
+
+        let response = RuntimeService::pod_sandbox_stats(
+            &service,
+            Request::new(PodSandboxStatsRequest {
+                pod_sandbox_id: "pod-short".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let stats = response
+            .stats
+            .expect("short pod id should resolve to pod sandbox stats");
+        let attributes = stats
+            .attributes
+            .expect("pod stats should include attributes");
+        assert_eq!(attributes.id, "pod-short-123");
+        assert_eq!(
+            attributes.annotations.get("visible").map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            !attributes.annotations.contains_key(INTERNAL_POD_STATE_KEY),
+            "internal pod annotations should not leak through statsp responses"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pod_sandbox_stats_returns_empty_when_short_id_filter_is_ambiguous() {
+        let service = test_service();
+
+        {
+            let mut pods = service.pod_sandboxes.lock().await;
+            pods.insert(
+                "pod-ambiguous-a".to_string(),
+                test_pod("pod-ambiguous-a", HashMap::new()),
+            );
+            pods.insert(
+                "pod-ambiguous-b".to_string(),
+                test_pod("pod-ambiguous-b", HashMap::new()),
+            );
+        }
+
+        let response = RuntimeService::list_pod_sandbox_stats(
+            &service,
+            Request::new(ListPodSandboxStatsRequest {
+                filter: Some(crate::proto::runtime::v1::PodSandboxStatsFilter {
+                    id: "pod-ambiguous".to_string(),
+                    ..Default::default()
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(
+            response.stats.is_empty(),
+            "ambiguous short pod ids should return no stats entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_metric_descriptors_returns_non_empty_supported_names() {
+        let service = test_service();
+        let response = RuntimeService::list_metric_descriptors(
+            &service,
+            Request::new(ListMetricDescriptorsRequest {}),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(
+            !response.descriptors.is_empty(),
+            "metric descriptors should not be empty"
+        );
+        let names: HashSet<String> = response
+            .descriptors
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect();
+        assert!(names.contains("container_cpu_usage_seconds_total"));
+        assert!(names.contains("container_memory_working_set_bytes"));
+        assert!(names.contains("container_memory_usage_bytes"));
+        assert!(names.contains("container_spec_memory_limit_bytes"));
+    }
+
+    #[tokio::test]
+    async fn list_pod_sandbox_metrics_returns_pod_and_container_entries() {
+        let service = test_service();
+
+        let pod = test_pod("pod-metrics", HashMap::new());
+        let pod_uid = pod
+            .metadata
+            .as_ref()
+            .expect("test pod should include metadata")
+            .uid
+            .clone();
+        service
+            .pod_sandboxes
+            .lock()
+            .await
+            .insert("pod-metrics".to_string(), pod);
+
+        let mut container_annotations = HashMap::new();
+        container_annotations.insert("io.kubernetes.pod.uid".to_string(), pod_uid);
+        service.containers.lock().await.insert(
+            "container-metrics".to_string(),
+            test_container("container-metrics", "pod-metrics", container_annotations),
+        );
+
+        let response = RuntimeService::list_pod_sandbox_metrics(
+            &service,
+            Request::new(ListPodSandboxMetricsRequest {}),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.pod_metrics.len(), 1);
+        let pod_metrics = &response.pod_metrics[0];
+        assert_eq!(pod_metrics.pod_sandbox_id, "pod-metrics");
+        assert!(
+            !pod_metrics.metrics.is_empty(),
+            "pod-level metrics should not be empty"
+        );
+        assert_eq!(pod_metrics.container_metrics.len(), 1);
+        assert_eq!(
+            pod_metrics.container_metrics[0].container_id,
+            "container-metrics"
+        );
+        assert!(
+            !pod_metrics.container_metrics[0].metrics.is_empty(),
+            "container-level metrics should not be empty"
+        );
+    }
+
+    #[tokio::test]
     async fn get_container_events_streams_broadcast_events() {
         let service = test_service();
         let mut stream =
@@ -5630,6 +8798,55 @@ exit 0
     }
 
     #[tokio::test]
+    async fn pod_events_use_pause_container_id_when_available_and_preserve_order() {
+        let service = test_service();
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                pause_container_id: Some("pause-event-1".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pod = test_pod("pod-event-1", annotations);
+
+        let mut stream =
+            RuntimeService::get_container_events(&service, Request::new(GetEventsRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+
+        service
+            .emit_pod_event(ContainerEventType::ContainerCreatedEvent, &pod, Vec::new())
+            .await;
+        service
+            .emit_pod_event(ContainerEventType::ContainerStartedEvent, &pod, Vec::new())
+            .await;
+
+        let created = stream.next().await.unwrap().unwrap();
+        let started = stream.next().await.unwrap().unwrap();
+        assert_eq!(created.container_id, "pause-event-1");
+        assert_eq!(started.container_id, "pause-event-1");
+        assert_eq!(
+            created.container_event_type,
+            ContainerEventType::ContainerCreatedEvent as i32
+        );
+        assert_eq!(
+            started.container_event_type,
+            ContainerEventType::ContainerStartedEvent as i32
+        );
+        assert_eq!(
+            started
+                .pod_sandbox_status
+                .expect("pod status should be included")
+                .id,
+            "pod-event-1"
+        );
+    }
+
+    #[tokio::test]
     async fn publish_event_without_subscribers_does_not_panic() {
         let service = test_service();
         service.publish_event(ContainerEventResponse {
@@ -5673,6 +8890,71 @@ exit 0
         }
 
         assert!(saw_lagged, "expected lagged consumer error");
+    }
+
+    #[tokio::test]
+    async fn exit_monitor_publishes_async_stop_events() {
+        let (dir, service) = test_service_with_fake_runtime();
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+        service.containers.lock().await.insert(
+            "async-stop".to_string(),
+            Container {
+                state: ContainerState::ContainerRunning as i32,
+                ..test_container("async-stop", "pod-1", annotations)
+            },
+        );
+        service.ensure_exit_monitor_registered("async-stop");
+
+        let mut stream =
+            RuntimeService::get_container_events(&service, Request::new(GetEventsRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+
+        let exit_code_path = dir
+            .path()
+            .join("shims")
+            .join("async-stop")
+            .join("exit_code");
+        fs::create_dir_all(exit_code_path.parent().unwrap()).unwrap();
+        fs::write(&exit_code_path, "17").unwrap();
+
+        let event = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(Ok(event)) = stream.next().await {
+                    if event.container_id == "async-stop"
+                        && event.container_event_type
+                            == ContainerEventType::ContainerStoppedEvent as i32
+                    {
+                        return event;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for async stop event");
+
+        assert_eq!(event.container_id, "async-stop");
+        let container = service
+            .containers
+            .lock()
+            .await
+            .get("async-stop")
+            .cloned()
+            .unwrap();
+        assert_eq!(container.state, ContainerState::ContainerExited as i32);
+        let state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        )
+        .unwrap();
+        assert_eq!(state.exit_code, Some(17));
     }
 
     #[tokio::test]
@@ -5776,6 +9058,52 @@ exit 0
         .unwrap()
         .into_inner();
         assert!(response.url.contains("/portforward/"));
+    }
+
+    #[tokio::test]
+    async fn port_forward_refreshes_stale_pause_container_state() {
+        let (dir, service) = test_service_with_fake_runtime();
+        set_fake_runtime_state(&dir, "pause-portforward", "stopped");
+
+        let netns_dir = tempdir().unwrap();
+        let netns_path = netns_dir.path().join("netns");
+        fs::write(&netns_path, "placeholder").unwrap();
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                netns_path: Some(netns_path.display().to_string()),
+                runtime_handler: "runc".to_string(),
+                pause_container_id: Some("pause-portforward".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service.pod_sandboxes.lock().await.insert(
+            "pod-stale-ready".to_string(),
+            crate::proto::runtime::v1::PodSandbox {
+                state: PodSandboxState::SandboxReady as i32,
+                ..test_pod("pod-stale-ready", annotations)
+            },
+        );
+        service
+            .set_streaming_server(crate::streaming::StreamingServer::for_test(
+                "http://127.0.0.1:12345",
+            ))
+            .await;
+
+        let err = RuntimeService::port_forward(
+            &service,
+            Request::new(PortForwardRequest {
+                pod_sandbox_id: "pod-stale-ready".to_string(),
+                port: vec![80],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("not ready"));
     }
 
     #[tokio::test]
@@ -6276,14 +9604,107 @@ exit 0
     }
 
     #[tokio::test]
+    async fn container_status_refreshes_stale_runtime_state_on_query() {
+        let (dir, service) = test_service_with_fake_runtime();
+        set_fake_runtime_state(&dir, "refresh-container", "stopped");
+
+        service.containers.lock().await.insert(
+            "refresh-container".to_string(),
+            Container {
+                state: ContainerState::ContainerRunning as i32,
+                ..test_container("refresh-container", "pod-1", HashMap::new())
+            },
+        );
+
+        let response = RuntimeService::container_status(
+            &service,
+            Request::new(ContainerStatusRequest {
+                container_id: "refresh-container".to_string(),
+                verbose: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response.status.unwrap().state,
+            ContainerState::ContainerExited as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn pod_queries_refresh_pause_container_state_on_query() {
+        let (dir, service) = test_service_with_fake_runtime();
+        set_fake_runtime_state(&dir, "pause-refresh", "stopped");
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                runtime_handler: "runc".to_string(),
+                pause_container_id: Some("pause-refresh".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        service.pod_sandboxes.lock().await.insert(
+            "pod-refresh".to_string(),
+            crate::proto::runtime::v1::PodSandbox {
+                state: PodSandboxState::SandboxReady as i32,
+                ..test_pod("pod-refresh", annotations)
+            },
+        );
+
+        let list = RuntimeService::list_pod_sandbox(
+            &service,
+            Request::new(ListPodSandboxRequest::default()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(list.items[0].state, PodSandboxState::SandboxNotready as i32);
+
+        let inspect = RuntimeService::pod_sandbox_status(
+            &service,
+            Request::new(PodSandboxStatusRequest {
+                pod_sandbox_id: "pod-refresh".to_string(),
+                verbose: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            inspect.status.unwrap().state,
+            PodSandboxState::SandboxNotready as i32
+        );
+    }
+
+    #[tokio::test]
     async fn recover_state_ignores_stale_shim_metadata_artifacts() {
         let (dir, service) = test_service_with_fake_runtime();
         set_fake_runtime_state(&dir, "recover-container", "running");
 
-        let stale_dir = dir.path().join("root").join("stale-shims").join("orphan");
+        let stale_dir = dir.path().join("shims").join("orphan");
         fs::create_dir_all(&stale_dir).unwrap();
         fs::write(stale_dir.join("attach.sock"), "stale").unwrap();
-        fs::write(stale_dir.join("shim.json"), "{}").unwrap();
+        fs::write(
+            stale_dir.join("shim.json"),
+            serde_json::to_vec_pretty(&crate::runtime::ShimProcess {
+                container_id: "orphan".to_string(),
+                shim_pid: 999_999,
+                exit_code_file: stale_dir.join("exit_code"),
+                log_file: stale_dir.join("shim.log"),
+                socket_path: stale_dir.join("attach.sock"),
+                bundle_path: dir.path().join("bundles").join("orphan"),
+            })
+            .unwrap(),
+        )
+        .unwrap();
 
         service
             .persistence
@@ -6310,5 +9731,9 @@ exit 0
         .unwrap()
         .into_inner();
         assert_eq!(containers.containers.len(), 1);
+        assert!(
+            !stale_dir.exists(),
+            "recover_state should clean orphaned shim artifacts"
+        );
     }
 }

@@ -8,7 +8,7 @@
 
 use super::*;
 use anyhow::{Context, Result};
-use log::{debug, error, info, warn};
+use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -127,7 +127,7 @@ impl NetworkSelector {
     /// 根据Pod配置选择网络
     pub fn select_networks(
         &self,
-        labels: &[(String, String)],
+        _labels: &[(String, String)],
         annotations: &[(String, String)],
     ) -> Vec<String> {
         let mut selected = Vec::new();
@@ -336,7 +336,7 @@ impl MultiNetworkManager {
         // 使用基础CNI管理器设置网络
         let status = self
             .cni_manager
-            .setup_pod_network(pod_id, netns, pod_name, pod_namespace)
+            .setup_pod_network(pod_id, netns, pod_name, pod_namespace, None)
             .await?;
 
         Ok(NetworkInterfaceStatus {
@@ -381,7 +381,9 @@ impl MultiNetworkManager {
             self.pod_networks.remove(pod_id);
         } else {
             // 如果没有缓存，尝试清理默认网络
-            self.cni_manager.teardown_pod_network(pod_id, netns).await?;
+            self.cni_manager
+                .teardown_pod_network(pod_id, netns, "", "")
+                .await?;
         }
 
         info!("Pod {} network teardown completed", pod_id);
@@ -393,10 +395,12 @@ impl MultiNetworkManager {
         &self,
         pod_id: &str,
         netns: &str,
-        network_name: &str,
+        _network_name: &str,
     ) -> Result<()> {
         // 调用CNI DEL命令
-        self.cni_manager.teardown_pod_network(pod_id, netns).await?;
+        self.cni_manager
+            .teardown_pod_network(pod_id, netns, "", "")
+            .await?;
         Ok(())
     }
 

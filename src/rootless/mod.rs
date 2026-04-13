@@ -342,7 +342,7 @@ impl RootlessManager {
 
         // 在rootless模式下禁用某些特权功能
         // 禁用cgroup资源限制（除非使用cgroup v2和systemd）
-        if let Some(ref mut resources) = linux.resources {
+        if let Some(ref mut _resources) = linux.resources {
             // 在rootless模式下，可能需要调整资源限制
             debug!("Configuring resources for rootless mode");
         }
