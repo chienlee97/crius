@@ -253,6 +253,82 @@ pub struct ContainerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+
+    fn shell_quote(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\"'\"'"))
+    }
+
+    fn write_fake_runtime(runtime_path: &Path, state_file: &Path) {
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+
+state_file={state_file}
+
+if [ ! -f "$state_file" ]; then
+  printf '%s' created > "$state_file"
+fi
+
+command="$1"
+shift || true
+
+case "$command" in
+  create)
+    printf '%s' created > "$state_file"
+    ;;
+  start)
+    printf '%s' running > "$state_file"
+    ;;
+  kill)
+    signal="$2"
+    if [ "$signal" = "TERM" ] || [ "$signal" = "KILL" ]; then
+      printf '%s' stopped > "$state_file"
+    fi
+    ;;
+  delete)
+    printf '%s' deleted > "$state_file"
+    ;;
+  state)
+    status="$(cat "$state_file")"
+    printf '{{"oci_version":"1.0.2","id":"test-container","status":"%s","pid":4242,"bundle":"/tmp/bundle","rootfs":"/tmp/rootfs","created":"2024-01-01T00:00:00Z","owner":"root"}}\n' "$status"
+    ;;
+  exec)
+    if [ "${{1:-}}" = "-t" ]; then
+      shift
+    fi
+    if [ "${{1:-}}" = "-i" ]; then
+      shift
+    fi
+    shift
+    exec "$@"
+    ;;
+  *)
+    echo "unsupported command: $command" >&2
+    exit 1
+    ;;
+esac
+"#,
+            state_file = shell_quote(state_file),
+        );
+
+        fs::write(runtime_path, script).expect("failed to write fake runtime");
+        fs::set_permissions(runtime_path, fs::Permissions::from_mode(0o755))
+            .expect("failed to chmod fake runtime");
+    }
+
+    fn new_process_manager() -> (tempfile::TempDir, PathBuf, ProcessManager) {
+        let temp_dir = tempdir().expect("failed to create tempdir");
+        let runtime_path = temp_dir.path().join("fake-runtime.sh");
+        let state_file = temp_dir.path().join("runtime-state.txt");
+        write_fake_runtime(&runtime_path, &state_file);
+        let manager = ProcessManager::new(runtime_path, "test-container".to_string());
+
+        (temp_dir, state_file, manager)
+    }
 
     #[test]
     fn test_process_manager_creation() {
@@ -261,5 +337,44 @@ mod tests {
             "test-container".to_string(),
         );
         assert_eq!(pm.container_id, "test-container");
+    }
+
+    #[test]
+    fn test_process_manager_lifecycle_commands() {
+        let (temp_dir, state_file, pm) = new_process_manager();
+        let bundle_dir = temp_dir.path().join("bundle");
+        fs::create_dir_all(&bundle_dir).unwrap();
+
+        pm.create(&bundle_dir).unwrap();
+        assert_eq!(pm.state().unwrap().status, "created");
+
+        pm.start().unwrap();
+        assert_eq!(pm.state().unwrap().status, "running");
+        assert_eq!(pm.pid().unwrap(), 4242);
+
+        pm.stop(1).unwrap();
+        assert_eq!(pm.state().unwrap().status, "stopped");
+
+        pm.delete().unwrap();
+        assert_eq!(fs::read_to_string(state_file).unwrap(), "deleted");
+    }
+
+    #[test]
+    fn test_process_manager_exec_spawns_runtime_exec() {
+        let (_temp_dir, _state_file, pm) = new_process_manager();
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf exec-ok".to_string(),
+        ];
+
+        let output = pm
+            .exec(&command, true, true, true, true)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "exec-ok");
     }
 }

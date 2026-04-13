@@ -3,7 +3,7 @@
 //! 当容器进程的父进程（runc）退出后，容器进程会被重新父进程化为shim。
 //! 通过设置PR_SET_CHILD_SUBREAPER，shim可以监控所有后代进程的状态。
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use log::{debug, error, info, warn};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
@@ -195,5 +195,19 @@ mod tests {
         // 可能没有子进程，也可能有系统留下的僵尸
         // 所以不断言具体值，只确保不panic
         println!("Reaped {} children", count);
+    }
+
+    #[test]
+    fn test_wait_pid_returns_child_exit_code() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .expect("failed to spawn child process");
+        let pid = Pid::from_raw(child.id() as i32);
+
+        let waited = SubReaper::wait_pid(pid, false).expect("failed to wait for child");
+
+        assert_eq!(waited, Some((7, false)));
     }
 }
