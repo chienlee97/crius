@@ -23,7 +23,7 @@ use std::os::unix::net::UnixListener;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::io::{IoConfig, IoManager};
@@ -61,8 +61,6 @@ pub struct Daemon {
     exit_code_file: Option<PathBuf>,
     /// IO管理器
     io_manager: IoManager,
-    /// 容器进程PID
-    container_pid: Arc<AtomicI32>,
     /// 是否正在运行
     running: Arc<AtomicBool>,
 }
@@ -81,7 +79,6 @@ impl Daemon {
             runtime,
             exit_code_file,
             io_manager: IoManager::new(),
-            container_pid: Arc::new(AtomicI32::new(-1)),
             running: Arc::new(AtomicBool::new(true)),
         }
     }

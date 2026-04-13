@@ -9,18 +9,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use crius::shim::Daemon;
 use log::{debug, info};
 use std::fs;
 use std::path::PathBuf;
-
-#[path = "../attach.rs"]
-mod attach;
-mod daemon;
-mod io;
-mod process;
-mod subreaper;
-
-use daemon::Daemon;
 
 /// crius-shim - OCI runtime shim for crius
 #[derive(Parser, Debug)]
