@@ -27,7 +27,7 @@ pub struct CniManager {
     /// CNI配置文件目录
     config_dirs: Vec<PathBuf>,
     /// 缓存目录
-    _cache_dir: PathBuf,
+    cache_dir: PathBuf,
     /// 网络配置缓存
     network_configs: std::collections::HashMap<String, CniNetworkConfig>,
     /// 默认使用的网络配置名称
@@ -81,10 +81,48 @@ impl CniManager {
         Ok(Self {
             plugin_dirs: plugin_dirs.into_iter().map(PathBuf::from).collect(),
             config_dirs: config_dirs.into_iter().map(PathBuf::from).collect(),
-            _cache_dir: PathBuf::from(cache_dir),
+            cache_dir: PathBuf::from(cache_dir),
             network_configs: std::collections::HashMap::new(),
             default_network_name: None,
         })
+    }
+
+    fn plugin_chain(config_value: &Value) -> Vec<Value> {
+        if let Some(plugins) = config_value
+            .get("plugins")
+            .and_then(|plugins| plugins.as_array())
+        {
+            return plugins.clone();
+        }
+
+        vec![config_value.clone()]
+    }
+
+    fn cache_result_path(&self, pod_id: &str) -> PathBuf {
+        self.cache_dir.join(format!("{}.result.json", pod_id))
+    }
+
+    async fn write_cached_result(&self, pod_id: &str, result: &Value) -> Result<()> {
+        tokio::fs::create_dir_all(&self.cache_dir)
+            .await
+            .context("Failed to create CNI cache directory")?;
+        tokio::fs::write(
+            self.cache_result_path(pod_id),
+            serde_json::to_vec_pretty(result)?,
+        )
+        .await
+        .context("Failed to write CNI cached result")?;
+        Ok(())
+    }
+
+    async fn read_cached_result(&self, pod_id: &str) -> Option<Value> {
+        let path = self.cache_result_path(pod_id);
+        let raw = tokio::fs::read(path).await.ok()?;
+        serde_json::from_slice(&raw).ok()
+    }
+
+    async fn remove_cached_result(&self, pod_id: &str) {
+        let _ = tokio::fs::remove_file(self.cache_result_path(pod_id)).await;
     }
 
     /// 加载网络配置
@@ -190,12 +228,19 @@ impl CniManager {
 
         debug!("Using CNI network config: {}", config.name);
 
-        let cni_args =
-            self.build_cni_args(config, pod_id, netns, pod_name, pod_namespace, pod_cidr);
         let result = self
-            .exec_cni_plugin(config, "ADD", pod_id, netns, "eth0", &cni_args)
+            .exec_cni_chain(
+                config,
+                "ADD",
+                pod_id,
+                netns,
+                "eth0",
+                pod_name,
+                pod_namespace,
+                pod_cidr,
+            )
             .await?;
-        let network_status = self.parse_cni_result(&result)?;
+        let network_status = self.parse_cni_result(result.as_ref())?;
 
         info!("Pod {} network setup completed", pod_id);
         Ok(network_status)
@@ -210,11 +255,17 @@ impl CniManager {
         pod_name: &str,
     ) -> Result<()> {
         if let Some(config) = self.default_network_config() {
-            let cni_args =
-                self.build_cni_args(config, pod_id, netns, pod_name, pod_namespace, None);
-
             match self
-                .exec_cni_plugin(config, "DEL", pod_id, netns, "eth0", &cni_args)
+                .exec_cni_chain(
+                    config,
+                    "DEL",
+                    pod_id,
+                    netns,
+                    "eth0",
+                    pod_name,
+                    pod_namespace,
+                    None,
+                )
                 .await
             {
                 Ok(_) => info!("Pod {} network teardown completed", pod_id),
@@ -225,16 +276,31 @@ impl CniManager {
     }
 
     /// 构建CNI参数
-    fn build_cni_args(
+    fn base_cni_args(&self, pod_id: &str, pod_name: &str, pod_namespace: &str) -> Value {
+        json!({
+            "cni": {
+                "podId": pod_id,
+                "podName": pod_name,
+                "podNamespace": pod_namespace
+            }
+        })
+    }
+
+    fn build_plugin_config(
         &self,
         config: &CniNetworkConfig,
+        plugin: &Value,
         pod_id: &str,
-        _netns: &str,
         pod_name: &str,
         pod_namespace: &str,
         pod_cidr: Option<&str>,
+        prev_result: Option<&Value>,
     ) -> Value {
-        let mut config_value = config.config.clone();
+        let mut config_value = plugin.clone();
+        if !config_value.is_object() {
+            config_value = json!({});
+        }
+
         if config_value.get("cniVersion").is_none() {
             config_value["cniVersion"] = json!(config.cni_version);
         }
@@ -253,28 +319,89 @@ impl CniManager {
             }
         }
 
-        config_value["args"] = json!({
-            "cni": {
-                "podId": pod_id,
-                "podName": pod_name,
-                "podNamespace": pod_namespace
-            }
-        });
+        config_value["args"] = self.base_cni_args(pod_id, pod_name, pod_namespace);
+
+        if let Some(prev_result) = prev_result {
+            config_value["prevResult"] = prev_result.clone();
+        }
+
         config_value
     }
 
-    /// 执行CNI插件
-    async fn exec_cni_plugin(
+    async fn exec_cni_chain(
         &self,
         config: &CniNetworkConfig,
         command: &str,
         pod_id: &str,
         netns: &str,
         if_name: &str,
+        pod_name: &str,
+        pod_namespace: &str,
+        pod_cidr: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let plugins = Self::plugin_chain(&config.config);
+        let cached_result = self.read_cached_result(pod_id).await;
+
+        let plugin_sequence: Vec<&Value> = if command == "DEL" {
+            plugins.iter().rev().collect()
+        } else {
+            plugins.iter().collect()
+        };
+
+        let mut prev_result = if command == "DEL" {
+            cached_result.clone()
+        } else {
+            None
+        };
+
+        for plugin in plugin_sequence {
+            let plugin_type = plugin
+                .get("type")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(&config.plugin_type);
+            let plugin_config = self.build_plugin_config(
+                config,
+                plugin,
+                pod_id,
+                pod_name,
+                pod_namespace,
+                pod_cidr,
+                prev_result.as_ref(),
+            );
+            let output = self
+                .exec_cni_plugin(plugin_type, command, pod_id, netns, if_name, &plugin_config)
+                .await?;
+
+            if command == "ADD" && !output.trim().is_empty() {
+                prev_result = Some(
+                    serde_json::from_str(&output)
+                        .context("Failed to parse chained CNI plugin result")?,
+                );
+            }
+        }
+
+        if command == "ADD" {
+            if let Some(result) = prev_result.as_ref() {
+                self.write_cached_result(pod_id, result).await?;
+            }
+        } else {
+            self.remove_cached_result(pod_id).await;
+        }
+
+        Ok(prev_result.or(cached_result))
+    }
+
+    /// 执行CNI插件
+    async fn exec_cni_plugin(
+        &self,
+        plugin_name: &str,
+        command: &str,
+        pod_id: &str,
+        netns: &str,
+        if_name: &str,
         cni_args: &Value,
     ) -> Result<String> {
-        let plugin_name = &config.plugin_type;
-
         let plugin_path = self
             .find_plugin(plugin_name)
             .context(format!("CNI plugin '{}' not found", plugin_name))?;
@@ -312,7 +439,19 @@ impl CniManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("CNI plugin failed: {}", stderr));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else if !stdout.trim().is_empty() {
+                stdout.trim().to_string()
+            } else {
+                format!("exited with status {}", output.status)
+            };
+            return Err(anyhow::anyhow!(
+                "CNI plugin {} failed: {}",
+                plugin_name,
+                detail
+            ));
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -327,17 +466,15 @@ impl CniManager {
     }
 
     /// 解析CNI结果
-    fn parse_cni_result(&self, result: &str) -> Result<NetworkStatus> {
-        if result.trim().is_empty() {
+    fn parse_cni_result(&self, result: Option<&Value>) -> Result<NetworkStatus> {
+        let Some(value) = result else {
             return Ok(NetworkStatus {
                 name: "crius-net".to_string(),
-                ip: Some("10.88.0.1".parse().unwrap()),
+                ip: None,
                 mac: None,
                 interfaces: vec![],
             });
-        }
-
-        let value: Value = serde_json::from_str(result).context("Failed to parse CNI result")?;
+        };
 
         let ip = value
             .get("ips")
@@ -346,11 +483,19 @@ impl CniManager {
             .and_then(|ip| ip.get("address"))
             .and_then(|addr| addr.as_str())
             .and_then(|s| s.split('/').next())
-            .and_then(|ip_str| ip_str.parse().ok());
+            .and_then(|ip_str| ip_str.parse().ok())
+            .or_else(|| {
+                value
+                    .get("ip4")
+                    .and_then(|ip4| ip4.get("ip"))
+                    .and_then(|addr| addr.as_str())
+                    .and_then(|s| s.split('/').next())
+                    .and_then(|ip_str| ip_str.parse().ok())
+            });
 
         Ok(NetworkStatus {
             name: "crius-net".to_string(),
-            ip: ip.or_else(|| Some("10.88.0.1".parse().unwrap())),
+            ip,
             mac: None,
             interfaces: vec![],
         })
@@ -360,6 +505,7 @@ impl CniManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -417,8 +563,6 @@ mod tests {
 
     #[test]
     fn find_plugin_ignores_non_executable_binaries() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempdir().unwrap();
         let plugin_dir = dir.path().join("bin");
         std::fs::create_dir_all(&plugin_dir).unwrap();
@@ -471,5 +615,92 @@ mod tests {
                 .map(|config| config.name.as_str()),
             Some("first-net")
         );
+    }
+
+    #[tokio::test]
+    async fn setup_pod_network_executes_conflist_as_plugin_chain() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("bin");
+        let config_dir = dir.path().join("net.d");
+        let record_dir = dir.path().join("records");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::create_dir_all(&config_dir).await.unwrap();
+        tokio::fs::create_dir_all(&record_dir).await.unwrap();
+
+        tokio::fs::write(
+            config_dir.join("10-test.conflist"),
+            r#"{
+                "cniVersion":"1.0.0",
+                "name":"test-net",
+                "plugins":[
+                    {"type":"bridge","bridge":"cni0","ipam":{"type":"host-local"}},
+                    {"type":"portmap","capabilities":{"portMappings":true}}
+                ]
+            }"#,
+        )
+        .await
+        .unwrap();
+
+        let bridge_script = format!(
+            "#!/bin/sh\ncat > \"{}/bridge.input\"\nprintf '%s\\n' '{{\"cniVersion\":\"1.0.0\",\"ips\":[{{\"address\":\"10.88.0.2/16\"}}]}}'\n",
+            record_dir.display()
+        );
+        let bridge_path = plugin_dir.join("bridge");
+        tokio::fs::write(&bridge_path, bridge_script).await.unwrap();
+        let mut bridge_perms = std::fs::metadata(&bridge_path).unwrap().permissions();
+        bridge_perms.set_mode(0o755);
+        std::fs::set_permissions(&bridge_path, bridge_perms).unwrap();
+
+        let portmap_script = format!(
+            "#!/bin/sh\ncat > \"{}/portmap.input\"\nprintf '%s\\n' '{{\"cniVersion\":\"1.0.0\",\"ips\":[{{\"address\":\"10.88.0.2/16\"}}]}}'\n",
+            record_dir.display()
+        );
+        let portmap_path = plugin_dir.join("portmap");
+        tokio::fs::write(&portmap_path, portmap_script)
+            .await
+            .unwrap();
+        let mut portmap_perms = std::fs::metadata(&portmap_path).unwrap().permissions();
+        portmap_perms.set_mode(0o755);
+        std::fs::set_permissions(&portmap_path, portmap_perms).unwrap();
+
+        let mut manager = CniManager::new(
+            vec![plugin_dir.display().to_string()],
+            vec![config_dir.display().to_string()],
+            dir.path().join("cache").display().to_string(),
+        )
+        .unwrap();
+        manager.load_network_configs().await.unwrap();
+
+        let status = manager
+            .setup_pod_network(
+                "pod-1",
+                "/var/run/netns/test-pod",
+                "test-pod",
+                "default",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(status.ip, Some("10.88.0.2".parse().unwrap()));
+
+        let bridge_input = tokio::fs::read_to_string(record_dir.join("bridge.input"))
+            .await
+            .unwrap();
+        assert!(bridge_input.contains("\"type\":\"bridge\""));
+        assert!(!bridge_input.contains("\"plugins\""));
+
+        let portmap_input = tokio::fs::read_to_string(record_dir.join("portmap.input"))
+            .await
+            .unwrap();
+        assert!(portmap_input.contains("\"type\":\"portmap\""));
+        assert!(portmap_input.contains("\"prevResult\""));
+    }
+
+    #[test]
+    fn parse_cni_result_returns_none_when_output_missing() {
+        let manager = CniManager::new(vec![], vec![], "/tmp/cache".to_string()).unwrap();
+        let status = manager.parse_cni_result(None).unwrap();
+        assert!(status.ip.is_none());
     }
 }

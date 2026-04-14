@@ -1068,9 +1068,17 @@ impl RuncRuntime {
                 source: Some(m.source.to_string_lossy().to_string()),
                 mount_type: Some("bind".to_string()),
                 options: if m.read_only {
-                    Some(vec!["rbind".to_string(), "ro".to_string()])
+                    Some(if m.source.is_dir() {
+                        vec!["rbind".to_string(), "ro".to_string()]
+                    } else {
+                        vec!["bind".to_string(), "ro".to_string()]
+                    })
                 } else {
-                    Some(vec!["rbind".to_string(), "rw".to_string()])
+                    Some(if m.source.is_dir() {
+                        vec!["rbind".to_string(), "rw".to_string()]
+                    } else {
+                        vec!["bind".to_string(), "rw".to_string()]
+                    })
                 },
             })
             .collect();
