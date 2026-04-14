@@ -860,6 +860,27 @@ impl RuntimeServiceImpl {
         })
     }
 
+    fn pod_requires_managed_netns(state: Option<&StoredPodState>) -> bool {
+        state
+            .and_then(|pod| pod.namespace_options.as_ref())
+            .map(|options| options.network != NamespaceMode::Node as i32)
+            .unwrap_or(true)
+    }
+
+    fn pod_has_required_netns(pod: &crate::proto::runtime::v1::PodSandbox) -> bool {
+        let state =
+            Self::read_internal_state::<StoredPodState>(&pod.annotations, INTERNAL_POD_STATE_KEY);
+        if !Self::pod_requires_managed_netns(state.as_ref()) {
+            return true;
+        }
+
+        state
+            .and_then(|pod| pod.netns_path)
+            .filter(|path| !path.is_empty())
+            .map(|path| Path::new(&path).exists())
+            .unwrap_or(true)
+    }
+
     fn runtime_state_name(runtime_state: i32) -> &'static str {
         match runtime_state {
             x if x == ContainerState::ContainerCreated as i32 => "created",
@@ -3183,8 +3204,23 @@ impl RuntimeServiceImpl {
             let pause_status = self
                 .runtime_container_status_checked(&pause_container_id)
                 .await;
+            let pod_has_required_netns = {
+                let pod_sandboxes = self.pod_sandboxes.lock().await;
+                pod_sandboxes
+                    .get(&pod_id)
+                    .map(Self::pod_has_required_netns)
+                    .unwrap_or(true)
+            };
+            if matches!(pause_status, ContainerStatus::Running) && !pod_has_required_netns {
+                log::warn!(
+                    "Recovered pod {} pause container is running but network namespace is missing; marking sandbox NotReady",
+                    pod_id
+                );
+            }
             let next_state = match pause_status {
-                ContainerStatus::Running => PodSandboxState::SandboxReady as i32,
+                ContainerStatus::Running if pod_has_required_netns => {
+                    PodSandboxState::SandboxReady as i32
+                }
                 _ => PodSandboxState::SandboxNotready as i32,
             };
 
@@ -3274,6 +3310,7 @@ impl RuntimeServiceImpl {
                                 ContainerState::ContainerUnknown as i32
                             }
                         },
+                        pod_sandbox_id: record.pod_id.clone(),
                         image: Some(ImageSpec {
                             image: record.image.clone(),
                             ..Default::default()
@@ -5066,6 +5103,32 @@ impl RuntimeService for RuntimeServiceImpl {
             .map(|restore| restore.image_ref.clone())
             .or_else(|| config.image.as_ref().map(|image| image.image.clone()))
             .unwrap_or_default();
+        let pod_resolv_path = self
+            .config
+            .root_dir
+            .join("pods")
+            .join(&pod_sandbox_id)
+            .join("resolv.conf");
+        let mut runtime_mounts: Vec<MountConfig> = config
+            .mounts
+            .iter()
+            .map(|m| MountConfig {
+                source: PathBuf::from(&m.host_path),
+                destination: PathBuf::from(&m.container_path),
+                read_only: m.readonly,
+            })
+            .collect();
+        if pod_resolv_path.exists()
+            && !runtime_mounts
+                .iter()
+                .any(|mount| mount.destination == Path::new("/etc/resolv.conf"))
+        {
+            runtime_mounts.push(MountConfig {
+                source: pod_resolv_path.clone(),
+                destination: PathBuf::from("/etc/resolv.conf"),
+                read_only: true,
+            });
+        }
         let mut stored_annotations = config.annotations.clone();
         let container_state = StoredContainerState {
             log_path: log_path
@@ -5093,15 +5156,15 @@ impl RuntimeService for RuntimeServiceImpl {
                 .as_ref()
                 .map(|path| path.to_string_lossy().to_string()),
             linux_resources: linux_resources.as_ref().map(StoredLinuxResources::from),
-            mounts: config
-                .mounts
+            mounts: runtime_mounts
                 .iter()
                 .map(|mount| StoredMount {
-                    container_path: mount.container_path.clone(),
-                    host_path: mount.host_path.clone(),
-                    readonly: mount.readonly,
-                    selinux_relabel: mount.selinux_relabel,
-                    propagation: mount.propagation,
+                    container_path: mount.destination.to_string_lossy().to_string(),
+                    host_path: mount.source.to_string_lossy().to_string(),
+                    readonly: mount.read_only,
+                    selinux_relabel: false,
+                    propagation: crate::proto::runtime::v1::MountPropagation::PropagationPrivate
+                        as i32,
                 })
                 .collect(),
             run_as_user: config
@@ -5171,15 +5234,7 @@ impl RuntimeService for RuntimeServiceImpl {
             } else {
                 Some(PathBuf::from(&config.working_dir))
             },
-            mounts: config
-                .mounts
-                .iter()
-                .map(|m| MountConfig {
-                    source: PathBuf::from(&m.host_path),
-                    destination: PathBuf::from(&m.container_path),
-                    read_only: m.readonly,
-                })
-                .collect(),
+            mounts: runtime_mounts,
             labels: config
                 .labels
                 .iter()
@@ -9852,15 +9907,19 @@ exit 0
         .into_inner();
 
         assert_eq!(
-            container_status.status.unwrap().state,
+            container_status.status.as_ref().unwrap().state,
             ContainerState::ContainerRunning as i32
         );
         assert_eq!(
-            pod_status.status.unwrap().state,
+            pod_status.status.as_ref().unwrap().state,
             PodSandboxState::SandboxReady as i32
         );
         assert_eq!(containers.containers.len(), 1);
+        assert_eq!(containers.containers[0].pod_sandbox_id, "pod-recover");
         assert_eq!(pods.items.len(), 1);
+        let info: serde_json::Value =
+            serde_json::from_str(container_status.info.get("info").unwrap()).unwrap();
+        assert_eq!(info["sandboxID"], "pod-recover");
     }
 
     #[tokio::test]
@@ -9967,6 +10026,159 @@ exit 0
             .await
             .storage()
             .get_pod_sandbox("pod-recover")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn recover_state_marks_ready_pod_notready_when_netns_is_missing() {
+        let (dir, service) = test_service_with_fake_runtime();
+        set_fake_runtime_state(&dir, "pause-missing-netns", "running");
+
+        let missing_netns_path = dir.path().join("missing.netns");
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                runtime_handler: "runc".to_string(),
+                netns_path: Some(missing_netns_path.display().to_string()),
+                pause_container_id: Some("pause-missing-netns".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        service
+            .persistence
+            .lock()
+            .await
+            .storage_mut()
+            .save_pod_sandbox(&PodSandboxRecord {
+                id: "pod-missing-netns".to_string(),
+                state: "ready".to_string(),
+                name: "pod-missing-netns".to_string(),
+                namespace: "default".to_string(),
+                uid: "uid-missing-netns".to_string(),
+                created_at: RuntimeServiceImpl::now_nanos(),
+                netns_path: missing_netns_path.display().to_string(),
+                labels: "{}".to_string(),
+                annotations: serde_json::to_string(&annotations).unwrap(),
+                pause_container_id: Some("pause-missing-netns".to_string()),
+                ip: Some("10.88.0.21".to_string()),
+            })
+            .unwrap();
+
+        service.recover_state().await.unwrap();
+
+        let pod = service
+            .pod_sandboxes
+            .lock()
+            .await
+            .get("pod-missing-netns")
+            .cloned()
+            .unwrap();
+        assert_eq!(pod.state, PodSandboxState::SandboxNotready as i32);
+
+        let persisted = service
+            .persistence
+            .lock()
+            .await
+            .storage()
+            .get_pod_sandbox("pod-missing-netns")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.state, "notready");
+    }
+
+    #[tokio::test]
+    async fn remove_pod_sandbox_cascades_recovered_containers_after_restart() {
+        let (dir, service) = test_service_with_fake_runtime();
+        set_fake_runtime_state(&dir, "recover-container", "running");
+        set_fake_runtime_state(&dir, "pause-recover", "running");
+        let netns_path = dir.path().join("recover-cascade.netns");
+        fs::write(&netns_path, "netns").unwrap();
+
+        let mut pod_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut pod_annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                runtime_handler: "runc".to_string(),
+                netns_path: Some(netns_path.display().to_string()),
+                pause_container_id: Some("pause-recover".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service
+            .persistence
+            .lock()
+            .await
+            .storage_mut()
+            .save_pod_sandbox(&PodSandboxRecord {
+                id: "pod-recover".to_string(),
+                state: "ready".to_string(),
+                name: "pod-recover".to_string(),
+                namespace: "default".to_string(),
+                uid: "uid-recover".to_string(),
+                created_at: RuntimeServiceImpl::now_nanos(),
+                netns_path: netns_path.display().to_string(),
+                labels: "{}".to_string(),
+                annotations: serde_json::to_string(&pod_annotations).unwrap(),
+                pause_container_id: Some("pause-recover".to_string()),
+                ip: None,
+            })
+            .unwrap();
+
+        let mut container_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut container_annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                metadata_name: Some("recover-container".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "recover-container",
+                "pod-recover",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &container_annotations,
+            )
+            .unwrap();
+
+        service.recover_state().await.unwrap();
+
+        RuntimeService::remove_pod_sandbox(
+            &service,
+            Request::new(RemovePodSandboxRequest {
+                pod_sandbox_id: "pod-recover".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(service
+            .containers
+            .lock()
+            .await
+            .get("recover-container")
+            .is_none());
+        assert!(service
+            .persistence
+            .lock()
+            .await
+            .storage()
+            .get_container("recover-container")
             .unwrap()
             .is_none());
     }

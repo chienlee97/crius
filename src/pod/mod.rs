@@ -141,6 +141,53 @@ impl<R: ContainerRuntime> std::fmt::Debug for PodSandboxManager<R> {
 }
 
 impl<R: ContainerRuntime> PodSandboxManager<R> {
+    fn pod_resolv_path(&self, pod_id: &str) -> PathBuf {
+        self.root_dir.join(pod_id).join("resolv.conf")
+    }
+
+    async fn create_resolv_conf(
+        &self,
+        pod_id: &str,
+        dns_config: Option<&DNSConfig>,
+    ) -> Result<PathBuf> {
+        let resolv_path = self.pod_resolv_path(pod_id);
+        let use_host_resolv = dns_config
+            .map(|config| {
+                config.servers.is_empty() && config.searches.is_empty() && config.options.is_empty()
+            })
+            .unwrap_or(true);
+
+        if use_host_resolv {
+            tokio::fs::copy("/etc/resolv.conf", &resolv_path)
+                .await
+                .context("Failed to copy host resolv.conf")?;
+            return Ok(resolv_path);
+        }
+
+        let dns_config = dns_config.expect("dns_config checked above");
+        let mut contents = String::new();
+        if !dns_config.searches.is_empty() {
+            contents.push_str("search ");
+            contents.push_str(&dns_config.searches.join(" "));
+            contents.push('\n');
+        }
+        for server in &dns_config.servers {
+            contents.push_str("nameserver ");
+            contents.push_str(server);
+            contents.push('\n');
+        }
+        if !dns_config.options.is_empty() {
+            contents.push_str("options ");
+            contents.push_str(&dns_config.options.join(" "));
+            contents.push('\n');
+        }
+
+        tokio::fs::write(&resolv_path, contents)
+            .await
+            .context("Failed to write pod resolv.conf")?;
+        Ok(resolv_path)
+    }
+
     async fn discover_netns_interfaces(&self, netns_name: &str) -> Vec<NetworkInterface> {
         let output = match Command::new("ip")
             .args(["-n", netns_name, "-o", "addr", "show"])
@@ -238,6 +285,11 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
         let pod_dir = self.root_dir.join(&pod_id);
         tokio::fs::create_dir_all(&pod_dir).await?;
 
+        // 1.1 为 Pod 准备 resolv.conf，参考 CRI-O 的 pod 级 DNS 文件做法。
+        self.create_resolv_conf(&pod_id, config.dns_config.as_ref())
+            .await
+            .context("Failed to create pod resolv.conf")?;
+
         // 2. 创建网络命名空间
         let netns_name = format!("crius-{}-{}", config.namespace, config.name);
         let netns_path = PathBuf::from(format!("/var/run/netns/{}", netns_name));
@@ -312,6 +364,15 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
         netns_path: &Path,
     ) -> Result<String> {
         let pause_image = self.resolve_pause_image(pod_config)?;
+        let mut pause_mounts = Vec::new();
+        let resolv_path = self.pod_resolv_path(pod_id);
+        if resolv_path.exists() {
+            pause_mounts.push(crate::runtime::MountConfig {
+                source: resolv_path,
+                destination: PathBuf::from("/etc/resolv.conf"),
+                read_only: true,
+            });
+        }
 
         // Pause容器配置
         let pause_config = ContainerConfig {
@@ -321,7 +382,7 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
             args: vec![],
             env: vec![],
             working_dir: None,
-            mounts: vec![],
+            mounts: pause_mounts,
             labels: vec![],
             annotations: vec![],
             privileged: pod_config.privileged,
@@ -519,6 +580,57 @@ mod tests {
     use super::*;
     use crate::runtime::RuncRuntime;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn create_resolv_conf_copies_host_config_when_dns_unspecified() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RuncRuntime::new(PathBuf::from("runc"), temp_dir.path().join("runtime"));
+        let manager = PodSandboxManager::new(
+            runtime,
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            CniConfig::default(),
+        );
+        tokio::fs::create_dir_all(temp_dir.path().join("pods").join("pod-1"))
+            .await
+            .unwrap();
+
+        let resolv_path = manager.create_resolv_conf("pod-1", None).await.unwrap();
+        let generated = tokio::fs::read_to_string(&resolv_path).await.unwrap();
+        let host = tokio::fs::read_to_string("/etc/resolv.conf").await.unwrap();
+        assert_eq!(generated, host);
+    }
+
+    #[tokio::test]
+    async fn create_resolv_conf_writes_explicit_dns_config() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RuncRuntime::new(PathBuf::from("runc"), temp_dir.path().join("runtime"));
+        let manager = PodSandboxManager::new(
+            runtime,
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            CniConfig::default(),
+        );
+        tokio::fs::create_dir_all(temp_dir.path().join("pods").join("pod-1"))
+            .await
+            .unwrap();
+
+        let dns = DNSConfig {
+            servers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+            searches: vec!["example.com".to_string()],
+            options: vec!["ndots:5".to_string()],
+        };
+        let resolv_path = manager
+            .create_resolv_conf("pod-1", Some(&dns))
+            .await
+            .unwrap();
+        let generated = tokio::fs::read_to_string(&resolv_path).await.unwrap();
+
+        assert!(generated.contains("search example.com"));
+        assert!(generated.contains("nameserver 1.1.1.1"));
+        assert!(generated.contains("nameserver 8.8.8.8"));
+        assert!(generated.contains("options ndots:5"));
+    }
 
     // 注意：这些测试需要root权限和runc环境
     #[tokio::test]
