@@ -19,6 +19,11 @@ use tonic_reflection::server::Builder as ReflectionBuilder;
 use tracing::{debug, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
+const LOCAL_LOG_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6f%:z";
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LocalLogTimer;
+
 /// crius - OCI-based implementation of Kubernetes Container Runtime Interface
 #[derive(Parser, Debug)]
 #[clap(version, about, long_about = None)]
@@ -156,10 +161,47 @@ fn init_logging() -> Result<(), Error> {
 
     fmt()
         .with_env_filter(filter)
+        .with_timer(LocalLogTimer)
         .with_file(true)
         .with_line_number(true)
         .with_writer(std::io::stderr)
         .init();
 
     Ok(())
+}
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalLogTimer {
+    fn format_time(
+        &self,
+        writer: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        write!(
+            writer,
+            "{}",
+            chrono::Local::now().format(LOCAL_LOG_TIME_FORMAT)
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LocalLogTimer;
+    use tracing_subscriber::fmt::time::FormatTime;
+
+    #[test]
+    fn local_log_time_uses_rfc3339_local_timestamp() {
+        let mut buf = String::new();
+        let mut writer = tracing_subscriber::fmt::format::Writer::new(&mut buf);
+
+        LocalLogTimer
+            .format_time(&mut writer)
+            .expect("local log time should format successfully");
+
+        let parsed = chrono::DateTime::parse_from_rfc3339(&buf)
+            .expect("local log time should be valid RFC3339");
+        assert_eq!(
+            parsed.offset().local_minus_utc(),
+            chrono::Local::now().offset().local_minus_utc()
+        );
+    }
 }

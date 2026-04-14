@@ -1,0 +1,32 @@
+[Unit]
+Description=CRIUS Container Runtime
+After=network.target dbus.service
+
+[Service]
+Environment="CRIUS_SHIM_PATH=/usr/bin/crius-shim"
+Environment="CRIUS_CNI_CONFIG_DIRS=/etc/cni/net.d"
+Environment="CRIUS_CNI_PLUGIN_DIRS=/usr/libexec/cni"
+Environment="CRIUS_PAUSE_IMAGE=registry.k8s.io/pause:3.9"
+ExecStart=/usr/bin/crius
+
+Type=simple
+Delegate=yes
+KillMode=process
+Restart=always
+RestartSec=5
+
+# Having non-zero Limit*s causes performance problems due to accounting overhead
+# in the kernel. We recommend using cgroups to do container-local accounting.
+LimitNPROC=infinity
+LimitCORE=infinity
+
+# Comment TasksMax if your systemd version does not supports it.
+# Only systemd 226 and above support this version.
+TasksMax=infinity
+OOMScoreAdjust=-999
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
