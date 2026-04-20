@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 use crate::nri::error::Result;
+use crate::nri_proto::api as nri_api;
 
 #[derive(Debug, Clone, Default)]
 pub struct NriPodEvent {
@@ -18,7 +19,10 @@ pub struct NriContainerEvent {
 #[async_trait]
 pub trait NriDomain: Send + Sync {
     async fn snapshot(&self) -> Result<()>;
-    async fn apply_updates(&self) -> Result<()>;
+    async fn apply_updates(
+        &self,
+        _updates: &[nri_api::ContainerUpdate],
+    ) -> Result<Vec<nri_api::ContainerUpdate>>;
     async fn evict(&self, _container_id: &str, _reason: &str) -> Result<()>;
 }
 
@@ -86,8 +90,11 @@ impl NriDomain for NopNri {
         Ok(())
     }
 
-    async fn apply_updates(&self) -> Result<()> {
-        Ok(())
+    async fn apply_updates(
+        &self,
+        _updates: &[nri_api::ContainerUpdate],
+    ) -> Result<Vec<nri_api::ContainerUpdate>> {
+        Ok(Vec::new())
     }
 
     async fn evict(&self, _container_id: &str, _reason: &str) -> Result<()> {
@@ -120,7 +127,11 @@ mod tests {
     async fn nop_nri_domain_methods_are_noop() {
         let nop = NopNri;
         nop.snapshot().await.expect("snapshot should be noop");
-        nop.apply_updates().await.expect("apply updates should be noop");
+        let failed = nop
+            .apply_updates(&[])
+            .await
+            .expect("apply updates should be noop");
+        assert!(failed.is_empty());
         nop.evict("container-1", "test")
             .await
             .expect("evict should be noop");
