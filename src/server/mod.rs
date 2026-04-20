@@ -43,12 +43,10 @@ use crate::proto::runtime::v1::{
 };
 use crate::storage::persistence::{PersistenceConfig, PersistenceManager};
 
+use crate::config::NriConfig;
 use crate::metrics::MetricsCollector;
 use crate::network::{CniConfig, DefaultNetworkManager, NetworkManager};
-use crate::config::NriConfig;
-use crate::nri::{
-    NopNri, NriApi, NriContainerEvent, NriManager, NriManagerConfig, NriPodEvent,
-};
+use crate::nri::{NopNri, NriApi, NriContainerEvent, NriManager, NriManagerConfig, NriPodEvent};
 use crate::pod::{PodSandboxConfig, PodSandboxManager};
 use crate::runtime::{
     default_shim_work_dir, ContainerConfig, ContainerRuntime, ContainerStatus, DeviceMapping,
@@ -5392,7 +5390,8 @@ impl RuntimeService for RuntimeServiceImpl {
                 .join(&container_id)
                 .join("rootfs"),
         };
-        let nri_event = self.nri_container_event(&pod_sandbox_id, &container_id, &stored_annotations);
+        let nri_event =
+            self.nri_container_event(&pod_sandbox_id, &container_id, &stored_annotations);
         // Runtime create 走分步链路，确保 NRI CreateContainer 位于 pristine spec 生成之后、
         // bundle 写入之前。
         let runtime = self.runtime.clone();
@@ -5540,7 +5539,10 @@ impl RuntimeService for RuntimeServiceImpl {
             let container = containers
                 .get(&actual_container_id)
                 .ok_or_else(|| Status::not_found("Container not found"))?;
-            (container.pod_sandbox_id.clone(), container.annotations.clone())
+            (
+                container.pod_sandbox_id.clone(),
+                container.annotations.clone(),
+            )
         };
         let nri_event = self.nri_container_event(
             &container_pod_id,
@@ -5720,7 +5722,10 @@ impl RuntimeService for RuntimeServiceImpl {
             let container = containers
                 .get(&actual_container_id)
                 .ok_or_else(|| Status::not_found("Container not found"))?;
-            (container.pod_sandbox_id.clone(), container.annotations.clone())
+            (
+                container.pod_sandbox_id.clone(),
+                container.annotations.clone(),
+            )
         };
         self.nri
             .stop_container(self.nri_container_event(
@@ -5851,7 +5856,10 @@ impl RuntimeService for RuntimeServiceImpl {
             let container = containers
                 .get(&actual_container_id)
                 .ok_or_else(|| Status::not_found("Container not found"))?;
-            (container.pod_sandbox_id.clone(), container.annotations.clone())
+            (
+                container.pod_sandbox_id.clone(),
+                container.annotations.clone(),
+            )
         };
         self.nri
             .remove_container(self.nri_container_event(
@@ -6841,7 +6849,10 @@ impl RuntimeService for RuntimeServiceImpl {
             let container = containers
                 .get(&container_id)
                 .ok_or_else(|| Status::not_found("Container not found"))?;
-            (container.pod_sandbox_id.clone(), container.annotations.clone())
+            (
+                container.pod_sandbox_id.clone(),
+                container.annotations.clone(),
+            )
         };
         let nri_event =
             self.nri_container_event(&container_pod_id, &container_id, &container_annotations);
@@ -7066,11 +7077,8 @@ exit 0
             pause_image: "registry.k8s.io/pause:3.9".to_string(),
             cni_config: crate::network::CniConfig::default(),
         };
-        let service = RuntimeServiceImpl::new_with_shim_work_dir(
-            config,
-            NriConfig::default(),
-            shim_work_dir,
-        );
+        let service =
+            RuntimeServiceImpl::new_with_shim_work_dir(config, NriConfig::default(), shim_work_dir);
         (dir, service)
     }
 

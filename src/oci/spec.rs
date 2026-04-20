@@ -837,7 +837,10 @@ mod tests {
             .as_ref()
             .and_then(|l| l.namespaces.as_ref())
             .expect("namespaces should exist");
-        assert_eq!(namespaces[0].path.as_deref(), Some("/var/run/netns/test-ns"));
+        assert_eq!(
+            namespaces[0].path.as_deref(),
+            Some("/var/run/netns/test-ns")
+        );
 
         let seccomp = parsed
             .linux

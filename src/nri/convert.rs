@@ -2,9 +2,7 @@ use std::collections::HashMap;
 
 const INTERNAL_ANNOTATION_PREFIX: &str = "io.crius.internal/";
 
-pub fn external_annotations(
-    annotations: &HashMap<String, String>,
-) -> HashMap<String, String> {
+pub fn external_annotations(annotations: &HashMap<String, String>) -> HashMap<String, String> {
     annotations
         .iter()
         .filter(|(k, _)| !k.starts_with(INTERNAL_ANNOTATION_PREFIX))
