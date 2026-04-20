@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Error;
 use clap::Parser;
+use crius::config::Config;
 use crius::image::ImageServiceImpl;
 use crius::network::CniConfig;
 use crius::proto::runtime::v1::{
@@ -53,8 +54,20 @@ async fn main() -> Result<(), Error> {
     // 解析命令行参数
     let args = Args::parse();
 
+    let file_config = match Config::load(&args.config) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            info!(
+                "Failed to load config from {}: {}. Using defaults.",
+                args.config.display(),
+                err
+            );
+            Config::default()
+        }
+    };
+
     // 创建运行时配置
-    let runtime_name = "runc".to_string();
+    let runtime_name = file_config.runtime.runtime_type.clone();
     let mut runtime_handlers: Vec<String> = std::env::var("CRIUS_RUNTIME_HANDLERS")
         .ok()
         .map(|raw| {
@@ -73,21 +86,20 @@ async fn main() -> Result<(), Error> {
     }
 
     let runtime_config = RuntimeConfig {
-        root_dir: PathBuf::from("/var/lib/crius"),
+        root_dir: PathBuf::from(&file_config.root),
         runtime: runtime_name,
         runtime_handlers,
-        // Keep runc state root (/run/runc) separate from crius bundle root.
-        // Using /var/run/runc for bundles causes "container ID already exists".
-        runtime_root: PathBuf::from("/var/lib/crius/runc-bundles"),
+        runtime_root: PathBuf::from(&file_config.runtime.root),
         log_dir: PathBuf::from("/var/log/crius"),
-        runtime_path: PathBuf::from("/usr/bin/runc"),
+        runtime_path: PathBuf::from(&file_config.runtime.runtime_path),
         pause_image: std::env::var("CRIUS_PAUSE_IMAGE")
             .unwrap_or_else(|_| "registry.k8s.io/pause:3.9".to_string()),
         cni_config: CniConfig::from_env(),
     };
 
     // 创建服务实例
-    let runtime_service = RuntimeServiceImpl::new(runtime_config.clone());
+    let runtime_service =
+        RuntimeServiceImpl::new_with_nri_config(runtime_config.clone(), file_config.nri.clone());
     let streaming_server =
         StreamingServer::start("127.0.0.1:0", runtime_config.runtime_path.clone()).await?;
     runtime_service

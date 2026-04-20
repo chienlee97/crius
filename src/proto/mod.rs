@@ -3,3 +3,7 @@ pub mod runtime {
         include!("runtime.v1.rs");
     }
 }
+
+pub mod nri {
+    include!(concat!(env!("OUT_DIR"), "/nri/mod.rs"));
+}

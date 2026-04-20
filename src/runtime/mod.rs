@@ -9,7 +9,6 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
-use uuid::Uuid;
 
 use crate::cgroups::{to_oci_resources, CgroupManager, CpuLimit, MemoryLimit, ResourceLimits};
 use crate::oci::spec::{
@@ -29,7 +28,7 @@ const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";
 /// 容器运行时接口
 pub trait ContainerRuntime {
     /// 创建容器
-    fn create_container(&self, config: &ContainerConfig) -> Result<String>;
+    fn create_container(&self, container_id: &str, config: &ContainerConfig) -> Result<String>;
 
     /// 启动容器
     fn start_container(&self, container_id: &str) -> Result<()>;
@@ -1189,6 +1188,40 @@ impl RuncRuntime {
         Ok(())
     }
 
+    /// 分步创建：准备 rootfs（NRI 可在后续步骤介入 spec）。
+    pub fn prepare_rootfs(&self, container_id: &str, config: &ContainerConfig) -> Result<()> {
+        let checkpoint_restore = Self::checkpoint_restore_from_annotations(&config.annotations);
+        let image_ref = checkpoint_restore
+            .as_ref()
+            .map(|restore| restore.image_ref.as_str())
+            .unwrap_or(config.image.as_str());
+        self.prepare_rootfs_from_image(image_ref, &config.rootfs, container_id)
+            .context("Failed to prepare rootfs from image")
+    }
+
+    /// 分步创建：构建 pristine OCI spec。
+    pub fn build_spec(&self, container_id: &str, config: &ContainerConfig) -> Result<Spec> {
+        let checkpoint_restore = Self::checkpoint_restore_from_annotations(&config.annotations);
+        if let Some(checkpoint_restore) = checkpoint_restore.as_ref() {
+            self.spec_from_restore_template(config, checkpoint_restore)
+                .context("Failed to create OCI spec from checkpoint artifact")
+        } else {
+            self.create_spec(config, container_id)
+                .context("Failed to create OCI spec")
+        }
+    }
+
+    /// 分步创建：落盘 bundle（config.json + bundle 目录）。
+    pub fn write_bundle(&self, container_id: &str, rootfs: &Path, spec: &Spec) -> Result<()> {
+        self.create_bundle(container_id, rootfs, spec)
+    }
+
+    /// 分步创建：从 bundle 读取 OCI spec。
+    pub fn load_spec(&self, container_id: &str) -> Result<Spec> {
+        Spec::load(self.config_path(container_id))
+            .map_err(|e| anyhow::anyhow!("Failed to load OCI spec for {}: {}", container_id, e))
+    }
+
     /// 获取runc容器状态
     fn get_runc_state(&self, container_id: &str) -> Result<Option<RuncState>> {
         let output = self.run_command_output(&["state", container_id])?;
@@ -1295,39 +1328,17 @@ impl RuncRuntime {
 }
 
 impl ContainerRuntime for RuncRuntime {
-    fn create_container(&self, config: &ContainerConfig) -> Result<String> {
-        // 生成容器ID
-        let container_id = Uuid::new_v4().to_simple().to_string();
-        let checkpoint_restore = Self::checkpoint_restore_from_annotations(&config.annotations);
-        let image_ref = checkpoint_restore
-            .as_ref()
-            .map(|restore| restore.image_ref.as_str())
-            .unwrap_or(config.image.as_str());
+    fn create_container(&self, container_id: &str, config: &ContainerConfig) -> Result<String> {
+        info!("Creating container {}", container_id);
 
-        info!(
-            "Creating container {} with image {}",
-            container_id, image_ref
-        );
-
-        // 先从镜像构建rootfs，再生成OCI配置
-        self.prepare_rootfs_from_image(image_ref, &config.rootfs, &container_id)
-            .context("Failed to prepare rootfs from image")?;
-
-        // 创建OCI配置
-        let spec = if let Some(checkpoint_restore) = checkpoint_restore.as_ref() {
-            self.spec_from_restore_template(config, checkpoint_restore)
-                .context("Failed to create OCI spec from checkpoint artifact")?
-        } else {
-            self.create_spec(config, &container_id)
-                .context("Failed to create OCI spec")?
-        };
-
-        // 创建bundle
-        self.create_bundle(&container_id, &config.rootfs, &spec)?;
+        // 分步 create 链路：prepare_rootfs -> build_spec -> write_bundle。
+        self.prepare_rootfs(container_id, config)?;
+        let spec = self.build_spec(container_id, config)?;
+        self.write_bundle(container_id, &config.rootfs, &spec)?;
 
         // 延迟到start阶段再调用runc，避免create阶段阻塞导致CRI超时。
         info!("Container {} bundle prepared successfully", container_id);
-        Ok(container_id)
+        Ok(container_id.to_string())
     }
 
     fn start_container(&self, container_id: &str) -> Result<()> {

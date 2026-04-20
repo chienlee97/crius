@@ -46,6 +46,7 @@ use crate::storage::persistence::{PersistenceConfig, PersistenceManager};
 use crate::metrics::MetricsCollector;
 use crate::network::{CniConfig, DefaultNetworkManager, NetworkManager};
 use crate::pod::{PodSandboxConfig, PodSandboxManager};
+use crate::config::NriConfig;
 use crate::runtime::{
     default_shim_work_dir, ContainerConfig, ContainerRuntime, ContainerStatus, DeviceMapping,
     MountConfig, NamespacePaths, RuncRuntime, SeccompProfile, ShimConfig, ShimProcess,
@@ -61,6 +62,8 @@ pub struct RuntimeServiceImpl {
     pod_sandboxes: Arc<Mutex<HashMap<String, crate::proto::runtime::v1::PodSandbox>>>,
     // 运行时配置
     config: RuntimeConfig,
+    // NRI 配置
+    nri_config: NriConfig,
     // 容器运行时
     runtime: RuncRuntime,
     // Pod沙箱管理器
@@ -2109,10 +2112,18 @@ impl RuntimeServiceImpl {
     }
 
     pub fn new(config: RuntimeConfig) -> Self {
-        Self::new_with_shim_work_dir(config, default_shim_work_dir())
+        Self::new_with_nri_config(config, NriConfig::default())
     }
 
-    fn new_with_shim_work_dir(config: RuntimeConfig, shim_work_dir: PathBuf) -> Self {
+    pub fn new_with_nri_config(config: RuntimeConfig, nri_config: NriConfig) -> Self {
+        Self::new_with_shim_work_dir(config, nri_config, default_shim_work_dir())
+    }
+
+    fn new_with_shim_work_dir(
+        config: RuntimeConfig,
+        nri_config: NriConfig,
+        shim_work_dir: PathBuf,
+    ) -> Self {
         let mut config = config;
         let mut handlers = Vec::new();
         for handler in &config.runtime_handlers {
@@ -2183,6 +2194,7 @@ impl RuntimeServiceImpl {
             containers: Arc::new(Mutex::new(HashMap::new())),
             pod_sandboxes: Arc::new(Mutex::new(HashMap::new())),
             config,
+            nri_config,
             runtime,
             pod_manager: tokio::sync::Mutex::new(pod_manager),
             persistence: Arc::new(Mutex::new(persistence)),
@@ -5327,12 +5339,20 @@ impl RuntimeService for RuntimeServiceImpl {
 
         // 调用runtime创建容器（在阻塞线程中执行）
         let runtime = self.runtime.clone();
+        let requested_container_id = container_id.clone();
         let container_config_clone = container_config.clone();
-        let created_id =
-            tokio::task::spawn_blocking(move || runtime.create_container(&container_config_clone))
-                .await
-                .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-                .map_err(|e| Status::internal(format!("Failed to create container: {}", e)))?;
+        let created_id = tokio::task::spawn_blocking(move || {
+            runtime.create_container(&requested_container_id, &container_config_clone)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(|e| Status::internal(format!("Failed to create container: {}", e)))?;
+        if created_id != container_id {
+            return Err(Status::internal(format!(
+                "Runtime returned mismatched container id: requested={}, got={}",
+                container_id, created_id
+            )));
+        }
 
         // 创建容器元数据
         let container = Container {
@@ -6897,7 +6917,11 @@ exit 0
             pause_image: "registry.k8s.io/pause:3.9".to_string(),
             cni_config: crate::network::CniConfig::default(),
         };
-        let service = RuntimeServiceImpl::new_with_shim_work_dir(config, shim_work_dir);
+        let service = RuntimeServiceImpl::new_with_shim_work_dir(
+            config,
+            NriConfig::default(),
+            shim_work_dir,
+        );
         (dir, service)
     }
 
@@ -7567,6 +7591,7 @@ sleep 1
                 pause_image: "registry.k8s.io/pause:3.9".to_string(),
                 cni_config: crate::network::CniConfig::default(),
             },
+            NriConfig::default(),
             shim_work_dir.clone(),
         );
         std::env::remove_var("CRIUS_SHIM_PATH");

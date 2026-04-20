@@ -19,6 +19,7 @@ pub mod server;
 pub mod storage;
 pub mod streaming;
 pub mod utils;
+pub use crate::proto::nri as nri_proto;
 
 #[cfg(feature = "shim")]
 pub mod shim;

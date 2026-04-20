@@ -416,10 +416,10 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
             rootfs: self.root_dir.join(pod_id).join("pause-rootfs"),
         };
 
-        // 创建pause容器
-        let container_id = self
-            .runtime
-            .create_container(&pause_config)
+        // 创建 pause 容器，ID 由上层（pod 管理器）统一分配，避免 runtime 二次生成。
+        let container_id = format!("pause-{}", pod_id);
+        self.runtime
+            .create_container(&container_id, &pause_config)
             .context("Failed to create pause container")?;
 
         // 启动pause容器

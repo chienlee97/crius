@@ -18,6 +18,10 @@ pub struct Config {
 
     /// 网络配置
     pub network: NetworkConfig,
+
+    /// NRI 配置
+    #[serde(default)]
+    pub nri: NriConfig,
 }
 
 /// 运行时配置
@@ -53,6 +57,46 @@ pub struct NetworkConfig {
     pub config_dir: String,
 }
 
+/// NRI 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NriConfig {
+    /// 是否启用 NRI
+    pub enable: bool,
+    /// runtime 名称（上报给插件）
+    pub runtime_name: String,
+    /// runtime 版本（上报给插件）
+    pub runtime_version: String,
+    /// runtime 侧 NRI socket 路径
+    pub socket_path: String,
+    /// 预装插件目录
+    pub plugin_path: String,
+    /// 插件配置目录
+    pub plugin_config_path: String,
+    /// 插件注册超时（毫秒）
+    pub registration_timeout_ms: i64,
+    /// 插件请求超时（毫秒）
+    pub request_timeout_ms: i64,
+    /// 允许外部插件连接
+    pub enable_external_connections: bool,
+}
+
+impl Default for NriConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            runtime_name: "crius".to_string(),
+            runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+            socket_path: "/run/crius/nri.sock".to_string(),
+            plugin_path: "/opt/nri/plugins".to_string(),
+            plugin_config_path: "/etc/nri/conf.d".to_string(),
+            registration_timeout_ms: 5000,
+            request_timeout_ms: 2000,
+            enable_external_connections: false,
+        }
+    }
+}
+
 impl Config {
     /// 从文件加载配置
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -78,6 +122,7 @@ impl Config {
                 plugin: "cni".to_string(),
                 config_dir: "/etc/cni/net.d/".to_string(),
             },
+            nri: NriConfig::default(),
         }
     }
 }

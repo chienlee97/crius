@@ -74,6 +74,8 @@ libc = { version = "0.2", optional = true }
 
 # 网络相关
 async-trait = "0.1"
+ttrpc = "0.9.0"
+protobuf = "3"
 
 tempfile = "3.3"
 
@@ -84,3 +86,4 @@ env_logger = "0.10"
 [build-dependencies]
 tonic-build = "0.11"
 prost-build = "0.12"
+ttrpc-codegen = "0.6.0"
