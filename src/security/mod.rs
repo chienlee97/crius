@@ -385,6 +385,7 @@ impl SecurityManager {
                         },
                         names: rule.names.clone(),
                         args: None,
+                        errno_ret: None,
                     })
                     .collect(),
             )
@@ -392,7 +393,11 @@ impl SecurityManager {
 
         crate::oci::spec::Seccomp {
             default_action: default_action.to_string(),
+            default_errno_ret: None,
             architectures: Some(vec!["SCMP_ARCH_X86_64".to_string()]),
+            flags: None,
+            listener_path: None,
+            listener_metadata: None,
             syscalls,
         }
     }

@@ -56,7 +56,7 @@ nix = "0.25"
 clap = { version = "4.0", features = ["derive"] }
 tower = "0.4"
 hyper = { version = "0.14", features = ["server", "tcp", "http1"] }
-oci-distribution = "0.8.0"
+oci-distribution = "0.11.0"
 rand = "0.8.0"
 uuid = { version = "0.8", features = ["v4"] }
 reqwest = { version = "0.11", features = ["json"] }
@@ -74,7 +74,7 @@ libc = { version = "0.2", optional = true }
 
 # 网络相关
 async-trait = "0.1"
-ttrpc = "0.9.0"
+ttrpc = { version = "0.9.0", features = ["async"] }
 protobuf = "3"
 
 tempfile = "3.3"

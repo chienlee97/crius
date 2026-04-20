@@ -1049,6 +1049,7 @@ impl RuncRuntime {
                 config.capabilities.as_ref(),
             )),
             rlimits: None,
+            oom_score_adj: None,
             no_new_privileges: Some(config.no_new_privileges.unwrap_or(!config.privileged)),
             apparmor_profile: config.apparmor_profile.clone(),
             selinux_label: config.selinux_label.clone(),
@@ -1834,7 +1835,11 @@ mod tests {
         let seccomp_profile_path = temp.path().join("seccomp.json");
         let seccomp_profile = crate::oci::spec::Seccomp {
             default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
             architectures: None,
+            flags: None,
+            listener_path: None,
+            listener_metadata: None,
             syscalls: None,
         };
         std::fs::write(

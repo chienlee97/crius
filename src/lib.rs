@@ -9,6 +9,7 @@ pub mod error;
 pub mod image;
 pub mod metrics;
 pub mod network;
+pub mod nri;
 pub mod oci;
 pub mod pod;
 pub mod proto;

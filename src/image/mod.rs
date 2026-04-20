@@ -1242,7 +1242,7 @@ impl ImageService for ImageServiceImpl {
                     .await?
                 } else {
                     // 拉取镜像（优先 OCI 库，失败时走标准 Registry API）
-                    let mut client = self.oci_client.lock().await;
+                    let client = self.oci_client.lock().await;
                     let pull_result = client
                         .pull(
                             &reference,

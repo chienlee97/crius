@@ -1,4 +1,4 @@
-# Makefile for crius with h2 authority fix
+# Makefile for crius vendor patch workflow
 
 .PHONY: all build clean check-patch apply-patch run test
 
@@ -7,18 +7,22 @@ all: build
 
 # 检查补丁是否已应用
 check-patch:
-	@echo "检查h2 authority补丁状态..."
+	@echo "检查vendor补丁状态..."
 	@if grep -q "is_connect" vendor/h2/src/server.rs && \
-		grep -q "authority.*not required.*HTTP/2" vendor/h2/src/server.rs; then \
-		echo "h2 authority补丁已应用"; \
+		grep -q "authority.*not required.*HTTP/2" vendor/h2/src/server.rs && \
+		grep -q "cfg(all(any(target_os = \"linux\", target_os = \"android\"), feature = \"tokio-vsock\"))" vendor/ttrpc/src/asynchronous/server.rs && \
+		grep -q "cfg(all(any(target_os = \"linux\", target_os = \"android\"), feature = \"tokio-vsock\"))" vendor/ttrpc/src/asynchronous/transport/mod.rs && \
+		! grep -q "\"tokio-vsock\"," vendor/ttrpc/Cargo.toml; then \
+		echo "vendor补丁已应用"; \
 		exit 0; \
 	else \
-		echo "h2 authority补丁未应用"; \
+		echo "vendor补丁未应用"; \
 		exit 1; \
 	fi
 
 # 应用补丁
 apply-patch:
+	@cargo vendor
 	@echo "应用h2 authority补丁..."
 	@echo "应用PR#612修改到vendor/h2/src/server.rs..."
 	@sed -i '1557,1568c\
@@ -50,7 +54,19 @@ apply-patch:
 	echo "更新checksum..." && \
 	NEW_CHECKSUM=$$(sha256sum vendor/h2/src/server.rs | cut -d' ' -f1) && \
 	sed -i "s/\"src\/server.rs\":\"[^\"]*\"/\"src\/server.rs\":\"$$NEW_CHECKSUM\"/" vendor/h2/.cargo-checksum.json && \
-	echo "补丁应用成功"
+	echo "h2补丁应用成功"
+	@echo "应用ttrpc async补丁..."
+	@sed -i '/"tokio-vsock",/d' vendor/ttrpc/Cargo.toml && \
+	sed -i 's/#\[cfg(any(target_os = "linux", target_os = "android"))\]/#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "tokio-vsock"))]/g' vendor/ttrpc/src/asynchronous/server.rs && \
+	sed -i 's/#\[cfg(any(target_os = "linux", target_os = "android"))\]/#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "tokio-vsock"))]/g' vendor/ttrpc/src/asynchronous/transport/mod.rs && \
+	TTRPC_TOML_SUM=$$(sha256sum vendor/ttrpc/Cargo.toml | cut -d' ' -f1) && \
+	TTRPC_SERVER_SUM=$$(sha256sum vendor/ttrpc/src/asynchronous/server.rs | cut -d' ' -f1) && \
+	TTRPC_TRANSPORT_SUM=$$(sha256sum vendor/ttrpc/src/asynchronous/transport/mod.rs | cut -d' ' -f1) && \
+	sed -i "s/\"Cargo.toml\":\"[^\"]*\"/\"Cargo.toml\":\"$$TTRPC_TOML_SUM\"/" vendor/ttrpc/.cargo-checksum.json && \
+	sed -i "s/\"src\/asynchronous\/server.rs\":\"[^\"]*\"/\"src\/asynchronous\/server.rs\":\"$$TTRPC_SERVER_SUM\"/" vendor/ttrpc/.cargo-checksum.json && \
+	sed -i "s/\"src\/asynchronous\/transport\/mod.rs\":\"[^\"]*\"/\"src\/asynchronous\/transport\/mod.rs\":\"$$TTRPC_TRANSPORT_SUM\"/" vendor/ttrpc/.cargo-checksum.json && \
+	echo "ttrpc补丁应用成功"
+	@echo "vendor补丁应用成功"
 
 # 构建项目（自动检查和应用补丁）
 build: 
@@ -91,7 +107,7 @@ help:
 	@echo "  all        - 构建项目（默认）"
 	@echo "  build      - 构建项目（自动检查和应用补丁）"
 	@echo "  check-patch - 检查补丁是否已应用"
-	@echo "  apply-patch - 应用h2 authority补丁"
+	@echo "  apply-patch - 应用vendor补丁"
 	@echo "  run        - 构建并运行服务"
 	@echo "  test       - 构建并测试crictl兼容性"
 	@echo "  clean      - 清理构建产物"

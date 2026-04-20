@@ -20,6 +20,8 @@ pub struct Spec {
     pub hostname: Option<String>,
     /// 挂载点
     pub mounts: Option<Vec<Mount>>,
+    /// OCI hooks
+    pub hooks: Option<Hooks>,
     /// Linux命名空间配置
     pub linux: Option<Linux>,
     /// 平台特定配置
@@ -44,6 +46,8 @@ pub struct Process {
     pub capabilities: Option<LinuxCapabilities>,
     /// RLimits
     pub rlimits: Option<Vec<Rlimit>>,
+    /// OOM 分数调整
+    pub oom_score_adj: Option<i32>,
     /// 进程属性
     pub no_new_privileges: Option<bool>,
     /// Apparmor配置
@@ -115,6 +119,27 @@ pub struct Mount {
     pub mount_type: Option<String>,
     /// 挂载选项
     pub options: Option<Vec<String>>,
+}
+
+/// OCI hooks 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hooks {
+    pub prestart: Option<Vec<Hook>>,
+    pub create_runtime: Option<Vec<Hook>>,
+    pub create_container: Option<Vec<Hook>>,
+    pub start_container: Option<Vec<Hook>>,
+    pub poststart: Option<Vec<Hook>>,
+    pub poststop: Option<Vec<Hook>>,
+}
+
+/// 单个 OCI hook
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Hook {
+    pub path: String,
+    pub args: Option<Vec<String>>,
+    pub env: Option<Vec<String>>,
+    pub timeout: Option<i32>,
 }
 
 /// Linux配置
@@ -372,8 +397,16 @@ pub struct LinuxIntelRdt {
 pub struct Seccomp {
     /// Seccomp模式
     pub default_action: String,
+    /// 默认 errno 返回值
+    pub default_errno_ret: Option<u32>,
     /// 架构
     pub architectures: Option<Vec<String>>,
+    /// seccomp flags
+    pub flags: Option<Vec<String>>,
+    /// listener socket path
+    pub listener_path: Option<String>,
+    /// listener metadata
+    pub listener_metadata: Option<String>,
     /// 系统调用
     pub syscalls: Option<Vec<SeccompSyscall>>,
 }
@@ -387,6 +420,8 @@ pub struct SeccompSyscall {
     pub names: Vec<String>,
     /// 条件
     pub args: Option<Vec<SeccompArg>>,
+    /// errno 返回值
+    pub errno_ret: Option<u32>,
 }
 
 /// Seccomp参数条件
@@ -422,6 +457,7 @@ impl Spec {
             root: None,
             hostname: None,
             mounts: None,
+            hooks: None,
             linux: None,
             annotations: None,
         }
@@ -653,5 +689,168 @@ mod tests {
         let mounts = Spec::default_mounts();
         assert!(!mounts.is_empty());
         assert!(mounts.iter().any(|m| m.destination == "/proc"));
+    }
+
+    #[test]
+    fn test_hooks_and_oom_score_adj_round_trip() {
+        let mut spec = Spec::new("1.0.2");
+        spec.process = Some(Process {
+            terminal: Some(false),
+            user: None,
+            args: vec!["/bin/sh".to_string()],
+            env: None,
+            cwd: "/".to_string(),
+            capabilities: None,
+            rlimits: None,
+            oom_score_adj: Some(321),
+            no_new_privileges: Some(true),
+            apparmor_profile: None,
+            selinux_label: None,
+        });
+        spec.hooks = Some(Hooks {
+            prestart: Some(vec![Hook {
+                path: "/usr/bin/prestart-hook".to_string(),
+                args: Some(vec!["hook".to_string()]),
+                env: Some(vec!["A=B".to_string()]),
+                timeout: Some(5),
+            }]),
+            create_runtime: None,
+            create_container: None,
+            start_container: None,
+            poststart: None,
+            poststop: None,
+        });
+
+        let json = spec.to_json().expect("serialize spec");
+        let parsed = Spec::from_json(&json).expect("deserialize spec");
+        let oom = parsed
+            .process
+            .as_ref()
+            .and_then(|p| p.oom_score_adj)
+            .expect("oom_score_adj should exist");
+        assert_eq!(oom, 321);
+        let hook_path = parsed
+            .hooks
+            .as_ref()
+            .and_then(|h| h.prestart.as_ref())
+            .and_then(|hooks| hooks.first())
+            .map(|hook| hook.path.clone())
+            .expect("prestart hook should exist");
+        assert_eq!(hook_path, "/usr/bin/prestart-hook");
+    }
+
+    #[test]
+    fn test_round_trip_rlimits_namespaces_and_seccomp() {
+        let mut spec = Spec::new("1.0.2");
+        spec.process = Some(Process {
+            terminal: Some(false),
+            user: None,
+            args: vec!["/bin/sleep".to_string(), "10".to_string()],
+            env: Some(vec!["A=B".to_string()]),
+            cwd: "/".to_string(),
+            capabilities: None,
+            rlimits: Some(vec![
+                Rlimit {
+                    rtype: "RLIMIT_NOFILE".to_string(),
+                    hard: 65535,
+                    soft: 65535,
+                },
+                Rlimit {
+                    rtype: "RLIMIT_NPROC".to_string(),
+                    hard: 4096,
+                    soft: 2048,
+                },
+            ]),
+            oom_score_adj: Some(-100),
+            no_new_privileges: Some(true),
+            apparmor_profile: None,
+            selinux_label: None,
+        });
+        spec.linux = Some(Linux {
+            namespaces: Some(vec![
+                Namespace {
+                    ns_type: "network".to_string(),
+                    path: Some("/var/run/netns/test-ns".to_string()),
+                },
+                Namespace {
+                    ns_type: "pid".to_string(),
+                    path: None,
+                },
+            ]),
+            uid_mappings: None,
+            gid_mappings: None,
+            devices: None,
+            cgroups_path: Some("/kubepods.slice/pod123".to_string()),
+            resources: None,
+            rootfs_propagation: None,
+            seccomp: Some(Seccomp {
+                default_action: "SCMP_ACT_ERRNO".to_string(),
+                default_errno_ret: Some(1),
+                architectures: Some(vec!["SCMP_ARCH_X86_64".to_string()]),
+                flags: Some(vec!["SECCOMP_FILTER_FLAG_LOG".to_string()]),
+                listener_path: Some("/run/seccomp-agent.sock".to_string()),
+                listener_metadata: Some("pod=test".to_string()),
+                syscalls: Some(vec![SeccompSyscall {
+                    action: "SCMP_ACT_ALLOW".to_string(),
+                    names: vec!["read".to_string(), "write".to_string()],
+                    args: Some(vec![SeccompArg {
+                        index: 0,
+                        value: 1,
+                        value_two: Some(2),
+                        op: "SCMP_CMP_EQ".to_string(),
+                    }]),
+                    errno_ret: Some(0),
+                }]),
+            }),
+            sysctl: None,
+            mount_label: None,
+            intel_rdt: None,
+        });
+        spec.hooks = Some(Hooks {
+            prestart: None,
+            create_runtime: Some(vec![Hook {
+                path: "/usr/bin/create-runtime-hook".to_string(),
+                args: Some(vec!["hook".to_string(), "arg".to_string()]),
+                env: None,
+                timeout: Some(10),
+            }]),
+            create_container: None,
+            start_container: None,
+            poststart: None,
+            poststop: None,
+        });
+
+        let json = spec.to_json().expect("serialize spec");
+        let parsed = Spec::from_json(&json).expect("deserialize spec");
+
+        let rlimits = parsed
+            .process
+            .as_ref()
+            .and_then(|p| p.rlimits.as_ref())
+            .expect("rlimits should exist");
+        assert_eq!(rlimits.len(), 2);
+        assert_eq!(rlimits[0].rtype, "RLIMIT_NOFILE");
+        assert_eq!(rlimits[1].soft, 2048);
+
+        let namespaces = parsed
+            .linux
+            .as_ref()
+            .and_then(|l| l.namespaces.as_ref())
+            .expect("namespaces should exist");
+        assert_eq!(namespaces[0].path.as_deref(), Some("/var/run/netns/test-ns"));
+
+        let seccomp = parsed
+            .linux
+            .as_ref()
+            .and_then(|l| l.seccomp.as_ref())
+            .expect("seccomp should exist");
+        assert_eq!(seccomp.default_action, "SCMP_ACT_ERRNO");
+        assert_eq!(seccomp.default_errno_ret, Some(1));
+        let syscall = seccomp
+            .syscalls
+            .as_ref()
+            .and_then(|list| list.first())
+            .expect("seccomp syscall should exist");
+        assert_eq!(syscall.errno_ret, Some(0));
     }
 }

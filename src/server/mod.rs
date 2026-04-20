@@ -45,8 +45,11 @@ use crate::storage::persistence::{PersistenceConfig, PersistenceManager};
 
 use crate::metrics::MetricsCollector;
 use crate::network::{CniConfig, DefaultNetworkManager, NetworkManager};
-use crate::pod::{PodSandboxConfig, PodSandboxManager};
 use crate::config::NriConfig;
+use crate::nri::{
+    NopNri, NriApi, NriContainerEvent, NriManager, NriManagerConfig, NriPodEvent,
+};
+use crate::pod::{PodSandboxConfig, PodSandboxManager};
 use crate::runtime::{
     default_shim_work_dir, ContainerConfig, ContainerRuntime, ContainerStatus, DeviceMapping,
     MountConfig, NamespacePaths, RuncRuntime, SeccompProfile, ShimConfig, ShimProcess,
@@ -54,7 +57,6 @@ use crate::runtime::{
 use crate::streaming::StreamingServer;
 
 /// 运行时服务实现
-#[derive(Debug)]
 pub struct RuntimeServiceImpl {
     // 存储容器状态的线程安全HashMap
     containers: Arc<Mutex<HashMap<String, Container>>>,
@@ -64,6 +66,8 @@ pub struct RuntimeServiceImpl {
     config: RuntimeConfig,
     // NRI 配置
     nri_config: NriConfig,
+    // NRI API（关闭场景默认 Nop）
+    nri: Arc<dyn NriApi>,
     // 容器运行时
     runtime: RuncRuntime,
     // Pod沙箱管理器
@@ -2124,6 +2128,12 @@ impl RuntimeServiceImpl {
         nri_config: NriConfig,
         shim_work_dir: PathBuf,
     ) -> Self {
+        let nri_manager_config = NriManagerConfig::from(nri_config.clone());
+        let nri: Arc<dyn NriApi> = if nri_manager_config.enable {
+            Arc::new(NriManager::new(nri_manager_config))
+        } else {
+            Arc::new(NopNri)
+        };
         let mut config = config;
         let mut handlers = Vec::new();
         for handler in &config.runtime_handlers {
@@ -2195,6 +2205,7 @@ impl RuntimeServiceImpl {
             pod_sandboxes: Arc::new(Mutex::new(HashMap::new())),
             config,
             nri_config,
+            nri,
             runtime,
             pod_manager: tokio::sync::Mutex::new(pod_manager),
             persistence: Arc::new(Mutex::new(persistence)),
@@ -2206,6 +2217,39 @@ impl RuntimeServiceImpl {
         };
 
         service
+    }
+
+    pub async fn initialize_nri(&self) -> Result<(), Status> {
+        if !self.nri_config.enable {
+            return Ok(());
+        }
+        self.nri
+            .start()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to start NRI: {}", e)))?;
+        self.nri
+            .synchronize()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to synchronize NRI: {}", e)))
+    }
+
+    fn nri_pod_event(&self, pod_id: &str) -> NriPodEvent {
+        NriPodEvent {
+            pod_id: pod_id.to_string(),
+        }
+    }
+
+    fn nri_container_event(
+        &self,
+        pod_id: &str,
+        container_id: &str,
+        annotations: &HashMap<String, String>,
+    ) -> NriContainerEvent {
+        NriContainerEvent {
+            pod_id: pod_id.to_string(),
+            container_id: container_id.to_string(),
+            annotations: Self::external_annotations(annotations),
+        }
     }
 
     pub async fn set_streaming_server(&self, streaming_server: StreamingServer) {
@@ -4122,6 +4166,10 @@ impl RuntimeService for RuntimeServiceImpl {
         } else {
             log::info!("Pod sandbox {} persisted to database", pod_id);
         }
+        self.nri
+            .run_pod_sandbox(self.nri_pod_event(&pod_id))
+            .await
+            .map_err(|e| Status::internal(format!("NRI RunPodSandbox failed: {}", e)))?;
 
         log::info!("Pod sandbox {} created successfully", pod_id);
         if let Some(pause_container_id) = pod_state.pause_container_id.as_deref() {
@@ -4158,6 +4206,10 @@ impl RuntimeService for RuntimeServiceImpl {
         };
 
         log::info!("Stopping pod sandbox {}", pod_id);
+        self.nri
+            .stop_pod_sandbox(self.nri_pod_event(&pod_id))
+            .await
+            .map_err(|e| Status::internal(format!("NRI StopPodSandbox failed: {}", e)))?;
 
         // 先停止该Pod下的所有业务容器，避免出现Pod已NotReady但容器仍Running。
         let container_ids: Vec<String> = {
@@ -4689,6 +4741,10 @@ impl RuntimeService for RuntimeServiceImpl {
         };
 
         log::info!("Removing pod sandbox {}", pod_id);
+        self.nri
+            .remove_pod_sandbox(self.nri_pod_event(&pod_id))
+            .await
+            .map_err(|e| Status::internal(format!("NRI RemovePodSandbox failed: {}", e)))?;
         let existing_pod = {
             let pod_sandboxes = self.pod_sandboxes.lock().await;
             pod_sandboxes.get(&pod_id).cloned()
@@ -5336,6 +5392,11 @@ impl RuntimeService for RuntimeServiceImpl {
                 .join(&container_id)
                 .join("rootfs"),
         };
+        let nri_event = self.nri_container_event(&pod_sandbox_id, &container_id, &stored_annotations);
+        self.nri
+            .create_container(nri_event.clone())
+            .await
+            .map_err(|e| Status::internal(format!("NRI CreateContainer failed: {}", e)))?;
 
         // 调用runtime创建容器（在阻塞线程中执行）
         let runtime = self.runtime.clone();
@@ -5401,6 +5462,10 @@ impl RuntimeService for RuntimeServiceImpl {
         } else {
             log::info!("Container {} persisted to database", created_id);
         }
+        self.nri
+            .post_create_container(nri_event)
+            .await
+            .map_err(|e| Status::internal(format!("NRI PostCreateContainer failed: {}", e)))?;
         self.emit_container_event(
             ContainerEventType::ContainerCreatedEvent,
             &container,
@@ -5453,6 +5518,22 @@ impl RuntimeService for RuntimeServiceImpl {
             }
         };
         drop(containers);
+        let (container_pod_id, container_annotations) = {
+            let containers = self.containers.lock().await;
+            let container = containers
+                .get(&actual_container_id)
+                .ok_or_else(|| Status::not_found("Container not found"))?;
+            (container.pod_sandbox_id.clone(), container.annotations.clone())
+        };
+        let nri_event = self.nri_container_event(
+            &container_pod_id,
+            &actual_container_id,
+            &container_annotations,
+        );
+        self.nri
+            .start_container(nri_event.clone())
+            .await
+            .map_err(|e| Status::internal(format!("NRI StartContainer failed: {}", e)))?;
 
         let checkpoint_restore = {
             let containers = self.containers.lock().await;
@@ -5588,6 +5669,10 @@ impl RuntimeService for RuntimeServiceImpl {
             let containers = self.containers.lock().await;
             containers.get(&actual_container_id).cloned()
         } {
+            self.nri
+                .post_start_container(nri_event)
+                .await
+                .map_err(|e| Status::internal(format!("NRI PostStartContainer failed: {}", e)))?;
             self.emit_container_event(
                 ContainerEventType::ContainerStartedEvent,
                 &container,
@@ -5613,6 +5698,21 @@ impl RuntimeService for RuntimeServiceImpl {
         else {
             return Ok(Response::new(StopContainerResponse {}));
         };
+        let (container_pod_id, container_annotations) = {
+            let containers = self.containers.lock().await;
+            let container = containers
+                .get(&actual_container_id)
+                .ok_or_else(|| Status::not_found("Container not found"))?;
+            (container.pod_sandbox_id.clone(), container.annotations.clone())
+        };
+        self.nri
+            .stop_container(self.nri_container_event(
+                &container_pod_id,
+                &actual_container_id,
+                &container_annotations,
+            ))
+            .await
+            .map_err(|e| Status::internal(format!("NRI StopContainer failed: {}", e)))?;
 
         // 调用runtime停止容器
         let runtime = self.runtime.clone();
@@ -5729,6 +5829,21 @@ impl RuntimeService for RuntimeServiceImpl {
         else {
             return Ok(Response::new(RemoveContainerResponse {}));
         };
+        let (container_pod_id, container_annotations) = {
+            let containers = self.containers.lock().await;
+            let container = containers
+                .get(&actual_container_id)
+                .ok_or_else(|| Status::not_found("Container not found"))?;
+            (container.pod_sandbox_id.clone(), container.annotations.clone())
+        };
+        self.nri
+            .remove_container(self.nri_container_event(
+                &container_pod_id,
+                &actual_container_id,
+                &container_annotations,
+            ))
+            .await
+            .map_err(|e| Status::internal(format!("NRI RemoveContainer failed: {}", e)))?;
         let deleted_container = {
             let containers = self.containers.lock().await;
             containers.get(&actual_container_id).cloned()
@@ -6704,6 +6819,19 @@ impl RuntimeService for RuntimeServiceImpl {
                 container.state = observed_state;
             }
         }
+        let (container_pod_id, container_annotations) = {
+            let containers = self.containers.lock().await;
+            let container = containers
+                .get(&container_id)
+                .ok_or_else(|| Status::not_found("Container not found"))?;
+            (container.pod_sandbox_id.clone(), container.annotations.clone())
+        };
+        let nri_event =
+            self.nri_container_event(&container_pod_id, &container_id, &container_annotations);
+        self.nri
+            .update_container(nri_event.clone())
+            .await
+            .map_err(|e| Status::internal(format!("NRI UpdateContainer failed: {}", e)))?;
 
         if let Some(resources) = linux {
             self.runtime_update_container_resources(&container_id, &resources)
@@ -6713,6 +6841,10 @@ impl RuntimeService for RuntimeServiceImpl {
             })
             .await?;
         }
+        self.nri
+            .post_update_container(nri_event)
+            .await
+            .map_err(|e| Status::internal(format!("NRI PostUpdateContainer failed: {}", e)))?;
 
         Ok(Response::new(UpdateContainerResourcesResponse {}))
     }

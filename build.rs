@@ -31,6 +31,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .rust_protobuf_customize(ttrpc_codegen::ProtobufCustomize::default().gen_mod_rs(false))
         .run()?;
 
+    std::fs::write(
+        format!("{}/mod.rs", nri_out_dir),
+        "pub mod api;\npub mod api_ttrpc;\n",
+    )?;
+
     println!("cargo:rerun-if-changed=proto/nri/pkg/api/api.proto");
     println!("cargo:rerun-if-changed=proto/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto");
 

@@ -111,6 +111,9 @@ async fn main() -> Result<(), Error> {
     if let Err(e) = runtime_service.recover_state().await {
         log::error!("Failed to recover state: {}", e);
     }
+    if let Err(e) = runtime_service.initialize_nri().await {
+        log::error!("Failed to initialize NRI: {}", e);
+    }
     let image_service = ImageServiceImpl::new(runtime_config.root_dir.join("storage"))?;
     let reflection_service = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(include_bytes!(concat!(

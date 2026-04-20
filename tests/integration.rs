@@ -160,7 +160,7 @@ mod system_runtime {
         };
 
         let container_id = runtime
-            .create_container(&config)
+            .create_container(&config.name, &config)
             .expect("Failed to create container");
 
         let status = runtime
@@ -252,7 +252,7 @@ mod system_runtime {
         };
 
         let container_id = runtime
-            .create_container(&config)
+            .create_container(&config.name, &config)
             .expect("Failed to create container");
         runtime
             .start_container(&container_id)
