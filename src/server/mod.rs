@@ -5393,27 +5393,44 @@ impl RuntimeService for RuntimeServiceImpl {
                 .join("rootfs"),
         };
         let nri_event = self.nri_container_event(&pod_sandbox_id, &container_id, &stored_annotations);
+        // Runtime create 走分步链路，确保 NRI CreateContainer 位于 pristine spec 生成之后、
+        // bundle 写入之前。
+        let runtime = self.runtime.clone();
+        let requested_container_id = container_id.clone();
+        let container_config_clone = container_config.clone();
+        tokio::task::spawn_blocking(move || {
+            runtime.prepare_rootfs(&requested_container_id, &container_config_clone)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(|e| Status::internal(format!("Failed to prepare container rootfs: {}", e)))?;
+
+        let runtime = self.runtime.clone();
+        let requested_container_id = container_id.clone();
+        let container_config_clone = container_config.clone();
+        let pristine_spec = tokio::task::spawn_blocking(move || {
+            runtime.build_spec(&requested_container_id, &container_config_clone)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(|e| Status::internal(format!("Failed to build pristine OCI spec: {}", e)))?;
+
         self.nri
             .create_container(nri_event.clone())
             .await
             .map_err(|e| Status::internal(format!("NRI CreateContainer failed: {}", e)))?;
 
-        // 调用runtime创建容器（在阻塞线程中执行）
         let runtime = self.runtime.clone();
         let requested_container_id = container_id.clone();
-        let container_config_clone = container_config.clone();
-        let created_id = tokio::task::spawn_blocking(move || {
-            runtime.create_container(&requested_container_id, &container_config_clone)
+        let rootfs = container_config.rootfs.clone();
+        tokio::task::spawn_blocking(move || {
+            runtime.write_bundle(&requested_container_id, &rootfs, &pristine_spec)
         })
         .await
         .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-        .map_err(|e| Status::internal(format!("Failed to create container: {}", e)))?;
-        if created_id != container_id {
-            return Err(Status::internal(format!(
-                "Runtime returned mismatched container id: requested={}, got={}",
-                container_id, created_id
-            )));
-        }
+        .map_err(|e| Status::internal(format!("Failed to write container bundle: {}", e)))?;
+
+        let created_id = container_id.clone();
 
         // 创建容器元数据
         let container = Container {
