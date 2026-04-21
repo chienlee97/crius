@@ -13,6 +13,12 @@ pub struct MergeResult {
     pub owners: nri_api::OwningPlugins,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MergedContainerUpdates {
+    pub target_linux_resources: Option<nri_api::LinuxResources>,
+    pub updates: Vec<nri_api::ContainerUpdate>,
+}
+
 fn is_marked_for_removal(key: &str) -> (String, bool) {
     if let Some(stripped) = key.strip_prefix(REMOVAL_PREFIX) {
         (stripped.to_string(), true)
@@ -686,9 +692,167 @@ pub fn merge_annotation_adjustments(
         .annotations)
 }
 
+fn has_linux_resources(resources: &nri_api::LinuxResources) -> bool {
+    resources.memory.is_some()
+        || resources.cpu.is_some()
+        || !resources.hugepage_limits.is_empty()
+        || resources.blockio_class.is_some()
+        || resources.rdt_class.is_some()
+        || !resources.unified.is_empty()
+        || resources.pids.is_some()
+}
+
+fn overlay_linux_resources(base: &mut nri_api::LinuxResources, delta: &nri_api::LinuxResources) {
+    if let Some(memory) = delta.memory.as_ref() {
+        if base.memory.is_none() {
+            base.memory = MessageField::some(nri_api::LinuxMemory::new());
+        }
+        let target = base.memory.as_mut().expect("linux memory initialized");
+        if memory.limit.is_some() {
+            target.limit = memory.limit.clone();
+        }
+        if memory.reservation.is_some() {
+            target.reservation = memory.reservation.clone();
+        }
+        if memory.swap.is_some() {
+            target.swap = memory.swap.clone();
+        }
+        if memory.kernel.is_some() {
+            target.kernel = memory.kernel.clone();
+        }
+        if memory.kernel_tcp.is_some() {
+            target.kernel_tcp = memory.kernel_tcp.clone();
+        }
+        if memory.swappiness.is_some() {
+            target.swappiness = memory.swappiness.clone();
+        }
+        if memory.disable_oom_killer.is_some() {
+            target.disable_oom_killer = memory.disable_oom_killer.clone();
+        }
+        if memory.use_hierarchy.is_some() {
+            target.use_hierarchy = memory.use_hierarchy.clone();
+        }
+    }
+
+    if let Some(cpu) = delta.cpu.as_ref() {
+        if base.cpu.is_none() {
+            base.cpu = MessageField::some(nri_api::LinuxCPU::new());
+        }
+        let target = base.cpu.as_mut().expect("linux cpu initialized");
+        if cpu.shares.is_some() {
+            target.shares = cpu.shares.clone();
+        }
+        if cpu.quota.is_some() {
+            target.quota = cpu.quota.clone();
+        }
+        if cpu.period.is_some() {
+            target.period = cpu.period.clone();
+        }
+        if cpu.realtime_runtime.is_some() {
+            target.realtime_runtime = cpu.realtime_runtime.clone();
+        }
+        if cpu.realtime_period.is_some() {
+            target.realtime_period = cpu.realtime_period.clone();
+        }
+        if !cpu.cpus.is_empty() {
+            target.cpus = cpu.cpus.clone();
+        }
+        if !cpu.mems.is_empty() {
+            target.mems = cpu.mems.clone();
+        }
+    }
+
+    for hugepage in &delta.hugepage_limits {
+        upsert_hugepage(base, hugepage);
+    }
+    if delta.blockio_class.is_some() {
+        base.blockio_class = delta.blockio_class.clone();
+    }
+    if delta.rdt_class.is_some() {
+        base.rdt_class = delta.rdt_class.clone();
+    }
+    if delta.pids.is_some() {
+        base.pids = delta.pids.clone();
+    }
+    for (key, value) in &delta.unified {
+        base.unified.insert(key.clone(), value.clone());
+    }
+}
+
+pub fn merge_container_updates(
+    target_container_id: &str,
+    requested_linux_resources: Option<&nri_api::LinuxResources>,
+    plugins: &[(String, Vec<nri_api::ContainerUpdate>)],
+) -> Result<MergedContainerUpdates> {
+    let mut merged_resources = HashMap::<String, nri_api::LinuxResources>::new();
+    let mut owners = nri_api::OwningPlugins::new();
+    let mut ignore_failure = HashMap::<String, bool>::new();
+    let mut order = Vec::<String>::new();
+
+    for (plugin, updates) in plugins {
+        for update in updates {
+            let container_id = update.container_id.clone();
+            if !merged_resources.contains_key(&container_id) {
+                merged_resources.insert(container_id.clone(), nri_api::LinuxResources::new());
+                ignore_failure.insert(container_id.clone(), update.ignore_failure);
+                order.push(container_id.clone());
+            } else if let Some(existing) = ignore_failure.get_mut(&container_id) {
+                *existing = *existing && update.ignore_failure;
+            }
+
+            if let Some(resources) = update.linux.as_ref().and_then(|linux| linux.resources.as_ref()) {
+                let mut delta = nri_api::ContainerAdjustment::new();
+                merge_resources(&container_id, &mut delta, &mut owners, plugin, resources)?;
+                if let Some(delta_resources) = delta
+                    .linux
+                    .as_ref()
+                    .and_then(|linux| linux.resources.as_ref())
+                {
+                    let merged = merged_resources
+                        .get_mut(&container_id)
+                        .expect("merged resources initialized");
+                    overlay_linux_resources(merged, delta_resources);
+                }
+            }
+        }
+    }
+
+    let target_linux_resources = if let Some(delta) = merged_resources.remove(target_container_id) {
+        let mut target = requested_linux_resources.cloned().unwrap_or_default();
+        overlay_linux_resources(&mut target, &delta);
+        Some(target)
+    } else {
+        requested_linux_resources.cloned()
+    };
+
+    let updates = order
+        .into_iter()
+        .filter(|container_id| container_id != target_container_id)
+        .filter_map(|container_id| {
+            let resources = merged_resources.remove(&container_id)?;
+            if !has_linux_resources(&resources) {
+                return None;
+            }
+            let mut linux = nri_api::LinuxContainerUpdate::new();
+            linux.resources = MessageField::some(resources);
+            Some(nri_api::ContainerUpdate {
+                container_id: container_id.clone(),
+                linux: MessageField::some(linux),
+                ignore_failure: ignore_failure.remove(&container_id).unwrap_or(false),
+                ..Default::default()
+            })
+        })
+        .collect();
+
+    Ok(MergedContainerUpdates {
+        target_linux_resources,
+        updates,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{mark_for_removal, merge_container_adjustments};
+    use super::{mark_for_removal, merge_container_adjustments, merge_container_updates};
     use crate::nri_proto::api as nri_api;
     use protobuf::MessageField;
 
@@ -728,6 +892,103 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("both tried to set Annotations"));
+    }
+
+    #[test]
+    fn merges_update_resources_for_target_and_side_effects() {
+        let mut requested = nri_api::LinuxResources::new();
+        let mut requested_cpu = nri_api::LinuxCPU::new();
+        let mut requested_shares = nri_api::OptionalUInt64::new();
+        requested_shares.value = 512;
+        requested_cpu.shares = MessageField::some(requested_shares);
+        requested.cpu = MessageField::some(requested_cpu);
+
+        let mut target_update = nri_api::ContainerUpdate::new();
+        target_update.container_id = "target".to_string();
+        let mut target_linux = nri_api::LinuxContainerUpdate::new();
+        let mut target_resources = nri_api::LinuxResources::new();
+        let mut target_memory = nri_api::LinuxMemory::new();
+        let mut limit = nri_api::OptionalInt64::new();
+        limit.value = 4096;
+        target_memory.limit = MessageField::some(limit);
+        target_resources.memory = MessageField::some(target_memory);
+        target_linux.resources = MessageField::some(target_resources);
+        target_update.linux = MessageField::some(target_linux);
+
+        let mut other_update = nri_api::ContainerUpdate::new();
+        other_update.container_id = "other".to_string();
+        other_update.ignore_failure = true;
+        let mut other_linux = nri_api::LinuxContainerUpdate::new();
+        let mut other_resources = nri_api::LinuxResources::new();
+        let mut other_cpu = nri_api::LinuxCPU::new();
+        let mut other_quota = nri_api::OptionalInt64::new();
+        other_quota.value = 1234;
+        other_cpu.quota = MessageField::some(other_quota);
+        other_resources.cpu = MessageField::some(other_cpu);
+        other_linux.resources = MessageField::some(other_resources);
+        other_update.linux = MessageField::some(other_linux);
+
+        let result = merge_container_updates(
+            "target",
+            Some(&requested),
+            &[("plugin-a".to_string(), vec![target_update, other_update])],
+        )
+        .unwrap();
+
+        let target_cpu = result
+            .target_linux_resources
+            .as_ref()
+            .and_then(|resources| resources.cpu.as_ref())
+            .unwrap();
+        assert_eq!(target_cpu.shares.as_ref().map(|value| value.value), Some(512));
+        let target_memory = result
+            .target_linux_resources
+            .as_ref()
+            .and_then(|resources| resources.memory.as_ref())
+            .unwrap();
+        assert_eq!(target_memory.limit.as_ref().map(|value| value.value), Some(4096));
+        assert_eq!(result.updates.len(), 1);
+        assert_eq!(result.updates[0].container_id, "other");
+        assert!(result.updates[0].ignore_failure);
+    }
+
+    #[test]
+    fn detects_conflicting_update_resource_owners() {
+        let mut first = nri_api::ContainerUpdate::new();
+        first.container_id = "target".to_string();
+        let mut first_linux = nri_api::LinuxContainerUpdate::new();
+        let mut first_resources = nri_api::LinuxResources::new();
+        let mut first_cpu = nri_api::LinuxCPU::new();
+        let mut first_shares = nri_api::OptionalUInt64::new();
+        first_shares.value = 100;
+        first_cpu.shares = MessageField::some(first_shares);
+        first_resources.cpu = MessageField::some(first_cpu);
+        first_linux.resources = MessageField::some(first_resources);
+        first.linux = MessageField::some(first_linux);
+
+        let mut second = nri_api::ContainerUpdate::new();
+        second.container_id = "target".to_string();
+        let mut second_linux = nri_api::LinuxContainerUpdate::new();
+        let mut second_resources = nri_api::LinuxResources::new();
+        let mut second_cpu = nri_api::LinuxCPU::new();
+        let mut second_shares = nri_api::OptionalUInt64::new();
+        second_shares.value = 200;
+        second_cpu.shares = MessageField::some(second_shares);
+        second_resources.cpu = MessageField::some(second_cpu);
+        second_linux.resources = MessageField::some(second_resources);
+        second.linux = MessageField::some(second_linux);
+
+        let err = merge_container_updates(
+            "target",
+            None,
+            &[
+                ("plugin-a".to_string(), vec![first]),
+                ("plugin-b".to_string(), vec![second]),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(format!("{err}").contains("both tried to set CPUShares"));
     }
 
     #[test]

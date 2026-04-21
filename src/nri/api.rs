@@ -15,11 +15,19 @@ pub struct NriPodEvent {
 pub struct NriContainerEvent {
     pub pod: Option<nri_api::PodSandbox>,
     pub container: nri_api::Container,
+    pub linux_resources: Option<nri_api::LinuxResources>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct NriCreateContainerResult {
     pub adjustment: nri_api::ContainerAdjustment,
+    pub updates: Vec<nri_api::ContainerUpdate>,
+    pub evictions: Vec<nri_api::ContainerEviction>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NriUpdateContainerResult {
+    pub linux_resources: Option<nri_api::LinuxResources>,
     pub updates: Vec<nri_api::ContainerUpdate>,
     pub evictions: Vec<nri_api::ContainerEviction>,
 }
@@ -66,8 +74,11 @@ pub trait NriApi: Send + Sync {
     async fn post_start_container(&self, _event: NriContainerEvent) -> Result<()> {
         Ok(())
     }
-    async fn update_container(&self, _event: NriContainerEvent) -> Result<()> {
-        Ok(())
+    async fn update_container(&self, event: NriContainerEvent) -> Result<NriUpdateContainerResult> {
+        Ok(NriUpdateContainerResult {
+            linux_resources: event.linux_resources,
+            ..Default::default()
+        })
     }
     async fn post_update_container(&self, _event: NriContainerEvent) -> Result<()> {
         Ok(())

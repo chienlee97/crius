@@ -17,9 +17,10 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::nri::{
-    merge_container_adjustments, multiplex_connection, NopNri, NriApi, NriContainerEvent,
-    NriCreateContainerResult, NriDomain, NriError, NriManagerConfig, NriPodEvent,
-    PluginTtrpcClient, Result, RuntimeTtrpcServer,
+    merge_container_adjustments, merge_container_updates, multiplex_connection, NopNri, NriApi,
+    NriContainerEvent, NriCreateContainerResult, NriDomain, NriError, NriManagerConfig,
+    NriPodEvent, NriUpdateContainerResult, PluginTtrpcClient, Result, RuntimeTtrpcServer,
+    validate_container_adjustment, validate_container_update, validate_update_linux_resources,
 };
 use crate::nri_proto::api as nri_api;
 
@@ -483,6 +484,11 @@ impl NriManager {
         updates: &[nri_api::ContainerUpdate],
         consulted_plugins: &[nri_api::PluginInstance],
     ) -> Result<()> {
+        validate_container_adjustment(&merged.adjustment)?;
+        for update in updates {
+            validate_container_update(update)?;
+        }
+
         let validators = self
             .plugins_for_event(nri_api::Event::VALIDATE_CONTAINER_ADJUSTMENT)
             .await;
@@ -531,30 +537,59 @@ impl NriManager {
         Ok(())
     }
 
-    async fn dispatch_update_container(&self, event_payload: &NriContainerEvent) -> Result<()> {
+    async fn dispatch_update_container(
+        &self,
+        event_payload: &NriContainerEvent,
+    ) -> Result<NriUpdateContainerResult> {
         let _sync_guard = self.plugin_sync_gate.read().await;
         let plugins = self
             .plugins_for_event(nri_api::Event::UPDATE_CONTAINER)
             .await;
+        let mut plugin_updates = Vec::new();
+        let mut evictions = Vec::new();
         for plugin in plugins {
             let mut req = nri_api::UpdateContainerRequest::new();
             if let Some(pod) = event_payload.pod.as_ref() {
                 req.pod = MessageField::some(pod.clone());
             }
             req.container = MessageField::some(event_payload.container.clone());
+            if let Some(resources) = event_payload.linux_resources.as_ref() {
+                req.linux_resources = MessageField::some(resources.clone());
+            }
             let result = self
                 .call_with_timeout(plugin.client.update_container(&req))
                 .await;
-            if let Err(err) = result {
-                if should_cleanup_plugin(&err) {
-                    self.unregister_plugin(&plugin.record.name, &plugin.record.index)
-                        .await;
-                    continue;
+            match result {
+                Ok(response) => {
+                    plugin_updates.push((plugin_adjustment_owner(&plugin.record), response.update));
+                    evictions.extend(response.evict);
                 }
-                return Err(err);
+                Err(err) => {
+                    if should_cleanup_plugin(&err) {
+                        self.unregister_plugin(&plugin.record.name, &plugin.record.index)
+                            .await;
+                        continue;
+                    }
+                    return Err(err);
+                }
             }
         }
-        Ok(())
+        let merged = merge_container_updates(
+            &event_payload.container.id,
+            event_payload.linux_resources.as_ref(),
+            &plugin_updates,
+        )?;
+        if let Some(resources) = merged.target_linux_resources.as_ref() {
+            validate_update_linux_resources(resources)?;
+        }
+        for update in &merged.updates {
+            validate_container_update(update)?;
+        }
+        Ok(NriUpdateContainerResult {
+            linux_resources: merged.target_linux_resources,
+            updates: merged.updates,
+            evictions,
+        })
     }
 
     async fn dispatch_stop_container(&self, event_payload: &NriContainerEvent) -> Result<()> {
@@ -1239,7 +1274,7 @@ impl NriApi for NriManager {
             .await
     }
 
-    async fn update_container(&self, event: NriContainerEvent) -> Result<()> {
+    async fn update_container(&self, event: NriContainerEvent) -> Result<NriUpdateContainerResult> {
         self.dispatch_update_container(&event).await
     }
 
@@ -1275,11 +1310,13 @@ mod tests {
     #[derive(Default)]
     struct FakePluginClient {
         calls: Mutex<Vec<String>>,
+        synchronize_snapshots: Mutex<Vec<(Vec<String>, Vec<String>)>>,
         fail_state_change: bool,
         synchronize_delay: Option<Duration>,
         state_change_delay: Option<Duration>,
         shutdown_calls: AtomicUsize,
         create_response: Option<nri_api::CreateContainerResponse>,
+        update_response: Option<nri_api::UpdateContainerResponse>,
     }
 
     #[derive(Default)]
@@ -1327,11 +1364,18 @@ mod tests {
 
         async fn synchronize(
             &self,
-            _req: &nri_api::SynchronizeRequest,
+            req: &nri_api::SynchronizeRequest,
         ) -> Result<nri_api::SynchronizeResponse> {
             if let Some(delay) = self.synchronize_delay {
                 sleep(delay).await;
             }
+            self.synchronize_snapshots.lock().await.push((
+                req.pods.iter().map(|pod| pod.id.clone()).collect(),
+                req.containers
+                    .iter()
+                    .map(|container| container.id.clone())
+                    .collect(),
+            ));
             self.calls.lock().await.push("synchronize".to_string());
             Ok(nri_api::SynchronizeResponse::new())
         }
@@ -1352,7 +1396,10 @@ mod tests {
             _req: &nri_api::UpdateContainerRequest,
         ) -> Result<nri_api::UpdateContainerResponse> {
             self.calls.lock().await.push("update".to_string());
-            Ok(nri_api::UpdateContainerResponse::new())
+            Ok(self
+                .update_response
+                .clone()
+                .unwrap_or_else(nri_api::UpdateContainerResponse::new))
         }
 
         async fn stop_container(
@@ -1460,6 +1507,7 @@ mod tests {
         NriContainerEvent {
             pod: Some(pod),
             container,
+            linux_resources: None,
         }
     }
 
@@ -1631,10 +1679,18 @@ mod tests {
         let mut first_adjust = nri_api::ContainerAdjustment::new();
         first_adjust.annotations.insert("a".to_string(), "1".to_string());
         first_response.adjust = MessageField::some(first_adjust);
-        first_response.update.push(nri_api::ContainerUpdate {
-            container_id: "u1".to_string(),
-            ..Default::default()
-        });
+        let mut update = nri_api::ContainerUpdate::new();
+        update.container_id = "u1".to_string();
+        let mut linux = nri_api::LinuxContainerUpdate::new();
+        let mut resources = nri_api::LinuxResources::new();
+        let mut cpu = nri_api::LinuxCPU::new();
+        let mut shares = nri_api::OptionalUInt64::new();
+        shares.value = 128;
+        cpu.shares = MessageField::some(shares);
+        resources.cpu = MessageField::some(cpu);
+        linux.resources = MessageField::some(resources);
+        update.linux = MessageField::some(linux);
+        first_response.update.push(update);
         let first = Arc::new(FakePluginClient {
             create_response: Some(first_response),
             ..Default::default()
@@ -1676,6 +1732,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_container_rejects_protected_annotations_before_validator() {
+        let manager = manager_for_tests();
+        let create_bit = 1_i32 << (nri_api::Event::CREATE_CONTAINER as u32);
+        let validate_bit = 1_i32 << (nri_api::Event::VALIDATE_CONTAINER_ADJUSTMENT as u32);
+
+        let mut response = nri_api::CreateContainerResponse::new();
+        let mut adjust = nri_api::ContainerAdjustment::new();
+        adjust.annotations.insert(
+            "io.crius.internal/container-state".to_string(),
+            "override".to_string(),
+        );
+        response.adjust = MessageField::some(adjust);
+
+        let creator = Arc::new(FakePluginClient {
+            create_response: Some(response),
+            ..Default::default()
+        });
+        let validator = Arc::new(FakePluginClient::default());
+
+        insert_plugin_for_test(&manager, "creator", "01", create_bit, true, creator.clone()).await;
+        insert_plugin_for_test(&manager, "validator", "02", validate_bit, true, validator.clone())
+            .await;
+        manager.synchronize().await.unwrap();
+
+        let err = manager.create_container(test_container_event()).await.unwrap_err();
+        assert!(format!("{err}").contains("protected annotation"));
+        assert_eq!(creator.calls.lock().await.clone(), vec!["synchronize", "create"]);
+        assert_eq!(validator.calls.lock().await.clone(), vec!["synchronize"]);
+    }
+
+    #[tokio::test]
+    async fn update_container_merges_target_resources_and_side_effects() {
+        let manager = manager_for_tests();
+        let update_bit = 1_i32 << (nri_api::Event::UPDATE_CONTAINER as u32);
+
+        let mut response = nri_api::UpdateContainerResponse::new();
+        let mut target = nri_api::ContainerUpdate::new();
+        target.container_id = "ctr-1".to_string();
+        let mut target_linux = nri_api::LinuxContainerUpdate::new();
+        let mut target_resources = nri_api::LinuxResources::new();
+        let mut target_cpu = nri_api::LinuxCPU::new();
+        let mut shares = nri_api::OptionalUInt64::new();
+        shares.value = 2048;
+        target_cpu.shares = MessageField::some(shares);
+        target_resources.cpu = MessageField::some(target_cpu);
+        target_linux.resources = MessageField::some(target_resources);
+        target.linux = MessageField::some(target_linux);
+        response.update.push(target);
+
+        let mut sidecar = nri_api::ContainerUpdate::new();
+        sidecar.container_id = "ctr-2".to_string();
+        let mut sidecar_linux = nri_api::LinuxContainerUpdate::new();
+        let mut sidecar_resources = nri_api::LinuxResources::new();
+        let mut sidecar_memory = nri_api::LinuxMemory::new();
+        let mut limit = nri_api::OptionalInt64::new();
+        limit.value = 4096;
+        sidecar_memory.limit = MessageField::some(limit);
+        sidecar_resources.memory = MessageField::some(sidecar_memory);
+        sidecar_linux.resources = MessageField::some(sidecar_resources);
+        sidecar.linux = MessageField::some(sidecar_linux);
+        response.update.push(sidecar);
+        response.evict.push(nri_api::ContainerEviction {
+            container_id: "ctr-3".to_string(),
+            reason: "policy".to_string(),
+            ..Default::default()
+        });
+
+        let plugin = Arc::new(FakePluginClient {
+            update_response: Some(response),
+            ..Default::default()
+        });
+        insert_plugin_for_test(&manager, "updater", "01", update_bit, true, plugin.clone()).await;
+        manager.synchronize().await.unwrap();
+
+        let mut event = test_container_event();
+        let mut requested = nri_api::LinuxResources::new();
+        let mut requested_cpu = nri_api::LinuxCPU::new();
+        let mut quota = nri_api::OptionalInt64::new();
+        quota.value = 1000;
+        requested_cpu.quota = MessageField::some(quota);
+        requested.cpu = MessageField::some(requested_cpu);
+        event.linux_resources = Some(requested);
+
+        let result = manager.update_container(event).await.unwrap();
+
+        let cpu = result
+            .linux_resources
+            .as_ref()
+            .and_then(|resources| resources.cpu.as_ref())
+            .unwrap();
+        assert_eq!(cpu.shares.as_ref().map(|value| value.value), Some(2048));
+        assert_eq!(cpu.quota.as_ref().map(|value| value.value), Some(1000));
+        assert_eq!(result.updates.len(), 1);
+        assert_eq!(result.updates[0].container_id, "ctr-2");
+        assert_eq!(result.evictions.len(), 1);
+        assert_eq!(plugin.calls.lock().await.clone(), vec!["synchronize", "update"]);
+    }
+
+    #[tokio::test]
     async fn block_plugin_sync_prevents_sync_completion_mid_lifecycle() {
         let manager = Arc::new(manager_for_tests());
         let create_bit = 1_i32 << (nri_api::Event::CREATE_CONTAINER as u32);
@@ -1713,6 +1868,56 @@ mod tests {
             .expect("plugin should be active after sync completes");
         let calls = plugin.calls.lock().await.clone();
         assert_eq!(calls, vec!["synchronize", "create"]);
+    }
+
+    #[tokio::test]
+    async fn synchronize_uses_current_snapshot_without_replaying_lifecycle_events() {
+        #[derive(Default)]
+        struct SnapshotDomain;
+
+        #[async_trait]
+        impl NriDomain for SnapshotDomain {
+            async fn snapshot(&self) -> Result<crate::nri::domain::RuntimeSnapshot> {
+                let mut pod = nri_api::PodSandbox::new();
+                pod.id = "pod-recovered".to_string();
+
+                let mut container = nri_api::Container::new();
+                container.id = "ctr-recovered".to_string();
+                container.pod_sandbox_id = "pod-recovered".to_string();
+
+                Ok(crate::nri::domain::RuntimeSnapshot {
+                    pods: vec![pod],
+                    containers: vec![container],
+                })
+            }
+
+            async fn apply_updates(
+                &self,
+                _updates: &[nri_api::ContainerUpdate],
+            ) -> Result<Vec<nri_api::ContainerUpdate>> {
+                Ok(Vec::new())
+            }
+
+            async fn evict(&self, _container_id: &str, _reason: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let manager = manager_with_domain_for_tests(Arc::new(SnapshotDomain));
+        let plugin = Arc::new(FakePluginClient::default());
+
+        insert_plugin_for_test(&manager, "recover", "01", 0, true, plugin.clone()).await;
+
+        manager
+            .synchronize()
+            .await
+            .expect("synchronize should deliver recovered snapshot");
+
+        assert_eq!(plugin.calls.lock().await.clone(), vec!["synchronize"]);
+        assert_eq!(
+            plugin.synchronize_snapshots.lock().await.clone(),
+            vec![(vec!["pod-recovered".to_string()], vec!["ctr-recovered".to_string()])]
+        );
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::nri::{NriError, Result};
 use crate::nri_proto::api as nri_api;
 use crate::oci::spec::{
     Device, Hook, Hooks, Linux, LinuxCpu, LinuxDeviceCgroup, LinuxHugepageLimit, LinuxMemory, LinuxPids,
@@ -7,9 +8,199 @@ use crate::oci::spec::{
 };
 
 const REMOVAL_PREFIX: &str = "-";
+const INTERNAL_ANNOTATION_PREFIX: &str = "io.crius.internal/";
+const CHECKPOINT_LOCATION_ANNOTATION_KEY: &str = "io.crius.checkpoint.location";
 
 fn is_marked_for_removal(key: &str) -> Option<&str> {
     key.strip_prefix(REMOVAL_PREFIX)
+}
+
+fn adjusted_key(key: &str) -> &str {
+    is_marked_for_removal(key).unwrap_or(key)
+}
+
+fn is_protected_annotation_key(key: &str) -> bool {
+    key.starts_with(INTERNAL_ANNOTATION_PREFIX) || key == CHECKPOINT_LOCATION_ANNOTATION_KEY
+}
+
+fn reject_unsupported(field: &str) -> Result<()> {
+    Err(NriError::Plugin(format!(
+        "container adjustment uses unsupported field {field}"
+    )))
+}
+
+fn validate_adjustment_resources(resources: &nri_api::LinuxResources) -> Result<()> {
+    if resources.blockio_class.is_some() {
+        return reject_unsupported("linux.resources.blockio_class");
+    }
+    if resources.rdt_class.is_some() {
+        return reject_unsupported("linux.resources.rdt_class");
+    }
+    for hugepage in &resources.hugepage_limits {
+        if hugepage.page_size.is_empty() {
+            return Err(NriError::Plugin(
+                "container adjustment hugepage limit must set page_size".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_container_adjustment(adjustment: &nri_api::ContainerAdjustment) -> Result<()> {
+    for key in adjustment.annotations.keys() {
+        let name = adjusted_key(key);
+        if name.is_empty() {
+            return Err(NriError::Plugin(
+                "container adjustment annotation key must not be empty".to_string(),
+            ));
+        }
+        if is_protected_annotation_key(name) {
+            return Err(NriError::Plugin(format!(
+                "container adjustment cannot modify protected annotation '{name}'"
+            )));
+        }
+    }
+
+    for mount in &adjustment.mounts {
+        if adjusted_key(&mount.destination).is_empty() {
+            return Err(NriError::Plugin(
+                "container adjustment mount destination must not be empty".to_string(),
+            ));
+        }
+    }
+
+    for env in &adjustment.env {
+        if adjusted_key(&env.key).is_empty() {
+            return Err(NriError::Plugin(
+                "container adjustment environment key must not be empty".to_string(),
+            ));
+        }
+    }
+
+    for rlimit in &adjustment.rlimits {
+        if rlimit.type_.is_empty() {
+            return Err(NriError::Plugin(
+                "container adjustment rlimit type must not be empty".to_string(),
+            ));
+        }
+    }
+
+    if !adjustment.CDI_devices.is_empty() {
+        return reject_unsupported("CDI_devices");
+    }
+
+    if let Some(linux) = adjustment.linux.as_ref() {
+        for device in &linux.devices {
+            if adjusted_key(&device.path).is_empty() {
+                return Err(NriError::Plugin(
+                    "container adjustment device path must not be empty".to_string(),
+                ));
+            }
+        }
+        if let Some(resources) = linux.resources.as_ref() {
+            validate_adjustment_resources(resources)?;
+        }
+        if linux.io_priority.is_some() {
+            return reject_unsupported("linux.io_priority");
+        }
+        for namespace in &linux.namespaces {
+            if adjusted_key(&namespace.type_).is_empty() {
+                return Err(NriError::Plugin(
+                    "container adjustment namespace type must not be empty".to_string(),
+                ));
+            }
+        }
+        for key in linux.sysctl.keys() {
+            if adjusted_key(key).is_empty() {
+                return Err(NriError::Plugin(
+                    "container adjustment sysctl key must not be empty".to_string(),
+                ));
+            }
+        }
+        if !linux.net_devices.is_empty() {
+            return reject_unsupported("linux.net_devices");
+        }
+        if linux.scheduler.is_some() {
+            return reject_unsupported("linux.scheduler");
+        }
+        if linux.rdt.is_some() {
+            return reject_unsupported("linux.rdt");
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_update_linux_resources(resources: &nri_api::LinuxResources) -> Result<()> {
+    if let Some(memory) = resources.memory.as_ref() {
+        if memory.reservation.is_some() {
+            return reject_unsupported("linux.resources.memory.reservation");
+        }
+        if memory.kernel.is_some() {
+            return reject_unsupported("linux.resources.memory.kernel");
+        }
+        if memory.kernel_tcp.is_some() {
+            return reject_unsupported("linux.resources.memory.kernel_tcp");
+        }
+        if memory.swappiness.is_some() {
+            return reject_unsupported("linux.resources.memory.swappiness");
+        }
+        if memory.disable_oom_killer.is_some() {
+            return reject_unsupported("linux.resources.memory.disable_oom_killer");
+        }
+        if memory.use_hierarchy.is_some() {
+            return reject_unsupported("linux.resources.memory.use_hierarchy");
+        }
+    }
+    if let Some(cpu) = resources.cpu.as_ref() {
+        if cpu.realtime_runtime.is_some() {
+            return reject_unsupported("linux.resources.cpu.realtime_runtime");
+        }
+        if cpu.realtime_period.is_some() {
+            return reject_unsupported("linux.resources.cpu.realtime_period");
+        }
+    }
+    for hugepage in &resources.hugepage_limits {
+        if hugepage.page_size.is_empty() {
+            return Err(NriError::Plugin(
+                "container update hugepage limit must set page_size".to_string(),
+            ));
+        }
+    }
+    if resources.blockio_class.is_some() {
+        return reject_unsupported("linux.resources.blockio_class");
+    }
+    if resources.rdt_class.is_some() {
+        return reject_unsupported("linux.resources.rdt_class");
+    }
+    if !resources.devices.is_empty() {
+        return reject_unsupported("linux.resources.devices");
+    }
+    if resources.pids.is_some() {
+        return reject_unsupported("linux.resources.pids");
+    }
+    Ok(())
+}
+
+pub fn validate_container_update(update: &nri_api::ContainerUpdate) -> Result<()> {
+    if update.container_id.is_empty() {
+        return Err(NriError::InvalidInput(
+            "container update is missing container_id".to_string(),
+        ));
+    }
+    let linux = update.linux.as_ref().ok_or_else(|| {
+        NriError::InvalidInput(format!(
+            "container {} update is missing linux payload",
+            update.container_id
+        ))
+    })?;
+    let resources = linux.resources.as_ref().ok_or_else(|| {
+        NriError::InvalidInput(format!(
+            "container {} update is missing linux resources",
+            update.container_id
+        ))
+    })?;
+    validate_update_linux_resources(resources)
 }
 
 fn ensure_process(spec: &mut Spec) -> &mut Process {
@@ -486,7 +677,10 @@ mod tests {
 
     use protobuf::MessageField;
 
-    use super::{apply_container_adjustment, REMOVAL_PREFIX};
+    use super::{
+        apply_container_adjustment, validate_container_adjustment, validate_container_update,
+        validate_update_linux_resources, REMOVAL_PREFIX,
+    };
     use crate::nri_proto::api as nri_api;
     use crate::oci::spec::{
         Device, Linux, LinuxCpu, LinuxHugepageLimit, LinuxMemory, LinuxPids, LinuxResources, Mount, Namespace,
@@ -818,5 +1012,51 @@ mod tests {
             rlimits.iter().find(|limit| limit.rtype == "RLIMIT_NPROC").unwrap().soft,
             1024
         );
+    }
+
+    #[test]
+    fn rejects_protected_annotations_in_adjustment() {
+        let mut adjustment = nri_api::ContainerAdjustment::new();
+        adjustment.annotations.insert(
+            "io.crius.internal/container-state".to_string(),
+            "forbidden".to_string(),
+        );
+
+        let err = validate_container_adjustment(&adjustment).unwrap_err();
+        assert!(format!("{err}").contains("protected annotation"));
+    }
+
+    #[test]
+    fn rejects_unsupported_adjustment_fields() {
+        let mut adjustment = nri_api::ContainerAdjustment::new();
+        adjustment.CDI_devices.push(nri_api::CDIDevice {
+            name: "vendor.com/device".to_string(),
+            ..Default::default()
+        });
+
+        let err = validate_container_adjustment(&adjustment).unwrap_err();
+        assert!(format!("{err}").contains("unsupported field CDI_devices"));
+    }
+
+    #[test]
+    fn rejects_unsupported_update_resources() {
+        let mut resources = nri_api::LinuxResources::new();
+        resources.pids = Some(nri_api::LinuxPids {
+            limit: 12,
+            ..Default::default()
+        })
+        .into();
+
+        let err = validate_update_linux_resources(&resources).unwrap_err();
+        assert!(format!("{err}").contains("unsupported field linux.resources.pids"));
+    }
+
+    #[test]
+    fn rejects_update_without_linux_resources() {
+        let mut update = nri_api::ContainerUpdate::new();
+        update.container_id = "ctr-1".to_string();
+
+        let err = validate_container_update(&update).unwrap_err();
+        assert!(format!("{err}").contains("missing linux payload"));
     }
 }
