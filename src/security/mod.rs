@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// 安全配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SecurityConfig {
     /// SELinux配置
     pub selinux: Option<SelinuxConfig>,
@@ -26,19 +26,6 @@ pub struct SecurityConfig {
     pub no_new_privileges: bool,
     /// ReadOnlyRootFilesystem
     pub read_only_root_filesystem: bool,
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            selinux: None,
-            apparmor: None,
-            seccomp: None,
-            capabilities: None,
-            no_new_privileges: false,
-            read_only_root_filesystem: false,
-        }
-    }
 }
 
 /// SELinux配置
@@ -242,11 +229,11 @@ impl SecurityManager {
             config.user,
             config.role,
             config.selinux_type,
-            config.level.as_ref().map(|l| l.as_str()).unwrap_or("s0")
+            config.level.as_deref().unwrap_or("s0")
         );
 
         *process_label = Some(context.clone());
-        *mount_label = Some(format!("{}", context));
+        *mount_label = Some(context.clone());
 
         debug!("SELinux context set: {}", context);
         Ok(())
@@ -259,7 +246,7 @@ impl SecurityManager {
             config.user,
             config.role,
             config.selinux_type,
-            config.level.as_ref().map(|l| l.as_str()).unwrap_or("s0")
+            config.level.as_deref().unwrap_or("s0")
         )
     }
 
@@ -288,7 +275,7 @@ impl SecurityManager {
 
         // 加载配置文件
         let output = std::process::Command::new("apparmor_parser")
-            .args(&["-r", "-W", &profile_path])
+            .args(["-r", "-W", &profile_path])
             .output()
             .context("Failed to execute apparmor_parser")?;
 
@@ -311,7 +298,7 @@ impl SecurityManager {
         }
 
         let output = std::process::Command::new("apparmor_parser")
-            .args(&["-R", profile_name])
+            .args(["-R", profile_name])
             .output()
             .context("Failed to execute apparmor_parser")?;
 
@@ -332,6 +319,7 @@ impl SecurityManager {
             uid_mappings: None,
             gid_mappings: None,
             devices: None,
+            net_devices: None,
             cgroups_path: None,
             resources: None,
             rootfs_propagation: None,
@@ -440,7 +428,6 @@ mod tests {
     #[test]
     fn test_security_manager_creation() {
         let _manager = SecurityManager::new();
-        assert!(true);
     }
 
     #[test]

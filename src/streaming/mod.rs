@@ -916,18 +916,15 @@ fn negotiate_remotecommand_websocket_protocol(req: &Request<Body>) -> Option<&'s
         .filter(|value| !value.is_empty())
         .collect();
 
-    for candidate in [
+    [
         "v5.channel.k8s.io",
         "v4.channel.k8s.io",
         "v3.channel.k8s.io",
         "v2.channel.k8s.io",
         "channel.k8s.io",
-    ] {
-        if requested.iter().any(|value| value == candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|candidate| requested.iter().any(|value| value == candidate))
 }
 
 fn websocket_switching_response(req: &Request<Body>, protocol: &str) -> Response<Body> {
@@ -1144,17 +1141,13 @@ fn negotiate_portforward_websocket_protocol(req: &Request<Body>) -> Option<&'sta
         .filter(|value| !value.is_empty())
         .collect();
 
-    for candidate in [
+    [
         PORT_FORWARD_WS_PROTOCOL_V4_BINARY,
         PORT_FORWARD_WS_PROTOCOL_V4_BASE64,
         PORT_FORWARD_PROTOCOL_V1,
-    ] {
-        if requested.iter().any(|value| value == candidate) {
-            return Some(candidate);
-        }
-    }
-
-    None
+    ]
+    .into_iter()
+    .find(|candidate| requested.iter().any(|value| value == candidate))
 }
 
 fn portforward_websocket_protocol(protocol: &str) -> PortForwardWebsocketProtocol {
@@ -1353,10 +1346,8 @@ fn take_expired_portforward_pairs(
 ) -> Vec<PortForwardPair> {
     let expired_request_ids: Vec<String> = pending_pairs
         .iter()
-        .filter_map(|(request_id, pair)| {
-            (now.duration_since(pair.created_at) >= PORT_FORWARD_STREAM_CREATION_TIMEOUT)
-                .then(|| request_id.clone())
-        })
+        .filter(|(_, pair)| now.duration_since(pair.created_at) >= PORT_FORWARD_STREAM_CREATION_TIMEOUT)
+        .map(|(request_id, _)| request_id.clone())
         .collect();
     expired_request_ids
         .into_iter()
@@ -2985,10 +2976,12 @@ async fn serve_portforward_websocket(
                 }
                 let port = ports[port_index] as u16;
 
-                if !data_channels.contains_key(&channel) {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    data_channels.entry(channel)
+                {
                     let (input_tx, mut input_rx) =
                         tokio::sync::mpsc::channel::<Option<Vec<u8>>>(32);
-                    data_channels.insert(channel, input_tx.clone());
+                    entry.insert(input_tx.clone());
                     let writer_for_output = writer.clone();
                     let netns_for_output = netns_path.clone();
                     let protocol_for_output = protocol;

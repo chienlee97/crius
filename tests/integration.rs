@@ -62,28 +62,28 @@ fn setup_minimal_rootfs(rootfs: &std::path::Path) -> anyhow::Result<()> {
     let null_path = dev_dir.join("null");
     if !null_path.exists() {
         std::process::Command::new("mknod")
-            .args(&["-m", "666", null_path.to_str().unwrap(), "c", "1", "3"])
+            .args(["-m", "666", null_path.to_str().unwrap(), "c", "1", "3"])
             .output()?;
     }
 
     let zero_path = dev_dir.join("zero");
     if !zero_path.exists() {
         std::process::Command::new("mknod")
-            .args(&["-m", "666", zero_path.to_str().unwrap(), "c", "1", "5"])
+            .args(["-m", "666", zero_path.to_str().unwrap(), "c", "1", "5"])
             .output()?;
     }
 
     let random_path = dev_dir.join("random");
     if !random_path.exists() {
         std::process::Command::new("mknod")
-            .args(&["-m", "666", random_path.to_str().unwrap(), "c", "1", "8"])
+            .args(["-m", "666", random_path.to_str().unwrap(), "c", "1", "8"])
             .output()?;
     }
 
     let urandom_path = dev_dir.join("urandom");
     if !urandom_path.exists() {
         std::process::Command::new("mknod")
-            .args(&["-m", "666", urandom_path.to_str().unwrap(), "c", "1", "9"])
+            .args(["-m", "666", urandom_path.to_str().unwrap(), "c", "1", "9"])
             .output()?;
     }
 

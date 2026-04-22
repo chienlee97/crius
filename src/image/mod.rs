@@ -778,15 +778,13 @@ impl ImageServiceImpl {
             .map_err(|e| Status::internal(format!("registry ping failed: {}", e)))?;
 
         let mut token: Option<String> = initial_bearer_token.map(str::to_string);
-        if ping.status() == reqwest::StatusCode::UNAUTHORIZED {
-            if token.is_none() {
-                let challenge = ping
-                    .headers()
-                    .get(reqwest::header::WWW_AUTHENTICATE)
-                    .and_then(|h| h.to_str().ok())
-                    .ok_or_else(|| Status::internal("missing WWW-Authenticate header"))?;
-                token = Self::request_bearer_token(&http, challenge, reference, auth).await?;
-            }
+        if ping.status() == reqwest::StatusCode::UNAUTHORIZED && token.is_none() {
+            let challenge = ping
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|h| h.to_str().ok())
+                .ok_or_else(|| Status::internal("missing WWW-Authenticate header"))?;
+            token = Self::request_bearer_token(&http, challenge, reference, auth).await?;
         }
 
         let manifest_url = Self::manifest_url(reference);
@@ -1550,7 +1548,7 @@ mod tests {
 
     fn test_image_service_in_tempdir() -> (TempDir, ImageServiceImpl) {
         let dir = tempdir().unwrap();
-        let service = ImageServiceImpl::new(dir.path().to_path_buf()).unwrap();
+        let service = ImageServiceImpl::new(dir.path()).unwrap();
         (dir, service)
     }
 

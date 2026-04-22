@@ -45,6 +45,7 @@ mod tests {
             socket_path: "/run/crius/nri.sock".to_string(),
             plugin_path: "/opt/nri/plugins".to_string(),
             plugin_config_path: "/etc/nri/conf.d".to_string(),
+            blockio_config_path: String::new(),
             registration_timeout_ms: 4000,
             request_timeout_ms: 1500,
             enable_external_connections: true,

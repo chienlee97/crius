@@ -32,6 +32,11 @@ pub struct NriUpdateContainerResult {
     pub evictions: Vec<nri_api::ContainerEviction>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct NriStopContainerResult {
+    pub updates: Vec<nri_api::ContainerUpdate>,
+}
+
 #[async_trait]
 pub trait NriDomain: Send + Sync {
     async fn snapshot(&self) -> Result<RuntimeSnapshot>;
@@ -42,11 +47,25 @@ pub trait NriDomain: Send + Sync {
     async fn evict(&self, _container_id: &str, _reason: &str) -> Result<()>;
 }
 
+pub trait NriPluginSyncBlock: Send {
+    fn unblock(self: Box<Self>);
+}
+
+#[derive(Debug, Default)]
+pub struct NopNriPluginSyncBlock;
+
+impl NriPluginSyncBlock for NopNriPluginSyncBlock {
+    fn unblock(self: Box<Self>) {}
+}
+
 #[async_trait]
 pub trait NriApi: Send + Sync {
     async fn start(&self) -> Result<()>;
     async fn shutdown(&self) -> Result<()>;
     async fn synchronize(&self) -> Result<()>;
+    async fn block_plugin_sync(&self) -> Box<dyn NriPluginSyncBlock> {
+        Box::new(NopNriPluginSyncBlock)
+    }
     async fn run_pod_sandbox(&self, _event: NriPodEvent) -> Result<()> {
         Ok(())
     }
@@ -57,6 +76,9 @@ pub trait NriApi: Send + Sync {
         Ok(())
     }
     async fn update_pod_sandbox(&self, _event: NriPodEvent) -> Result<()> {
+        Ok(())
+    }
+    async fn post_update_pod_sandbox(&self, _event: NriPodEvent) -> Result<()> {
         Ok(())
     }
     async fn create_container(
@@ -83,8 +105,8 @@ pub trait NriApi: Send + Sync {
     async fn post_update_container(&self, _event: NriContainerEvent) -> Result<()> {
         Ok(())
     }
-    async fn stop_container(&self, _event: NriContainerEvent) -> Result<()> {
-        Ok(())
+    async fn stop_container(&self, _event: NriContainerEvent) -> Result<NriStopContainerResult> {
+        Ok(NriStopContainerResult::default())
     }
     async fn remove_container(&self, _event: NriContainerEvent) -> Result<()> {
         Ok(())
@@ -129,7 +151,9 @@ impl NriDomain for NopNri {
 
 #[cfg(test)]
 mod tests {
-    use super::{NopNri, NriApi, NriContainerEvent, NriCreateContainerResult, NriDomain, NriPodEvent};
+    use super::{
+        NopNri, NriApi, NriContainerEvent, NriCreateContainerResult, NriDomain, NriPodEvent,
+    };
 
     #[tokio::test]
     async fn nop_nri_api_methods_are_noop() {

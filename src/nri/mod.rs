@@ -9,17 +9,18 @@ pub mod merge;
 pub mod transport;
 
 pub use adjust::{
-    apply_annotation_adjustments, apply_container_adjustment, validate_container_adjustment,
-    validate_container_update, validate_update_linux_resources,
+    apply_annotation_adjustments, apply_container_adjustment,
+    apply_container_adjustment_with_blockio_config, resolve_blockio_class, resolve_rdt_class,
+    validate_container_adjustment, validate_container_update, validate_update_linux_resources,
 };
 pub use api::{
-    NopNri, NriApi, NriContainerEvent, NriCreateContainerResult, NriDomain, NriPodEvent,
-    NriUpdateContainerResult,
+    NopNri, NopNriPluginSyncBlock, NriApi, NriContainerEvent, NriCreateContainerResult, NriDomain,
+    NriPluginSyncBlock, NriPodEvent, NriStopContainerResult, NriUpdateContainerResult,
 };
 pub use config::NriManagerConfig;
 pub use convert::{
-    cri_linux_resources_from_nri, external_annotations, linux_resources_from_cri, oci_args, oci_env, oci_hooks,
-    oci_linux_container, oci_mounts, oci_rlimits, oci_user,
+    cri_linux_resources_from_nri, external_annotations, linux_resources_from_cri, oci_args,
+    oci_env, oci_hooks, oci_linux_container, oci_mounts, oci_rlimits, oci_user,
 };
 pub use domain::RuntimeSnapshot;
 pub use error::{NriError, Result};

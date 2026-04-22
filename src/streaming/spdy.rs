@@ -244,6 +244,12 @@ impl HeaderCompressor {
     }
 }
 
+impl Default for HeaderCompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for HeaderCompressor {
     fn drop(&mut self) {
         if self.initialized {
@@ -338,6 +344,12 @@ impl HeaderDecompressor {
         }
 
         Ok(output)
+    }
+}
+
+impl Default for HeaderDecompressor {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

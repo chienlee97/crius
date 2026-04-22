@@ -658,10 +658,10 @@ impl RuncRuntime {
         container_id: &str,
     ) -> Result<()> {
         if rootfs_dir.exists() {
-            std::fs::remove_dir_all(&rootfs_dir)
+            std::fs::remove_dir_all(rootfs_dir)
                 .with_context(|| format!("Failed to clean rootfs directory: {:?}", rootfs_dir))?;
         }
-        std::fs::create_dir_all(&rootfs_dir)
+        std::fs::create_dir_all(rootfs_dir)
             .with_context(|| format!("Failed to create rootfs directory: {:?}", rootfs_dir))?;
 
         let image_dir = self.resolve_image_dir(image_ref)?;
@@ -686,7 +686,7 @@ impl RuncRuntime {
         }
 
         for layer_file in &layer_files {
-            Self::unpack_layer_with_tar(layer_file, &rootfs_dir)
+            Self::unpack_layer_with_tar(layer_file, rootfs_dir)
                 .with_context(|| format!("Failed to unpack layer archive: {:?}", layer_file))?;
         }
 
@@ -1050,9 +1050,11 @@ impl RuncRuntime {
             )),
             rlimits: None,
             oom_score_adj: None,
+            scheduler: None,
             no_new_privileges: Some(config.no_new_privileges.unwrap_or(!config.privileged)),
             apparmor_profile: config.apparmor_profile.clone(),
             selinux_label: config.selinux_label.clone(),
+            io_priority: None,
         });
 
         // 设置主机名
@@ -1142,6 +1144,7 @@ impl RuncRuntime {
             uid_mappings: None,
             gid_mappings: None,
             devices: Some(devices),
+            net_devices: None,
             cgroups_path: config.cgroup_parent.clone(),
             resources: Some(resources),
             rootfs_propagation: None,
@@ -1177,7 +1180,7 @@ impl RuncRuntime {
         std::fs::create_dir_all(&bundle_path).context("Failed to create bundle directory")?;
 
         // 保存config.json
-        spec.save(&self.config_path(container_id))?;
+        spec.save(self.config_path(container_id))?;
 
         // 当前运行时使用 OCI spec.root.path 作为 rootfs 来源，bundle 内不再强制准备 rootfs 目录。
         let _ = rootfs;

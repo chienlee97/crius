@@ -73,6 +73,8 @@ pub struct NriConfig {
     pub plugin_path: String,
     /// 插件配置目录
     pub plugin_config_path: String,
+    /// NRI blockio class 配置文件
+    pub blockio_config_path: String,
     /// 插件注册超时（毫秒）
     pub registration_timeout_ms: i64,
     /// 插件请求超时（毫秒）
@@ -90,6 +92,7 @@ impl Default for NriConfig {
             socket_path: "/run/crius/nri.sock".to_string(),
             plugin_path: "/opt/nri/plugins".to_string(),
             plugin_config_path: "/etc/nri/conf.d".to_string(),
+            blockio_config_path: String::new(),
             registration_timeout_ms: 5000,
             request_timeout_ms: 2000,
             enable_external_connections: false,
@@ -105,8 +108,10 @@ impl Config {
         Ok(config)
     }
 
-    /// 获取默认配置
-    pub fn default() -> Self {
+}
+
+impl Default for Config {
+    fn default() -> Self {
         Self {
             root: "/var/lib/crius".to_string(),
             runtime: RuntimeConfig {

@@ -19,6 +19,7 @@ use crate::nri_proto::api as nri_api;
 
 const RUNTIME_SERVICE: &str = "nri.pkg.api.v1alpha1.Runtime";
 const PLUGIN_SERVICE: &str = "nri.pkg.api.v1alpha1.Plugin";
+const HOST_FUNCTIONS_SERVICE: &str = "nri.pkg.api.v1alpha1.HostFunctions";
 const PLUGIN_SERVICE_CONN_ID: u32 = 1;
 const RUNTIME_SERVICE_CONN_ID: u32 = 2;
 
@@ -45,6 +46,11 @@ pub trait RuntimeServiceHandler: Send + Sync {
     ) -> Result<nri_api::UpdateContainersResponse>;
 }
 
+#[async_trait]
+pub trait HostFunctionsHandler: Send + Sync {
+    async fn log(&self, req: nri_api::LogRequest) -> Result<nri_api::Empty>;
+}
+
 #[derive(Debug, Default)]
 struct NopRuntimeServiceHandler;
 
@@ -65,8 +71,19 @@ impl RuntimeServiceHandler for NopRuntimeServiceHandler {
     }
 }
 
+#[async_trait]
+impl HostFunctionsHandler for NopRuntimeServiceHandler {
+    async fn log(&self, _req: nri_api::LogRequest) -> Result<nri_api::Empty> {
+        Ok(nri_api::Empty::new())
+    }
+}
+
 struct RuntimeServiceDispatcher {
     handler: Arc<dyn RuntimeServiceHandler>,
+}
+
+struct HostFunctionsDispatcher {
+    handler: Arc<dyn HostFunctionsHandler>,
 }
 
 struct RegisterPluginMethod {
@@ -75,6 +92,10 @@ struct RegisterPluginMethod {
 
 struct UpdateContainersMethod {
     dispatcher: Arc<RuntimeServiceDispatcher>,
+}
+
+struct LogMethod {
+    dispatcher: Arc<HostFunctionsDispatcher>,
 }
 
 struct MuxConnState {
@@ -121,6 +142,7 @@ struct MuxShared {
     write_tx: mpsc::UnboundedSender<MuxWriteFrame>,
     connections: Mutex<HashMap<u32, Arc<MuxConnState>>>,
     closed: AtomicBool,
+    close_notify: Arc<tokio::sync::Notify>,
 }
 
 impl MuxShared {
@@ -129,6 +151,7 @@ impl MuxShared {
             write_tx,
             connections: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
+            close_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -168,6 +191,7 @@ impl MuxShared {
         for state in states {
             state.close();
         }
+        self.close_notify.notify_waiters();
     }
 }
 
@@ -238,6 +262,7 @@ impl AsyncWrite for MuxConn {
 pub struct MultiplexedRuntimeConnection {
     pub plugin_client: PluginTtrpcClient,
     pub runtime_listener: ttrpc::r#async::transport::Listener,
+    pub close_notify: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait]
@@ -276,8 +301,34 @@ impl ttrpc::r#async::MethodHandler for UpdateContainersMethod {
     }
 }
 
-fn build_runtime_services(handler: Arc<dyn RuntimeServiceHandler>) -> RuntimeServices {
-    let dispatcher = Arc::new(RuntimeServiceDispatcher { handler });
+#[async_trait]
+impl ttrpc::r#async::MethodHandler for LogMethod {
+    async fn handler(
+        &self,
+        _ctx: ttrpc::r#async::TtrpcContext,
+        req: ttrpc::Request,
+    ) -> ttrpc::Result<ttrpc::Response> {
+        let request = decode_message::<nri_api::LogRequest>(&req.payload)?;
+        let response = self
+            .dispatcher
+            .handler
+            .log(request)
+            .await
+            .map_err(|e| ttrpc::Error::Others(e.to_string()))?;
+        encode_ok_response(&response)
+    }
+}
+
+fn build_runtime_services(
+    runtime_handler: Arc<dyn RuntimeServiceHandler>,
+    host_functions_handler: Arc<dyn HostFunctionsHandler>,
+) -> RuntimeServices {
+    let dispatcher = Arc::new(RuntimeServiceDispatcher {
+        handler: runtime_handler,
+    });
+    let host_dispatcher = Arc::new(HostFunctionsDispatcher {
+        handler: host_functions_handler,
+    });
     let mut methods: HashMap<String, Box<dyn ttrpc::r#async::MethodHandler + Send + Sync>> =
         HashMap::new();
     methods.insert(
@@ -295,6 +346,21 @@ fn build_runtime_services(handler: Arc<dyn RuntimeServiceHandler>) -> RuntimeSer
         RUNTIME_SERVICE.to_string(),
         ttrpc::r#async::Service {
             methods,
+            streams: HashMap::new(),
+        },
+    );
+    let mut host_methods: HashMap<String, Box<dyn ttrpc::r#async::MethodHandler + Send + Sync>> =
+        HashMap::new();
+    host_methods.insert(
+        "Log".to_string(),
+        Box::new(LogMethod {
+            dispatcher: host_dispatcher,
+        }),
+    );
+    services.insert(
+        HOST_FUNCTIONS_SERVICE.to_string(),
+        ttrpc::r#async::Service {
+            methods: host_methods,
             streams: HashMap::new(),
         },
     );
@@ -360,6 +426,7 @@ pub fn multiplex_connection(
     Ok(MultiplexedRuntimeConnection {
         plugin_client,
         runtime_listener,
+        close_notify: shared.close_notify.clone(),
     })
 }
 
@@ -368,7 +435,8 @@ pub struct RuntimeTtrpcServer {
     registration_timeout: Duration,
     request_timeout: Duration,
     enable_external_connections: bool,
-    handler: Arc<dyn RuntimeServiceHandler>,
+    runtime_handler: Arc<dyn RuntimeServiceHandler>,
+    host_functions_handler: Arc<dyn HostFunctionsHandler>,
     servers: Arc<tokio::sync::Mutex<Vec<ttrpc::r#async::Server>>>,
 }
 
@@ -393,7 +461,8 @@ impl Clone for RuntimeTtrpcServer {
             registration_timeout: self.registration_timeout,
             request_timeout: self.request_timeout,
             enable_external_connections: self.enable_external_connections,
-            handler: self.handler.clone(),
+            runtime_handler: self.runtime_handler.clone(),
+            host_functions_handler: self.host_functions_handler.clone(),
             servers: self.servers.clone(),
         }
     }
@@ -406,12 +475,14 @@ impl RuntimeTtrpcServer {
         request_timeout: Duration,
         enable_external_connections: bool,
     ) -> Self {
+        let handler = Arc::new(NopRuntimeServiceHandler);
         Self::with_handler(
             socket_path,
             registration_timeout,
             request_timeout,
             enable_external_connections,
-            Arc::new(NopRuntimeServiceHandler),
+            handler.clone(),
+            handler,
         )
     }
 
@@ -420,14 +491,16 @@ impl RuntimeTtrpcServer {
         registration_timeout: Duration,
         request_timeout: Duration,
         enable_external_connections: bool,
-        handler: Arc<dyn RuntimeServiceHandler>,
+        runtime_handler: Arc<dyn RuntimeServiceHandler>,
+        host_functions_handler: Arc<dyn HostFunctionsHandler>,
     ) -> Self {
         Self {
             socket_path,
             registration_timeout,
             request_timeout,
             enable_external_connections,
-            handler,
+            runtime_handler,
+            host_functions_handler,
             servers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
@@ -454,7 +527,10 @@ impl RuntimeTtrpcServer {
     }
 
     async fn start_with_server(&self, server: ttrpc::r#async::Server) -> Result<()> {
-        let mut server = server.register_service(build_runtime_services(self.handler.clone()));
+        let mut server = server.register_service(build_runtime_services(
+            self.runtime_handler.clone(),
+            self.host_functions_handler.clone(),
+        ));
         server.start().await.map_err(map_ttrpc_error)?;
 
         let mut guard = self.servers.lock().await;
@@ -698,5 +774,19 @@ mod tests {
             multiplexed.plugin_client.configure(&req),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn runtime_services_include_host_functions_log_method() {
+        let handler = Arc::new(NopRuntimeServiceHandler);
+        let services = build_runtime_services(handler.clone(), handler);
+
+        let host_service = services
+            .get(HOST_FUNCTIONS_SERVICE)
+            .expect("host functions service should be registered");
+        assert!(
+            host_service.methods.contains_key("Log"),
+            "host functions service should expose Log",
+        );
     }
 }
