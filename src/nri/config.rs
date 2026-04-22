@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::config::NriConfig;
+use crate::config::{NriConfig, NriDefaultValidatorConfig};
 
 #[derive(Debug, Clone)]
 pub struct NriManagerConfig {
@@ -13,6 +13,7 @@ pub struct NriManagerConfig {
     pub registration_timeout: Duration,
     pub request_timeout: Duration,
     pub enable_external_connections: bool,
+    pub default_validator: NriDefaultValidatorConfig,
 }
 
 impl From<NriConfig> for NriManagerConfig {
@@ -27,6 +28,7 @@ impl From<NriConfig> for NriManagerConfig {
             registration_timeout: Duration::from_millis(value.registration_timeout_ms.max(0) as u64),
             request_timeout: Duration::from_millis(value.request_timeout_ms.max(0) as u64),
             enable_external_connections: value.enable_external_connections,
+            default_validator: value.default_validator,
         }
     }
 }
@@ -34,7 +36,7 @@ impl From<NriConfig> for NriManagerConfig {
 #[cfg(test)]
 mod tests {
     use super::NriManagerConfig;
-    use crate::config::NriConfig;
+    use crate::config::{NriConfig, NriDefaultValidatorConfig};
 
     #[test]
     fn converts_from_global_nri_config() {
@@ -46,9 +48,17 @@ mod tests {
             plugin_path: "/opt/nri/plugins".to_string(),
             plugin_config_path: "/etc/nri/conf.d".to_string(),
             blockio_config_path: String::new(),
+            allowed_annotation_prefixes: Vec::new(),
+            runtime_allowed_annotation_prefixes: std::collections::HashMap::new(),
+            workload_allowed_annotation_prefixes: Vec::new(),
             registration_timeout_ms: 4000,
             request_timeout_ms: 1500,
             enable_external_connections: true,
+            default_validator: NriDefaultValidatorConfig {
+                enable: true,
+                reject_namespace_adjustment: true,
+                ..Default::default()
+            },
         };
 
         let mapped = NriManagerConfig::from(config);
@@ -57,5 +67,7 @@ mod tests {
         assert_eq!(mapped.registration_timeout.as_millis(), 4000);
         assert_eq!(mapped.request_timeout.as_millis(), 1500);
         assert!(mapped.enable_external_connections);
+        assert!(mapped.default_validator.enable);
+        assert!(mapped.default_validator.reject_namespace_adjustment);
     }
 }

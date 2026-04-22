@@ -147,6 +147,8 @@ pub enum ContainerStatus {
     Unknown,
 }
 
+const CRIO_LABELS_ANNOTATION: &str = "io.kubernetes.cri-o.Labels";
+
 /// runc容器状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RuncState {
@@ -171,6 +173,24 @@ pub struct RuncRuntime {
 }
 
 impl RuncRuntime {
+    fn insert_label_annotation(
+        annotations: &mut std::collections::HashMap<String, String>,
+        labels: &[(String, String)],
+    ) -> Result<()> {
+        if labels.is_empty() {
+            return Ok(());
+        }
+        let encoded = serde_json::to_string(
+            &labels
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashMap<_, _>>(),
+        )
+        .context("Failed to encode container labels as annotation")?;
+        annotations.insert(CRIO_LABELS_ANNOTATION.to_string(), encoded);
+        Ok(())
+    }
+
     fn restore_rootfs_snapshot(&self, container_id: &str, image_path: &Path) -> Result<()> {
         let snapshot_path = image_path.join("rootfs.tar");
         if !snapshot_path.exists() {
@@ -778,6 +798,7 @@ impl RuncRuntime {
             "org.opencontainers.image.ref.name".to_string(),
             restore.image_ref.clone(),
         );
+        Self::insert_label_annotation(&mut annotations, &config.labels)?;
         for (key, value) in &config.annotations {
             annotations.insert(key.clone(), value.clone());
         }
@@ -837,6 +858,13 @@ impl RuncRuntime {
             )),
             None => Err(anyhow::anyhow!("container {} not found", container_id)),
         }
+    }
+
+    pub fn is_container_paused(&self, container_id: &str) -> Result<bool> {
+        Ok(matches!(
+            self.get_runc_state(container_id)?,
+            Some(state) if state.status == "paused"
+        ))
     }
 
     pub fn restore_container_from_checkpoint(
@@ -1164,6 +1192,7 @@ impl RuncRuntime {
             "org.opencontainers.image.ref.name".to_string(),
             config.image.clone(),
         );
+        Self::insert_label_annotation(&mut annotations, &config.labels)?;
         for (k, v) in &config.annotations {
             annotations.insert(k.clone(), v.clone());
         }
@@ -1637,6 +1666,20 @@ mod tests {
         assert!(spec.process.is_some());
         assert!(spec.root.is_some());
         assert!(spec.linux.is_some());
+    }
+
+    #[test]
+    fn test_create_spec_encodes_labels_annotation_for_nri() {
+        let (runtime, _temp) = create_test_runtime();
+        let mut config = create_test_config();
+        config.labels = vec![("app".to_string(), "demo".to_string())];
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let annotations = spec.annotations.unwrap();
+        let labels: std::collections::HashMap<String, String> =
+            serde_json::from_str(annotations.get(CRIO_LABELS_ANNOTATION).unwrap()).unwrap();
+
+        assert_eq!(labels.get("app").map(String::as_str), Some("demo"));
     }
 
     #[test]

@@ -19,10 +19,10 @@ use tokio::time::timeout;
 use crate::nri::transport::HostFunctionsHandler;
 use crate::nri::{
     merge_container_adjustments, merge_container_updates, multiplex_connection,
-    validate_container_adjustment, validate_container_update, validate_update_linux_resources,
-    NopNri, NriApi, NriContainerEvent, NriCreateContainerResult, NriDomain, NriError,
-    NriManagerConfig, NriPodEvent, NriStopContainerResult, NriUpdateContainerResult,
-    PluginTtrpcClient, Result, RuntimeTtrpcServer,
+    validate_container_adjustment, validate_container_update, validate_default_adjustment,
+    validate_update_linux_resources, NopNri, NriApi, NriContainerEvent, NriCreateContainerResult,
+    NriDomain, NriError, NriManagerConfig, NriPodEvent, NriStopContainerResult,
+    NriUpdateContainerResult, PluginTtrpcClient, Result, RuntimeTtrpcServer,
 };
 use crate::nri_proto::api as nri_api;
 
@@ -536,9 +536,6 @@ impl NriManager {
         let validators = self
             .plugins_for_event(nri_api::Event::VALIDATE_CONTAINER_ADJUSTMENT)
             .await;
-        if validators.is_empty() {
-            return Ok(());
-        }
 
         let mut req = nri_api::ValidateContainerAdjustmentRequest::new();
         if let Some(pod) = event_payload.pod.as_ref() {
@@ -549,6 +546,12 @@ impl NriManager {
         req.update = updates.to_vec();
         req.owners = MessageField::some(owners.clone());
         req.plugins = consulted_plugins.to_vec();
+
+        validate_default_adjustment(&self.config.default_validator, &req)?;
+
+        if validators.is_empty() {
+            return Ok(());
+        }
 
         for plugin in validators {
             let result = self
@@ -1177,10 +1180,7 @@ fn merge_owning_plugins(
     incoming: &nri_api::OwningPlugins,
 ) -> Result<()> {
     for (container_id, incoming_field_owners) in &incoming.owners {
-        let field_owners = target
-            .owners
-            .entry(container_id.clone())
-            .or_default();
+        let field_owners = target.owners.entry(container_id.clone()).or_default();
 
         for (field, owner) in &incoming_field_owners.simple {
             if let Some(existing) = field_owners.simple.get(field) {
@@ -1195,10 +1195,7 @@ fn merge_owning_plugins(
         }
 
         for (field, incoming_compound) in &incoming_field_owners.compound {
-            let compound = field_owners
-                .compound
-                .entry(*field)
-                .or_default();
+            let compound = field_owners.compound.entry(*field).or_default();
             for (key, owner) in &incoming_compound.owners {
                 if let Some(existing) = compound.owners.get(key) {
                     if existing != owner {
@@ -1421,9 +1418,9 @@ impl NriApi for NriManager {
         if !self.config.enable {
             return Ok(());
         }
-        self.start_external_listener().await?;
         let plugins = self.discover_preinstalled_plugins()?;
-        self.launch_preinstalled_plugins(&plugins).await
+        self.launch_preinstalled_plugins(&plugins).await?;
+        self.start_external_listener().await
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -1653,10 +1650,7 @@ mod tests {
                     .collect(),
             ));
             self.calls.lock().await.push("synchronize".to_string());
-            let mut response = self
-                .synchronize_response
-                .clone()
-                .unwrap_or_default();
+            let mut response = self.synchronize_response.clone().unwrap_or_default();
             if self.synchronize_echo_more {
                 response.more = req.more;
             }
@@ -1668,10 +1662,7 @@ mod tests {
             _req: &nri_api::CreateContainerRequest,
         ) -> Result<nri_api::CreateContainerResponse> {
             self.calls.lock().await.push("create".to_string());
-            Ok(self
-                .create_response
-                .clone()
-                .unwrap_or_default())
+            Ok(self.create_response.clone().unwrap_or_default())
         }
 
         async fn update_container(
@@ -1679,10 +1670,7 @@ mod tests {
             _req: &nri_api::UpdateContainerRequest,
         ) -> Result<nri_api::UpdateContainerResponse> {
             self.calls.lock().await.push("update".to_string());
-            Ok(self
-                .update_response
-                .clone()
-                .unwrap_or_default())
+            Ok(self.update_response.clone().unwrap_or_default())
         }
 
         async fn stop_container(
@@ -1690,10 +1678,7 @@ mod tests {
             _req: &nri_api::StopContainerRequest,
         ) -> Result<nri_api::StopContainerResponse> {
             self.calls.lock().await.push("stop".to_string());
-            Ok(self
-                .stop_response
-                .clone()
-                .unwrap_or_default())
+            Ok(self.stop_response.clone().unwrap_or_default())
         }
 
         async fn update_pod_sandbox(
@@ -1754,6 +1739,7 @@ mod tests {
                 registration_timeout: Duration::from_secs(1),
                 request_timeout: Duration::from_secs(1),
                 enable_external_connections: false,
+                default_validator: Default::default(),
             },
             domain,
         )
@@ -2403,6 +2389,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_container_runs_builtin_default_validator_before_external_validators() {
+        let manager = NriManager::with_domain(
+            NriManagerConfig {
+                enable: true,
+                runtime_name: "crius".to_string(),
+                runtime_version: "test".to_string(),
+                socket_path: "unix:///tmp/crius-nri-default-validator-tests.sock".to_string(),
+                plugin_path: String::new(),
+                plugin_config_path: String::new(),
+                registration_timeout: Duration::from_secs(1),
+                request_timeout: Duration::from_secs(1),
+                enable_external_connections: false,
+                default_validator: crate::config::NriDefaultValidatorConfig {
+                    enable: true,
+                    reject_oci_hook_adjustment: true,
+                    ..Default::default()
+                },
+            },
+            Arc::new(NopNri),
+        );
+        let create_bit = event_mask_bit(nri_api::Event::CREATE_CONTAINER).unwrap();
+        let validate_bit = event_mask_bit(nri_api::Event::VALIDATE_CONTAINER_ADJUSTMENT).unwrap();
+
+        let mut response = nri_api::CreateContainerResponse::new();
+        let mut adjust = nri_api::ContainerAdjustment::new();
+        let mut hooks = nri_api::Hooks::new();
+        hooks.prestart.push(nri_api::Hook::new());
+        adjust.hooks = MessageField::some(hooks);
+        response.adjust = MessageField::some(adjust);
+
+        let creator = Arc::new(FakePluginClient {
+            create_response: Some(response),
+            ..Default::default()
+        });
+        let validator = Arc::new(FakePluginClient::default());
+
+        insert_plugin_for_test(&manager, "creator", "01", create_bit, true, creator.clone()).await;
+        insert_plugin_for_test(
+            &manager,
+            "validator",
+            "02",
+            validate_bit,
+            true,
+            validator.clone(),
+        )
+        .await;
+        manager.synchronize().await.unwrap();
+
+        let err = manager
+            .create_container(test_container_event())
+            .await
+            .expect_err("builtin validator should reject OCI hook adjustment");
+        assert!(format!("{err}").contains("OCI hook injection"));
+        assert_eq!(
+            creator.calls.lock().await.clone(),
+            vec!["synchronize", "create"]
+        );
+        assert_eq!(validator.calls.lock().await.clone(), vec!["synchronize"]);
+    }
+
+    #[tokio::test]
     async fn create_container_rejects_updates_targeting_container_being_created() {
         let manager = manager_for_tests();
         let create_bit = event_mask_bit(nri_api::Event::CREATE_CONTAINER).unwrap();
@@ -2644,6 +2691,7 @@ mod tests {
                 registration_timeout: Duration::from_secs(1),
                 request_timeout: Duration::from_millis(10),
                 enable_external_connections: false,
+                default_validator: Default::default(),
             },
             Arc::new(NopNri),
         );
@@ -2827,6 +2875,40 @@ mod tests {
         assert_eq!(lines[1], "01");
         assert_eq!(lines[2], "3");
         assert!(lines.iter().any(|line| *line == "fd3=open"));
+    }
+
+    #[tokio::test]
+    async fn start_does_not_create_external_socket_when_plugin_discovery_fails() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins");
+        fs::create_dir_all(&plugin_dir).unwrap();
+
+        let invalid_plugin = plugin_dir.join("broken-plugin-name");
+        fs::write(&invalid_plugin, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = fs::metadata(&invalid_plugin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&invalid_plugin, perms).unwrap();
+
+        let socket_path = dir.path().join("nri.sock");
+        let manager = NriManager::new(NriManagerConfig {
+            enable: true,
+            runtime_name: "crius".to_string(),
+            runtime_version: "test".to_string(),
+            socket_path: format!("unix://{}", socket_path.display()),
+            plugin_path: plugin_dir.display().to_string(),
+            plugin_config_path: dir.path().join("conf.d").display().to_string(),
+            registration_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(1),
+            enable_external_connections: true,
+            default_validator: Default::default(),
+        });
+
+        let err = manager.start().await.expect_err("start should fail");
+        assert!(matches!(err, NriError::Plugin(_)));
+        assert!(
+            !socket_path.exists(),
+            "listener socket should not exist after plugin startup failure"
+        );
     }
 
     #[test]

@@ -217,6 +217,63 @@ fn is_protected_annotation_key(key: &str) -> bool {
     key.starts_with(INTERNAL_ANNOTATION_PREFIX) || key == CHECKPOINT_LOCATION_ANNOTATION_KEY
 }
 
+fn normalized_annotation_key(key: &str) -> &str {
+    adjusted_key(key).trim()
+}
+
+fn has_only_valid_device_access(access: &str) -> bool {
+    !access.is_empty()
+        && access
+            .bytes()
+            .all(|byte| matches!(byte, b'r' | b'w' | b'm'))
+}
+
+fn is_valid_device_type(device_type: &str, allow_all: bool) -> bool {
+    matches!(device_type, "b" | "c" | "u" | "p") || (allow_all && device_type == "a")
+}
+
+fn is_annotation_allowed(key: &str, allowed_prefixes: &[String]) -> bool {
+    allowed_prefixes
+        .iter()
+        .map(|prefix| prefix.trim())
+        .filter(|prefix| !prefix.is_empty())
+        .any(|prefix| key.starts_with(prefix))
+}
+
+pub fn disallowed_annotation_adjustment_keys(
+    adjustments: &HashMap<String, String>,
+    allowed_prefixes: &[String],
+) -> Vec<String> {
+    let mut disallowed = adjustments
+        .keys()
+        .filter_map(|key| {
+            let name = normalized_annotation_key(key);
+            (!name.is_empty()
+                && !is_protected_annotation_key(name)
+                && !is_annotation_allowed(name, allowed_prefixes))
+            .then(|| key.clone())
+        })
+        .collect::<Vec<_>>();
+    disallowed.sort();
+    disallowed
+}
+
+pub fn filter_annotation_adjustments_by_allowlist(
+    adjustments: &HashMap<String, String>,
+    allowed_prefixes: &[String],
+) -> HashMap<String, String> {
+    adjustments
+        .iter()
+        .filter(|(key, _)| {
+            let name = normalized_annotation_key(key);
+            !name.is_empty()
+                && !is_protected_annotation_key(name)
+                && is_annotation_allowed(name, allowed_prefixes)
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 fn effective_blockio_config_path(config_path: Option<&str>) -> Option<PathBuf> {
     config_path
         .filter(|path| !path.trim().is_empty())
@@ -288,11 +345,30 @@ pub fn resolve_rdt_class(class_name: &str) -> Option<crate::oci::spec::LinuxInte
     })
 }
 
-fn validate_adjustment_resources(resources: &nri_api::LinuxResources) -> Result<()> {
+fn validate_adjustment_resources(
+    resources: &nri_api::LinuxResources,
+    min_memory_limit: Option<i64>,
+) -> Result<()> {
+    if let Some(memory) = resources.memory.as_ref() {
+        validate_linux_memory(memory, min_memory_limit, "container adjustment")?;
+    }
+    if let Some(cpu) = resources.cpu.as_ref() {
+        validate_linux_cpu(cpu, "container adjustment")?;
+    }
     for hugepage in &resources.hugepage_limits {
-        if hugepage.page_size.is_empty() {
+        if hugepage.page_size.trim().is_empty() {
             return Err(NriError::Plugin(
                 "container adjustment hugepage limit must set page_size".to_string(),
+            ));
+        }
+    }
+    for device in &resources.devices {
+        validate_device_rule(device, "container adjustment")?;
+    }
+    for key in resources.unified.keys() {
+        if key.trim().is_empty() {
+            return Err(NriError::Plugin(
+                "container adjustment unified resource key must not be empty".to_string(),
             ));
         }
     }
@@ -301,7 +377,7 @@ fn validate_adjustment_resources(resources: &nri_api::LinuxResources) -> Result<
 
 pub fn validate_container_adjustment(adjustment: &nri_api::ContainerAdjustment) -> Result<()> {
     for key in adjustment.annotations.keys() {
-        let name = adjusted_key(key);
+        let name = normalized_annotation_key(key);
         if name.is_empty() {
             return Err(NriError::Plugin(
                 "container adjustment annotation key must not be empty".to_string(),
@@ -315,7 +391,7 @@ pub fn validate_container_adjustment(adjustment: &nri_api::ContainerAdjustment) 
     }
 
     for mount in &adjustment.mounts {
-        if adjusted_key(&mount.destination).is_empty() {
+        if adjusted_key(&mount.destination).trim().is_empty() {
             return Err(NriError::Plugin(
                 "container adjustment mount destination must not be empty".to_string(),
             ));
@@ -323,15 +399,21 @@ pub fn validate_container_adjustment(adjustment: &nri_api::ContainerAdjustment) 
     }
 
     for env in &adjustment.env {
-        if adjusted_key(&env.key).is_empty() {
+        let key = adjusted_key(&env.key).trim();
+        if key.is_empty() {
             return Err(NriError::Plugin(
                 "container adjustment environment key must not be empty".to_string(),
+            ));
+        }
+        if key.contains('=') {
+            return Err(NriError::Plugin(
+                "container adjustment environment key must not contain '='".to_string(),
             ));
         }
     }
 
     for rlimit in &adjustment.rlimits {
-        if rlimit.type_.is_empty() {
+        if rlimit.type_.trim().is_empty() {
             return Err(NriError::Plugin(
                 "container adjustment rlimit type must not be empty".to_string(),
             ));
@@ -339,7 +421,7 @@ pub fn validate_container_adjustment(adjustment: &nri_api::ContainerAdjustment) 
     }
 
     for device in &adjustment.CDI_devices {
-        if device.name.is_empty() {
+        if device.name.trim().is_empty() {
             return Err(NriError::Plugin(
                 "container adjustment CDI device name must not be empty".to_string(),
             ));
@@ -348,24 +430,38 @@ pub fn validate_container_adjustment(adjustment: &nri_api::ContainerAdjustment) 
 
     if let Some(linux) = adjustment.linux.as_ref() {
         for device in &linux.devices {
-            if adjusted_key(&device.path).is_empty() {
+            let path = adjusted_key(&device.path).trim();
+            if path.is_empty() {
                 return Err(NriError::Plugin(
                     "container adjustment device path must not be empty".to_string(),
                 ));
             }
+            if !is_marked_for_removal(&device.path).is_some() {
+                if device.type_.trim().is_empty() {
+                    return Err(NriError::Plugin(
+                        "container adjustment device type must not be empty".to_string(),
+                    ));
+                }
+                if !is_valid_device_type(device.type_.trim(), false) {
+                    return Err(NriError::Plugin(format!(
+                        "container adjustment device type '{}' is invalid",
+                        device.type_
+                    )));
+                }
+            }
         }
         if let Some(resources) = linux.resources.as_ref() {
-            validate_adjustment_resources(resources)?;
+            validate_adjustment_resources(resources, None)?;
         }
         for namespace in &linux.namespaces {
-            if adjusted_key(&namespace.type_).is_empty() {
+            if adjusted_key(&namespace.type_).trim().is_empty() {
                 return Err(NriError::Plugin(
                     "container adjustment namespace type must not be empty".to_string(),
                 ));
             }
         }
         for key in linux.sysctl.keys() {
-            if adjusted_key(key).is_empty() {
+            if adjusted_key(key).trim().is_empty() {
                 return Err(NriError::Plugin(
                     "container adjustment sysctl key must not be empty".to_string(),
                 ));
@@ -376,23 +472,118 @@ pub fn validate_container_adjustment(adjustment: &nri_api::ContainerAdjustment) 
     Ok(())
 }
 
+fn validate_linux_memory(
+    memory: &nri_api::LinuxMemory,
+    min_memory_limit: Option<i64>,
+    context: &str,
+) -> Result<()> {
+    if let Some(swappiness) = memory.swappiness.as_ref() {
+        if swappiness.value > 100 {
+            return Err(NriError::Plugin(format!(
+                "{context} memory swappiness must be between 0 and 100"
+            )));
+        }
+    }
+
+    if let (Some(limit), Some(reservation)) = (memory.limit.as_ref(), memory.reservation.as_ref()) {
+        if limit.value >= 0 && reservation.value >= 0 && reservation.value > limit.value {
+            return Err(NriError::Plugin(format!(
+                "{context} memory reservation must not exceed memory limit"
+            )));
+        }
+    }
+
+    if let (Some(limit), Some(minimum)) = (memory.limit.as_ref(), min_memory_limit) {
+        if limit.value >= 0 && limit.value < minimum {
+            return Err(NriError::Plugin(format!(
+                "{context} memory limit {} is below required minimum {}",
+                limit.value, minimum
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_linux_cpu(cpu: &nri_api::LinuxCPU, context: &str) -> Result<()> {
+    if !cpu.cpus.is_empty() && cpu.cpus.trim().is_empty() {
+        return Err(NriError::Plugin(format!(
+            "{context} CPU set must not be blank"
+        )));
+    }
+    if !cpu.mems.is_empty() && cpu.mems.trim().is_empty() {
+        return Err(NriError::Plugin(format!(
+            "{context} memory node set must not be blank"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_device_rule(device: &nri_api::LinuxDeviceCgroup, context: &str) -> Result<()> {
+    let device_type = device.type_.trim();
+    if device_type.is_empty() {
+        return Err(NriError::Plugin(format!(
+            "{context} device rule must set type"
+        )));
+    }
+    if !is_valid_device_type(device_type, true) {
+        return Err(NriError::Plugin(format!(
+            "{context} device rule type '{}' is invalid",
+            device.type_
+        )));
+    }
+    if !has_only_valid_device_access(&device.access) {
+        return Err(NriError::Plugin(format!(
+            "{context} device rule access must be a non-empty combination of 'r', 'w', and 'm'"
+        )));
+    }
+    Ok(())
+}
+
+pub fn validate_adjustment_resources_with_min_memory(
+    resources: &nri_api::LinuxResources,
+    min_memory_limit: Option<i64>,
+) -> Result<()> {
+    validate_adjustment_resources(resources, min_memory_limit)
+}
+
+pub fn sanitize_linux_resources_for_capabilities(
+    resources: &mut nri_api::LinuxResources,
+    memory_swap_supported: bool,
+    hugetlb_supported: bool,
+) {
+    if !memory_swap_supported {
+        if let Some(memory) = resources.memory.as_mut() {
+            memory.swap = protobuf::MessageField::none();
+        }
+    }
+
+    if !hugetlb_supported {
+        resources.hugepage_limits.clear();
+    }
+}
+
 pub fn validate_update_linux_resources(resources: &nri_api::LinuxResources) -> Result<()> {
+    if let Some(memory) = resources.memory.as_ref() {
+        validate_linux_memory(memory, None, "container update")?;
+    }
+    if let Some(cpu) = resources.cpu.as_ref() {
+        validate_linux_cpu(cpu, "container update")?;
+    }
     for hugepage in &resources.hugepage_limits {
-        if hugepage.page_size.is_empty() {
+        if hugepage.page_size.trim().is_empty() {
             return Err(NriError::Plugin(
                 "container update hugepage limit must set page_size".to_string(),
             ));
         }
     }
     for device in &resources.devices {
-        if device.type_.is_empty() {
+        validate_device_rule(device, "container update")?;
+    }
+    for key in resources.unified.keys() {
+        if key.trim().is_empty() {
             return Err(NriError::Plugin(
-                "container update device rule must set type".to_string(),
-            ));
-        }
-        if device.access.is_empty() {
-            return Err(NriError::Plugin(
-                "container update device rule must set access".to_string(),
+                "container update unified resource key must not be empty".to_string(),
             ));
         }
     }
@@ -456,19 +647,17 @@ fn ensure_linux(spec: &mut Spec) -> &mut Linux {
 }
 
 fn ensure_linux_resources(spec: &mut Spec) -> &mut LinuxResources {
-    ensure_linux(spec)
-        .resources
-        .get_or_insert(LinuxResources {
-            network: None,
-            pids: None,
-            memory: None,
-            cpu: None,
-            block_io: None,
-            hugepage_limits: None,
-            devices: None,
-            intel_rdt: None,
-            unified: None,
-        })
+    ensure_linux(spec).resources.get_or_insert(LinuxResources {
+        network: None,
+        pids: None,
+        memory: None,
+        cpu: None,
+        block_io: None,
+        hugepage_limits: None,
+        devices: None,
+        intel_rdt: None,
+        unified: None,
+    })
 }
 
 fn env_name(entry: &str) -> &str {
@@ -771,16 +960,15 @@ fn apply_linux_rdt(spec: &mut Spec, rdt: &nri_api::LinuxRdt) {
         return;
     }
 
-    let intel_rdt =
-        ensure_linux(spec)
-            .intel_rdt
-            .get_or_insert(crate::oci::spec::LinuxIntelRdt {
-                clos_id: None,
-                l3_cache_schema: None,
-                mem_bw_schema: None,
-                enable_cmt: None,
-                enable_mbm: None,
-            });
+    let intel_rdt = ensure_linux(spec)
+        .intel_rdt
+        .get_or_insert(crate::oci::spec::LinuxIntelRdt {
+            clos_id: None,
+            l3_cache_schema: None,
+            mem_bw_schema: None,
+            enable_cmt: None,
+            enable_mbm: None,
+        });
     if let Some(clos_id) = rdt.clos_id.as_ref() {
         intel_rdt.clos_id = Some(clos_id.value.clone());
     }
@@ -1362,8 +1550,10 @@ mod tests {
 
     use super::{
         apply_container_adjustment, apply_container_adjustment_with_blockio_config,
-        resolve_rdt_class, validate_container_adjustment, validate_container_update,
-        validate_update_linux_resources, REMOVAL_PREFIX,
+        disallowed_annotation_adjustment_keys, filter_annotation_adjustments_by_allowlist,
+        resolve_rdt_class, sanitize_linux_resources_for_capabilities,
+        validate_adjustment_resources_with_min_memory, validate_container_adjustment,
+        validate_container_update, validate_update_linux_resources, REMOVAL_PREFIX,
     };
     use crate::nri_proto::api as nri_api;
     use crate::oci::spec::{
@@ -1867,6 +2057,107 @@ mod tests {
 
         let err = validate_container_adjustment(&adjustment).unwrap_err();
         assert!(format!("{err}").contains("protected annotation"));
+    }
+
+    #[test]
+    fn filters_annotation_adjustments_by_allowlist() {
+        let adjustments = HashMap::from([
+            (
+                "io.kubernetes.cri.sandbox-name".to_string(),
+                "pod-a".to_string(),
+            ),
+            (
+                "cpu-load-balancing.crio.io".to_string(),
+                "disable".to_string(),
+            ),
+            ("-cpu-quota.crio.io".to_string(), String::new()),
+        ]);
+        let allowed = vec!["cpu-".to_string()];
+
+        let filtered = filter_annotation_adjustments_by_allowlist(&adjustments, &allowed);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.contains_key("cpu-load-balancing.crio.io"));
+        assert!(filtered.contains_key("-cpu-quota.crio.io"));
+        assert!(!filtered.contains_key("io.kubernetes.cri.sandbox-name"));
+
+        let disallowed = disallowed_annotation_adjustment_keys(&adjustments, &allowed);
+        assert_eq!(
+            disallowed,
+            vec!["io.kubernetes.cri.sandbox-name".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_adjustment_resource_values() {
+        let mut resources = nri_api::LinuxResources::new();
+        let mut memory = nri_api::LinuxMemory::new();
+        let mut swappiness = nri_api::OptionalUInt64::new();
+        swappiness.value = 101;
+        memory.swappiness = protobuf::MessageField::some(swappiness);
+        resources.memory = protobuf::MessageField::some(memory);
+        resources.devices.push(nri_api::LinuxDeviceCgroup {
+            allow: true,
+            type_: "x".to_string(),
+            access: "rwm".to_string(),
+            ..Default::default()
+        });
+
+        let err =
+            validate_adjustment_resources_with_min_memory(&resources, Some(1024)).unwrap_err();
+        let rendered = format!("{err}");
+        assert!(rendered.contains("swappiness") || rendered.contains("device rule type"));
+    }
+
+    #[test]
+    fn rejects_adjustment_memory_limit_below_minimum() {
+        let mut resources = nri_api::LinuxResources::new();
+        let mut memory = nri_api::LinuxMemory::new();
+        let mut limit = nri_api::OptionalInt64::new();
+        limit.value = 512;
+        memory.limit = protobuf::MessageField::some(limit);
+        resources.memory = protobuf::MessageField::some(memory);
+
+        let err =
+            validate_adjustment_resources_with_min_memory(&resources, Some(1024)).unwrap_err();
+        assert!(format!("{err}").contains("below required minimum"));
+    }
+
+    #[test]
+    fn sanitizes_resources_for_missing_capabilities() {
+        let mut resources = nri_api::LinuxResources::new();
+        let mut memory = nri_api::LinuxMemory::new();
+        let mut swap = nri_api::OptionalInt64::new();
+        swap.value = 8192;
+        memory.swap = protobuf::MessageField::some(swap);
+        resources.memory = protobuf::MessageField::some(memory);
+        resources.hugepage_limits.push(nri_api::HugepageLimit {
+            page_size: "2MB".to_string(),
+            limit: 4,
+            ..Default::default()
+        });
+
+        sanitize_linux_resources_for_capabilities(&mut resources, false, false);
+
+        assert!(resources
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.swap.as_ref())
+            .is_none());
+        assert!(resources.hugepage_limits.is_empty());
+    }
+
+    #[test]
+    fn rejects_update_with_invalid_device_access() {
+        let mut resources = nri_api::LinuxResources::new();
+        resources.devices.push(nri_api::LinuxDeviceCgroup {
+            allow: true,
+            type_: "c".to_string(),
+            access: "rx".to_string(),
+            ..Default::default()
+        });
+
+        let err = validate_update_linux_resources(&resources).unwrap_err();
+        assert!(format!("{err}").contains("device rule access"));
     }
 
     #[test]
