@@ -40,10 +40,7 @@ fn owners_for_container<'a>(
     owners: &'a mut nri_api::OwningPlugins,
     container_id: &str,
 ) -> &'a mut nri_api::FieldOwners {
-    owners
-        .owners
-        .entry(container_id.to_string())
-        .or_default()
+    owners.owners.entry(container_id.to_string()).or_default()
 }
 
 fn conflict(field: nri_api::Field, plugin: &str, other: &str, qualifier: Option<&str>) -> NriError {
@@ -65,10 +62,7 @@ fn claim_compound(
     plugin: &str,
 ) -> Result<()> {
     let field_owners = owners_for_container(owners, container_id);
-    let entry = field_owners
-        .compound
-        .entry(field_key(field))
-        .or_default();
+    let entry = field_owners.compound.entry(field_key(field)).or_default();
     if let Some(current) = entry.owners.get(key) {
         let (other, _) = is_marked_for_removal(current);
         if other != plugin {
@@ -87,10 +81,7 @@ fn clear_compound(
     plugin: &str,
 ) {
     let field_owners = owners_for_container(owners, container_id);
-    let entry = field_owners
-        .compound
-        .entry(field_key(field))
-        .or_default();
+    let entry = field_owners.compound.entry(field_key(field)).or_default();
     entry
         .owners
         .insert(key.to_string(), mark_for_removal(plugin));
@@ -559,10 +550,7 @@ fn merge_linux_adjustment(
                 nri_api::Field::RdtEnableMonitoring,
                 plugin,
             );
-            let mut merged_rdt = ensure_linux(merged)
-                .rdt
-                .take()
-                .unwrap_or_default();
+            let mut merged_rdt = ensure_linux(merged).rdt.take().unwrap_or_default();
             merged_rdt.remove = true;
             merged_rdt.clos_id = MessageField::none();
             merged_rdt.schemata = MessageField::none();

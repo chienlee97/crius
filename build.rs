@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&nri_out_dir)?;
     ttrpc_codegen::Codegen::new()
         .out_dir(&nri_out_dir)
-        .inputs(["proto/nri/pkg/api/api.proto"])
+        .inputs(["proto/github.com/containerd/nri/pkg/api/api.proto"])
         .include("proto")
         .rust_protobuf()
         .customize(ttrpc_codegen::Customize {
@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "pub mod api;\npub mod api_ttrpc;\n",
     )?;
 
-    println!("cargo:rerun-if-changed=proto/nri/pkg/api/api.proto");
+    println!("cargo:rerun-if-changed=proto/github.com/containerd/nri/pkg/api/api.proto");
     println!("cargo:rerun-if-changed=proto/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto");
 
     Ok(())

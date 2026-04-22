@@ -18,6 +18,24 @@ use crate::runtime::{
 use std::collections::HashSet;
 use std::net::IpAddr;
 
+const CRIO_CONTAINER_ID_ANNOTATION: &str = "io.kubernetes.cri-o.ContainerID";
+const CRIO_CONTAINER_NAME_ANNOTATION: &str = "io.kubernetes.cri-o.ContainerName";
+const CRIO_CONTAINER_TYPE_ANNOTATION: &str = "io.kubernetes.cri-o.ContainerType";
+const CRIO_LOG_PATH_ANNOTATION: &str = "io.kubernetes.cri-o.LogPath";
+const CRIO_RUNTIME_HANDLER_ANNOTATION: &str = "io.kubernetes.cri-o.RuntimeHandler";
+const CRIO_SANDBOX_ID_ANNOTATION: &str = "io.kubernetes.cri-o.SandboxID";
+const CRIO_SANDBOX_NAME_ANNOTATION: &str = "io.kubernetes.cri-o.SandboxName";
+const CRIO_POD_NAME_ANNOTATION: &str = "io.kubernetes.cri-o.Name";
+const CRIO_POD_NAMESPACE_ANNOTATION: &str = "io.kubernetes.cri-o.Namespace";
+const CONTAINERD_CONTAINER_TYPE_ANNOTATION: &str = "io.kubernetes.cri.container-type";
+const CONTAINERD_SANDBOX_ID_ANNOTATION: &str = "io.kubernetes.cri.sandbox-id";
+const CONTAINERD_SANDBOX_LOG_DIR_ANNOTATION: &str = "io.kubernetes.cri.sandbox-log-directory";
+const CONTAINERD_SANDBOX_NAME_ANNOTATION: &str = "io.kubernetes.cri.sandbox-name";
+const CONTAINERD_SANDBOX_NAMESPACE_ANNOTATION: &str = "io.kubernetes.cri.sandbox-namespace";
+const CONTAINERD_SANDBOX_UID_ANNOTATION: &str = "io.kubernetes.cri.sandbox-uid";
+const CONTAINERD_RUNTIME_HANDLER_ANNOTATION: &str = "io.containerd.cri.runtime-handler";
+const CONTAINER_TYPE_SANDBOX: &str = "sandbox";
+
 /// Pod沙箱配置
 #[derive(Debug, Clone)]
 pub struct PodSandboxConfig {
@@ -365,6 +383,64 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
     ) -> Result<String> {
         let pause_image = self.resolve_pause_image(pod_config)?;
         let mut pause_mounts = Vec::new();
+        let pause_name = format!("pause-{}", pod_id);
+        let mut pause_annotations = pod_config.annotations.clone();
+        pause_annotations.push((CRIO_CONTAINER_ID_ANNOTATION.to_string(), pod_id.to_string()));
+        pause_annotations.push((
+            CRIO_CONTAINER_NAME_ANNOTATION.to_string(),
+            pause_name.clone(),
+        ));
+        pause_annotations.push((
+            CRIO_CONTAINER_TYPE_ANNOTATION.to_string(),
+            CONTAINER_TYPE_SANDBOX.to_string(),
+        ));
+        pause_annotations.push((CRIO_SANDBOX_ID_ANNOTATION.to_string(), pod_id.to_string()));
+        pause_annotations.push((
+            CRIO_SANDBOX_NAME_ANNOTATION.to_string(),
+            pod_config.name.clone(),
+        ));
+        pause_annotations.push((
+            CRIO_POD_NAME_ANNOTATION.to_string(),
+            pod_config.name.clone(),
+        ));
+        pause_annotations.push((
+            CRIO_POD_NAMESPACE_ANNOTATION.to_string(),
+            pod_config.namespace.clone(),
+        ));
+        pause_annotations.push((
+            CRIO_RUNTIME_HANDLER_ANNOTATION.to_string(),
+            pod_config.runtime_handler.clone(),
+        ));
+        pause_annotations.push((
+            CONTAINERD_SANDBOX_ID_ANNOTATION.to_string(),
+            pod_id.to_string(),
+        ));
+        pause_annotations.push((
+            CONTAINERD_CONTAINER_TYPE_ANNOTATION.to_string(),
+            CONTAINER_TYPE_SANDBOX.to_string(),
+        ));
+        pause_annotations.push((
+            CONTAINERD_SANDBOX_NAME_ANNOTATION.to_string(),
+            pod_config.name.clone(),
+        ));
+        pause_annotations.push((
+            CONTAINERD_SANDBOX_NAMESPACE_ANNOTATION.to_string(),
+            pod_config.namespace.clone(),
+        ));
+        pause_annotations.push((
+            CONTAINERD_SANDBOX_UID_ANNOTATION.to_string(),
+            pod_config.uid.clone(),
+        ));
+        pause_annotations.push((
+            CONTAINERD_RUNTIME_HANDLER_ANNOTATION.to_string(),
+            pod_config.runtime_handler.clone(),
+        ));
+        if let Some(log_directory) = pod_config.log_directory.as_ref() {
+            pause_annotations.push((
+                CONTAINERD_SANDBOX_LOG_DIR_ANNOTATION.to_string(),
+                log_directory.to_string_lossy().to_string(),
+            ));
+        }
         let resolv_path = self.pod_resolv_path(pod_id);
         if resolv_path.exists() {
             pause_mounts.push(crate::runtime::MountConfig {
@@ -373,18 +449,28 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
                 read_only: true,
             });
         }
+        let pause_log_path = pod_config
+            .log_directory
+            .as_ref()
+            .map(|dir| dir.join("sandbox.log"));
+        if let Some(log_path) = pause_log_path.as_ref() {
+            pause_annotations.push((
+                CRIO_LOG_PATH_ANNOTATION.to_string(),
+                log_path.to_string_lossy().to_string(),
+            ));
+        }
 
         // Pause容器配置
         let pause_config = ContainerConfig {
-            name: format!("pause-{}", pod_id),
+            name: pause_name.clone(),
             image: pause_image,
             command: vec!["/pause".to_string()],
             args: vec![],
             env: vec![],
             working_dir: None,
             mounts: pause_mounts,
-            labels: vec![],
-            annotations: vec![],
+            labels: pod_config.labels.clone(),
+            annotations: pause_annotations,
             privileged: pod_config.privileged,
             user: pod_config.run_as_user.clone(),
             run_as_group: pod_config.run_as_group,
@@ -393,10 +479,7 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
             tty: false,
             stdin: false,
             stdin_once: false,
-            log_path: pod_config
-                .log_directory
-                .as_ref()
-                .map(|dir| dir.join("sandbox.log")),
+            log_path: pause_log_path,
             readonly_rootfs: pod_config.readonly_rootfs,
             no_new_privileges: pod_config.no_new_privileges,
             apparmor_profile: pod_config.apparmor_profile.clone(),
@@ -417,7 +500,7 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
         };
 
         // 创建 pause 容器，ID 由上层（pod 管理器）统一分配，避免 runtime 二次生成。
-        let container_id = format!("pause-{}", pod_id);
+        let container_id = pause_name;
         self.runtime
             .create_container(&container_id, &pause_config)
             .context("Failed to create pause container")?;
@@ -593,7 +676,66 @@ pub struct PodSandboxStatus {
 mod tests {
     use super::*;
     use crate::runtime::RuncRuntime;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    #[derive(Clone, Default)]
+    struct RecordingRuntime {
+        created: Arc<Mutex<Vec<(String, ContainerConfig)>>>,
+    }
+
+    impl RecordingRuntime {
+        fn take_created(&self) -> Vec<(String, ContainerConfig)> {
+            self.created.lock().unwrap().clone()
+        }
+    }
+
+    impl ContainerRuntime for RecordingRuntime {
+        fn create_container(&self, container_id: &str, config: &ContainerConfig) -> Result<String> {
+            self.created
+                .lock()
+                .unwrap()
+                .push((container_id.to_string(), config.clone()));
+            Ok(container_id.to_string())
+        }
+
+        fn start_container(&self, _container_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop_container(&self, _container_id: &str, _timeout: Option<u32>) -> Result<()> {
+            Ok(())
+        }
+
+        fn remove_container(&self, _container_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn container_status(&self, _container_id: &str) -> Result<ContainerStatus> {
+            Ok(ContainerStatus::Running)
+        }
+
+        fn reopen_container_log(&self, _container_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn exec_in_container(
+            &self,
+            _container_id: &str,
+            _command: &[String],
+            _tty: bool,
+        ) -> Result<i32> {
+            Ok(0)
+        }
+
+        fn update_container_resources(
+            &self,
+            _container_id: &str,
+            _resources: &LinuxContainerResources,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn create_resolv_conf_copies_host_config_when_dns_unspecified() {
@@ -644,6 +786,153 @@ mod tests {
         assert!(generated.contains("nameserver 1.1.1.1"));
         assert!(generated.contains("nameserver 8.8.8.8"));
         assert!(generated.contains("options ndots:5"));
+    }
+
+    #[tokio::test]
+    async fn create_pause_container_propagates_pod_metadata_to_runtime() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RecordingRuntime::default();
+        let manager = PodSandboxManager::new(
+            runtime.clone(),
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            CniConfig::default(),
+        );
+        tokio::fs::create_dir_all(temp_dir.path().join("pods").join("pod-1"))
+            .await
+            .unwrap();
+
+        let pod_config = PodSandboxConfig {
+            name: "test-pod".to_string(),
+            namespace: "default".to_string(),
+            uid: "uid-1".to_string(),
+            hostname: "test-host".to_string(),
+            log_directory: Some(temp_dir.path().join("logs")),
+            runtime_handler: "runc".to_string(),
+            labels: vec![("app".to_string(), "demo".to_string())],
+            annotations: vec![
+                ("team".to_string(), "runtime".to_string()),
+                (
+                    "io.kubernetes.cri.sandbox-image".to_string(),
+                    "registry.example/pause:custom".to_string(),
+                ),
+            ],
+            dns_config: None,
+            port_mappings: vec![],
+            network_config: None,
+            cgroup_parent: Some("kubepods.slice".to_string()),
+            sysctls: HashMap::from([("net.ipv4.ip_forward".to_string(), "1".to_string())]),
+            namespace_options: None,
+            privileged: false,
+            run_as_user: Some("1000".to_string()),
+            run_as_group: Some(1000),
+            supplemental_groups: vec![2000],
+            readonly_rootfs: true,
+            no_new_privileges: Some(true),
+            apparmor_profile: Some("runtime/default".to_string()),
+            selinux_label: Some("system_u:system_r:container_t:s0".to_string()),
+            seccomp_profile: None,
+            linux_resources: None,
+        };
+
+        let pause_id = manager
+            .create_pause_container("pod-1", &pod_config, Path::new("/var/run/netns/pod-1"))
+            .await
+            .unwrap();
+
+        assert_eq!(pause_id, "pause-pod-1");
+
+        let created = runtime.take_created();
+        assert_eq!(created.len(), 1);
+        let (container_id, pause_config) = &created[0];
+        assert_eq!(container_id, "pause-pod-1");
+        assert_eq!(pause_config.image, "registry.example/pause:custom");
+        assert_eq!(pause_config.labels, pod_config.labels);
+        assert!(pause_config
+            .annotations
+            .starts_with(&pod_config.annotations));
+        let annotations = pause_config
+            .annotations
+            .iter()
+            .cloned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            annotations
+                .get(CRIO_SANDBOX_ID_ANNOTATION)
+                .map(String::as_str),
+            Some("pod-1")
+        );
+        assert_eq!(
+            annotations
+                .get(CRIO_SANDBOX_NAME_ANNOTATION)
+                .map(String::as_str),
+            Some("test-pod")
+        );
+        assert_eq!(
+            annotations
+                .get(CRIO_POD_NAMESPACE_ANNOTATION)
+                .map(String::as_str),
+            Some("default")
+        );
+        assert_eq!(
+            annotations
+                .get(CONTAINERD_SANDBOX_UID_ANNOTATION)
+                .map(String::as_str),
+            Some("uid-1")
+        );
+        assert_eq!(
+            annotations
+                .get(CRIO_CONTAINER_NAME_ANNOTATION)
+                .map(String::as_str),
+            Some("pause-pod-1")
+        );
+        assert_eq!(
+            annotations
+                .get(CRIO_CONTAINER_TYPE_ANNOTATION)
+                .map(String::as_str),
+            Some(CONTAINER_TYPE_SANDBOX)
+        );
+        assert_eq!(
+            annotations
+                .get(CONTAINERD_CONTAINER_TYPE_ANNOTATION)
+                .map(String::as_str),
+            Some(CONTAINER_TYPE_SANDBOX)
+        );
+        assert_eq!(
+            annotations
+                .get(CRIO_RUNTIME_HANDLER_ANNOTATION)
+                .map(String::as_str),
+            Some("runc")
+        );
+        assert_eq!(
+            annotations
+                .get(CONTAINERD_RUNTIME_HANDLER_ANNOTATION)
+                .map(String::as_str),
+            Some("runc")
+        );
+        assert_eq!(
+            annotations
+                .get(CONTAINERD_SANDBOX_LOG_DIR_ANNOTATION)
+                .map(String::as_str),
+            Some(temp_dir.path().join("logs").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            annotations
+                .get(CRIO_LOG_PATH_ANNOTATION)
+                .map(String::as_str),
+            Some(
+                temp_dir
+                    .path()
+                    .join("logs")
+                    .join("sandbox.log")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            pause_config.namespace_paths.network.as_deref(),
+            Some(Path::new("/var/run/netns/pod-1"))
+        );
     }
 
     // 注意：这些测试需要root权限和runc环境

@@ -1346,7 +1346,9 @@ fn take_expired_portforward_pairs(
 ) -> Vec<PortForwardPair> {
     let expired_request_ids: Vec<String> = pending_pairs
         .iter()
-        .filter(|(_, pair)| now.duration_since(pair.created_at) >= PORT_FORWARD_STREAM_CREATION_TIMEOUT)
+        .filter(|(_, pair)| {
+            now.duration_since(pair.created_at) >= PORT_FORWARD_STREAM_CREATION_TIMEOUT
+        })
         .map(|(request_id, _)| request_id.clone())
         .collect();
     expired_request_ids

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -75,12 +76,52 @@ pub struct NriConfig {
     pub plugin_config_path: String,
     /// NRI blockio class 配置文件
     pub blockio_config_path: String,
+    /// 全局允许的 NRI annotation 前缀
+    pub allowed_annotation_prefixes: Vec<String>,
+    /// 按 runtime handler 额外允许的 annotation 前缀
+    pub runtime_allowed_annotation_prefixes: HashMap<String, Vec<String>>,
+    /// 按 workload 激活 annotation 追加允许的 annotation 前缀
+    pub workload_allowed_annotation_prefixes: Vec<NriAnnotationWorkloadConfig>,
     /// 插件注册超时（毫秒）
     pub registration_timeout_ms: i64,
     /// 插件请求超时（毫秒）
     pub request_timeout_ms: i64,
     /// 允许外部插件连接
     pub enable_external_connections: bool,
+    /// 默认内建 validator 配置
+    pub default_validator: NriDefaultValidatorConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct NriAnnotationWorkloadConfig {
+    /// 用于激活 workload 规则的 annotation key
+    pub activation_annotation: String,
+    /// 可选的 annotation value 过滤；为空时只要求 key 存在
+    pub activation_value: String,
+    /// workload 追加允许的 annotation 前缀
+    pub allowed_annotation_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct NriDefaultValidatorConfig {
+    /// 启用默认 validator
+    pub enable: bool,
+    /// 拒绝 OCI hooks 调整
+    pub reject_oci_hook_adjustment: bool,
+    /// 拒绝 runtime default seccomp 调整
+    pub reject_runtime_default_seccomp_adjustment: bool,
+    /// 拒绝 unconfined seccomp 调整
+    pub reject_unconfined_seccomp_adjustment: bool,
+    /// 拒绝 custom seccomp 调整
+    pub reject_custom_seccomp_adjustment: bool,
+    /// 拒绝 namespace 调整
+    pub reject_namespace_adjustment: bool,
+    /// 全局要求存在的插件列表
+    pub required_plugins: Vec<String>,
+    /// 容忍缺失 required plugins 的 annotation 名
+    pub tolerate_missing_plugins_annotation: String,
 }
 
 impl Default for NriConfig {
@@ -93,9 +134,13 @@ impl Default for NriConfig {
             plugin_path: "/opt/nri/plugins".to_string(),
             plugin_config_path: "/etc/nri/conf.d".to_string(),
             blockio_config_path: String::new(),
+            allowed_annotation_prefixes: Vec::new(),
+            runtime_allowed_annotation_prefixes: HashMap::new(),
+            workload_allowed_annotation_prefixes: Vec::new(),
             registration_timeout_ms: 5000,
             request_timeout_ms: 2000,
             enable_external_connections: false,
+            default_validator: NriDefaultValidatorConfig::default(),
         }
     }
 }
@@ -107,7 +152,6 @@ impl Config {
         let config: Self = toml::from_str(&content)?;
         Ok(config)
     }
-
 }
 
 impl Default for Config {
