@@ -39,8 +39,9 @@ use crate::proto::runtime::v1::{
     RemovePodSandboxResponse, ReopenContainerLogRequest, ReopenContainerLogResponse,
     RuntimeCondition, RuntimeConfigRequest, RuntimeConfigResponse, RuntimeStatus,
     StartContainerRequest, StartContainerResponse, StopContainerRequest, StopContainerResponse,
-    UpdateContainerResourcesRequest, UpdateContainerResourcesResponse, UpdateRuntimeConfigRequest,
-    UpdateRuntimeConfigResponse,
+    UpdateContainerResourcesRequest, UpdateContainerResourcesResponse,
+    UpdatePodSandboxResourcesRequest, UpdatePodSandboxResourcesResponse,
+    UpdateRuntimeConfigRequest, UpdateRuntimeConfigResponse,
 };
 use crate::storage::persistence::{PersistenceConfig, PersistenceManager};
 
@@ -48,11 +49,11 @@ use crate::config::NriConfig;
 use crate::metrics::MetricsCollector;
 use crate::network::{CniConfig, DefaultNetworkManager, NetworkManager};
 use crate::nri::{
-    apply_container_adjustment, cri_linux_resources_from_nri, linux_resources_from_cri, oci_args,
-    oci_env, oci_hooks, oci_linux_container, oci_mounts, oci_rlimits, oci_user,
-    validate_container_adjustment, validate_container_update, validate_update_linux_resources,
-    NopNri, NriApi, NriContainerEvent, NriCreateContainerResult, NriDomain, NriManager,
-    NriManagerConfig, NriPodEvent, RuntimeSnapshot,
+    apply_container_adjustment_with_blockio_config, linux_resources_from_cri, oci_args, oci_env,
+    oci_hooks, oci_linux_container, oci_mounts, oci_rlimits, oci_user, resolve_blockio_class,
+    resolve_rdt_class, validate_container_adjustment, validate_container_update,
+    validate_update_linux_resources, NopNri, NriApi, NriContainerEvent, NriCreateContainerResult,
+    NriDomain, NriManager, NriManagerConfig, NriPodEvent, NriStopContainerResult, RuntimeSnapshot,
 };
 use crate::pod::{PodSandboxConfig, PodSandboxManager};
 use crate::runtime::{
@@ -151,6 +152,16 @@ struct StoredHugepageLimit {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
+struct StoredLinuxDeviceCgroup {
+    allow: bool,
+    device_type: Option<String>,
+    major: Option<i64>,
+    minor: Option<i64>,
+    access: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 struct StoredLinuxResources {
     cpu_period: i64,
     cpu_quota: i64,
@@ -162,6 +173,30 @@ struct StoredLinuxResources {
     hugepage_limits: Vec<StoredHugepageLimit>,
     unified: HashMap<String, String>,
     memory_swap_limit_in_bytes: i64,
+    memory_reservation_in_bytes: Option<i64>,
+    memory_kernel_limit_in_bytes: Option<i64>,
+    memory_kernel_tcp_limit_in_bytes: Option<i64>,
+    memory_swappiness: Option<u64>,
+    memory_disable_oom_killer: Option<bool>,
+    memory_use_hierarchy: Option<bool>,
+    cpu_realtime_runtime: Option<i64>,
+    cpu_realtime_period: Option<u64>,
+    pids_limit: Option<i64>,
+    devices: Vec<StoredLinuxDeviceCgroup>,
+    blockio_class: Option<String>,
+    rdt_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CgroupResourceSupport {
+    swap: bool,
+    hugetlb: bool,
+    memory_kernel: bool,
+    memory_kernel_tcp: bool,
+    memory_swappiness: bool,
+    memory_disable_oom_killer: bool,
+    memory_use_hierarchy: bool,
+    cpu_realtime: bool,
 }
 
 impl StoredLinuxResources {
@@ -186,6 +221,222 @@ impl StoredLinuxResources {
             memory_swap_limit_in_bytes: self.memory_swap_limit_in_bytes,
         }
     }
+
+    fn optional_int64(value: i64) -> protobuf::MessageField<crate::nri_proto::api::OptionalInt64> {
+        let mut result = crate::nri_proto::api::OptionalInt64::new();
+        result.value = value;
+        protobuf::MessageField::some(result)
+    }
+
+    fn optional_uint64(
+        value: u64,
+    ) -> protobuf::MessageField<crate::nri_proto::api::OptionalUInt64> {
+        let mut result = crate::nri_proto::api::OptionalUInt64::new();
+        result.value = value;
+        protobuf::MessageField::some(result)
+    }
+
+    fn optional_bool(value: bool) -> protobuf::MessageField<crate::nri_proto::api::OptionalBool> {
+        let mut result = crate::nri_proto::api::OptionalBool::new();
+        result.value = value;
+        protobuf::MessageField::some(result)
+    }
+
+    fn optional_string(
+        value: impl Into<String>,
+    ) -> protobuf::MessageField<crate::nri_proto::api::OptionalString> {
+        let mut result = crate::nri_proto::api::OptionalString::new();
+        result.value = value.into();
+        protobuf::MessageField::some(result)
+    }
+
+    fn apply_nri(&mut self, resources: &crate::nri_proto::api::LinuxResources) {
+        if let Some(memory) = resources.memory.as_ref() {
+            if let Some(limit) = memory.limit.as_ref() {
+                self.memory_limit_in_bytes = limit.value;
+            }
+            if let Some(reservation) = memory.reservation.as_ref() {
+                self.memory_reservation_in_bytes = Some(reservation.value);
+            }
+            if let Some(swap) = memory.swap.as_ref() {
+                self.memory_swap_limit_in_bytes = swap.value;
+            }
+            if let Some(kernel) = memory.kernel.as_ref() {
+                self.memory_kernel_limit_in_bytes = Some(kernel.value);
+            }
+            if let Some(kernel_tcp) = memory.kernel_tcp.as_ref() {
+                self.memory_kernel_tcp_limit_in_bytes = Some(kernel_tcp.value);
+            }
+            if let Some(swappiness) = memory.swappiness.as_ref() {
+                self.memory_swappiness = Some(swappiness.value);
+            }
+            if let Some(disable_oom_killer) = memory.disable_oom_killer.as_ref() {
+                self.memory_disable_oom_killer = Some(disable_oom_killer.value);
+            }
+            if let Some(use_hierarchy) = memory.use_hierarchy.as_ref() {
+                self.memory_use_hierarchy = Some(use_hierarchy.value);
+            }
+        }
+
+        if let Some(cpu) = resources.cpu.as_ref() {
+            if let Some(shares) = cpu.shares.as_ref() {
+                self.cpu_shares = shares.value as i64;
+            }
+            if let Some(quota) = cpu.quota.as_ref() {
+                self.cpu_quota = quota.value;
+            }
+            if let Some(period) = cpu.period.as_ref() {
+                self.cpu_period = period.value as i64;
+            }
+            if let Some(runtime) = cpu.realtime_runtime.as_ref() {
+                self.cpu_realtime_runtime = Some(runtime.value);
+            }
+            if let Some(period) = cpu.realtime_period.as_ref() {
+                self.cpu_realtime_period = Some(period.value);
+            }
+            if !cpu.cpus.is_empty() {
+                self.cpuset_cpus = cpu.cpus.clone();
+            }
+            if !cpu.mems.is_empty() {
+                self.cpuset_mems = cpu.mems.clone();
+            }
+        }
+
+        for limit in &resources.hugepage_limits {
+            if let Some(existing) = self
+                .hugepage_limits
+                .iter_mut()
+                .find(|existing| existing.page_size == limit.page_size)
+            {
+                existing.limit = limit.limit;
+            } else {
+                self.hugepage_limits.push(StoredHugepageLimit {
+                    page_size: limit.page_size.clone(),
+                    limit: limit.limit,
+                });
+            }
+        }
+
+        if let Some(pids) = resources.pids.as_ref() {
+            self.pids_limit = Some(pids.limit);
+        }
+        if !resources.devices.is_empty() {
+            self.devices = resources
+                .devices
+                .iter()
+                .map(|device| StoredLinuxDeviceCgroup {
+                    allow: device.allow,
+                    device_type: (!device.type_.is_empty()).then(|| device.type_.clone()),
+                    major: device.major.as_ref().map(|value| value.value),
+                    minor: device.minor.as_ref().map(|value| value.value),
+                    access: (!device.access.is_empty()).then(|| device.access.clone()),
+                })
+                .collect();
+        }
+        if let Some(blockio_class) = resources.blockio_class.as_ref() {
+            self.blockio_class =
+                (!blockio_class.value.trim().is_empty()).then(|| blockio_class.value.clone());
+        }
+        if let Some(rdt_class) = resources.rdt_class.as_ref() {
+            self.rdt_class = resolve_rdt_class(&rdt_class.value).and_then(|rdt| rdt.clos_id);
+        }
+        for (key, value) in &resources.unified {
+            self.unified.insert(key.clone(), value.clone());
+        }
+    }
+
+    fn to_nri(&self) -> crate::nri_proto::api::LinuxResources {
+        let mut result = linux_resources_from_cri(&self.to_proto());
+
+        if self.memory_reservation_in_bytes.is_some()
+            || self.memory_kernel_limit_in_bytes.is_some()
+            || self.memory_kernel_tcp_limit_in_bytes.is_some()
+            || self.memory_swappiness.is_some()
+            || self.memory_disable_oom_killer.is_some()
+            || self.memory_use_hierarchy.is_some()
+        {
+            let mut memory = result
+                .memory
+                .take()
+                .unwrap_or_default();
+            if let Some(reservation) = self.memory_reservation_in_bytes {
+                memory.reservation = Self::optional_int64(reservation);
+            }
+            if let Some(kernel) = self.memory_kernel_limit_in_bytes {
+                memory.kernel = Self::optional_int64(kernel);
+            }
+            if let Some(kernel_tcp) = self.memory_kernel_tcp_limit_in_bytes {
+                memory.kernel_tcp = Self::optional_int64(kernel_tcp);
+            }
+            if let Some(swappiness) = self.memory_swappiness {
+                memory.swappiness = Self::optional_uint64(swappiness);
+            }
+            if let Some(disable_oom_killer) = self.memory_disable_oom_killer {
+                memory.disable_oom_killer = Self::optional_bool(disable_oom_killer);
+            }
+            if let Some(use_hierarchy) = self.memory_use_hierarchy {
+                memory.use_hierarchy = Self::optional_bool(use_hierarchy);
+            }
+            result.memory = protobuf::MessageField::some(memory);
+        }
+
+        if self.cpu_realtime_runtime.is_some() || self.cpu_realtime_period.is_some() {
+            let mut cpu = result
+                .cpu
+                .take()
+                .unwrap_or_default();
+            if let Some(runtime) = self.cpu_realtime_runtime {
+                cpu.realtime_runtime = Self::optional_int64(runtime);
+            }
+            if let Some(period) = self.cpu_realtime_period {
+                cpu.realtime_period = Self::optional_uint64(period);
+            }
+            result.cpu = protobuf::MessageField::some(cpu);
+        }
+
+        if let Some(limit) = self.pids_limit {
+            result.pids = protobuf::MessageField::some(crate::nri_proto::api::LinuxPids {
+                limit,
+                ..Default::default()
+            });
+        }
+        if !self.devices.is_empty() {
+            result.devices = self
+                .devices
+                .iter()
+                .map(|device| crate::nri_proto::api::LinuxDeviceCgroup {
+                    allow: device.allow,
+                    type_: device.device_type.clone().unwrap_or_default(),
+                    major: device
+                        .major
+                        .map(|value| {
+                            let mut value_msg = crate::nri_proto::api::OptionalInt64::new();
+                            value_msg.value = value;
+                            protobuf::MessageField::some(value_msg)
+                        })
+                        .unwrap_or_default(),
+                    minor: device
+                        .minor
+                        .map(|value| {
+                            let mut value_msg = crate::nri_proto::api::OptionalInt64::new();
+                            value_msg.value = value;
+                            protobuf::MessageField::some(value_msg)
+                        })
+                        .unwrap_or_default(),
+                    access: device.access.clone().unwrap_or_default(),
+                    ..Default::default()
+                })
+                .collect();
+        }
+        if let Some(blockio_class) = self.blockio_class.as_ref() {
+            result.blockio_class = Self::optional_string(blockio_class.clone());
+        }
+        if let Some(rdt_class) = self.rdt_class.as_ref() {
+            result.rdt_class = Self::optional_string(rdt_class.clone());
+        }
+
+        result
+    }
 }
 
 impl From<&crate::proto::runtime::v1::LinuxContainerResources> for StoredLinuxResources {
@@ -208,6 +459,18 @@ impl From<&crate::proto::runtime::v1::LinuxContainerResources> for StoredLinuxRe
                 .collect(),
             unified: value.unified.clone(),
             memory_swap_limit_in_bytes: value.memory_swap_limit_in_bytes,
+            memory_reservation_in_bytes: None,
+            memory_kernel_limit_in_bytes: None,
+            memory_kernel_tcp_limit_in_bytes: None,
+            memory_swappiness: None,
+            memory_disable_oom_killer: None,
+            memory_use_hierarchy: None,
+            cpu_realtime_runtime: None,
+            cpu_realtime_period: None,
+            pids_limit: None,
+            devices: Vec::new(),
+            blockio_class: None,
+            rdt_class: None,
         }
     }
 }
@@ -247,6 +510,35 @@ impl StoredSecurityProfile {
             _ => None,
         }
     }
+
+    fn to_nri_seccomp(&self) -> Option<crate::nri_proto::api::SecurityProfile> {
+        let mut profile = crate::nri_proto::api::SecurityProfile::new();
+        match self.profile_type {
+            x if x
+                == crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
+                    as i32 =>
+            {
+                profile.profile_type =
+                    crate::nri_proto::api::security_profile::ProfileType::RUNTIME_DEFAULT.into();
+            }
+            x if x
+                == crate::proto::runtime::v1::security_profile::ProfileType::Unconfined as i32 =>
+            {
+                profile.profile_type =
+                    crate::nri_proto::api::security_profile::ProfileType::UNCONFINED.into();
+            }
+            x if x
+                == crate::proto::runtime::v1::security_profile::ProfileType::Localhost as i32 =>
+            {
+                profile.profile_type =
+                    crate::nri_proto::api::security_profile::ProfileType::LOCALHOST.into();
+                profile.localhost_ref = self.localhost_ref.clone();
+            }
+            _ => return None,
+        }
+
+        Some(profile)
+    }
 }
 
 impl From<&crate::proto::runtime::v1::SecurityProfile> for StoredSecurityProfile {
@@ -280,6 +572,7 @@ struct StoredPodState {
     apparmor_profile: Option<String>,
     selinux_label: Option<String>,
     seccomp_profile: Option<StoredSecurityProfile>,
+    overhead_linux_resources: Option<StoredLinuxResources>,
     linux_resources: Option<StoredLinuxResources>,
 }
 
@@ -301,6 +594,7 @@ struct StoredContainerState {
     supplemental_groups: Vec<u32>,
     no_new_privileges: Option<bool>,
     apparmor_profile: Option<String>,
+    seccomp_profile: Option<StoredSecurityProfile>,
     metadata_name: Option<String>,
     metadata_attempt: Option<u32>,
     started_at: Option<i64>,
@@ -339,12 +633,174 @@ struct NriRuntimeDomain {
     containers: Arc<Mutex<HashMap<String, Container>>>,
     pod_sandboxes: Arc<Mutex<HashMap<String, crate::proto::runtime::v1::PodSandbox>>>,
     config: RuntimeConfig,
+    nri_config: NriConfig,
     runtime: RuncRuntime,
     persistence: Arc<Mutex<PersistenceManager>>,
     events: tokio::sync::broadcast::Sender<ContainerEventResponse>,
 }
 
 impl RuntimeServiceImpl {
+    fn cgroup_support_flags() -> CgroupResourceSupport {
+        Self::cgroup_support_flags_for_root(Path::new("/sys/fs/cgroup"))
+    }
+
+    fn cgroup_support_flags_for_root(root: &Path) -> CgroupResourceSupport {
+        let is_v2 = root.join("cgroup.controllers").exists();
+
+        let swap = if is_v2 {
+            root.join("memory.swap.max").exists()
+        } else {
+            root.join("memory")
+                .join("memory.memsw.limit_in_bytes")
+                .exists()
+        };
+
+        let hugetlb = if is_v2 {
+            std::fs::read_dir(root)
+                .ok()
+                .into_iter()
+                .flat_map(|entries| entries.filter_map(Result::ok))
+                .map(|entry| entry.file_name())
+                .filter_map(|name| name.into_string().ok())
+                .any(|name| name.starts_with("hugetlb.") && name.ends_with(".max"))
+        } else {
+            root.join("hugetlb").exists()
+        };
+
+        let memory_kernel = if is_v2 {
+            false
+        } else {
+            root.join("memory")
+                .join("memory.kmem.limit_in_bytes")
+                .exists()
+        };
+        let memory_kernel_tcp = if is_v2 {
+            false
+        } else {
+            root.join("memory")
+                .join("memory.kmem.tcp.limit_in_bytes")
+                .exists()
+        };
+        let memory_swappiness = if is_v2 {
+            false
+        } else {
+            root.join("memory").join("memory.swappiness").exists()
+        };
+        let memory_disable_oom_killer = if is_v2 {
+            false
+        } else {
+            root.join("memory").join("memory.oom_control").exists()
+        };
+        let memory_use_hierarchy = if is_v2 {
+            false
+        } else {
+            root.join("memory").join("memory.use_hierarchy").exists()
+        };
+        let cpu_realtime = if is_v2 {
+            false
+        } else {
+            root.join("cpu").join("cpu.rt_runtime_us").exists()
+                && root.join("cpu").join("cpu.rt_period_us").exists()
+        };
+
+        CgroupResourceSupport {
+            swap,
+            hugetlb,
+            memory_kernel,
+            memory_kernel_tcp,
+            memory_swappiness,
+            memory_disable_oom_killer,
+            memory_use_hierarchy,
+            cpu_realtime,
+        }
+    }
+
+    fn sanitize_spec_runtime_resources(spec: &mut crate::oci::spec::Spec) {
+        let support = Self::cgroup_support_flags();
+        Self::sanitize_spec_runtime_resources_with_flags(spec, support);
+    }
+
+    fn sanitize_spec_runtime_resources_with_flags(
+        spec: &mut crate::oci::spec::Spec,
+        support: CgroupResourceSupport,
+    ) {
+        let Some(resources) = spec
+            .linux
+            .as_mut()
+            .and_then(|linux| linux.resources.as_mut())
+        else {
+            return;
+        };
+
+        if let Some(memory) = resources.memory.as_mut() {
+            if !support.swap {
+                memory.swap = None;
+            }
+            if !support.memory_kernel {
+                memory.kernel = None;
+            }
+            if !support.memory_kernel_tcp {
+                memory.kernel_tcp = None;
+            }
+            if !support.memory_swappiness {
+                memory.swappiness = None;
+            }
+            if !support.memory_disable_oom_killer {
+                memory.disable_oom_killer = None;
+            }
+            if !support.memory_use_hierarchy {
+                memory.use_hierarchy = None;
+            }
+        }
+
+        if let Some(cpu) = resources.cpu.as_mut() {
+            if !support.cpu_realtime {
+                cpu.realtime_runtime = None;
+                cpu.realtime_period = None;
+            }
+        }
+
+        if !support.hugetlb {
+            resources.hugepage_limits = None;
+        }
+    }
+
+    fn sanitize_stored_runtime_resources(resources: &mut StoredLinuxResources) {
+        let support = Self::cgroup_support_flags();
+        Self::sanitize_stored_runtime_resources_with_flags(resources, support);
+    }
+
+    fn sanitize_stored_runtime_resources_with_flags(
+        resources: &mut StoredLinuxResources,
+        support: CgroupResourceSupport,
+    ) {
+        if !support.swap {
+            resources.memory_swap_limit_in_bytes = 0;
+        }
+        if !support.memory_kernel {
+            resources.memory_kernel_limit_in_bytes = None;
+        }
+        if !support.memory_kernel_tcp {
+            resources.memory_kernel_tcp_limit_in_bytes = None;
+        }
+        if !support.memory_swappiness {
+            resources.memory_swappiness = None;
+        }
+        if !support.memory_disable_oom_killer {
+            resources.memory_disable_oom_killer = None;
+        }
+        if !support.memory_use_hierarchy {
+            resources.memory_use_hierarchy = None;
+        }
+        if !support.cpu_realtime {
+            resources.cpu_realtime_runtime = None;
+            resources.cpu_realtime_period = None;
+        }
+        if !support.hugetlb {
+            resources.hugepage_limits.clear();
+        }
+    }
+
     fn runtime_network_config_path(root_dir: &Path) -> PathBuf {
         root_dir.join("runtime_network_config.json")
     }
@@ -503,18 +959,28 @@ impl RuntimeServiceImpl {
             .as_ref()
             .and_then(|state| state.cgroup_parent.clone())
             .unwrap_or_default();
-        if let Some(resources) = pod_state
+        let overhead_resources = pod_state
+            .as_ref()
+            .and_then(|state| state.overhead_linux_resources.as_ref())
+            .map(StoredLinuxResources::to_proto);
+        let linux_resources = pod_state
             .as_ref()
             .and_then(|state| state.linux_resources.as_ref())
-        {
-            let converted = linux_resources_from_cri(&resources.to_proto());
-            linux.pod_resources = protobuf::MessageField::some(converted.clone());
-            linux.resources = protobuf::MessageField::some(converted);
+            .map(StoredLinuxResources::to_proto);
+        if let Some(resources) = overhead_resources.as_ref() {
+            linux.pod_overhead = protobuf::MessageField::some(linux_resources_from_cri(resources));
+        }
+        if let Some(resources) = linux_resources.as_ref() {
+            linux.pod_resources = protobuf::MessageField::some(linux_resources_from_cri(resources));
+        }
+        if let Some(resources) = linux_resources.as_ref().or(overhead_resources.as_ref()) {
+            linux.resources = protobuf::MessageField::some(linux_resources_from_cri(resources));
         }
         if let Some(spec) = pause_spec.as_ref() {
             if let Some(pause_linux) = oci_linux_container(spec) {
                 linux.cgroups_path = pause_linux.cgroups_path.clone();
                 linux.namespaces = pause_linux.namespaces;
+                linux.resources = pause_linux.resources;
             }
         }
         pod.linux = protobuf::MessageField::some(linux);
@@ -595,25 +1061,41 @@ impl RuntimeServiceImpl {
             }
         }
 
+        let stored_linux_resources = stored_state
+            .as_ref()
+            .and_then(|state| state.linux_resources.as_ref());
+        let stored_cgroup_parent = stored_state
+            .as_ref()
+            .and_then(|state| state.cgroup_parent.clone())
+            .unwrap_or_default();
+        let stored_seccomp_profile = stored_state
+            .as_ref()
+            .and_then(|state| state.seccomp_profile.as_ref());
+
         if nri_container.linux.is_none() {
-            let mut linux = crate::nri_proto::api::LinuxContainer::new();
-            if let Some(resources) = stored_state
-                .as_ref()
-                .and_then(|state| state.linux_resources.as_ref())
-            {
-                linux.resources =
-                    protobuf::MessageField::some(linux_resources_from_cri(&resources.to_proto()));
+            nri_container.linux =
+                protobuf::MessageField::some(crate::nri_proto::api::LinuxContainer::new());
+        }
+
+        if let Some(linux) = nri_container.linux.as_mut() {
+            if let Some(resources) = stored_linux_resources {
+                linux.resources = protobuf::MessageField::some(resources.to_nri());
                 if resources.oom_score_adj != 0 {
                     let mut oom_score_adj = crate::nri_proto::api::OptionalInt::new();
-                    oom_score_adj.value = resources.oom_score_adj as i64;
+                    oom_score_adj.value = resources.oom_score_adj;
                     linux.oom_score_adj = protobuf::MessageField::some(oom_score_adj);
                 }
             }
-            linux.cgroups_path = stored_state
-                .as_ref()
-                .and_then(|state| state.cgroup_parent.clone())
-                .unwrap_or_default();
-            nri_container.linux = protobuf::MessageField::some(linux);
+            if linux.cgroups_path.is_empty() && !stored_cgroup_parent.is_empty() {
+                linux.cgroups_path = stored_cgroup_parent;
+            }
+            if linux.seccomp_profile.is_none() {
+                if let Some(seccomp_profile) =
+                    stored_seccomp_profile.and_then(StoredSecurityProfile::to_nri_seccomp)
+                {
+                    linux.seccomp_profile = protobuf::MessageField::some(seccomp_profile);
+                }
+            }
         }
 
         nri_container
@@ -728,8 +1210,9 @@ impl RuntimeServiceImpl {
     }
 
     fn linux_resources_to_runtime_update_payload(
-        resources: &crate::proto::runtime::v1::LinuxContainerResources,
-    ) -> serde_json::Value {
+        resources: &StoredLinuxResources,
+        blockio_config_path: Option<&str>,
+    ) -> Result<serde_json::Value, Status> {
         let mut payload = serde_json::Map::new();
 
         let mut cpu = serde_json::Map::new();
@@ -741,6 +1224,12 @@ impl RuntimeServiceImpl {
         }
         if resources.cpu_period > 0 {
             cpu.insert("period".to_string(), json!(resources.cpu_period));
+        }
+        if let Some(runtime) = resources.cpu_realtime_runtime {
+            cpu.insert("realtimeRuntime".to_string(), json!(runtime));
+        }
+        if let Some(period) = resources.cpu_realtime_period {
+            cpu.insert("realtimePeriod".to_string(), json!(period));
         }
         if !resources.cpuset_cpus.is_empty() {
             cpu.insert("cpus".to_string(), json!(resources.cpuset_cpus));
@@ -756,11 +1245,29 @@ impl RuntimeServiceImpl {
         if resources.memory_limit_in_bytes > 0 {
             memory.insert("limit".to_string(), json!(resources.memory_limit_in_bytes));
         }
+        if let Some(reservation) = resources.memory_reservation_in_bytes {
+            memory.insert("reservation".to_string(), json!(reservation));
+        }
         if resources.memory_swap_limit_in_bytes > 0 {
             memory.insert(
                 "swap".to_string(),
                 json!(resources.memory_swap_limit_in_bytes),
             );
+        }
+        if let Some(kernel) = resources.memory_kernel_limit_in_bytes {
+            memory.insert("kernel".to_string(), json!(kernel));
+        }
+        if let Some(kernel_tcp) = resources.memory_kernel_tcp_limit_in_bytes {
+            memory.insert("kernelTCP".to_string(), json!(kernel_tcp));
+        }
+        if let Some(swappiness) = resources.memory_swappiness {
+            memory.insert("swappiness".to_string(), json!(swappiness));
+        }
+        if let Some(disable_oom_killer) = resources.memory_disable_oom_killer {
+            memory.insert("disableOOMKiller".to_string(), json!(disable_oom_killer));
+        }
+        if let Some(use_hierarchy) = resources.memory_use_hierarchy {
+            memory.insert("useHierarchy".to_string(), json!(use_hierarchy));
         }
         if !memory.is_empty() {
             payload.insert("memory".to_string(), serde_json::Value::Object(memory));
@@ -789,21 +1296,77 @@ impl RuntimeServiceImpl {
         if !resources.unified.is_empty() {
             payload.insert("unified".to_string(), json!(resources.unified));
         }
+        if let Some(limit) = resources.pids_limit {
+            payload.insert("pids".to_string(), json!({ "limit": limit }));
+        }
+        if !resources.devices.is_empty() {
+            payload.insert(
+                "devices".to_string(),
+                serde_json::Value::Array(
+                    resources
+                        .devices
+                        .iter()
+                        .map(|device| {
+                            let mut entry = serde_json::Map::new();
+                            entry.insert("allow".to_string(), json!(device.allow));
+                            if let Some(device_type) = device.device_type.as_ref() {
+                                entry.insert("type".to_string(), json!(device_type));
+                            }
+                            if let Some(major) = device.major {
+                                entry.insert("major".to_string(), json!(major));
+                            }
+                            if let Some(minor) = device.minor {
+                                entry.insert("minor".to_string(), json!(minor));
+                            }
+                            if let Some(access) = device.access.as_ref() {
+                                entry.insert("access".to_string(), json!(access));
+                            }
+                            serde_json::Value::Object(entry)
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(blockio_class) = resources.blockio_class.as_ref() {
+            if let Some(block_io) = resolve_blockio_class(blockio_class, blockio_config_path)
+                .map_err(|e| Status::internal(format!("Failed to resolve blockio class: {}", e)))?
+            {
+                payload.insert(
+                    "blockIO".to_string(),
+                    serde_json::to_value(block_io).map_err(|e| {
+                        Status::internal(format!("Failed to encode OCI block IO resources: {}", e))
+                    })?,
+                );
+            }
+        }
+        if let Some(rdt_class) = resources.rdt_class.as_ref() {
+            if let Some(intel_rdt) = resolve_rdt_class(rdt_class) {
+                payload.insert(
+                    "intelRdt".to_string(),
+                    serde_json::to_value(intel_rdt).map_err(|e| {
+                        Status::internal(format!("Failed to encode OCI intel RDT resources: {}", e))
+                    })?,
+                );
+            }
+        }
 
-        serde_json::Value::Object(payload)
+        Ok(serde_json::Value::Object(payload))
     }
 
     async fn runtime_update_container_resources(
         &self,
         container_id: &str,
-        resources: &crate::proto::runtime::v1::LinuxContainerResources,
+        resources: &StoredLinuxResources,
     ) -> Result<(), Status> {
         let mut resource_file = NamedTempFile::new_in(&self.config.root_dir)
             .or_else(|_| NamedTempFile::new())
             .map_err(|e| {
                 Status::internal(format!("Failed to create temporary resource file: {}", e))
             })?;
-        let payload = Self::linux_resources_to_runtime_update_payload(resources);
+        let payload = Self::linux_resources_to_runtime_update_payload(
+            resources,
+            Some(&self.nri_config.blockio_config_path),
+        )?;
         serde_json::to_writer(resource_file.as_file_mut(), &payload)
             .map_err(|e| Status::internal(format!("Failed to encode OCI resources: {}", e)))?;
         resource_file
@@ -1490,7 +2053,6 @@ impl RuntimeServiceImpl {
                     windows: None,
                 })
             }),
-            ..Default::default()
         }
     }
 
@@ -2204,10 +2766,10 @@ impl RuntimeServiceImpl {
         container: &Container,
         filter: &crate::proto::runtime::v1::ContainerFilter,
     ) -> bool {
-        if !filter.id.is_empty()
-            && !(container.id == filter.id
-                || container.id.starts_with(&filter.id)
-                || filter.id.starts_with(&container.id))
+        if !(filter.id.is_empty()
+            || container.id == filter.id
+            || container.id.starts_with(&filter.id)
+            || filter.id.starts_with(&container.id))
         {
             return false;
         }
@@ -2218,10 +2780,10 @@ impl RuntimeServiceImpl {
             }
         }
 
-        if !filter.pod_sandbox_id.is_empty()
-            && !(container.pod_sandbox_id == filter.pod_sandbox_id
-                || container.pod_sandbox_id.starts_with(&filter.pod_sandbox_id)
-                || filter.pod_sandbox_id.starts_with(&container.pod_sandbox_id))
+        if !(filter.pod_sandbox_id.is_empty()
+            || container.pod_sandbox_id == filter.pod_sandbox_id
+            || container.pod_sandbox_id.starts_with(&filter.pod_sandbox_id)
+            || filter.pod_sandbox_id.starts_with(&container.pod_sandbox_id))
         {
             return false;
         }
@@ -2290,10 +2852,10 @@ impl RuntimeServiceImpl {
         pod: &crate::proto::runtime::v1::PodSandbox,
         filter: &crate::proto::runtime::v1::PodSandboxFilter,
     ) -> bool {
-        if !filter.id.is_empty()
-            && !(pod.id == filter.id
-                || pod.id.starts_with(&filter.id)
-                || filter.id.starts_with(&pod.id))
+        if !(filter.id.is_empty()
+            || pod.id == filter.id
+            || pod.id.starts_with(&filter.id)
+            || filter.id.starts_with(&pod.id))
         {
             return false;
         }
@@ -2360,22 +2922,23 @@ impl RuntimeServiceImpl {
         }
         config.runtime_handlers = handlers;
 
-        let mut shim_config = ShimConfig::default();
-        shim_config.runtime_path = config.runtime_path.clone();
-        shim_config.work_dir = shim_work_dir;
-        shim_config.debug = std::env::var("CRIUS_SHIM_DEBUG")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        shim_config.shim_path = std::env::var("CRIUS_SHIM_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let local = PathBuf::from("/root/crius/target/debug/crius-shim");
-                if local.exists() {
-                    local
-                } else {
-                    PathBuf::from("crius-shim")
-                }
-            });
+        let shim_config = ShimConfig {
+            runtime_path: config.runtime_path.clone(),
+            work_dir: shim_work_dir,
+            debug: std::env::var("CRIUS_SHIM_DEBUG")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            shim_path: std::env::var("CRIUS_SHIM_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    let local = PathBuf::from("/root/crius/target/debug/crius-shim");
+                    if local.exists() {
+                        local
+                    } else {
+                        PathBuf::from("crius-shim")
+                    }
+                }),
+        };
         let resolved_shim_work_dir = shim_config.work_dir.clone();
 
         let runtime = RuncRuntime::with_shim_and_image_storage(
@@ -2408,6 +2971,7 @@ impl RuntimeServiceImpl {
                         containers: containers.clone(),
                         pod_sandboxes: pod_sandboxes.clone(),
                         config: config.clone(),
+                        nri_config: nri_config.clone(),
                         runtime: runtime.clone(),
                         persistence: persistence.clone(),
                         events: events.clone(),
@@ -2427,7 +2991,7 @@ impl RuntimeServiceImpl {
                 None
             });
 
-        let service = Self {
+        Self {
             containers,
             pod_sandboxes,
             config,
@@ -2441,9 +3005,7 @@ impl RuntimeServiceImpl {
             shim_work_dir: resolved_shim_work_dir,
             runtime_network_config: Arc::new(Mutex::new(runtime_network_config)),
             exit_monitors: Arc::new(Mutex::new(HashSet::new())),
-        };
-
-        service
+        }
     }
 
     pub async fn initialize_nri(&self) -> Result<(), Status> {
@@ -2460,6 +3022,10 @@ impl RuntimeServiceImpl {
             .map_err(|e| Status::internal(format!("Failed to synchronize NRI: {}", e)))
     }
 
+    pub fn nri_handle(&self) -> Arc<dyn NriApi> {
+        self.nri.clone()
+    }
+
     async fn nri_pod_event(&self, pod_id: &str) -> NriPodEvent {
         let pod = {
             let pods = self.pod_sandboxes.lock().await;
@@ -2471,6 +3037,13 @@ impl RuntimeServiceImpl {
             overhead_linux_resources: None,
             linux_resources: None,
         }
+    }
+
+    fn effective_pod_linux_resources(
+        overhead: Option<&crate::proto::runtime::v1::LinuxContainerResources>,
+        resources: Option<&crate::proto::runtime::v1::LinuxContainerResources>,
+    ) -> Option<crate::proto::runtime::v1::LinuxContainerResources> {
+        resources.cloned().or_else(|| overhead.cloned())
     }
 
     #[allow(dead_code)]
@@ -2486,6 +3059,14 @@ impl RuntimeServiceImpl {
         event
     }
 
+    async fn process_nri_stop_side_effects(
+        &self,
+        result: &NriStopContainerResult,
+    ) -> Result<(), Status> {
+        self.process_nri_update_side_effects(&result.updates, &[], "stop")
+            .await
+    }
+
     async fn undo_failed_nri_run_pod_sandbox(&self, pod_id: &str) {
         let event = self.nri_pod_event(pod_id).await;
         if let Err(err) = self.nri.stop_pod_sandbox(event.clone()).await {
@@ -2497,9 +3078,369 @@ impl RuntimeServiceImpl {
     }
 
     async fn undo_failed_nri_start_container(&self, event: NriContainerEvent) {
-        if let Err(err) = self.nri.stop_container(event).await {
-            log::warn!("Undo stop of failed NRI container start failed: {}", err);
+        match self.nri.stop_container(event.clone()).await {
+            Ok(result) => {
+                if let Err(err) = self.process_nri_stop_side_effects(&result).await {
+                    log::warn!(
+                        "Undo stop side effects of failed NRI container start failed: {}",
+                        err
+                    );
+                }
+                if let Some(container) = self
+                    .mutate_container_internal_state(&event.container.id, |state| {
+                        state.nri_stop_notified = true;
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    if let Err(err) =
+                        self.persist_bundle_annotations(&event.container.id, &container.annotations)
+                    {
+                        log::warn!(
+                            "Failed to persist undo stop annotations for {}: {}",
+                            event.container.id,
+                            err
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!("Undo stop of failed NRI container start failed: {}", err);
+            }
         }
+    }
+
+    async fn undo_failed_nri_create_container(&self, event: NriContainerEvent) {
+        match self.nri.stop_container(event.clone()).await {
+            Ok(result) => {
+                if let Err(err) = self.process_nri_stop_side_effects(&result).await {
+                    log::warn!(
+                        "Undo stop side effects of failed NRI container create failed: {}",
+                        err
+                    );
+                }
+            }
+            Err(err) => {
+                log::warn!("Undo stop of failed NRI container create failed: {}", err);
+            }
+        }
+        if let Err(err) = self.nri.remove_container(event).await {
+            log::warn!("Undo remove of failed NRI container create failed: {}", err);
+        }
+    }
+
+    async fn rollback_failed_container_create(
+        &self,
+        container_id: &str,
+        nri_event: NriContainerEvent,
+    ) {
+        self.undo_failed_nri_create_container(nri_event).await;
+
+        {
+            let mut containers = self.containers.lock().await;
+            containers.remove(container_id);
+        }
+
+        {
+            let mut persistence = self.persistence.lock().await;
+            if let Err(err) = persistence.delete_container(container_id) {
+                log::warn!(
+                    "Failed to delete container {} during create rollback: {}",
+                    container_id,
+                    err
+                );
+            }
+        }
+
+        let runtime = self.runtime.clone();
+        let container_id_owned = container_id.to_string();
+        if let Err(err) =
+            tokio::task::spawn_blocking(move || runtime.remove_container(&container_id_owned)).await
+        {
+            log::warn!(
+                "Failed to join runtime remove task for {} during create rollback: {}",
+                container_id,
+                err
+            );
+        }
+    }
+
+    async fn finalize_container_stop_state(
+        &self,
+        container_id: &str,
+        final_runtime_status: ContainerStatus,
+    ) -> Result<Option<Container>, Status> {
+        let mut resolved_exit_code = match &final_runtime_status {
+            ContainerStatus::Stopped(code) => Some(*code),
+            _ => None,
+        };
+
+        let updated_container = {
+            let mut containers = self.containers.lock().await;
+            let Some(container) = containers.get_mut(container_id) else {
+                return Ok(None);
+            };
+
+            container.state = match &final_runtime_status {
+                ContainerStatus::Created => ContainerState::ContainerCreated as i32,
+                ContainerStatus::Running => ContainerState::ContainerRunning as i32,
+                ContainerStatus::Stopped(_) => ContainerState::ContainerExited as i32,
+                ContainerStatus::Unknown => ContainerState::ContainerUnknown as i32,
+            };
+            if let Some(mut state) = Self::read_internal_state::<StoredContainerState>(
+                &container.annotations,
+                INTERNAL_CONTAINER_STATE_KEY,
+            ) {
+                state.finished_at = Some(Self::now_nanos());
+                if resolved_exit_code.is_none() {
+                    resolved_exit_code = state.exit_code;
+                }
+                if let Some(code) = resolved_exit_code {
+                    state.exit_code = Some(code);
+                }
+                if let Err(err) = Self::insert_internal_state(
+                    &mut container.annotations,
+                    INTERNAL_CONTAINER_STATE_KEY,
+                    &state,
+                ) {
+                    log::warn!(
+                        "Failed to persist in-memory container state for {}: {}",
+                        container_id,
+                        err
+                    );
+                }
+            }
+            if container.state == ContainerState::ContainerUnknown as i32
+                && resolved_exit_code.is_some()
+            {
+                container.state = ContainerState::ContainerExited as i32;
+            }
+
+            Some(container.clone())
+        };
+
+        let persistence_status = match &final_runtime_status {
+            ContainerStatus::Created => crate::runtime::ContainerStatus::Created,
+            ContainerStatus::Running => crate::runtime::ContainerStatus::Running,
+            ContainerStatus::Stopped(_) => {
+                crate::runtime::ContainerStatus::Stopped(resolved_exit_code.unwrap_or_default())
+            }
+            ContainerStatus::Unknown => match resolved_exit_code {
+                Some(code) => crate::runtime::ContainerStatus::Stopped(code),
+                None => crate::runtime::ContainerStatus::Unknown,
+            },
+        };
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = persistence.update_container_state(container_id, persistence_status) {
+            log::error!(
+                "Failed to update container {} state in database: {}",
+                container_id,
+                err
+            );
+        }
+        drop(persistence);
+
+        Ok(updated_container)
+    }
+
+    async fn notify_nri_container_stop(
+        &self,
+        container_id: &str,
+        pod_id: &str,
+        annotations: &HashMap<String, String>,
+    ) {
+        let stop_event = self.nri_container_event(pod_id, container_id, annotations).await;
+        match self.nri.stop_container(stop_event).await {
+            Ok(result) => {
+                if let Err(err) = self.process_nri_stop_side_effects(&result).await {
+                    log::warn!(
+                        "NRI stop side effects failed for {}: {}",
+                        container_id,
+                        err
+                    );
+                    return;
+                }
+                if let Err(err) = self
+                    .mutate_container_internal_state(container_id, |state| {
+                        state.nri_stop_notified = true;
+                    })
+                    .await
+                {
+                    log::warn!(
+                        "Failed to mark NRI stop notification for {}: {}",
+                        container_id,
+                        err
+                    );
+                }
+            }
+            Err(err) => {
+                log::warn!("NRI StopContainer failed for {}: {}", container_id, err);
+            }
+        }
+    }
+
+    async fn stop_container_internal(
+        &self,
+        actual_container_id: &str,
+        timeout: u32,
+    ) -> Result<Option<Container>, Status> {
+        let (container_pod_id, container_annotations) = {
+            let containers = self.containers.lock().await;
+            let container = containers
+                .get(actual_container_id)
+                .ok_or_else(|| Status::not_found("Container not found"))?;
+            (
+                container.pod_sandbox_id.clone(),
+                container.annotations.clone(),
+            )
+        };
+        let stop_notified = self
+            .container_internal_state(actual_container_id)
+            .await
+            .map(|state| state.nri_stop_notified)
+            .unwrap_or_default();
+        let runtime_status_before_stop = self
+            .runtime_container_status_checked(actual_container_id)
+            .await;
+        let needs_nri_stop = matches!(
+            runtime_status_before_stop,
+            ContainerStatus::Created | ContainerStatus::Running
+        );
+
+        let runtime = self.runtime.clone();
+        let actual_container_id_owned = actual_container_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            runtime.stop_container(&actual_container_id_owned, Some(timeout))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(|e| Status::internal(format!("Failed to stop container: {}", e)))?;
+
+        let final_runtime_status = {
+            let runtime = self.runtime.clone();
+            let container_id_for_status = actual_container_id.to_string();
+            tokio::task::spawn_blocking(move || runtime.container_status(&container_id_for_status))
+                .await
+                .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+                .unwrap_or(ContainerStatus::Unknown)
+        };
+        let updated_container = self
+            .finalize_container_stop_state(actual_container_id, final_runtime_status)
+            .await?;
+
+        if needs_nri_stop && !stop_notified {
+            let current_annotations = updated_container
+                .as_ref()
+                .map(|container| container.annotations.clone())
+                .unwrap_or(container_annotations);
+            self.notify_nri_container_stop(
+                actual_container_id,
+                &container_pod_id,
+                &current_annotations,
+            )
+            .await;
+        }
+
+        Ok(updated_container)
+    }
+
+    async fn remove_container_internal(
+        &self,
+        actual_container_id: &str,
+    ) -> Result<Option<Container>, Status> {
+        let (container_pod_id, container_annotations) = {
+            let containers = self.containers.lock().await;
+            let container = containers
+                .get(actual_container_id)
+                .ok_or_else(|| Status::not_found("Container not found"))?;
+            (
+                container.pod_sandbox_id.clone(),
+                container.annotations.clone(),
+            )
+        };
+        let stop_notified = self
+            .container_internal_state(actual_container_id)
+            .await
+            .map(|state| state.nri_stop_notified)
+            .unwrap_or_default();
+        let runtime_status = self.runtime_container_status_checked(actual_container_id).await;
+        let needs_nri_stop_before_remove = matches!(
+            runtime_status,
+            ContainerStatus::Created | ContainerStatus::Running
+        );
+        if needs_nri_stop_before_remove && !stop_notified {
+            let updated_container = self.stop_container_internal(actual_container_id, 30).await?;
+            if let Some(container) = updated_container {
+                self.emit_container_event(
+                    ContainerEventType::ContainerStoppedEvent,
+                    &container,
+                    Some(container.state),
+                )
+                .await;
+            }
+        }
+
+        let remove_notified = self
+            .container_internal_state(actual_container_id)
+            .await
+            .map(|state| state.nri_remove_notified)
+            .unwrap_or_default();
+        if !remove_notified {
+            if let Err(err) = self
+                .nri
+                .remove_container(
+                    self.nri_container_event(
+                        &container_pod_id,
+                        actual_container_id,
+                        &container_annotations,
+                    )
+                    .await,
+                )
+                .await
+            {
+                log::warn!(
+                    "NRI RemoveContainer failed for {}: {}",
+                    actual_container_id,
+                    err
+                );
+            }
+            let _ = self
+                .mutate_container_internal_state(actual_container_id, |state| {
+                    state.nri_remove_notified = true;
+                })
+                .await?;
+        }
+
+        let deleted_container = {
+            let containers = self.containers.lock().await;
+            containers.get(actual_container_id).cloned()
+        };
+
+        let runtime = self.runtime.clone();
+        let actual_container_id_owned = actual_container_id.to_string();
+        tokio::task::spawn_blocking(move || runtime.remove_container(&actual_container_id_owned))
+            .await
+            .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+            .map_err(|e| Status::internal(format!("Failed to remove container: {}", e)))?;
+
+        {
+            let mut containers = self.containers.lock().await;
+            containers.remove(actual_container_id);
+        }
+
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = persistence.delete_container(actual_container_id) {
+            log::error!(
+                "Failed to delete container {} from database: {}",
+                actual_container_id,
+                err
+            );
+        } else {
+            log::info!("Container {} removed from database", actual_container_id);
+        }
+
+        Ok(deleted_container)
     }
 
     async fn rollback_failed_pod_sandbox_run(&self, pod_id: &str) {
@@ -2589,6 +3530,7 @@ impl RuntimeServiceImpl {
             containers: self.containers.clone(),
             pod_sandboxes: self.pod_sandboxes.clone(),
             config: self.config.clone(),
+            nri_config: self.nri_config.clone(),
             runtime: self.runtime.clone(),
             persistence: self.persistence.clone(),
             events: self.events.clone(),
@@ -2668,11 +3610,13 @@ impl RuntimeServiceImpl {
             .ok_or_else(|| Status::unavailable("streaming server is not initialized"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn maybe_start_exit_monitor_task(
         monitor_key: String,
         container_id: String,
         exit_code_path: PathBuf,
         config: RuntimeConfig,
+        nri_config: NriConfig,
         runtime: RuncRuntime,
         nri: Arc<dyn NriApi>,
         containers: Arc<Mutex<HashMap<String, Container>>>,
@@ -2732,6 +3676,7 @@ impl RuntimeServiceImpl {
                     &container_id,
                     exit_code,
                     &config,
+                    &nri_config,
                     &runtime,
                     nri.as_ref(),
                     &containers,
@@ -2762,6 +3707,7 @@ impl RuntimeServiceImpl {
         let monitor_key = format!("ctr:{}", container_id);
         let exit_code_path = self.exit_code_path(&container_id);
         let config = self.config.clone();
+        let nri_config = self.nri_config.clone();
         let runtime = self.runtime.clone();
         let nri = self.nri.clone();
         let containers = self.containers.clone();
@@ -2789,6 +3735,7 @@ impl RuntimeServiceImpl {
                 container_id,
                 exit_code_path,
                 config,
+                nri_config,
                 runtime,
                 nri,
                 containers,
@@ -3056,7 +4003,7 @@ impl RuntimeServiceImpl {
             .await;
         let snapshot = Self::build_container_status_snapshot(
             container,
-            runtime_state.unwrap_or_else(|| container.state),
+            runtime_state.unwrap_or(container.state),
         );
         self.publish_event(ContainerEventResponse {
             container_id: container.id.clone(),
@@ -3091,10 +4038,12 @@ impl RuntimeServiceImpl {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_container_exit_from_monitor(
         container_id: &str,
         exit_code: i32,
         config: &RuntimeConfig,
+        nri_config: &NriConfig,
         runtime: &RuncRuntime,
         nri: &dyn NriApi,
         containers: &Arc<Mutex<HashMap<String, Container>>>,
@@ -3152,7 +4101,38 @@ impl RuntimeServiceImpl {
             };
 
             match nri.stop_container(nri_event).await {
-                Ok(()) => {
+                Ok(result) => {
+                    let domain = NriRuntimeDomain {
+                        containers: containers.clone(),
+                        pod_sandboxes: pod_sandboxes.clone(),
+                        config: config.clone(),
+                        nri_config: nri_config.clone(),
+                        runtime: runtime.clone(),
+                        persistence: persistence.clone(),
+                        events: events.clone(),
+                    };
+                    match domain.apply_updates(&result.updates).await {
+                        Ok(failed) if failed.is_empty() => {}
+                        Ok(failed) => {
+                            let failed_ids = failed
+                                .iter()
+                                .map(|update| update.container_id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            log::warn!(
+                                "Exit monitor failed to apply NRI StopContainer updates for {}: {}",
+                                container_id,
+                                failed_ids
+                            );
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "Exit monitor failed to apply NRI StopContainer updates for {}: {}",
+                                container_id,
+                                err
+                            );
+                        }
+                    }
                     let updated_annotations = {
                         let mut containers = containers.lock().await;
                         containers.get_mut(container_id).and_then(|container| {
@@ -3435,8 +4415,7 @@ impl RuntimeServiceImpl {
                 }
             } else {
                 pod_sandbox.runtime_handler.clone()
-            },
-            ..Default::default()
+            }
         }
     }
 
@@ -3896,7 +4875,6 @@ impl RuntimeServiceImpl {
                         labels: serde_json::from_str(&record.labels).unwrap_or_default(),
                         annotations,
                         created_at: record.created_at,
-                        ..Default::default()
                     };
                     let mut container = container;
                     if let Some(mut state) = container_state.clone() {
@@ -3977,7 +4955,6 @@ impl RuntimeServiceImpl {
                         labels: labels.clone(),
                         annotations: annotations.clone(),
                         runtime_handler: recovered_runtime_handler.clone(),
-                        ..Default::default()
                     };
                     log::info!("Recovered pod: {} with state {}", record.id, record.state);
                     memory_pods.insert(record.id.clone(), pod);
@@ -4050,7 +5027,13 @@ impl RuntimeServiceImpl {
                             linux_resources: pod_state
                                 .linux_resources
                                 .as_ref()
-                                .map(StoredLinuxResources::to_proto),
+                                .map(StoredLinuxResources::to_proto)
+                                .or_else(|| {
+                                    pod_state
+                                        .overhead_linux_resources
+                                        .as_ref()
+                                        .map(StoredLinuxResources::to_proto)
+                                }),
                         },
                         netns_path: PathBuf::from(
                             pod_state
@@ -4330,7 +5313,7 @@ impl NriRuntimeDomain {
     async fn runtime_update_container_resources(
         &self,
         container_id: &str,
-        resources: &crate::proto::runtime::v1::LinuxContainerResources,
+        resources: &StoredLinuxResources,
     ) -> crate::nri::Result<()> {
         let mut resource_file = NamedTempFile::new_in(&self.config.root_dir)
             .or_else(|_| NamedTempFile::new())
@@ -4340,7 +5323,11 @@ impl NriRuntimeDomain {
                     e
                 ))
             })?;
-        let payload = RuntimeServiceImpl::linux_resources_to_runtime_update_payload(resources);
+        let payload = RuntimeServiceImpl::linux_resources_to_runtime_update_payload(
+            resources,
+            Some(&self.nri_config.blockio_config_path),
+        )
+        .map_err(|e| crate::nri::NriError::Plugin(e.message().to_string()))?;
         serde_json::to_writer(resource_file.as_file_mut(), &payload).map_err(|e| {
             crate::nri::NriError::Plugin(format!("failed to encode OCI resources: {}", e))
         })?;
@@ -4466,15 +5453,26 @@ impl NriRuntimeDomain {
                 update.container_id
             ))
         })?;
-        let resources =
-            cri_linux_resources_from_nri(linux_update.resources.as_ref().ok_or_else(|| {
-                crate::nri::NriError::InvalidInput(format!(
-                    "container {} update is missing linux resources",
-                    update.container_id
-                ))
-            })?);
+        let resources = linux_update.resources.as_ref().ok_or_else(|| {
+            crate::nri::NriError::InvalidInput(format!(
+                "container {} update is missing linux resources",
+                update.container_id
+            ))
+        })?;
+        let mut stored_resources = self
+            .get_container(&update.container_id)
+            .await
+            .and_then(|container| {
+                RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+                    &container.annotations,
+                    INTERNAL_CONTAINER_STATE_KEY,
+                )
+            })
+            .and_then(|state| state.linux_resources)
+            .unwrap_or_default();
+        stored_resources.apply_nri(resources);
 
-        self.runtime_update_container_resources(&update.container_id, &resources)
+        self.runtime_update_container_resources(&update.container_id, &stored_resources)
             .await?;
 
         let mut updated_container = None;
@@ -4488,7 +5486,7 @@ impl NriRuntimeDomain {
                     INTERNAL_CONTAINER_STATE_KEY,
                 )
                 .unwrap_or_default();
-                state.linux_resources = Some(StoredLinuxResources::from(&resources));
+                state.linux_resources = Some(stored_resources.clone());
                 RuntimeServiceImpl::insert_internal_state(
                     &mut container.annotations,
                     INTERNAL_CONTAINER_STATE_KEY,
@@ -4586,6 +5584,7 @@ impl NriRuntimeDomain {
                 )
                 .unwrap_or_default();
                 state.finished_at = Some(RuntimeServiceImpl::now_nanos());
+                state.nri_stop_notified = true;
                 if let Some(code) = exit_code {
                     state.exit_code = Some(code);
                 }
@@ -4682,10 +5681,14 @@ impl NriDomain for NriRuntimeDomain {
                         update.container_id,
                         err
                     );
-                    failed.push(update.clone());
                     continue;
                 }
-                return Err(err);
+                log::warn!(
+                    "NRI container update for {} failed: {}",
+                    update.container_id,
+                    err
+                );
+                failed.push(update.clone());
             }
         }
         Ok(failed)
@@ -4719,6 +5722,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<RunPodSandboxRequest>,
     ) -> Result<Response<RunPodSandboxResponse>, Status> {
+        let _sync_block = self.nri.block_plugin_sync().await;
         let req = request.into_inner();
         let pod_config = req
             .config
@@ -4728,9 +5732,16 @@ impl RuntimeService for RuntimeServiceImpl {
         let sandbox_security = linux_config
             .as_ref()
             .and_then(|linux| linux.security_context.as_ref());
+        let pod_overhead = linux_config
+            .as_ref()
+            .and_then(|linux| linux.overhead.clone());
         let pod_linux_resources = linux_config
             .as_ref()
-            .and_then(|linux| linux.resources.clone().or_else(|| linux.overhead.clone()));
+            .and_then(|linux| linux.resources.clone());
+        let effective_pod_linux_resources = Self::effective_pod_linux_resources(
+            pod_overhead.as_ref(),
+            pod_linux_resources.as_ref(),
+        );
         let pod_selinux_label = Self::selinux_label_from_proto(
             sandbox_security.and_then(|security| security.selinux_options.as_ref()),
         );
@@ -4864,7 +5875,7 @@ impl RuntimeService for RuntimeServiceImpl {
             ),
             selinux_label: pod_selinux_label.clone(),
             seccomp_profile: pod_seccomp_profile.clone(),
-            linux_resources: pod_linux_resources.clone(),
+            linux_resources: effective_pod_linux_resources.clone(),
         };
 
         // 创建Pod沙箱
@@ -4944,6 +5955,7 @@ impl RuntimeService for RuntimeServiceImpl {
                 ),
                 selinux_label: pod_selinux_label.clone(),
                 seccomp_profile: stored_seccomp_profile.clone(),
+                overhead_linux_resources: pod_overhead.as_ref().map(StoredLinuxResources::from),
                 linux_resources: pod_linux_resources.as_ref().map(StoredLinuxResources::from),
             })
             .unwrap_or_else(|| StoredPodState {
@@ -4953,7 +5965,7 @@ impl RuntimeService for RuntimeServiceImpl {
                     Some(pod_config.log_directory.clone())
                 },
                 runtime_handler: runtime_handler.clone(),
-                runtime_pod_cidr: runtime_pod_cidr,
+                runtime_pod_cidr,
                 cgroup_parent: linux_config.as_ref().and_then(|linux| {
                     (!linux.cgroup_parent.is_empty()).then(|| linux.cgroup_parent.clone())
                 }),
@@ -4992,6 +6004,7 @@ impl RuntimeService for RuntimeServiceImpl {
                 ),
                 selinux_label: pod_selinux_label.clone(),
                 seccomp_profile: stored_seccomp_profile.clone(),
+                overhead_linux_resources: pod_overhead.as_ref().map(StoredLinuxResources::from),
                 linux_resources: pod_linux_resources.as_ref().map(StoredLinuxResources::from),
                 ..Default::default()
             });
@@ -5015,7 +6028,6 @@ impl RuntimeService for RuntimeServiceImpl {
             labels: pod_config.labels.clone(),
             annotations: stored_annotations.clone(),
             runtime_handler: runtime_handler.clone(),
-            ..Default::default()
         };
 
         // 存储Pod沙箱信息到内存
@@ -5100,11 +6112,138 @@ impl RuntimeService for RuntimeServiceImpl {
         }))
     }
 
+    async fn update_pod_sandbox_resources(
+        &self,
+        request: Request<UpdatePodSandboxResourcesRequest>,
+    ) -> Result<Response<UpdatePodSandboxResourcesResponse>, Status> {
+        let _sync_block = self.nri.block_plugin_sync().await;
+        let req = request.into_inner();
+        let pod_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
+        let overhead = req.overhead;
+        let resources = req.resources;
+        let effective_resources =
+            Self::effective_pod_linux_resources(overhead.as_ref(), resources.as_ref());
+        self.nri
+            .update_pod_sandbox(
+                self.nri_pod_update_event(&pod_id, overhead.as_ref(), resources.as_ref())
+                    .await,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("NRI UpdatePodSandbox failed: {}", e)))?;
+        let pause_container_id = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            let pod = pod_sandboxes
+                .get(&pod_id)
+                .ok_or_else(|| Status::not_found("Pod sandbox not found"))?;
+            Self::read_internal_state::<StoredPodState>(&pod.annotations, INTERNAL_POD_STATE_KEY)
+                .and_then(|state| state.pause_container_id)
+                .filter(|pause_container_id| !pause_container_id.is_empty())
+        };
+
+        if let (Some(pause_container_id), Some(resources)) =
+            (pause_container_id.as_deref(), effective_resources.as_ref())
+        {
+            let stored_resources = StoredLinuxResources::from(resources);
+            self.runtime_update_container_resources(pause_container_id, &stored_resources)
+                .await?;
+        }
+
+        {
+            let mut pod_manager = self.pod_manager.lock().await;
+            pod_manager
+                .update_pod_sandbox_resources(&pod_id, effective_resources.clone())
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("Failed to update pod sandbox resources: {}", e))
+                })?;
+        }
+
+        let updated_pod = {
+            let mut pod_sandboxes = self.pod_sandboxes.lock().await;
+            let pod = pod_sandboxes
+                .get_mut(&pod_id)
+                .ok_or_else(|| Status::not_found("Pod sandbox not found"))?;
+            let mut state = Self::read_internal_state::<StoredPodState>(
+                &pod.annotations,
+                INTERNAL_POD_STATE_KEY,
+            )
+            .unwrap_or_default();
+            state.overhead_linux_resources = overhead.as_ref().map(StoredLinuxResources::from);
+            state.linux_resources = resources.as_ref().map(StoredLinuxResources::from);
+            Self::insert_internal_state(&mut pod.annotations, INTERNAL_POD_STATE_KEY, &state)?;
+            pod.clone()
+        };
+
+        let netns_path = Self::read_internal_state::<StoredPodState>(
+            &updated_pod.annotations,
+            INTERNAL_POD_STATE_KEY,
+        )
+        .and_then(|state| state.netns_path)
+        .unwrap_or_default();
+        let mut persistence = self.persistence.lock().await;
+        persistence
+            .save_pod_sandbox(
+                &updated_pod.id,
+                if updated_pod.state == PodSandboxState::SandboxReady as i32 {
+                    "ready"
+                } else {
+                    "notready"
+                },
+                &updated_pod
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.name.clone())
+                    .unwrap_or_default(),
+                &updated_pod
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.namespace.clone())
+                    .unwrap_or_default(),
+                &updated_pod
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.uid.clone())
+                    .unwrap_or_default(),
+                &netns_path,
+                &updated_pod.labels,
+                &updated_pod.annotations,
+                Self::read_internal_state::<StoredPodState>(
+                    &updated_pod.annotations,
+                    INTERNAL_POD_STATE_KEY,
+                )
+                .and_then(|state| state.pause_container_id)
+                .as_deref(),
+                Self::read_internal_state::<StoredPodState>(
+                    &updated_pod.annotations,
+                    INTERNAL_POD_STATE_KEY,
+                )
+                .and_then(|state| state.ip)
+                .as_deref(),
+            )
+            .map_err(|e| Status::internal(format!("Failed to persist pod sandbox: {}", e)))?;
+        drop(persistence);
+
+        if let Err(err) = self
+            .nri
+            .post_update_pod_sandbox(self.nri_pod_event(&pod_id).await)
+            .await
+        {
+            log::warn!(
+                "NRI PostUpdatePodSandbox failed for {}: {}",
+                pod_id,
+                err
+            );
+        }
+
+        Ok(Response::new(UpdatePodSandboxResourcesResponse {}))
+    }
+
     // 停止Pod沙箱
     async fn stop_pod_sandbox(
         &self,
         request: Request<StopPodSandboxRequest>,
     ) -> Result<Response<StopPodSandboxResponse>, Status> {
+        let _sync_block = self.nri.block_plugin_sync().await;
         let req = request.into_inner();
         let Some(pod_id) = self
             .resolve_pod_sandbox_id_if_exists(&req.pod_sandbox_id)
@@ -5114,10 +6253,6 @@ impl RuntimeService for RuntimeServiceImpl {
         };
 
         log::info!("Stopping pod sandbox {}", pod_id);
-        self.nri
-            .stop_pod_sandbox(self.nri_pod_event(&pod_id).await)
-            .await
-            .map_err(|e| Status::internal(format!("NRI StopPodSandbox failed: {}", e)))?;
 
         // 先停止该Pod下的所有业务容器，避免出现Pod已NotReady但容器仍Running。
         let container_ids: Vec<String> = {
@@ -5129,81 +6264,10 @@ impl RuntimeService for RuntimeServiceImpl {
                 .collect()
         };
 
-        let mut post_stop_status: HashMap<String, ContainerStatus> = HashMap::new();
+        let mut stopped_containers = Vec::new();
         for container_id in &container_ids {
-            let runtime = self.runtime.clone();
-            let container_id_clone = container_id.clone();
-            tokio::task::spawn_blocking(move || {
-                runtime.stop_container(&container_id_clone, Some(30))
-            })
-            .await
-            .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-            .map_err(|e| {
-                Status::internal(format!(
-                    "Failed to stop container {} in pod {}: {}",
-                    container_id, pod_id, e
-                ))
-            })?;
-
-            let runtime = self.runtime.clone();
-            let container_id_clone = container_id.clone();
-            let status =
-                tokio::task::spawn_blocking(move || runtime.container_status(&container_id_clone))
-                    .await
-                    .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-                    .unwrap_or(ContainerStatus::Unknown);
-            post_stop_status.insert(container_id.clone(), status);
-        }
-
-        // 更新容器状态到内存
-        {
-            let mut containers = self.containers.lock().await;
-            for container_id in &container_ids {
-                if let Some(container) = containers.get_mut(container_id) {
-                    let status = post_stop_status
-                        .get(container_id)
-                        .cloned()
-                        .unwrap_or(ContainerStatus::Unknown);
-                    container.state = Self::map_runtime_container_state(status.clone());
-                    if let Some(mut state) = Self::read_internal_state::<StoredContainerState>(
-                        &container.annotations,
-                        INTERNAL_CONTAINER_STATE_KEY,
-                    ) {
-                        state.finished_at = Some(Self::now_nanos());
-                        if let ContainerStatus::Stopped(code) = status {
-                            state.exit_code = Some(code);
-                        }
-                        if let Err(e) = Self::insert_internal_state(
-                            &mut container.annotations,
-                            INTERNAL_CONTAINER_STATE_KEY,
-                            &state,
-                        ) {
-                            log::warn!(
-                                "Failed to persist in-memory container state for {}: {}",
-                                container_id,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // 更新容器持久化状态
-        {
-            let mut persistence = self.persistence.lock().await;
-            for container_id in &container_ids {
-                let status = post_stop_status
-                    .get(container_id)
-                    .cloned()
-                    .unwrap_or(ContainerStatus::Unknown);
-                if let Err(e) = persistence.update_container_state(container_id, status) {
-                    log::error!(
-                        "Failed to update container {} state in database: {}",
-                        container_id,
-                        e
-                    );
-                }
+            if let Some(container) = self.stop_container_internal(container_id, 30).await? {
+                stopped_containers.push(container);
             }
         }
 
@@ -5221,6 +6285,11 @@ impl RuntimeService for RuntimeServiceImpl {
         }
         drop(pod_sandboxes);
 
+        let pod_stop_event = self.nri_pod_event(&pod_id).await;
+        if let Err(err) = self.nri.stop_pod_sandbox(pod_stop_event).await {
+            log::warn!("NRI StopPodSandbox failed for {}: {}", pod_id, err);
+        }
+
         // 更新持久化状态
         let mut persistence = self.persistence.lock().await;
         if let Err(e) = persistence.update_pod_state(&pod_id, "notready") {
@@ -5228,13 +6297,6 @@ impl RuntimeService for RuntimeServiceImpl {
         }
 
         log::info!("Pod sandbox {} stopped", pod_id);
-        let stopped_containers: Vec<Container> = {
-            let containers = self.containers.lock().await;
-            container_ids
-                .iter()
-                .filter_map(|container_id| containers.get(container_id).cloned())
-                .collect()
-        };
         for container in stopped_containers {
             self.emit_container_event(
                 ContainerEventType::ContainerStoppedEvent,
@@ -5640,6 +6702,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<RemovePodSandboxRequest>,
     ) -> Result<Response<RemovePodSandboxResponse>, Status> {
+        let _sync_block = self.nri.block_plugin_sync().await;
         let req = request.into_inner();
         let Some(pod_id) = self
             .resolve_pod_sandbox_id_if_exists(&req.pod_sandbox_id)
@@ -5649,14 +6712,11 @@ impl RuntimeService for RuntimeServiceImpl {
         };
 
         log::info!("Removing pod sandbox {}", pod_id);
-        self.nri
-            .remove_pod_sandbox(self.nri_pod_event(&pod_id).await)
-            .await
-            .map_err(|e| Status::internal(format!("NRI RemovePodSandbox failed: {}", e)))?;
         let existing_pod = {
             let pod_sandboxes = self.pod_sandboxes.lock().await;
             pod_sandboxes.get(&pod_id).cloned()
         };
+        let pod_remove_event = self.nri_pod_event(&pod_id).await;
         let existing_container_statuses = self.current_pod_container_snapshots(&pod_id).await;
 
         // Keep a fallback netns name from CRI metadata, so rmp can clean netns
@@ -5669,15 +6729,8 @@ impl RuntimeService for RuntimeServiceImpl {
                 .map(|m| format!("crius-{}-{}", m.namespace, m.name))
         };
 
-        // 删除Pod沙箱
-        let mut pod_manager = self.pod_manager.lock().await;
-        pod_manager
-            .remove_pod_sandbox(&pod_id)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to remove pod sandbox: {}", e)))?;
-
         // 级联删除该Pod下的所有容器（匹配containerd/CRI-O期望行为）
-        let removed_containers: Vec<Container> = {
+        let containers_in_pod: Vec<Container> = {
             let containers = self.containers.lock().await;
             containers
                 .values()
@@ -5685,46 +6738,24 @@ impl RuntimeService for RuntimeServiceImpl {
                 .cloned()
                 .collect()
         };
-        let container_ids: Vec<String> = removed_containers
+        let container_ids: Vec<String> = containers_in_pod
             .iter()
             .map(|container| container.id.clone())
             .collect();
 
+        let mut removed_containers = Vec::new();
         for container_id in &container_ids {
-            let runtime = self.runtime.clone();
-            let container_id_clone = container_id.clone();
-            tokio::task::spawn_blocking(move || runtime.remove_container(&container_id_clone))
-                .await
-                .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-                .map_err(|e| {
-                    Status::internal(format!(
-                        "Failed to remove container {} in pod {}: {}",
-                        container_id, pod_id, e
-                    ))
-                })?;
-        }
-
-        // 从内存中移除容器
-        {
-            let mut containers = self.containers.lock().await;
-            for container_id in &container_ids {
-                containers.remove(container_id);
+            if let Some(container) = self.remove_container_internal(container_id).await? {
+                removed_containers.push(container);
             }
         }
 
-        // 从持久化中移除容器
-        {
-            let mut persistence = self.persistence.lock().await;
-            for container_id in &container_ids {
-                if let Err(e) = persistence.delete_container(container_id) {
-                    log::error!(
-                        "Failed to delete container {} from database: {}",
-                        container_id,
-                        e
-                    );
-                }
-            }
-        }
+        // 删除Pod沙箱
+        let mut pod_manager = self.pod_manager.lock().await;
+        pod_manager
+            .remove_pod_sandbox(&pod_id)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to remove pod sandbox: {}", e)))?;
 
         // Best-effort fallback cleanup for stale netns.
         if let Some(netns_name) = fallback_netns_name {
@@ -5746,6 +6777,10 @@ impl RuntimeService for RuntimeServiceImpl {
             log::error!("Failed to delete pod {} from database: {}", pod_id, e);
         } else {
             log::info!("Pod sandbox {} removed from database", pod_id);
+        }
+
+        if let Err(err) = self.nri.remove_pod_sandbox(pod_remove_event).await {
+            log::warn!("NRI RemovePodSandbox failed for {}: {}", pod_id, err);
         }
 
         log::info!("Pod sandbox {} removed", pod_id);
@@ -5872,6 +6907,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<CreateContainerRequest>,
     ) -> Result<Response<CreateContainerResponse>, Status> {
+        let _sync_block = self.nri.block_plugin_sync().await;
         log::info!("CreateContainer called");
         let req = request.into_inner();
         let pod_sandbox_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
@@ -5992,6 +7028,10 @@ impl RuntimeService for RuntimeServiceImpl {
         let selinux_label =
             Self::selinux_label_from_proto(security.and_then(|ctx| ctx.selinux_options.as_ref()));
         let seccomp_profile = Self::seccomp_profile_from_proto(
+            security.and_then(|ctx| ctx.seccomp.as_ref()),
+            Self::legacy_linux_container_seccomp_profile_path(security),
+        );
+        let stored_seccomp_profile = Self::stored_seccomp_profile_from_proto(
             security.and_then(|ctx| ctx.seccomp.as_ref()),
             Self::legacy_linux_container_seccomp_profile_path(security),
         );
@@ -6164,6 +7204,7 @@ impl RuntimeService for RuntimeServiceImpl {
             supplemental_groups: supplemental_groups.clone(),
             no_new_privileges: security.map(|security| security.no_new_privs),
             apparmor_profile: apparmor_profile.clone(),
+            seccomp_profile: stored_seccomp_profile,
             metadata_name: config
                 .metadata
                 .as_ref()
@@ -6350,18 +7391,40 @@ impl RuntimeService for RuntimeServiceImpl {
             .create_container(nri_event.clone())
             .await
             .map_err(|e| Status::internal(format!("NRI CreateContainer failed: {}", e)))?;
-        validate_container_adjustment(&nri_create_result.adjustment)
-            .map_err(|e| Status::internal(format!("NRI CreateContainer failed: {}", e)))?;
+        if let Err(status) = validate_container_adjustment(&nri_create_result.adjustment)
+            .map_err(|e| Status::internal(format!("NRI CreateContainer failed: {}", e)))
+        {
+            self.rollback_failed_container_create(&container_id, nri_event.clone())
+                .await;
+            return Err(status);
+        }
         for update in &nri_create_result.updates {
-            validate_container_update(update)
-                .map_err(|e| Status::internal(format!("NRI CreateContainer failed: {}", e)))?;
+            if let Err(status) = validate_container_update(update)
+                .map_err(|e| Status::internal(format!("NRI CreateContainer failed: {}", e)))
+            {
+                self.rollback_failed_container_create(&container_id, nri_event.clone())
+                    .await;
+                return Err(status);
+            }
         }
 
-        self.process_nri_create_side_effects(&nri_create_result)
-            .await?;
+        if let Err(status) = self
+            .process_nri_create_side_effects(&nri_create_result)
+            .await
+        {
+            self.rollback_failed_container_create(&container_id, nri_event.clone())
+                .await;
+            return Err(status);
+        }
 
         let mut adjusted_spec = pristine_spec.clone();
-        apply_container_adjustment(&mut adjusted_spec, &nri_create_result.adjustment);
+        apply_container_adjustment_with_blockio_config(
+            &mut adjusted_spec,
+            &nri_create_result.adjustment,
+            Some(&self.nri_config.blockio_config_path),
+        )
+        .map_err(|e| Status::internal(format!("NRI CreateContainer failed: {}", e)))?;
+        Self::sanitize_spec_runtime_resources(&mut adjusted_spec);
         Self::apply_adjusted_annotations(&mut stored_annotations, &nri_create_result.adjustment);
         Self::refresh_nri_event_container_from_spec(
             &mut nri_event,
@@ -6372,12 +7435,19 @@ impl RuntimeService for RuntimeServiceImpl {
         let runtime = self.runtime.clone();
         let requested_container_id = container_id.clone();
         let rootfs = container_config.rootfs.clone();
-        tokio::task::spawn_blocking(move || {
+        let write_bundle_result = tokio::task::spawn_blocking(move || {
             runtime.write_bundle(&requested_container_id, &rootfs, &adjusted_spec)
         })
         .await
-        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-        .map_err(|e| Status::internal(format!("Failed to write container bundle: {}", e)))?;
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))
+        .and_then(|result| {
+            result.map_err(|e| Status::internal(format!("Failed to write container bundle: {}", e)))
+        });
+        if let Err(status) = write_bundle_result {
+            self.rollback_failed_container_create(&container_id, nri_event.clone())
+                .await;
+            return Err(status);
+        }
 
         let created_id = container_id.clone();
 
@@ -6401,7 +7471,6 @@ impl RuntimeService for RuntimeServiceImpl {
                 })
             }),
             image_ref: container_image_ref.clone(),
-            ..Default::default()
         };
 
         // 存储容器信息到内存
@@ -6428,10 +7497,9 @@ impl RuntimeService for RuntimeServiceImpl {
         } else {
             log::info!("Container {} persisted to database", created_id);
         }
-        self.nri
-            .post_create_container(nri_event)
-            .await
-            .map_err(|e| Status::internal(format!("NRI PostCreateContainer failed: {}", e)))?;
+        if let Err(err) = self.nri.post_create_container(nri_event.clone()).await {
+            log::warn!("NRI PostCreateContainer failed for {}: {}", created_id, err);
+        }
         self.emit_container_event(
             ContainerEventType::ContainerCreatedEvent,
             &container,
@@ -6449,6 +7517,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<StartContainerRequest>,
     ) -> Result<Response<StartContainerResponse>, Status> {
+        let _sync_block = self.nri.block_plugin_sync().await;
         let req = request.into_inner();
         let container_id = req.container_id;
 
@@ -6650,10 +7719,20 @@ impl RuntimeService for RuntimeServiceImpl {
             let containers = self.containers.lock().await;
             containers.get(&actual_container_id).cloned()
         } {
-            self.nri
-                .post_start_container(nri_event)
-                .await
-                .map_err(|e| Status::internal(format!("NRI PostStartContainer failed: {}", e)))?;
+            let post_start_event = self
+                .nri_container_event(
+                    &container_pod_id,
+                    &actual_container_id,
+                    &container.annotations,
+                )
+                .await;
+            if let Err(err) = self.nri.post_start_container(post_start_event).await {
+                log::warn!(
+                    "NRI PostStartContainer failed for {}: {}",
+                    actual_container_id,
+                    err
+                );
+            }
             self.emit_container_event(
                 ContainerEventType::ContainerStartedEvent,
                 &container,
@@ -6669,6 +7748,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<StopContainerRequest>,
     ) -> Result<Response<StopContainerResponse>, Status> {
+        let _sync_block = self.nri.block_plugin_sync().await;
         let req = request.into_inner();
         let container_id = req.container_id;
         let timeout = req.timeout as u32;
@@ -6679,131 +7759,12 @@ impl RuntimeService for RuntimeServiceImpl {
         else {
             return Ok(Response::new(StopContainerResponse {}));
         };
-        let (container_pod_id, container_annotations) = {
-            let containers = self.containers.lock().await;
-            let container = containers
-                .get(&actual_container_id)
-                .ok_or_else(|| Status::not_found("Container not found"))?;
-            (
-                container.pod_sandbox_id.clone(),
-                container.annotations.clone(),
-            )
-        };
-        let stop_notified = self
-            .container_internal_state(&actual_container_id)
-            .await
-            .map(|state| state.nri_stop_notified)
-            .unwrap_or_default();
-        if !stop_notified {
-            self.nri
-                .stop_container(
-                    self.nri_container_event(
-                        &container_pod_id,
-                        &actual_container_id,
-                        &container_annotations,
-                    )
-                    .await,
-                )
-                .await
-                .map_err(|e| Status::internal(format!("NRI StopContainer failed: {}", e)))?;
-            let _ = self
-                .mutate_container_internal_state(&actual_container_id, |state| {
-                    state.nri_stop_notified = true;
-                })
-                .await?;
-        }
-
-        // 调用runtime停止容器
-        let runtime = self.runtime.clone();
-        let actual_container_id_clone = actual_container_id.clone();
-        tokio::task::spawn_blocking(move || {
-            runtime.stop_container(&actual_container_id_clone, Some(timeout))
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-        .map_err(|e| Status::internal(format!("Failed to stop container: {}", e)))?;
-
-        let final_runtime_status = {
-            let runtime = self.runtime.clone();
-            let container_id_for_status = actual_container_id.clone();
-            tokio::task::spawn_blocking(move || runtime.container_status(&container_id_for_status))
-                .await
-                .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-                .unwrap_or(ContainerStatus::Unknown)
-        };
-        let mut resolved_exit_code = match &final_runtime_status {
-            ContainerStatus::Stopped(code) => Some(*code),
-            _ => None,
-        };
-
-        // 更新容器状态到内存
-        let mut containers = self.containers.lock().await;
-        if let Some(container) = containers.get_mut(&actual_container_id) {
-            container.state = match &final_runtime_status {
-                ContainerStatus::Created => ContainerState::ContainerCreated as i32,
-                ContainerStatus::Running => ContainerState::ContainerRunning as i32,
-                ContainerStatus::Stopped(_) => ContainerState::ContainerExited as i32,
-                ContainerStatus::Unknown => ContainerState::ContainerUnknown as i32,
-            };
-            if let Some(mut state) = Self::read_internal_state::<StoredContainerState>(
-                &container.annotations,
-                INTERNAL_CONTAINER_STATE_KEY,
-            ) {
-                state.finished_at = Some(Self::now_nanos());
-                if resolved_exit_code.is_none() {
-                    resolved_exit_code = state.exit_code;
-                }
-                if let Some(code) = resolved_exit_code {
-                    state.exit_code = Some(code);
-                }
-                if let Err(e) = Self::insert_internal_state(
-                    &mut container.annotations,
-                    INTERNAL_CONTAINER_STATE_KEY,
-                    &state,
-                ) {
-                    log::warn!(
-                        "Failed to persist in-memory container state for {}: {}",
-                        actual_container_id,
-                        e
-                    );
-                }
-            }
-            if container.state == ContainerState::ContainerUnknown as i32
-                && resolved_exit_code.is_some()
-            {
-                container.state = ContainerState::ContainerExited as i32;
-            }
-        }
-        drop(containers);
-
-        let persistence_status = match &final_runtime_status {
-            ContainerStatus::Created => crate::runtime::ContainerStatus::Created,
-            ContainerStatus::Running => crate::runtime::ContainerStatus::Running,
-            ContainerStatus::Stopped(_) => {
-                crate::runtime::ContainerStatus::Stopped(resolved_exit_code.unwrap_or_default())
-            }
-            ContainerStatus::Unknown => match resolved_exit_code {
-                Some(code) => crate::runtime::ContainerStatus::Stopped(code),
-                None => crate::runtime::ContainerStatus::Unknown,
-            },
-        };
-
-        // 更新持久化状态（标记为已停止）
-        let mut persistence = self.persistence.lock().await;
-        if let Err(e) = persistence.update_container_state(&actual_container_id, persistence_status)
-        {
-            log::error!(
-                "Failed to update container {} state in database: {}",
-                actual_container_id,
-                e
-            );
-        }
+        let updated_container = self
+            .stop_container_internal(&actual_container_id, timeout)
+            .await?;
 
         log::info!("Container {} stopped", actual_container_id);
-        if let Some(container) = {
-            let containers = self.containers.lock().await;
-            containers.get(&actual_container_id).cloned()
-        } {
+        if let Some(container) = updated_container {
             self.emit_container_event(
                 ContainerEventType::ContainerStoppedEvent,
                 &container,
@@ -6819,6 +7780,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<RemoveContainerRequest>,
     ) -> Result<Response<RemoveContainerResponse>, Status> {
+        let _sync_block = self.nri.block_plugin_sync().await;
         let req = request.into_inner();
         let container_id = req.container_id;
 
@@ -6828,68 +7790,7 @@ impl RuntimeService for RuntimeServiceImpl {
         else {
             return Ok(Response::new(RemoveContainerResponse {}));
         };
-        let (container_pod_id, container_annotations) = {
-            let containers = self.containers.lock().await;
-            let container = containers
-                .get(&actual_container_id)
-                .ok_or_else(|| Status::not_found("Container not found"))?;
-            (
-                container.pod_sandbox_id.clone(),
-                container.annotations.clone(),
-            )
-        };
-        let remove_notified = self
-            .container_internal_state(&actual_container_id)
-            .await
-            .map(|state| state.nri_remove_notified)
-            .unwrap_or_default();
-        if !remove_notified {
-            self.nri
-                .remove_container(
-                    self.nri_container_event(
-                        &container_pod_id,
-                        &actual_container_id,
-                        &container_annotations,
-                    )
-                    .await,
-                )
-                .await
-                .map_err(|e| Status::internal(format!("NRI RemoveContainer failed: {}", e)))?;
-            let _ = self
-                .mutate_container_internal_state(&actual_container_id, |state| {
-                    state.nri_remove_notified = true;
-                })
-                .await?;
-        }
-        let deleted_container = {
-            let containers = self.containers.lock().await;
-            containers.get(&actual_container_id).cloned()
-        };
-
-        // 调用runtime删除容器
-        let runtime = self.runtime.clone();
-        let actual_container_id_clone = actual_container_id.clone();
-        tokio::task::spawn_blocking(move || runtime.remove_container(&actual_container_id_clone))
-            .await
-            .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-            .map_err(|e| Status::internal(format!("Failed to remove container: {}", e)))?;
-
-        // 从内存中移除
-        let mut containers = self.containers.lock().await;
-        containers.remove(&actual_container_id);
-        drop(containers);
-
-        // 从持久化存储中删除
-        let mut persistence = self.persistence.lock().await;
-        if let Err(e) = persistence.delete_container(&actual_container_id) {
-            log::error!(
-                "Failed to delete container {} from database: {}",
-                actual_container_id,
-                e
-            );
-        } else {
-            log::info!("Container {} removed from database", actual_container_id);
-        }
+        let deleted_container = self.remove_container_internal(&actual_container_id).await?;
 
         log::info!("Container {} removed", actual_container_id);
         if let Some(container) = deleted_container {
@@ -7794,7 +8695,6 @@ impl RuntimeService for RuntimeServiceImpl {
             linux: Some(crate::proto::runtime::v1::LinuxRuntimeConfiguration {
                 cgroup_driver: self.cgroup_driver() as i32,
             }),
-            ..Default::default()
         };
 
         Ok(Response::new(config))
@@ -7804,6 +8704,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         request: Request<UpdateContainerResourcesRequest>,
     ) -> Result<Response<UpdateContainerResourcesResponse>, Status> {
+        let _sync_block = self.nri.block_plugin_sync().await;
         let req = request.into_inner();
         let container_id = self.resolve_container_id(&req.container_id).await?;
 
@@ -7867,25 +8768,41 @@ impl RuntimeService for RuntimeServiceImpl {
         self.process_nri_update_side_effects(&nri_result.updates, &nri_result.evictions, "update")
             .await?;
 
-        let final_resources = match (linux, nri_result.linux_resources) {
-            (Some(_), Some(resources)) => Some(cri_linux_resources_from_nri(&resources)),
-            (Some(original), None) => Some(original),
-            (None, Some(resources)) => Some(cri_linux_resources_from_nri(&resources)),
-            (None, None) => None,
-        };
+        let mut final_resources = self
+            .container_internal_state(&container_id)
+            .await
+            .and_then(|state| state.linux_resources)
+            .unwrap_or_default();
+        if let Some(original) = linux.as_ref() {
+            final_resources = StoredLinuxResources::from(original);
+        }
+        if let Some(resources) = nri_result.linux_resources.as_ref() {
+            final_resources.apply_nri(resources);
+        }
+        Self::sanitize_stored_runtime_resources(&mut final_resources);
 
-        if let Some(resources) = final_resources {
-            self.runtime_update_container_resources(&container_id, &resources)
+        if linux.is_some() || nri_result.linux_resources.is_some() {
+            self.runtime_update_container_resources(&container_id, &final_resources)
                 .await?;
             self.mutate_container_internal_state(&container_id, |state| {
-                state.linux_resources = Some(StoredLinuxResources::from(&resources));
+                state.linux_resources = Some(final_resources.clone());
             })
             .await?;
         }
-        self.nri
-            .post_update_container(nri_event)
-            .await
-            .map_err(|e| Status::internal(format!("NRI PostUpdateContainer failed: {}", e)))?;
+        let post_update_annotations = {
+            let containers = self.containers.lock().await;
+            containers
+                .get(&container_id)
+                .map(|container| container.annotations.clone())
+                .ok_or_else(|| Status::not_found("Container not found"))?
+        };
+        let mut post_update_event = self
+            .nri_container_event(&container_pod_id, &container_id, &post_update_annotations)
+            .await;
+        post_update_event.linux_resources = Some(final_resources.to_nri());
+        if let Err(err) = self.nri.post_update_container(post_update_event).await {
+            log::warn!("NRI PostUpdateContainer failed for {}: {}", container_id, err);
+        }
 
         Ok(Response::new(UpdateContainerResourcesResponse {}))
     }
@@ -7894,7 +8811,9 @@ impl RuntimeService for RuntimeServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nri::NriUpdateContainerResult;
+    use crate::nri::{
+        apply_container_adjustment, NriStopContainerResult, NriUpdateContainerResult,
+    };
     use crate::storage::ContainerRecord;
     use crate::storage::PodSandboxRecord;
     use std::collections::HashMap;
@@ -7933,12 +8852,199 @@ mod tests {
         RuntimeServiceImpl::new(config)
     }
 
+    #[test]
+    fn cgroup_support_flags_detect_v1_and_v2_layouts() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("memory")).unwrap();
+        fs::create_dir_all(root.join("cpu")).unwrap();
+        fs::create_dir_all(root.join("hugetlb")).unwrap();
+        fs::write(root.join("memory").join("memory.memsw.limit_in_bytes"), "0").unwrap();
+        fs::write(root.join("memory").join("memory.kmem.limit_in_bytes"), "0").unwrap();
+        fs::write(
+            root.join("memory").join("memory.kmem.tcp.limit_in_bytes"),
+            "0",
+        )
+        .unwrap();
+        fs::write(root.join("memory").join("memory.swappiness"), "60").unwrap();
+        fs::write(root.join("memory").join("memory.oom_control"), "0").unwrap();
+        fs::write(root.join("memory").join("memory.use_hierarchy"), "1").unwrap();
+        fs::write(root.join("cpu").join("cpu.rt_runtime_us"), "0").unwrap();
+        fs::write(root.join("cpu").join("cpu.rt_period_us"), "0").unwrap();
+        assert_eq!(
+            RuntimeServiceImpl::cgroup_support_flags_for_root(root),
+            CgroupResourceSupport {
+                swap: true,
+                hugetlb: true,
+                memory_kernel: true,
+                memory_kernel_tcp: true,
+                memory_swappiness: true,
+                memory_disable_oom_killer: true,
+                memory_use_hierarchy: true,
+                cpu_realtime: true,
+            }
+        );
+
+        fs::remove_dir_all(root.join("memory")).unwrap();
+        fs::remove_dir_all(root.join("cpu")).unwrap();
+        fs::remove_dir_all(root.join("hugetlb")).unwrap();
+        fs::write(root.join("cgroup.controllers"), "cpu memory").unwrap();
+        fs::write(root.join("memory.swap.max"), "max").unwrap();
+        fs::write(root.join("hugetlb.2MB.max"), "max").unwrap();
+        assert_eq!(
+            RuntimeServiceImpl::cgroup_support_flags_for_root(root),
+            CgroupResourceSupport {
+                swap: true,
+                hugetlb: true,
+                memory_kernel: false,
+                memory_kernel_tcp: false,
+                memory_swappiness: false,
+                memory_disable_oom_killer: false,
+                memory_use_hierarchy: false,
+                cpu_realtime: false,
+            }
+        );
+    }
+
+    #[test]
+    fn stored_linux_resources_to_nri_omits_cleared_swap_and_hugepages() {
+        let mut resources = StoredLinuxResources {
+            memory_swap_limit_in_bytes: 8192,
+            hugepage_limits: vec![StoredHugepageLimit {
+                page_size: "2MB".to_string(),
+                limit: 1,
+            }],
+            ..Default::default()
+        };
+        RuntimeServiceImpl::sanitize_stored_runtime_resources_with_flags(
+            &mut resources,
+            CgroupResourceSupport {
+                swap: false,
+                hugetlb: false,
+                memory_kernel: false,
+                memory_kernel_tcp: false,
+                memory_swappiness: false,
+                memory_disable_oom_killer: false,
+                memory_use_hierarchy: false,
+                cpu_realtime: false,
+            },
+        );
+
+        let nri = resources.to_nri();
+        assert!(nri
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.swap.as_ref())
+            .is_none());
+        assert!(nri.hugepage_limits.is_empty());
+    }
+
+    #[test]
+    fn sanitize_spec_runtime_resources_clears_unsupported_extended_resources() {
+        let mut spec = crate::oci::spec::Spec {
+            oci_version: "1.0.2".to_string(),
+            process: None,
+            root: None,
+            hostname: None,
+            mounts: None,
+            hooks: None,
+            linux: Some(crate::oci::spec::Linux {
+                namespaces: None,
+                uid_mappings: None,
+                gid_mappings: None,
+                devices: None,
+                net_devices: None,
+                cgroups_path: None,
+                resources: Some(crate::oci::spec::LinuxResources {
+                    memory: Some(crate::oci::spec::LinuxMemory {
+                        limit: None,
+                        swap: Some(8192),
+                        kernel: Some(4096),
+                        kernel_tcp: Some(2048),
+                        reservation: None,
+                        swappiness: Some(60),
+                        disable_oom_killer: Some(true),
+                        use_hierarchy: Some(true),
+                    }),
+                    network: None,
+                    pids: None,
+                    cpu: Some(crate::oci::spec::LinuxCpu {
+                        shares: None,
+                        quota: None,
+                        period: None,
+                        realtime_runtime: Some(1000),
+                        realtime_period: Some(2000),
+                        cpus: None,
+                        mems: None,
+                    }),
+                    block_io: None,
+                    hugepage_limits: Some(vec![crate::oci::spec::LinuxHugepageLimit {
+                        page_size: "2MB".to_string(),
+                        limit: 1,
+                    }]),
+                    devices: None,
+                    intel_rdt: None,
+                    unified: None,
+                }),
+                rootfs_propagation: None,
+                seccomp: None,
+                sysctl: None,
+                mount_label: None,
+                intel_rdt: None,
+            }),
+            annotations: None,
+        };
+
+        RuntimeServiceImpl::sanitize_spec_runtime_resources_with_flags(
+            &mut spec,
+            CgroupResourceSupport {
+                swap: false,
+                hugetlb: false,
+                memory_kernel: false,
+                memory_kernel_tcp: false,
+                memory_swappiness: false,
+                memory_disable_oom_killer: false,
+                memory_use_hierarchy: false,
+                cpu_realtime: false,
+            },
+        );
+
+        let resources = spec
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.resources.as_ref())
+            .unwrap();
+        let memory = resources.memory.as_ref().unwrap();
+        assert!(memory.swap.is_none());
+        assert!(memory.kernel.is_none());
+        assert!(memory.kernel_tcp.is_none());
+        assert!(memory.swappiness.is_none());
+        assert!(memory.disable_oom_killer.is_none());
+        assert!(memory.use_hierarchy.is_none());
+        let cpu = resources.cpu.as_ref().unwrap();
+        assert!(cpu.realtime_runtime.is_none());
+        assert!(cpu.realtime_period.is_none());
+        assert!(resources.hugepage_limits.is_none());
+    }
+
     #[derive(Default)]
     struct FakeNri {
         calls: tokio::sync::Mutex<Vec<&'static str>>,
+        post_start_events: tokio::sync::Mutex<Vec<NriContainerEvent>>,
+        post_update_events: tokio::sync::Mutex<Vec<NriContainerEvent>>,
+        stop_events: tokio::sync::Mutex<Vec<NriContainerEvent>>,
+        stop_pod_events: tokio::sync::Mutex<Vec<NriPodEvent>>,
         fail_run_pod_sandbox: bool,
+        fail_post_update_pod_sandbox: bool,
+        fail_post_create_container: bool,
+        fail_post_start_container: bool,
+        fail_post_update_container: bool,
+        fail_stop_container: bool,
+        fail_remove_container: bool,
         create_result: tokio::sync::Mutex<Option<NriCreateContainerResult>>,
         update_result: tokio::sync::Mutex<Option<NriUpdateContainerResult>>,
+        stop_result: tokio::sync::Mutex<Option<NriStopContainerResult>>,
     }
 
     #[async_trait::async_trait]
@@ -7970,6 +9076,7 @@ mod tests {
 
         async fn stop_pod_sandbox(&self, _event: NriPodEvent) -> crate::nri::Result<()> {
             self.calls.lock().await.push("stop_pod");
+            self.stop_pod_events.lock().await.push(_event);
             Ok(())
         }
 
@@ -7983,6 +9090,16 @@ mod tests {
             Ok(())
         }
 
+        async fn post_update_pod_sandbox(&self, _event: NriPodEvent) -> crate::nri::Result<()> {
+            self.calls.lock().await.push("post_update_pod");
+            if self.fail_post_update_pod_sandbox {
+                return Err(crate::nri::NriError::Plugin(
+                    "forced post update pod failure".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
         async fn create_container(
             &self,
             _event: NriContainerEvent,
@@ -7993,6 +9110,11 @@ mod tests {
 
         async fn post_create_container(&self, _event: NriContainerEvent) -> crate::nri::Result<()> {
             self.calls.lock().await.push("post_create");
+            if self.fail_post_create_container {
+                return Err(crate::nri::NriError::Plugin(
+                    "forced post create failure".to_string(),
+                ));
+            }
             Ok(())
         }
 
@@ -8001,8 +9123,14 @@ mod tests {
             Ok(())
         }
 
-        async fn post_start_container(&self, _event: NriContainerEvent) -> crate::nri::Result<()> {
+        async fn post_start_container(&self, event: NriContainerEvent) -> crate::nri::Result<()> {
             self.calls.lock().await.push("post_start_container");
+            self.post_start_events.lock().await.push(event);
+            if self.fail_post_start_container {
+                return Err(crate::nri::NriError::Plugin(
+                    "forced post start failure".to_string(),
+                ));
+            }
             Ok(())
         }
 
@@ -8022,18 +9150,38 @@ mod tests {
                 }))
         }
 
-        async fn post_update_container(&self, _event: NriContainerEvent) -> crate::nri::Result<()> {
+        async fn post_update_container(&self, event: NriContainerEvent) -> crate::nri::Result<()> {
             self.calls.lock().await.push("post_update_container");
+            self.post_update_events.lock().await.push(event);
+            if self.fail_post_update_container {
+                return Err(crate::nri::NriError::Plugin(
+                    "forced post update failure".to_string(),
+                ));
+            }
             Ok(())
         }
 
-        async fn stop_container(&self, _event: NriContainerEvent) -> crate::nri::Result<()> {
+        async fn stop_container(
+            &self,
+            event: NriContainerEvent,
+        ) -> crate::nri::Result<NriStopContainerResult> {
             self.calls.lock().await.push("stop_container");
-            Ok(())
+            self.stop_events.lock().await.push(event);
+            if self.fail_stop_container {
+                return Err(crate::nri::NriError::Plugin(
+                    "forced stop failure".to_string(),
+                ));
+            }
+            Ok(self.stop_result.lock().await.clone().unwrap_or_default())
         }
 
         async fn remove_container(&self, _event: NriContainerEvent) -> crate::nri::Result<()> {
             self.calls.lock().await.push("remove_container");
+            if self.fail_remove_container {
+                return Err(crate::nri::NriError::Plugin(
+                    "forced remove failure".to_string(),
+                ));
+            }
             Ok(())
         }
     }
@@ -8182,6 +9330,59 @@ exit 0
         script_path
     }
 
+    fn ensure_test_shim_binary() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+
+        ONCE.call_once(|| {
+            let shim_path = PathBuf::from("/root/crius/target/debug/crius-shim");
+            if let Some(parent) = shim_path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+
+            fs::write(
+                &shim_path,
+                r#"#!/bin/sh
+set -eu
+exit_code_file=""
+log_file=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --exit-code-file)
+      exit_code_file="${2:-}"
+      shift 2
+      ;;
+    --log)
+      log_file="${2:-}"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [ -n "$exit_code_file" ]; then
+  shim_dir="$(dirname "$exit_code_file")"
+  mkdir -p "$shim_dir"
+  : > "$shim_dir/attach.sock"
+  : > "$shim_dir/resize.sock"
+fi
+if [ -n "$log_file" ]; then
+  mkdir -p "$(dirname "$log_file")"
+  : > "$log_file"
+fi
+trap 'exit 0' TERM INT
+while :; do
+  sleep 1
+done
+"#,
+            )
+            .unwrap();
+            let mut perms = fs::metadata(&shim_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&shim_path, perms).unwrap();
+        });
+    }
+
     fn test_service_with_fake_runtime() -> (TempDir, RuntimeServiceImpl) {
         let dir = tempdir().unwrap();
         let runtime_path = write_fake_runtime_script(dir.path());
@@ -8196,8 +9397,11 @@ exit 0
             pause_image: "registry.k8s.io/pause:3.9".to_string(),
             cni_config: crate::network::CniConfig::default(),
         };
-        let service =
-            RuntimeServiceImpl::new_with_shim_work_dir(config, NriConfig::default(), shim_work_dir);
+        let nri_config = NriConfig {
+            blockio_config_path: write_blockio_config(&dir).display().to_string(),
+            ..Default::default()
+        };
+        let service = RuntimeServiceImpl::new_with_shim_work_dir(config, nri_config, shim_work_dir);
         (dir, service)
     }
 
@@ -8213,9 +9417,27 @@ exit 0
             .join(format!("{}.update.json", id))
     }
 
+    fn write_blockio_config(dir: &TempDir) -> PathBuf {
+        let path = dir.path().join("blockio.json");
+        fs::write(
+            &path,
+            serde_json::json!({
+                "classes": {
+                    "gold": {
+                        "weight": 500
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        path
+    }
+
     fn test_service_with_fake_runtime_and_nri(
         fake_nri: Arc<dyn NriApi>,
     ) -> (TempDir, RuntimeServiceImpl) {
+        ensure_test_shim_binary();
         let dir = tempdir().unwrap();
         let runtime_path = write_fake_runtime_script(dir.path());
         let shim_work_dir = dir.path().join("shims");
@@ -8229,8 +9451,11 @@ exit 0
             pause_image: "registry.k8s.io/pause:3.9".to_string(),
             cni_config: crate::network::CniConfig::default(),
         };
-        let mut nri_config = NriConfig::default();
-        nri_config.enable = true;
+        let nri_config = NriConfig {
+            enable: true,
+            blockio_config_path: write_blockio_config(&dir).display().to_string(),
+            ..Default::default()
+        };
         let service = RuntimeServiceImpl::new_with_shim_work_dir_and_nri(
             config,
             nri_config,
@@ -8243,8 +9468,10 @@ exit 0
     #[tokio::test]
     async fn initialize_nri_starts_then_synchronizes_once() {
         let fake_nri = Arc::new(FakeNri::default());
-        let mut nri_config = NriConfig::default();
-        nri_config.enable = true;
+        let nri_config = NriConfig {
+            enable: true,
+            ..Default::default()
+        };
         let service = RuntimeServiceImpl::new_with_nri_api(
             test_runtime_config(tempdir().unwrap().keep()),
             nri_config,
@@ -8285,8 +9512,10 @@ exit 0
             fail_run_pod_sandbox: true,
             ..Default::default()
         });
-        let mut nri_config = NriConfig::default();
-        nri_config.enable = true;
+        let nri_config = NriConfig {
+            enable: true,
+            ..Default::default()
+        };
         let root_dir = tempdir().unwrap().keep();
         let service = RuntimeServiceImpl::new_with_nri_api(
             test_runtime_config(root_dir.clone()),
@@ -8345,6 +9574,464 @@ exit 0
             .get_pod_sandbox("pod-rollback")
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn rollback_failed_container_create_undoes_nri_and_local_state() {
+        let fake_nri = Arc::new(FakeNri {
+            fail_post_create_container: true,
+            ..Default::default()
+        });
+        let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+        let container_id = "ctr-create-undo".to_string();
+        let pod_id = "pod-create-undo".to_string();
+        let sidecar_id = "ctr-create-undo-sidecar".to_string();
+
+        service
+            .pod_sandboxes
+            .lock()
+            .await
+            .insert(pod_id.clone(), test_pod(&pod_id, HashMap::new()));
+        service.containers.lock().await.insert(
+            container_id.clone(),
+            test_container(&container_id, &pod_id, HashMap::new()),
+        );
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                &container_id,
+                &pod_id,
+                crate::runtime::ContainerStatus::Created,
+                "busybox:latest",
+                &["/bin/sh".to_string()],
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
+        service.containers.lock().await.insert(
+            sidecar_id.clone(),
+            test_container(&sidecar_id, &pod_id, HashMap::new()),
+        );
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                &sidecar_id,
+                &pod_id,
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &["sleep".to_string()],
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
+        set_fake_runtime_state(&dir, &sidecar_id, "running");
+
+        let mut update = crate::nri_proto::api::ContainerUpdate::new();
+        update.container_id = sidecar_id.clone();
+        let mut linux = crate::nri_proto::api::LinuxContainerUpdate::new();
+        let mut resources = crate::nri_proto::api::LinuxResources::new();
+        let mut cpu = crate::nri_proto::api::LinuxCPU::new();
+        let mut shares = crate::nri_proto::api::OptionalUInt64::new();
+        shares.value = 333;
+        cpu.shares = protobuf::MessageField::some(shares);
+        resources.cpu = protobuf::MessageField::some(cpu);
+        linux.resources = protobuf::MessageField::some(resources);
+        update.linux = protobuf::MessageField::some(linux);
+        *fake_nri.stop_result.lock().await = Some(NriStopContainerResult {
+            updates: vec![update],
+        });
+
+        let event = service
+            .nri_container_event(&pod_id, &container_id, &HashMap::new())
+            .await;
+        fake_nri.create_container(event.clone()).await.unwrap();
+        let _ = fake_nri.post_create_container(event.clone()).await;
+
+        service
+            .rollback_failed_container_create(&container_id, event)
+            .await;
+
+        assert_eq!(
+            fake_nri.calls.lock().await.clone(),
+            vec![
+                "create",
+                "post_create",
+                "stop_container",
+                "remove_container"
+            ]
+        );
+        let containers = service.containers.lock().await;
+        assert!(!containers.contains_key(&container_id));
+        assert!(containers.contains_key(&sidecar_id));
+        drop(containers);
+        assert!(service
+            .persistence
+            .lock()
+            .await
+            .storage()
+            .list_containers()
+            .unwrap()
+            .iter()
+            .all(|container| container.id != container_id));
+        let update_payload: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(fake_runtime_update_path(&dir, &sidecar_id)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(update_payload["cpu"]["shares"], 333);
+    }
+
+    #[tokio::test]
+    async fn update_pod_sandbox_resources_updates_pause_container_and_notifies_nri() {
+        let fake_nri = Arc::new(FakeNri::default());
+        let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+        let pod_id = "pod-update".to_string();
+        let pause_id = "pause-pod-update".to_string();
+        let netns_path = "/var/run/netns/pod-update".to_string();
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                pause_container_id: Some(pause_id.clone()),
+                netns_path: Some(netns_path.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        service.pod_sandboxes.lock().await.insert(
+            pod_id.clone(),
+            crate::proto::runtime::v1::PodSandbox {
+                id: pod_id.clone(),
+                metadata: Some(PodSandboxMetadata {
+                    name: "pod-update".to_string(),
+                    namespace: "default".to_string(),
+                    uid: "uid-update".to_string(),
+                    attempt: 0,
+                }),
+                state: PodSandboxState::SandboxReady as i32,
+                annotations: annotations.clone(),
+                runtime_handler: "runc".to_string(),
+                ..Default::default()
+            },
+        );
+        {
+            let mut pod_manager = service.pod_manager.lock().await;
+            pod_manager.restore_pod_sandbox(crate::pod::PodSandbox {
+                id: pod_id.clone(),
+                config: PodSandboxConfig {
+                    name: "pod-update".to_string(),
+                    namespace: "default".to_string(),
+                    uid: "uid-update".to_string(),
+                    hostname: "pod-update".to_string(),
+                    log_directory: None,
+                    runtime_handler: "runc".to_string(),
+                    labels: Vec::new(),
+                    annotations: Vec::new(),
+                    dns_config: None,
+                    port_mappings: Vec::new(),
+                    network_config: None,
+                    cgroup_parent: None,
+                    sysctls: HashMap::new(),
+                    namespace_options: None,
+                    privileged: false,
+                    run_as_user: None,
+                    run_as_group: None,
+                    supplemental_groups: Vec::new(),
+                    readonly_rootfs: false,
+                    no_new_privileges: None,
+                    apparmor_profile: None,
+                    selinux_label: None,
+                    seccomp_profile: None,
+                    linux_resources: None,
+                },
+                netns_path: PathBuf::from(&netns_path),
+                pause_container_id: pause_id.clone(),
+                state: crate::pod::PodSandboxState::Ready,
+                created_at: 0,
+                ip: String::new(),
+                network_status: None,
+            });
+        }
+        service
+            .persistence
+            .lock()
+            .await
+            .save_pod_sandbox(
+                &pod_id,
+                "ready",
+                "pod-update",
+                "default",
+                "uid-update",
+                &netns_path,
+                &HashMap::new(),
+                &annotations,
+                Some(&pause_id),
+                None,
+            )
+            .unwrap();
+
+        let overhead = crate::proto::runtime::v1::LinuxContainerResources {
+            cpu_shares: 128,
+            ..Default::default()
+        };
+        let resources = crate::proto::runtime::v1::LinuxContainerResources {
+            cpu_shares: 512,
+            memory_limit_in_bytes: 4096,
+            ..Default::default()
+        };
+
+        RuntimeService::update_pod_sandbox_resources(
+            &service,
+            Request::new(UpdatePodSandboxResourcesRequest {
+                pod_sandbox_id: pod_id.clone(),
+                overhead: Some(overhead.clone()),
+                resources: Some(resources.clone()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let update_payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(fake_runtime_update_path(&dir, &pause_id)).unwrap())
+                .unwrap();
+        assert_eq!(update_payload["cpu"]["shares"], 512);
+        assert_eq!(update_payload["memory"]["limit"], 4096);
+        assert_eq!(
+            fake_nri.calls.lock().await.clone(),
+            vec!["update_pod", "post_update_pod"]
+        );
+
+        let updated_pod = service
+            .pod_sandboxes
+            .lock()
+            .await
+            .get(&pod_id)
+            .cloned()
+            .unwrap();
+        let state = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
+            &updated_pod.annotations,
+            INTERNAL_POD_STATE_KEY,
+        )
+        .unwrap();
+        assert_eq!(state.overhead_linux_resources.unwrap().cpu_shares, 128);
+        assert_eq!(state.linux_resources.unwrap().cpu_shares, 512);
+        let pod = service.nri_pod_event(&pod_id).await.pod.unwrap();
+        let pod_linux = pod.linux.unwrap();
+        assert_eq!(
+            pod_linux
+                .pod_overhead
+                .as_ref()
+                .and_then(|resources| resources.cpu.as_ref())
+                .and_then(|cpu| cpu.shares.as_ref())
+                .map(|shares| shares.value),
+            Some(128)
+        );
+        assert_eq!(
+            pod_linux
+                .pod_resources
+                .as_ref()
+                .and_then(|resources| resources.cpu.as_ref())
+                .and_then(|cpu| cpu.shares.as_ref())
+                .map(|shares| shares.value),
+            Some(512)
+        );
+
+        let persisted = service
+            .persistence
+            .lock()
+            .await
+            .storage()
+            .get_pod_sandbox(&pod_id)
+            .unwrap()
+            .unwrap();
+        let persisted_annotations: HashMap<String, String> =
+            serde_json::from_str(&persisted.annotations).unwrap();
+        let persisted_state = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
+            &persisted_annotations,
+            INTERNAL_POD_STATE_KEY,
+        )
+        .unwrap();
+        assert_eq!(
+            persisted_state.overhead_linux_resources.unwrap().cpu_shares,
+            128
+        );
+        assert_eq!(
+            persisted_state
+                .linux_resources
+                .unwrap()
+                .memory_limit_in_bytes,
+            4096
+        );
+    }
+
+    #[tokio::test]
+    async fn update_pod_sandbox_resources_succeeds_when_nri_post_update_fails() {
+        let fake_nri = Arc::new(FakeNri {
+            fail_post_update_pod_sandbox: true,
+            ..Default::default()
+        });
+        let (_dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+        let pod_id = "pod-update-post-fail".to_string();
+        let pause_id = "pause-pod-update-post-fail".to_string();
+        let netns_path = "/var/run/netns/pod-update-post-fail".to_string();
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                pause_container_id: Some(pause_id.clone()),
+                netns_path: Some(netns_path.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        service.pod_sandboxes.lock().await.insert(
+            pod_id.clone(),
+            crate::proto::runtime::v1::PodSandbox {
+                id: pod_id.clone(),
+                metadata: Some(PodSandboxMetadata {
+                    name: "pod-update-post-fail".to_string(),
+                    namespace: "default".to_string(),
+                    uid: "uid-update-post-fail".to_string(),
+                    attempt: 0,
+                }),
+                state: PodSandboxState::SandboxReady as i32,
+                annotations,
+                runtime_handler: "runc".to_string(),
+                ..Default::default()
+            },
+        );
+        {
+            let mut pod_manager = service.pod_manager.lock().await;
+            pod_manager.restore_pod_sandbox(crate::pod::PodSandbox {
+                id: pod_id.clone(),
+                config: PodSandboxConfig {
+                    name: "pod-update-post-fail".to_string(),
+                    namespace: "default".to_string(),
+                    uid: "uid-update-post-fail".to_string(),
+                    hostname: "pod-update-post-fail".to_string(),
+                    log_directory: None,
+                    runtime_handler: "runc".to_string(),
+                    labels: Vec::new(),
+                    annotations: Vec::new(),
+                    dns_config: None,
+                    port_mappings: Vec::new(),
+                    network_config: None,
+                    cgroup_parent: None,
+                    sysctls: HashMap::new(),
+                    namespace_options: None,
+                    privileged: false,
+                    run_as_user: None,
+                    run_as_group: None,
+                    supplemental_groups: Vec::new(),
+                    readonly_rootfs: false,
+                    no_new_privileges: None,
+                    apparmor_profile: None,
+                    selinux_label: None,
+                    seccomp_profile: None,
+                    linux_resources: None,
+                },
+                netns_path: PathBuf::from(&netns_path),
+                pause_container_id: pause_id,
+                state: crate::pod::PodSandboxState::Ready,
+                created_at: 0,
+                ip: String::new(),
+                network_status: None,
+            });
+        }
+
+        RuntimeService::update_pod_sandbox_resources(
+            &service,
+            Request::new(UpdatePodSandboxResourcesRequest {
+                pod_sandbox_id: pod_id,
+                overhead: None,
+                resources: Some(crate::proto::runtime::v1::LinuxContainerResources {
+                    cpu_shares: 256,
+                    ..Default::default()
+                }),
+            }),
+        )
+        .await
+        .expect("post-update pod failure should not fail sandbox resource update");
+
+        assert_eq!(
+            fake_nri.calls.lock().await.clone(),
+            vec!["update_pod", "post_update_pod"]
+        );
+    }
+
+    #[tokio::test]
+    async fn nri_pod_event_uses_pause_spec_resources_for_linux_resources() {
+        let (dir, service) = test_service_with_fake_runtime();
+        let pod_id = "pod-nri-linux-resources".to_string();
+        let pause_id = "pause-nri-linux-resources".to_string();
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                pause_container_id: Some(pause_id.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        service.pod_sandboxes.lock().await.insert(
+            pod_id.clone(),
+            crate::proto::runtime::v1::PodSandbox {
+                id: pod_id.clone(),
+                annotations,
+                ..Default::default()
+            },
+        );
+
+        write_test_bundle_config_with_linux(
+            &dir,
+            &pause_id,
+            &HashMap::new(),
+            serde_json::json!({
+                "resources": {
+                    "memory": {
+                        "limit": 8192
+                    },
+                    "cpu": {
+                        "shares": 1024
+                    }
+                }
+            }),
+        );
+
+        let pod = service.nri_pod_event(&pod_id).await.pod.unwrap();
+        let linux = pod.linux.unwrap();
+        let resources = linux
+            .resources
+            .into_option()
+            .expect("pause OCI resources should be exposed");
+        assert_eq!(
+            resources
+                .memory
+                .as_ref()
+                .and_then(|memory| memory.limit.as_ref())
+                .map(|limit| limit.value),
+            Some(8192)
+        );
+        assert_eq!(
+            resources
+                .cpu
+                .as_ref()
+                .and_then(|cpu| cpu.shares.as_ref())
+                .map(|shares| shares.value),
+            Some(1024)
+        );
     }
 
     #[tokio::test]
@@ -8492,7 +10179,7 @@ exit 0
             .process_nri_create_side_effects(&create_result)
             .await
             .unwrap();
-        apply_container_adjustment(&mut spec, &create_result.adjustment);
+        apply_container_adjustment(&mut spec, &create_result.adjustment).unwrap();
         RuntimeServiceImpl::apply_adjusted_annotations(
             &mut stored_annotations,
             &create_result.adjustment,
@@ -8586,6 +10273,29 @@ exit 0
         .unwrap();
     }
 
+    fn write_test_bundle_config_with_linux(
+        dir: &TempDir,
+        container_id: &str,
+        annotations: &HashMap<String, String>,
+        linux: serde_json::Value,
+    ) {
+        let bundle_dir = dir.path().join("runtime-root").join(container_id);
+        fs::create_dir_all(&bundle_dir).unwrap();
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::json!({
+                "ociVersion": "1.0.2",
+                "annotations": annotations,
+                "root": {
+                    "path": "/tmp/rootfs"
+                },
+                "linux": linux,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
     fn test_container(
         id: &str,
         pod_sandbox_id: &str,
@@ -8627,7 +10337,6 @@ exit 0
             labels: HashMap::new(),
             annotations,
             runtime_handler: "runc".to_string(),
-            ..Default::default()
         }
     }
 
@@ -8736,6 +10445,90 @@ exit 0
         ));
 
         assert_eq!(label.as_deref(), Some("system_u:system_r:spc_t:s0"));
+    }
+
+    #[test]
+    fn build_nri_container_from_proto_preserves_spec_cgroups_path() {
+        let (_dir, service) = test_service_with_fake_runtime();
+        let mut spec = crate::oci::spec::Spec::new("1.0.2");
+        spec.linux = Some(crate::oci::spec::Linux {
+            namespaces: None,
+            uid_mappings: None,
+            gid_mappings: None,
+            devices: None,
+            net_devices: None,
+            cgroups_path: Some("/kubepods.slice/pod123/ctr.scope".to_string()),
+            resources: None,
+            rootfs_propagation: None,
+            seccomp: None,
+            sysctl: None,
+            mount_label: None,
+            intel_rdt: None,
+        });
+        service
+            .runtime
+            .write_bundle("container-cgroup-path", Path::new("/tmp"), &spec)
+            .unwrap();
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                cgroup_parent: Some("kubepods.slice/pod123".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let container = Container {
+            id: "container-cgroup-path".to_string(),
+            pod_sandbox_id: "pod-1".to_string(),
+            annotations,
+            ..Default::default()
+        };
+
+        let nri = RuntimeServiceImpl::build_nri_container_from_proto(&service.runtime, &container);
+        let linux = nri.linux.unwrap();
+        assert_eq!(linux.cgroups_path, "/kubepods.slice/pod123/ctr.scope");
+    }
+
+    #[test]
+    fn build_nri_container_from_proto_exposes_stored_seccomp_profile() {
+        let (_dir, service) = test_service_with_fake_runtime();
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState {
+                seccomp_profile: Some(StoredSecurityProfile {
+                    profile_type:
+                        crate::proto::runtime::v1::security_profile::ProfileType::Localhost as i32,
+                    localhost_ref: "/etc/seccomp/workload.json".to_string(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let container = Container {
+            id: "container-seccomp".to_string(),
+            pod_sandbox_id: "pod-1".to_string(),
+            annotations,
+            ..Default::default()
+        };
+
+        let nri = RuntimeServiceImpl::build_nri_container_from_proto(&service.runtime, &container);
+        let profile = nri
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.seccomp_profile.as_ref())
+            .expect("seccomp profile should be present");
+        assert_eq!(
+            profile.profile_type.enum_value().unwrap(),
+            crate::nri_proto::api::security_profile::ProfileType::LOCALHOST
+        );
+        assert_eq!(profile.localhost_ref, "/etc/seccomp/workload.json");
     }
 
     #[test]
@@ -9182,6 +10975,7 @@ exit 0
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn attach_recreates_tty_shim_when_socket_is_missing() {
         let _guard = env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
@@ -9461,7 +11255,7 @@ sleep 1
         let config: serde_json::Value =
             serde_json::from_str(response.info.get("config").unwrap()).unwrap();
         assert_eq!(config["runtimeName"], "crius");
-        assert!(config["runtimeHandlers"].as_array().unwrap().len() >= 1);
+        assert!(!config["runtimeHandlers"].as_array().unwrap().is_empty());
         assert_eq!(config["recovery"]["startupReconcile"], true);
         assert_eq!(config["recovery"]["eventReplayOnRecovery"], false);
         assert_eq!(config["runtimeFeatures"]["updateContainerResources"], true);
@@ -10078,9 +11872,86 @@ exit 0
             .cloned()
             .unwrap();
         assert_eq!(container.state, ContainerState::ContainerRunning as i32);
+
+        let post_start_event = fake_nri
+            .post_start_events
+            .lock()
+            .await
+            .last()
+            .cloned()
+            .expect("post start event should be recorded");
+        assert_eq!(
+            post_start_event.container.state.enum_value().unwrap(),
+            crate::nri_proto::api::ContainerState::CONTAINER_RUNNING
+        );
+        assert!(post_start_event.container.started_at > 0);
     }
 
     #[tokio::test]
+    async fn start_container_succeeds_when_nri_post_start_fails() {
+        let fake_nri = Arc::new(FakeNri {
+            fail_post_start_container: true,
+            ..Default::default()
+        });
+        let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+
+        service.pod_sandboxes.lock().await.insert(
+            "pod-start-post-fail".to_string(),
+            test_pod("pod-start-post-fail", HashMap::new()),
+        );
+        service.containers.lock().await.insert(
+            "container-start-post-fail".to_string(),
+            test_container(
+                "container-start-post-fail",
+                "pod-start-post-fail",
+                annotations.clone(),
+            ),
+        );
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-start-post-fail",
+                "pod-start-post-fail",
+                crate::runtime::ContainerStatus::Created,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+        write_test_bundle_config(&dir, "container-start-post-fail", &annotations);
+
+        RuntimeService::start_container(
+            &service,
+            Request::new(StartContainerRequest {
+                container_id: "container-start-post-fail".to_string(),
+            }),
+        )
+        .await
+        .expect("post-start failure should not fail start");
+
+        let container = service
+            .containers
+            .lock()
+            .await
+            .get("container-start-post-fail")
+            .cloned()
+            .unwrap();
+        assert_eq!(container.state, ContainerState::ContainerRunning as i32);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn start_container_undoes_nri_when_runtime_start_fails() {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var("CRIUS_SHIM_PATH", "/definitely/missing/crius-shim");
@@ -10124,6 +11995,41 @@ exit 0
             .unwrap();
         write_test_bundle_config(&dir, "container-start-fail", &annotations);
 
+        let mut update = crate::nri_proto::api::ContainerUpdate::new();
+        update.container_id = "container-sidecar".to_string();
+        let mut linux = crate::nri_proto::api::LinuxContainerUpdate::new();
+        let mut resources = crate::nri_proto::api::LinuxResources::new();
+        let mut cpu = crate::nri_proto::api::LinuxCPU::new();
+        let mut shares = crate::nri_proto::api::OptionalUInt64::new();
+        shares.value = 256;
+        cpu.shares = protobuf::MessageField::some(shares);
+        resources.cpu = protobuf::MessageField::some(cpu);
+        linux.resources = protobuf::MessageField::some(resources);
+        update.linux = protobuf::MessageField::some(linux);
+        *fake_nri.stop_result.lock().await = Some(NriStopContainerResult {
+            updates: vec![update],
+        });
+
+        service.containers.lock().await.insert(
+            "container-sidecar".to_string(),
+            test_container("container-sidecar", "pod-start-fail", annotations.clone()),
+        );
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-sidecar",
+                "pod-start-fail",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+        set_fake_runtime_state(&dir, "container-sidecar", "running");
+
         let err = RuntimeService::start_container(
             &service,
             Request::new(StartContainerRequest {
@@ -10147,6 +12053,88 @@ exit 0
             .cloned()
             .unwrap();
         assert_eq!(container.state, ContainerState::ContainerCreated as i32);
+        let state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        )
+        .unwrap();
+        assert!(state.nri_stop_notified);
+
+        let sidecar_update_payload: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(fake_runtime_update_path(&dir, "container-sidecar")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sidecar_update_payload["cpu"]["shares"], 256);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn remove_after_failed_start_does_not_repeat_nri_stop() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("CRIUS_SHIM_PATH", "/definitely/missing/crius-shim");
+        let fake_nri = Arc::new(FakeNri::default());
+        let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+        std::env::remove_var("CRIUS_SHIM_PATH");
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+
+        service.pod_sandboxes.lock().await.insert(
+            "pod-start-remove".to_string(),
+            test_pod("pod-start-remove", HashMap::new()),
+        );
+        service.containers.lock().await.insert(
+            "container-start-remove".to_string(),
+            test_container(
+                "container-start-remove",
+                "pod-start-remove",
+                annotations.clone(),
+            ),
+        );
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-start-remove",
+                "pod-start-remove",
+                crate::runtime::ContainerStatus::Created,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+        write_test_bundle_config(&dir, "container-start-remove", &annotations);
+
+        let err = RuntimeService::start_container(
+            &service,
+            Request::new(StartContainerRequest {
+                container_id: "container-start-remove".to_string(),
+            }),
+        )
+        .await
+        .expect_err("runtime start failure should be surfaced");
+        assert_eq!(err.code(), tonic::Code::Internal);
+
+        RuntimeService::remove_container(
+            &service,
+            Request::new(RemoveContainerRequest {
+                container_id: "container-start-remove".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fake_nri.calls.lock().await.clone(),
+            vec!["start_container", "stop_container", "remove_container"]
+        );
     }
 
     #[tokio::test]
@@ -10222,6 +12210,172 @@ exit 0
     }
 
     #[tokio::test]
+    async fn stop_container_notifies_nri_with_post_stop_state() {
+        let fake_nri = Arc::new(FakeNri::default());
+        let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+
+        service
+            .pod_sandboxes
+            .lock()
+            .await
+            .insert("pod-stop-state".to_string(), test_pod("pod-stop-state", HashMap::new()));
+        service.containers.lock().await.insert(
+            "container-stop-state".to_string(),
+            test_container("container-stop-state", "pod-stop-state", annotations.clone()),
+        );
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-stop-state",
+                "pod-stop-state",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+        set_fake_runtime_state(&dir, "container-stop-state", "running");
+
+        RuntimeService::stop_container(
+            &service,
+            Request::new(StopContainerRequest {
+                container_id: "container-stop-state".to_string(),
+                timeout: 1,
+            }),
+        )
+        .await
+        .expect("stop should succeed");
+
+        let stop_event = fake_nri
+            .stop_events
+            .lock()
+            .await
+            .last()
+            .cloned()
+            .expect("stop event should be recorded");
+        assert_eq!(
+            stop_event.container.state.enum_value().unwrap(),
+            crate::nri_proto::api::ContainerState::CONTAINER_STOPPED
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_container_succeeds_when_nri_stop_fails() {
+        let fake_nri = Arc::new(FakeNri {
+            fail_stop_container: true,
+            ..Default::default()
+        });
+        let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+
+        service
+            .pod_sandboxes
+            .lock()
+            .await
+            .insert("pod-stop-fail".to_string(), test_pod("pod-stop-fail", HashMap::new()));
+        service.containers.lock().await.insert(
+            "container-stop-fail".to_string(),
+            test_container("container-stop-fail", "pod-stop-fail", annotations.clone()),
+        );
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-stop-fail",
+                "pod-stop-fail",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+        set_fake_runtime_state(&dir, "container-stop-fail", "running");
+
+        RuntimeService::stop_container(
+            &service,
+            Request::new(StopContainerRequest {
+                container_id: "container-stop-fail".to_string(),
+                timeout: 1,
+            }),
+        )
+        .await
+        .expect("NRI stop failure should not fail container stop");
+    }
+
+    #[tokio::test]
+    async fn stop_container_skips_nri_for_already_exited_container() {
+        let fake_nri = Arc::new(FakeNri::default());
+        let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+
+        service.pod_sandboxes.lock().await.insert(
+            "pod-exited".to_string(),
+            test_pod("pod-exited", HashMap::new()),
+        );
+        let mut container = test_container("container-exited", "pod-exited", annotations.clone());
+        container.state = ContainerState::ContainerExited as i32;
+        service
+            .containers
+            .lock()
+            .await
+            .insert("container-exited".to_string(), container);
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-exited",
+                "pod-exited",
+                crate::runtime::ContainerStatus::Stopped(17),
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+        set_fake_runtime_state(&dir, "container-exited", "stopped");
+
+        RuntimeService::stop_container(
+            &service,
+            Request::new(StopContainerRequest {
+                container_id: "container-exited".to_string(),
+                timeout: 1,
+            }),
+        )
+        .await
+        .expect("stop should succeed");
+
+        assert!(fake_nri.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn remove_container_notifies_nri_only_once_across_repeat_calls() {
         let fake_nri = Arc::new(FakeNri::default());
         let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
@@ -10278,6 +12432,203 @@ exit 0
         assert_eq!(
             fake_nri.calls.lock().await.clone(),
             vec!["remove_container"]
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_container_succeeds_when_nri_remove_fails() {
+        let fake_nri = Arc::new(FakeNri {
+            fail_remove_container: true,
+            ..Default::default()
+        });
+        let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+
+        service.pod_sandboxes.lock().await.insert(
+            "pod-remove-fail".to_string(),
+            test_pod("pod-remove-fail", HashMap::new()),
+        );
+        service.containers.lock().await.insert(
+            "container-remove-fail".to_string(),
+            test_container(
+                "container-remove-fail",
+                "pod-remove-fail",
+                annotations.clone(),
+            ),
+        );
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-remove-fail",
+                "pod-remove-fail",
+                crate::runtime::ContainerStatus::Stopped(0),
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+        set_fake_runtime_state(&dir, "container-remove-fail", "stopped");
+
+        RuntimeService::remove_container(
+            &service,
+            Request::new(RemoveContainerRequest {
+                container_id: "container-remove-fail".to_string(),
+            }),
+        )
+        .await
+        .expect("NRI remove failure should not fail container removal");
+    }
+
+    #[tokio::test]
+    async fn remove_container_notifies_nri_stop_before_remove_for_running_container() {
+        let fake_nri = Arc::new(FakeNri::default());
+        let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+
+        service.pod_sandboxes.lock().await.insert(
+            "pod-remove-running".to_string(),
+            test_pod("pod-remove-running", HashMap::new()),
+        );
+        service.containers.lock().await.insert(
+            "container-remove-running".to_string(),
+            test_container(
+                "container-remove-running",
+                "pod-remove-running",
+                annotations.clone(),
+            ),
+        );
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-remove-running",
+                "pod-remove-running",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+        set_fake_runtime_state(&dir, "container-remove-running", "running");
+
+        RuntimeService::remove_container(
+            &service,
+            Request::new(RemoveContainerRequest {
+                container_id: "container-remove-running".to_string(),
+            }),
+        )
+        .await
+        .expect("remove should succeed");
+
+        assert_eq!(
+            fake_nri.calls.lock().await.clone(),
+            vec!["stop_container", "remove_container"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_pod_sandbox_stops_member_containers_before_pod_notification() {
+        let fake_nri = Arc::new(FakeNri::default());
+        let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+        service
+            .pod_sandboxes
+            .lock()
+            .await
+            .insert("pod-stop-order".to_string(), test_pod("pod-stop-order", HashMap::new()));
+        service.containers.lock().await.insert(
+            "container-under-pod-stop".to_string(),
+            test_container("container-under-pod-stop", "pod-stop-order", HashMap::new()),
+        );
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-under-pod-stop",
+                "pod-stop-order",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
+        set_fake_runtime_state(&dir, "container-under-pod-stop", "running");
+
+        RuntimeService::stop_pod_sandbox(
+            &service,
+            Request::new(StopPodSandboxRequest {
+                pod_sandbox_id: "pod-stop-order".to_string(),
+            }),
+        )
+        .await
+        .expect("pod stop should succeed");
+
+        assert_eq!(fake_nri.calls.lock().await.clone(), vec!["stop_container", "stop_pod"]);
+        assert_eq!(fake_nri.stop_pod_events.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_pod_sandbox_removes_member_containers_before_pod_notification() {
+        let fake_nri = Arc::new(FakeNri::default());
+        let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+        service.pod_sandboxes.lock().await.insert(
+            "pod-remove-order".to_string(),
+            test_pod("pod-remove-order", HashMap::new()),
+        );
+        service.containers.lock().await.insert(
+            "container-under-pod-remove".to_string(),
+            test_container("container-under-pod-remove", "pod-remove-order", HashMap::new()),
+        );
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-under-pod-remove",
+                "pod-remove-order",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
+        set_fake_runtime_state(&dir, "container-under-pod-remove", "running");
+
+        RuntimeService::remove_pod_sandbox(
+            &service,
+            Request::new(RemovePodSandboxRequest {
+                pod_sandbox_id: "pod-remove-order".to_string(),
+            }),
+        )
+        .await
+        .expect("pod remove should succeed");
+
+        assert_eq!(
+            fake_nri.calls.lock().await.clone(),
+            vec!["stop_container", "remove_container", "remove_pod"]
         );
     }
 
@@ -10729,10 +13080,99 @@ exit 0
             fake_nri.calls.lock().await.clone(),
             vec!["update_container", "post_update_container"]
         );
+
+        let post_update_event = fake_nri
+            .post_update_events
+            .lock()
+            .await
+            .last()
+            .cloned()
+            .expect("post update event should be recorded");
+        let post_update_linux = post_update_event
+            .container
+            .linux
+            .as_ref()
+            .expect("post update container should include linux state");
+        assert_eq!(
+            post_update_linux
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.cpu.as_ref())
+                .and_then(|cpu| cpu.shares.as_ref())
+                .map(|value| value.value),
+            Some(1024)
+        );
     }
 
     #[tokio::test]
-    async fn update_container_resources_rejects_unsupported_nri_resources() {
+    async fn update_container_resources_succeeds_when_nri_post_update_fails() {
+        let fake_nri = Arc::new(FakeNri {
+            fail_post_update_container: true,
+            ..Default::default()
+        });
+        let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+        service.pod_sandboxes.lock().await.insert(
+            "pod-update-post-fail".to_string(),
+            test_pod("pod-update-post-fail", HashMap::new()),
+        );
+
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+        service.containers.lock().await.insert(
+            "container-update-post-fail".to_string(),
+            test_container(
+                "container-update-post-fail",
+                "pod-update-post-fail",
+                annotations.clone(),
+            ),
+        );
+        set_fake_runtime_state(&dir, "container-update-post-fail", "running");
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-update-post-fail",
+                "pod-update-post-fail",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+
+        RuntimeService::update_container_resources(
+            &service,
+            Request::new(UpdateContainerResourcesRequest {
+                container_id: "container-update-post-fail".to_string(),
+                linux: Some(crate::proto::runtime::v1::LinuxContainerResources {
+                    cpu_shares: 512,
+                    ..Default::default()
+                }),
+                windows: None,
+                annotations: HashMap::new(),
+            }),
+        )
+        .await
+        .expect("post-update failure should not fail resource update");
+
+        let payload: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(fake_runtime_update_path(&dir, "container-update-post-fail"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["cpu"]["shares"], 512);
+    }
+
+    #[tokio::test]
+    async fn update_container_resources_applies_extended_nri_resources() {
         let fake_nri = Arc::new(FakeNri::default());
         let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
 
@@ -10769,19 +13209,45 @@ exit 0
             )
             .unwrap();
 
-        let mut unsupported = crate::nri_proto::api::LinuxResources::new();
-        unsupported.pids = Some(crate::nri_proto::api::LinuxPids {
+        let mut extended = crate::nri_proto::api::LinuxResources::new();
+        let mut memory = crate::nri_proto::api::LinuxMemory::new();
+        let mut reservation = crate::nri_proto::api::OptionalInt64::new();
+        reservation.value = 4096;
+        memory.reservation = protobuf::MessageField::some(reservation);
+        extended.memory = protobuf::MessageField::some(memory);
+        extended.pids = Some(crate::nri_proto::api::LinuxPids {
             limit: 42,
             ..Default::default()
         })
         .into();
+        extended
+            .devices
+            .push(crate::nri_proto::api::LinuxDeviceCgroup {
+                allow: true,
+                type_: "c".to_string(),
+                access: "rwm".to_string(),
+                major: {
+                    let mut value = crate::nri_proto::api::OptionalInt64::new();
+                    value.value = 10;
+                    protobuf::MessageField::some(value)
+                },
+                minor: {
+                    let mut value = crate::nri_proto::api::OptionalInt64::new();
+                    value.value = 200;
+                    protobuf::MessageField::some(value)
+                },
+                ..Default::default()
+            });
+        let mut blockio_class = crate::nri_proto::api::OptionalString::new();
+        blockio_class.value = "gold".to_string();
+        extended.blockio_class = protobuf::MessageField::some(blockio_class);
         *fake_nri.update_result.lock().await = Some(NriUpdateContainerResult {
-            linux_resources: Some(unsupported),
+            linux_resources: Some(extended),
             updates: Vec::new(),
             evictions: Vec::new(),
         });
 
-        let err = RuntimeService::update_container_resources(
+        RuntimeService::update_container_resources(
             &service,
             Request::new(UpdateContainerResourcesRequest {
                 container_id: "container-running".to_string(),
@@ -10794,15 +13260,156 @@ exit 0
             }),
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(err.code(), tonic::Code::Internal);
-        assert!(err.message().contains("unsupported field linux.resources.pids"));
-        assert_eq!(fake_nri.calls.lock().await.clone(), vec!["update_container"]);
-        assert!(
-            !fake_runtime_update_path(&dir, "container-running").exists(),
-            "runtime update should not run after validation failure"
+        let payload: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(fake_runtime_update_path(&dir, "container-running")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["cpu"]["shares"], 256);
+        assert_eq!(payload["memory"]["reservation"], 4096);
+        assert_eq!(payload["pids"]["limit"], 42);
+        assert_eq!(payload["devices"][0]["type"], "c");
+        assert_eq!(payload["devices"][0]["major"], 10);
+        assert_eq!(payload["devices"][0]["minor"], 200);
+        assert_eq!(payload["devices"][0]["access"], "rwm");
+        assert_eq!(payload["blockIO"]["weight"], 500);
+        assert_eq!(
+            fake_nri.calls.lock().await.clone(),
+            vec!["update_container", "post_update_container"]
         );
+
+        let container = service
+            .containers
+            .lock()
+            .await
+            .get("container-running")
+            .cloned()
+            .unwrap();
+        let state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        )
+        .unwrap();
+        let resources = state.linux_resources.unwrap();
+        assert_eq!(resources.cpu_shares, 256);
+        assert_eq!(resources.memory_reservation_in_bytes, Some(4096));
+        assert_eq!(resources.pids_limit, Some(42));
+        assert_eq!(resources.devices.len(), 1);
+        assert_eq!(resources.devices[0].device_type.as_deref(), Some("c"));
+        assert_eq!(resources.devices[0].major, Some(10));
+        assert_eq!(resources.devices[0].minor, Some(200));
+        assert_eq!(resources.blockio_class.as_deref(), Some("gold"));
+    }
+
+    #[tokio::test]
+    async fn stop_container_applies_nri_update_side_effects() {
+        let fake_nri = Arc::new(FakeNri::default());
+        let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+        let mut target_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut target_annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+        let mut sidecar_annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut sidecar_annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+
+        service
+            .pod_sandboxes
+            .lock()
+            .await
+            .insert("pod-1".to_string(), test_pod("pod-1", HashMap::new()));
+        service.containers.lock().await.insert(
+            "container-stop".to_string(),
+            test_container("container-stop", "pod-1", target_annotations.clone()),
+        );
+        service.containers.lock().await.insert(
+            "container-sidecar".to_string(),
+            test_container("container-sidecar", "pod-1", sidecar_annotations.clone()),
+        );
+        set_fake_runtime_state(&dir, "container-stop", "running");
+        set_fake_runtime_state(&dir, "container-sidecar", "running");
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-stop",
+                "pod-1",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &target_annotations,
+            )
+            .unwrap();
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-sidecar",
+                "pod-1",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &sidecar_annotations,
+            )
+            .unwrap();
+
+        let mut update = crate::nri_proto::api::ContainerUpdate::new();
+        update.container_id = "container-sidecar".to_string();
+        let mut linux = crate::nri_proto::api::LinuxContainerUpdate::new();
+        let mut resources = crate::nri_proto::api::LinuxResources::new();
+        let mut cpu = crate::nri_proto::api::LinuxCPU::new();
+        let mut shares = crate::nri_proto::api::OptionalUInt64::new();
+        shares.value = 2048;
+        cpu.shares = protobuf::MessageField::some(shares);
+        resources.cpu = protobuf::MessageField::some(cpu);
+        linux.resources = protobuf::MessageField::some(resources);
+        update.linux = protobuf::MessageField::some(linux);
+        *fake_nri.stop_result.lock().await = Some(NriStopContainerResult {
+            updates: vec![update],
+        });
+
+        RuntimeService::stop_container(
+            &service,
+            Request::new(StopContainerRequest {
+                container_id: "container-stop".to_string(),
+                timeout: 1,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fake_nri.calls.lock().await.clone(), vec!["stop_container"]);
+        let update_payload: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(fake_runtime_update_path(&dir, "container-sidecar")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(update_payload["cpu"]["shares"], 2048);
+        let sidecar = service
+            .containers
+            .lock()
+            .await
+            .get("container-sidecar")
+            .cloned()
+            .unwrap();
+        let state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+            &sidecar.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        )
+        .unwrap();
+        assert_eq!(state.linux_resources.unwrap().cpu_shares, 2048);
     }
 
     #[tokio::test]
@@ -10844,6 +13451,7 @@ exit 0
             containers: service.containers.clone(),
             pod_sandboxes: service.pod_sandboxes.clone(),
             config: service.config.clone(),
+            nri_config: service.nri_config.clone(),
             runtime: service.runtime.clone(),
             persistence: service.persistence.clone(),
             events: service.events.clone(),
@@ -10889,12 +13497,13 @@ exit 0
     }
 
     #[tokio::test]
-    async fn nri_domain_apply_updates_returns_failed_when_ignore_failure_is_set() {
+    async fn nri_domain_apply_updates_ignores_failures_marked_ignore_failure() {
         let (_dir, service) = test_service_with_fake_runtime();
         let domain = NriRuntimeDomain {
             containers: service.containers.clone(),
             pod_sandboxes: service.pod_sandboxes.clone(),
             config: service.config.clone(),
+            nri_config: service.nri_config.clone(),
             runtime: service.runtime.clone(),
             persistence: service.persistence.clone(),
             events: service.events.clone(),
@@ -10905,17 +13514,65 @@ exit 0
         update.ignore_failure = true;
 
         let failed = domain.apply_updates(&[update.clone()]).await.unwrap();
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].container_id, update.container_id);
+        assert!(failed.is_empty());
     }
 
     #[tokio::test]
-    async fn nri_domain_apply_updates_rejects_unsupported_resources() {
+    async fn nri_domain_apply_updates_reports_non_ignored_failures() {
         let (_dir, service) = test_service_with_fake_runtime();
         let domain = NriRuntimeDomain {
             containers: service.containers.clone(),
             pod_sandboxes: service.pod_sandboxes.clone(),
             config: service.config.clone(),
+            nri_config: service.nri_config.clone(),
+            runtime: service.runtime.clone(),
+            persistence: service.persistence.clone(),
+            events: service.events.clone(),
+        };
+
+        let mut update = crate::nri_proto::api::ContainerUpdate::new();
+        update.container_id = "missing".to_string();
+
+        let failed = domain.apply_updates(&[update.clone()]).await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].container_id, "missing");
+    }
+
+    #[tokio::test]
+    async fn nri_domain_apply_updates_accepts_extended_resources() {
+        let (dir, service) = test_service_with_fake_runtime();
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &StoredContainerState::default(),
+        )
+        .unwrap();
+        service.containers.lock().await.insert(
+            "container-running".to_string(),
+            test_container("container-running", "pod-1", annotations.clone()),
+        );
+        set_fake_runtime_state(&dir, "container-running", "running");
+        service
+            .persistence
+            .lock()
+            .await
+            .save_container(
+                "container-running",
+                "pod-1",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+
+        let domain = NriRuntimeDomain {
+            containers: service.containers.clone(),
+            pod_sandboxes: service.pod_sandboxes.clone(),
+            config: service.config.clone(),
+            nri_config: service.nri_config.clone(),
             runtime: service.runtime.clone(),
             persistence: service.persistence.clone(),
             events: service.events.clone(),
@@ -10925,16 +13582,53 @@ exit 0
         update.container_id = "container-running".to_string();
         let mut linux_update = crate::nri_proto::api::LinuxContainerUpdate::new();
         let mut resources = crate::nri_proto::api::LinuxResources::new();
+        let mut cpu = crate::nri_proto::api::LinuxCPU::new();
+        let mut shares = crate::nri_proto::api::OptionalUInt64::new();
+        shares.value = 512;
+        cpu.shares = protobuf::MessageField::some(shares);
+        resources.cpu = protobuf::MessageField::some(cpu);
         resources.pids = Some(crate::nri_proto::api::LinuxPids {
             limit: 7,
             ..Default::default()
         })
         .into();
+        resources
+            .devices
+            .push(crate::nri_proto::api::LinuxDeviceCgroup {
+                allow: false,
+                type_: "b".to_string(),
+                access: "rw".to_string(),
+                major: {
+                    let mut value = crate::nri_proto::api::OptionalInt64::new();
+                    value.value = 8;
+                    protobuf::MessageField::some(value)
+                },
+                minor: {
+                    let mut value = crate::nri_proto::api::OptionalInt64::new();
+                    value.value = 0;
+                    protobuf::MessageField::some(value)
+                },
+                ..Default::default()
+            });
+        let mut blockio_class = crate::nri_proto::api::OptionalString::new();
+        blockio_class.value = "gold".to_string();
+        resources.blockio_class = protobuf::MessageField::some(blockio_class);
         linux_update.resources = protobuf::MessageField::some(resources);
         update.linux = protobuf::MessageField::some(linux_update);
 
-        let err = domain.apply_updates(&[update]).await.unwrap_err();
-        assert!(format!("{err}").contains("unsupported field linux.resources.pids"));
+        let failed = domain.apply_updates(&[update]).await.unwrap();
+        assert!(failed.is_empty());
+
+        let payload: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(fake_runtime_update_path(&dir, "container-running")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["cpu"]["shares"], 512);
+        assert_eq!(payload["pids"]["limit"], 7);
+        assert_eq!(payload["devices"][0]["type"], "b");
+        assert_eq!(payload["devices"][0]["allow"], false);
+        assert_eq!(payload["devices"][0]["major"], 8);
+        assert_eq!(payload["blockIO"]["weight"], 500);
     }
 
     #[tokio::test]
@@ -10979,6 +13673,7 @@ exit 0
             containers: service.containers.clone(),
             pod_sandboxes: service.pod_sandboxes.clone(),
             config: service.config.clone(),
+            nri_config: service.nri_config.clone(),
             runtime: service.runtime.clone(),
             persistence: service.persistence.clone(),
             events: service.events.clone(),
@@ -11002,6 +13697,14 @@ exit 0
             .unwrap()
             .unwrap();
         assert_eq!(persisted.state, "stopped");
+        let persisted_annotations: HashMap<String, String> =
+            serde_json::from_str(&persisted.annotations).unwrap();
+        let persisted_state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+            &persisted_annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        )
+        .unwrap();
+        assert!(persisted_state.nri_stop_notified);
     }
 
     #[tokio::test]

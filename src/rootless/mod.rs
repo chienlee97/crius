@@ -157,8 +157,8 @@ impl RootlessManager {
     /// 创建新的rootless管理器
     pub fn new(config: RootlessConfig) -> Result<Self> {
         let uid = Self::current_uid();
-        let subuid_path = PathBuf::from(format!("/etc/subuid"));
-        let subgid_path = PathBuf::from(format!("/etc/subgid"));
+        let subuid_path = PathBuf::from("/etc/subuid");
+        let subgid_path = PathBuf::from("/etc/subgid");
 
         let mut manager = Self {
             config,
@@ -300,6 +300,7 @@ impl RootlessManager {
                 uid_mappings: None,
                 gid_mappings: None,
                 devices: None,
+                net_devices: None,
                 cgroups_path: None,
                 resources: None,
                 rootfs_propagation: None,

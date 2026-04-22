@@ -50,13 +50,14 @@ pub struct VolumeConfig {
 }
 
 /// HostPath类型
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum HostPathType {
     /// 默认类型
     Default,
     /// 目录必须存在
     Directory,
     /// 目录或创建
+    #[default]
     DirectoryOrCreate,
     /// 文件必须存在
     File,
@@ -68,12 +69,6 @@ pub enum HostPathType {
     CharDevice,
     /// 块设备
     BlockDevice,
-}
-
-impl Default for HostPathType {
-    fn default() -> Self {
-        HostPathType::DirectoryOrCreate
-    }
 }
 
 impl VolumeConfig {

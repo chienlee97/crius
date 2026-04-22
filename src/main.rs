@@ -2,6 +2,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Error;
 use clap::Parser;
@@ -107,6 +108,7 @@ async fn main() -> Result<(), Error> {
         .await;
 
     prepare_runtime_service(&runtime_service).await;
+    let shutdown_nri = runtime_service.nri_handle();
     let image_service = ImageServiceImpl::new(runtime_config.root_dir.join("storage"))?;
     let reflection_service = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(include_bytes!(concat!(
@@ -153,10 +155,16 @@ async fn main() -> Result<(), Error> {
         let uds_stream = UnixListenerStream::new(TokioUnixListener::from_std(uds)?);
 
         // 启动服务
-        server.serve_with_incoming(uds_stream).await?;
+        let serve_result = server
+            .serve_with_incoming_shutdown(uds_stream, shutdown_signal())
+            .await;
+        shutdown_runtime_service(shutdown_nri).await;
+        serve_result?;
     } else {
         let addr: SocketAddr = args.listen.parse()?;
-        server.serve(addr).await?;
+        let serve_result = server.serve_with_shutdown(addr, shutdown_signal()).await;
+        shutdown_runtime_service(shutdown_nri).await;
+        serve_result?;
     }
 
     Ok(())
@@ -169,6 +177,29 @@ async fn prepare_runtime_service(runtime_service: &RuntimeServiceImpl) {
     }
     if let Err(e) = runtime_service.initialize_nri().await {
         log::error!("Failed to initialize NRI: {}", e);
+    }
+}
+
+async fn shutdown_runtime_service(nri: Arc<dyn crius::nri::NriApi>) {
+    if let Err(err) = nri.shutdown().await {
+        log::error!("Failed to shutdown NRI: {}", err);
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -203,18 +234,19 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalLogTimer {
 
 #[cfg(test)]
 mod tests {
-    use super::LocalLogTimer;
     use super::prepare_runtime_service;
+    use super::shutdown_runtime_service;
+    use super::LocalLogTimer;
     use super::RuntimeConfig;
-    use tracing_subscriber::fmt::time::FormatTime;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use tempfile::tempdir;
-    use tokio::sync::Mutex;
     use crius::config::NriConfig;
     use crius::network::CniConfig;
     use crius::nri::NriApi;
     use crius::server::RuntimeServiceImpl;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::Mutex;
+    use tracing_subscriber::fmt::time::FormatTime;
 
     #[derive(Default)]
     struct FakeNri {
@@ -229,6 +261,7 @@ mod tests {
         }
 
         async fn shutdown(&self) -> crius::nri::Result<()> {
+            self.calls.lock().await.push("shutdown");
             Ok(())
         }
 
@@ -271,8 +304,10 @@ mod tests {
     #[tokio::test]
     async fn prepare_runtime_service_recovers_then_initializes_nri_before_serve() {
         let fake_nri = Arc::new(FakeNri::default());
-        let mut nri_config = NriConfig::default();
-        nri_config.enable = true;
+        let nri_config = NriConfig {
+            enable: true,
+            ..Default::default()
+        };
         let service = RuntimeServiceImpl::new_with_nri_api(
             test_runtime_config(tempdir().unwrap().keep()),
             nri_config,
@@ -285,5 +320,14 @@ mod tests {
             fake_nri.calls.lock().await.clone(),
             vec!["start", "synchronize"]
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_runtime_service_invokes_nri_shutdown() {
+        let fake_nri = Arc::new(FakeNri::default());
+
+        shutdown_runtime_service(fake_nri.clone()).await;
+
+        assert_eq!(fake_nri.calls.lock().await.clone(), vec!["shutdown"]);
     }
 }

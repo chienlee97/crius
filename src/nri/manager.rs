@@ -16,13 +16,19 @@ use tokio::sync::{oneshot, Mutex, Notify, OwnedRwLockReadGuard, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+use crate::nri::transport::HostFunctionsHandler;
 use crate::nri::{
-    merge_container_adjustments, merge_container_updates, multiplex_connection, NopNri, NriApi,
-    NriContainerEvent, NriCreateContainerResult, NriDomain, NriError, NriManagerConfig,
-    NriPodEvent, NriUpdateContainerResult, PluginTtrpcClient, Result, RuntimeTtrpcServer,
+    merge_container_adjustments, merge_container_updates, multiplex_connection,
     validate_container_adjustment, validate_container_update, validate_update_linux_resources,
+    NopNri, NriApi, NriContainerEvent, NriCreateContainerResult, NriDomain, NriError,
+    NriManagerConfig, NriPodEvent, NriStopContainerResult, NriUpdateContainerResult,
+    PluginTtrpcClient, Result, RuntimeTtrpcServer,
 };
 use crate::nri_proto::api as nri_api;
+
+const MIN_SYNC_OBJECTS_PER_MESSAGE: usize = 8;
+type PluginIdentity = (String, String);
+type RegisteredSender = Arc<Mutex<Option<oneshot::Sender<PluginIdentity>>>>;
 
 #[derive(Debug, Clone)]
 pub struct PluginRecord {
@@ -162,7 +168,8 @@ struct ManagerRuntimeHandler {
     config: String,
     plugin_config_path: PathBuf,
     expected_plugin: Option<(String, String)>,
-    registered_tx: Arc<Mutex<Option<oneshot::Sender<(String, String)>>>>,
+    registered_tx: RegisteredSender,
+    connection_identity: Arc<Mutex<Option<(String, String)>>>,
 }
 
 #[async_trait]
@@ -173,6 +180,7 @@ impl crate::nri::transport::RuntimeServiceHandler for ManagerRuntimeHandler {
                 "plugin name must not be empty".to_string(),
             ));
         }
+        validate_plugin_index(&req.plugin_idx)?;
         if let Some((expected_name, expected_index)) = &self.expected_plugin {
             if req.plugin_name != *expected_name || req.plugin_idx != *expected_index {
                 return Err(NriError::InvalidInput(format!(
@@ -201,6 +209,7 @@ impl crate::nri::transport::RuntimeServiceHandler for ManagerRuntimeHandler {
             true,
             self.client.clone(),
         );
+        *self.connection_identity.lock().await = Some((plugin_name.clone(), plugin_idx.clone()));
         self.registration_notify.notify_waiters();
         if let Some(tx) = self.registered_tx.lock().await.take() {
             let _ = tx.send((plugin_name, plugin_idx));
@@ -220,6 +229,22 @@ impl crate::nri::transport::RuntimeServiceHandler for ManagerRuntimeHandler {
                 .await?;
         }
         Ok(response)
+    }
+}
+
+#[async_trait]
+impl HostFunctionsHandler for ManagerRuntimeHandler {
+    async fn log(&self, req: nri_api::LogRequest) -> Result<nri_api::Empty> {
+        match req.level.enum_value_or_default() {
+            nri_api::log_request::Level::LEVEL_DEBUG => log::debug!("NRI plugin: {}", req.msg),
+            nri_api::log_request::Level::LEVEL_INFO
+            | nri_api::log_request::Level::LEVEL_UNSPECIFIED => {
+                log::info!("NRI plugin: {}", req.msg)
+            }
+            nri_api::log_request::Level::LEVEL_WARN => log::warn!("NRI plugin: {}", req.msg),
+            nri_api::log_request::Level::LEVEL_ERROR => log::error!("NRI plugin: {}", req.msg),
+        }
+        Ok(nri_api::Empty::new())
     }
 }
 
@@ -258,12 +283,14 @@ impl NriManager {
             plugin_config_path: PathBuf::from(&config.plugin_config_path),
             expected_plugin: None,
             registered_tx: Arc::new(Mutex::new(None)),
+            connection_identity: Arc::new(Mutex::new(None)),
         });
         let runtime_server = RuntimeTtrpcServer::with_handler(
             config.socket_path.clone(),
             config.registration_timeout,
             config.request_timeout,
             config.enable_external_connections,
+            runtime_handler.clone(),
             runtime_handler,
         );
         Self {
@@ -349,7 +376,7 @@ impl NriManager {
                 client.configure(&configure_req),
             )
             .await?;
-        record.events_mask = configure_resp.events;
+        record.events_mask = normalize_events_mask(configure_resp.events)?;
 
         let mut state = self.state.write().await;
         upsert_plugin(&mut state.plugins, record, false, Some(client));
@@ -434,7 +461,7 @@ impl NriManager {
             .plugins_for_event(nri_api::Event::CREATE_CONTAINER)
             .await;
         let mut plugin_adjustments = Vec::new();
-        let mut updates = Vec::new();
+        let mut plugin_updates = Vec::new();
         let mut evictions = Vec::new();
         let mut consulted_plugins = Vec::new();
         for plugin in plugins {
@@ -464,15 +491,31 @@ impl NriManager {
                     .into_option()
                     .unwrap_or_else(nri_api::ContainerAdjustment::new),
             ));
-            updates.extend(response.update);
+            plugin_updates.push((plugin_adjustment_owner(&plugin.record), response.update));
             evictions.extend(response.evict);
         }
         let merged = merge_container_adjustments(&event_payload.container.id, &plugin_adjustments)?;
-        self.validate_create_container_result(event_payload, &merged, &updates, &consulted_plugins)
-            .await?;
+        let merged_updates =
+            merge_container_updates(&event_payload.container.id, None, &plugin_updates)?;
+        if merged_updates.target_linux_resources.is_some() {
+            return Err(NriError::InvalidInput(format!(
+                "plugin update targeted container {} during create",
+                event_payload.container.id
+            )));
+        }
+        let mut owners = merged.owners.clone();
+        merge_owning_plugins(&mut owners, &merged_updates.owners)?;
+        self.validate_create_container_result(
+            event_payload,
+            &merged.adjustment,
+            &merged_updates.updates,
+            &owners,
+            &consulted_plugins,
+        )
+        .await?;
         Ok(NriCreateContainerResult {
             adjustment: merged.adjustment,
-            updates,
+            updates: merged_updates.updates,
             evictions,
         })
     }
@@ -480,11 +523,12 @@ impl NriManager {
     async fn validate_create_container_result(
         &self,
         event_payload: &NriContainerEvent,
-        merged: &crate::nri::MergeResult,
+        adjustment: &nri_api::ContainerAdjustment,
         updates: &[nri_api::ContainerUpdate],
+        owners: &nri_api::OwningPlugins,
         consulted_plugins: &[nri_api::PluginInstance],
     ) -> Result<()> {
-        validate_container_adjustment(&merged.adjustment)?;
+        validate_container_adjustment(adjustment)?;
         for update in updates {
             validate_container_update(update)?;
         }
@@ -501,9 +545,9 @@ impl NriManager {
             req.pod = MessageField::some(pod.clone());
         }
         req.container = MessageField::some(event_payload.container.clone());
-        req.adjust = MessageField::some(merged.adjustment.clone());
+        req.adjust = MessageField::some(adjustment.clone());
         req.update = updates.to_vec();
-        req.owners = MessageField::some(merged.owners.clone());
+        req.owners = MessageField::some(owners.clone());
         req.plugins = consulted_plugins.to_vec();
 
         for plugin in validators {
@@ -592,9 +636,13 @@ impl NriManager {
         })
     }
 
-    async fn dispatch_stop_container(&self, event_payload: &NriContainerEvent) -> Result<()> {
+    async fn dispatch_stop_container(
+        &self,
+        event_payload: &NriContainerEvent,
+    ) -> Result<NriStopContainerResult> {
         let _sync_guard = self.plugin_sync_gate.read().await;
         let plugins = self.plugins_for_event(nri_api::Event::STOP_CONTAINER).await;
+        let mut plugin_updates = Vec::new();
         for plugin in plugins {
             let mut req = nri_api::StopContainerRequest::new();
             if let Some(pod) = event_payload.pod.as_ref() {
@@ -604,16 +652,27 @@ impl NriManager {
             let result = self
                 .call_with_timeout(plugin.client.stop_container(&req))
                 .await;
-            if let Err(err) = result {
-                if should_cleanup_plugin(&err) {
-                    self.unregister_plugin(&plugin.record.name, &plugin.record.index)
-                        .await;
-                    continue;
+            match result {
+                Ok(response) => {
+                    plugin_updates.push((plugin_adjustment_owner(&plugin.record), response.update));
                 }
-                return Err(err);
+                Err(err) => {
+                    if should_cleanup_plugin(&err) {
+                        self.unregister_plugin(&plugin.record.name, &plugin.record.index)
+                            .await;
+                        continue;
+                    }
+                    return Err(err);
+                }
             }
         }
-        Ok(())
+        let merged = merge_container_updates("__nri_stop_non_target__", None, &plugin_updates)?;
+        for update in &merged.updates {
+            validate_container_update(update)?;
+        }
+        Ok(NriStopContainerResult {
+            updates: merged.updates,
+        })
     }
 
     async fn dispatch_update_pod_sandbox(&self, event_payload: &NriPodEvent) -> Result<()> {
@@ -691,6 +750,81 @@ impl NriManager {
         state.plugins.retain(|plugin| !plugin.key_eq(name, index));
     }
 
+    async fn synchronize_plugin(
+        &self,
+        plugin: &DispatchPlugin,
+        pods: &[nri_api::PodSandbox],
+        containers: &[nri_api::Container],
+    ) -> Result<nri_api::SynchronizeResponse> {
+        let mut pod_offset = 0usize;
+        let mut container_offset = 0usize;
+        let mut pod_batch = initial_sync_batch_size(pods.len(), containers.len(), pods.len());
+        let mut container_batch =
+            initial_sync_batch_size(containers.len(), pods.len(), containers.len());
+
+        let final_response = loop {
+            let pod_end = pods.len().min(pod_offset.saturating_add(pod_batch));
+            let container_end = containers
+                .len()
+                .min(container_offset.saturating_add(container_batch));
+
+            let mut req = nri_api::SynchronizeRequest::new();
+            req.pods = pods[pod_offset..pod_end].to_vec();
+            req.containers = containers[container_offset..container_end].to_vec();
+            req.more = pod_end < pods.len() || container_end < containers.len();
+
+            let response = self
+                .call_with_timeout(plugin.client.synchronize(&req))
+                .await?;
+            if req.more {
+                if !response.update.is_empty() || response.more != req.more {
+                    return Err(NriError::Plugin(format!(
+                        "plugin {} does not handle split synchronize requests",
+                        plugin_adjustment_owner(&plugin.record)
+                    )));
+                }
+            } else if response.more {
+                return Err(NriError::Plugin(format!(
+                    "plugin {} requested more synchronize data after final chunk",
+                    plugin_adjustment_owner(&plugin.record)
+                )));
+            }
+
+            if !req.more {
+                break response;
+            }
+
+            pod_offset = pod_end;
+            container_offset = container_end;
+
+            let remaining_objects =
+                (pods.len() - pod_offset) + (containers.len() - container_offset);
+            if remaining_objects == 0 {
+                break response;
+            }
+
+            pod_batch = (pods.len() - pod_offset).max(1).min(pod_batch);
+            container_batch = (containers.len() - container_offset)
+                .max(1)
+                .min(container_batch);
+            if pod_batch + container_batch < MIN_SYNC_OBJECTS_PER_MESSAGE {
+                let remaining_pods = pods.len() - pod_offset;
+                let remaining_containers = containers.len() - container_offset;
+                let desired_pods = (MIN_SYNC_OBJECTS_PER_MESSAGE / 2).min(remaining_pods);
+                let desired_containers =
+                    (MIN_SYNC_OBJECTS_PER_MESSAGE - desired_pods).min(remaining_containers);
+                if desired_pods > 0 {
+                    pod_batch = desired_pods;
+                }
+                if desired_containers > 0 {
+                    container_batch = desired_containers;
+                }
+            }
+        };
+
+        Ok(final_response)
+    }
+
     async fn mark_plugin_synchronized(&self, name: &str, index: &str) {
         let mut state = self.state.write().await;
         if let Some(plugin) = state
@@ -752,10 +886,15 @@ impl NriManager {
         &self,
         stream: UnixStream,
         expected_plugin: Option<DiscoveredPlugin>,
-        registered_tx: Arc<Mutex<Option<oneshot::Sender<(String, String)>>>>,
+        registered_tx: RegisteredSender,
     ) -> Result<()> {
         let multiplexed = multiplex_connection(stream, self.config.request_timeout)?;
         let plugin_client: Arc<dyn PluginRpc> = Arc::new(multiplexed.plugin_client);
+        let connection_identity = Arc::new(Mutex::new(
+            expected_plugin
+                .as_ref()
+                .map(|plugin| (plugin.name.clone(), plugin.index.clone())),
+        ));
         let runtime_handler = Arc::new(ManagerRuntimeHandler {
             state: self.state.clone(),
             domain: self.domain.clone(),
@@ -770,18 +909,27 @@ impl NriManager {
                 .as_ref()
                 .map(|plugin| (plugin.name.clone(), plugin.index.clone())),
             registered_tx,
+            connection_identity: connection_identity.clone(),
         });
         let runtime_server = RuntimeTtrpcServer::with_handler(
             self.config.socket_path.clone(),
             self.config.registration_timeout,
             self.config.request_timeout,
             self.config.enable_external_connections,
+            runtime_handler.clone(),
             runtime_handler,
         );
         runtime_server
             .start_with_listener(multiplexed.runtime_listener)
             .await?;
         self.connection_servers.lock().await.push(runtime_server);
+        let manager = self.clone();
+        tokio::spawn(async move {
+            multiplexed.close_notify.notified().await;
+            if let Some((name, index)) = connection_identity.lock().await.clone() {
+                manager.unregister_plugin(&name, &index).await;
+            }
+        });
         Ok(())
     }
 
@@ -830,6 +978,7 @@ impl NriManager {
                 client.configure(&configure_req),
             )
             .await?;
+        let events_mask = normalize_events_mask(configure_resp.events)?;
 
         let mut state = self.state.write().await;
         if let Some(plugin) = state
@@ -837,7 +986,7 @@ impl NriManager {
             .iter_mut()
             .find(|plugin| plugin.key_eq(name, index))
         {
-            plugin.record.events_mask = configure_resp.events;
+            plugin.record.events_mask = events_mask;
         }
         Ok(())
     }
@@ -962,6 +1111,12 @@ impl PluginSyncBlock {
     }
 }
 
+impl crate::nri::NriPluginSyncBlock for PluginSyncBlock {
+    fn unblock(self: Box<Self>) {
+        PluginSyncBlock::unblock(*self);
+    }
+}
+
 fn upsert_plugin(
     plugins: &mut Vec<ManagedPlugin>,
     record: PluginRecord,
@@ -1017,12 +1172,110 @@ fn sort_dispatch_plugins(plugins: &mut [DispatchPlugin]) {
     plugins.sort_by(|a, b| compare_plugin_order(&a.record, &b.record));
 }
 
+fn merge_owning_plugins(
+    target: &mut nri_api::OwningPlugins,
+    incoming: &nri_api::OwningPlugins,
+) -> Result<()> {
+    for (container_id, incoming_field_owners) in &incoming.owners {
+        let field_owners = target
+            .owners
+            .entry(container_id.clone())
+            .or_default();
+
+        for (field, owner) in &incoming_field_owners.simple {
+            if let Some(existing) = field_owners.simple.get(field) {
+                if existing != owner {
+                    return Err(NriError::Plugin(format!(
+                        "conflicting owner metadata for container {container_id}, field {field}"
+                    )));
+                }
+            } else {
+                field_owners.simple.insert(*field, owner.clone());
+            }
+        }
+
+        for (field, incoming_compound) in &incoming_field_owners.compound {
+            let compound = field_owners
+                .compound
+                .entry(*field)
+                .or_default();
+            for (key, owner) in &incoming_compound.owners {
+                if let Some(existing) = compound.owners.get(key) {
+                    if existing != owner {
+                        return Err(NriError::Plugin(format!(
+                            "conflicting owner metadata for container {container_id}, field {field}, key {key}"
+                        )));
+                    }
+                } else {
+                    compound.owners.insert(key.clone(), owner.clone());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn valid_events_mask() -> i32 {
+    (1_i32 << (nri_api::Event::LAST.value() - 1)) - 1
+}
+
+fn event_mask_bit(event: nri_api::Event) -> Option<i32> {
+    match event.value() {
+        value if value > 0 => 1_i32.checked_shl((value - 1) as u32),
+        _ => None,
+    }
+}
+
+fn normalize_events_mask(events_mask: i32) -> Result<i32> {
+    if events_mask == 0 {
+        return Ok(valid_events_mask());
+    }
+
+    let extra = events_mask & !valid_events_mask();
+    if extra != 0 {
+        return Err(NriError::InvalidInput(format!(
+            "invalid plugin events mask 0x{events_mask:x} (extra bits 0x{extra:x})"
+        )));
+    }
+
+    Ok(events_mask)
+}
+
 fn event_subscribed(events_mask: i32, event: nri_api::Event) -> bool {
-    if events_mask <= 0 {
+    let events_mask = if events_mask == 0 {
+        valid_events_mask()
+    } else {
+        events_mask
+    };
+    if events_mask < 0 {
         return false;
     }
-    let bit = 1_i32.checked_shl(event.value() as u32);
+    let bit = event_mask_bit(event);
     bit.is_some_and(|value| (events_mask & value) != 0)
+}
+
+fn validate_plugin_index(index: &str) -> Result<()> {
+    let bytes = index.as_bytes();
+    if bytes.len() != 2 || !bytes.iter().all(u8::is_ascii_digit) {
+        return Err(NriError::InvalidInput(format!(
+            "invalid plugin index {index:?}, must be 2 digits"
+        )));
+    }
+    Ok(())
+}
+
+fn initial_sync_batch_size(primary_len: usize, secondary_len: usize, default_len: usize) -> usize {
+    let total = primary_len + secondary_len;
+    if total <= MIN_SYNC_OBJECTS_PER_MESSAGE {
+        return default_len.max(1);
+    }
+
+    let reserved = MIN_SYNC_OBJECTS_PER_MESSAGE / 2;
+    let other_share = secondary_len.min(reserved);
+    primary_len
+        .min(MIN_SYNC_OBJECTS_PER_MESSAGE.saturating_sub(other_share))
+        .max(1)
 }
 
 fn build_state_change_event(
@@ -1211,26 +1464,40 @@ impl NriApi for NriManager {
         let _sync_gate = self.plugin_sync_gate.write().await;
         let snapshot = self.domain.snapshot().await?;
         let plugins = self.plugins_for_synchronize().await;
-        let mut sync_req = nri_api::SynchronizeRequest::new();
-        sync_req.pods = snapshot.pods;
-        sync_req.containers = snapshot.containers;
-        sync_req.more = false;
         for plugin in plugins {
-            let result = self
-                .call_with_timeout(plugin.client.synchronize(&sync_req))
-                .await;
-            if let Err(err) = result {
-                if should_cleanup_plugin(&err) {
-                    self.unregister_plugin(&plugin.record.name, &plugin.record.index)
-                        .await;
-                    continue;
+            let response = match self
+                .synchronize_plugin(&plugin, &snapshot.pods, &snapshot.containers)
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    if should_cleanup_plugin(&err) {
+                        self.unregister_plugin(&plugin.record.name, &plugin.record.index)
+                            .await;
+                        continue;
+                    }
+                    return Err(err);
                 }
-                return Err(err);
+            };
+            let failed = self.domain.apply_updates(&response.update).await?;
+            if !failed.is_empty() {
+                let failed_ids = failed
+                    .iter()
+                    .map(|update| update.container_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(NriError::Plugin(format!(
+                    "NRI synchronize updates failed for: {failed_ids}"
+                )));
             }
             self.mark_plugin_synchronized(&plugin.record.name, &plugin.record.index)
                 .await;
         }
         Ok(())
+    }
+
+    async fn block_plugin_sync(&self) -> Box<dyn crate::nri::NriPluginSyncBlock> {
+        Box::new(NriManager::block_plugin_sync(self).await)
     }
 
     async fn run_pod_sandbox(&self, event: NriPodEvent) -> Result<()> {
@@ -1252,10 +1519,12 @@ impl NriApi for NriManager {
         self.dispatch_update_pod_sandbox(&event).await
     }
 
-    async fn create_container(
-        &self,
-        event: NriContainerEvent,
-    ) -> Result<NriCreateContainerResult> {
+    async fn post_update_pod_sandbox(&self, event: NriPodEvent) -> Result<()> {
+        self.dispatch_lifecycle_with_pod_event(nri_api::Event::POST_UPDATE_POD_SANDBOX, &event)
+            .await
+    }
+
+    async fn create_container(&self, event: NriContainerEvent) -> Result<NriCreateContainerResult> {
         self.dispatch_create_container(&event).await
     }
 
@@ -1283,7 +1552,7 @@ impl NriApi for NriManager {
             .await
     }
 
-    async fn stop_container(&self, event: NriContainerEvent) -> Result<()> {
+    async fn stop_container(&self, event: NriContainerEvent) -> Result<NriStopContainerResult> {
         self.dispatch_stop_container(&event).await
     }
 
@@ -1311,16 +1580,22 @@ mod tests {
     struct FakePluginClient {
         calls: Mutex<Vec<String>>,
         synchronize_snapshots: Mutex<Vec<(Vec<String>, Vec<String>)>>,
+        synchronize_more_flags: Mutex<Vec<bool>>,
+        validate_requests: Mutex<Vec<nri_api::ValidateContainerAdjustmentRequest>>,
         fail_state_change: bool,
         synchronize_delay: Option<Duration>,
+        synchronize_response: Option<nri_api::SynchronizeResponse>,
+        synchronize_echo_more: bool,
         state_change_delay: Option<Duration>,
         shutdown_calls: AtomicUsize,
         create_response: Option<nri_api::CreateContainerResponse>,
         update_response: Option<nri_api::UpdateContainerResponse>,
+        stop_response: Option<nri_api::StopContainerResponse>,
     }
 
     #[derive(Default)]
     struct FakeDomain {
+        snapshot: crate::nri::domain::RuntimeSnapshot,
         update_calls: Mutex<Vec<Vec<String>>>,
         evictions: Mutex<Vec<(String, String)>>,
     }
@@ -1328,7 +1603,7 @@ mod tests {
     #[async_trait]
     impl NriDomain for FakeDomain {
         async fn snapshot(&self) -> Result<crate::nri::domain::RuntimeSnapshot> {
-            Ok(crate::nri::domain::RuntimeSnapshot::default())
+            Ok(self.snapshot.clone())
         }
 
         async fn apply_updates(
@@ -1369,6 +1644,7 @@ mod tests {
             if let Some(delay) = self.synchronize_delay {
                 sleep(delay).await;
             }
+            self.synchronize_more_flags.lock().await.push(req.more);
             self.synchronize_snapshots.lock().await.push((
                 req.pods.iter().map(|pod| pod.id.clone()).collect(),
                 req.containers
@@ -1377,7 +1653,14 @@ mod tests {
                     .collect(),
             ));
             self.calls.lock().await.push("synchronize".to_string());
-            Ok(nri_api::SynchronizeResponse::new())
+            let mut response = self
+                .synchronize_response
+                .clone()
+                .unwrap_or_default();
+            if self.synchronize_echo_more {
+                response.more = req.more;
+            }
+            Ok(response)
         }
 
         async fn create_container(
@@ -1388,7 +1671,7 @@ mod tests {
             Ok(self
                 .create_response
                 .clone()
-                .unwrap_or_else(nri_api::CreateContainerResponse::new))
+                .unwrap_or_default())
         }
 
         async fn update_container(
@@ -1399,7 +1682,7 @@ mod tests {
             Ok(self
                 .update_response
                 .clone()
-                .unwrap_or_else(nri_api::UpdateContainerResponse::new))
+                .unwrap_or_default())
         }
 
         async fn stop_container(
@@ -1407,7 +1690,10 @@ mod tests {
             _req: &nri_api::StopContainerRequest,
         ) -> Result<nri_api::StopContainerResponse> {
             self.calls.lock().await.push("stop".to_string());
-            Ok(nri_api::StopContainerResponse::new())
+            Ok(self
+                .stop_response
+                .clone()
+                .unwrap_or_default())
         }
 
         async fn update_pod_sandbox(
@@ -1420,9 +1706,10 @@ mod tests {
 
         async fn validate_container_adjustment(
             &self,
-            _req: &nri_api::ValidateContainerAdjustmentRequest,
+            req: &nri_api::ValidateContainerAdjustmentRequest,
         ) -> Result<nri_api::ValidateContainerAdjustmentResponse> {
             self.calls.lock().await.push("validate".to_string());
+            self.validate_requests.lock().await.push(req.clone());
             Ok(nri_api::ValidateContainerAdjustmentResponse::new())
         }
 
@@ -1554,7 +1841,8 @@ mod tests {
         let manager = manager_for_tests();
         let subscribed = Arc::new(FakePluginClient::default());
         let unsubscribed = Arc::new(FakePluginClient::default());
-        let create_bit = 1_i32 << (nri_api::Event::CREATE_CONTAINER as u32);
+        let create_bit = event_mask_bit(nri_api::Event::CREATE_CONTAINER).unwrap();
+        let unrelated_bit = event_mask_bit(nri_api::Event::REMOVE_CONTAINER).unwrap();
 
         insert_plugin_for_test(
             &manager,
@@ -1569,7 +1857,7 @@ mod tests {
             &manager,
             "unsubscribed",
             "02",
-            0,
+            unrelated_bit,
             true,
             unsubscribed.clone(),
         )
@@ -1593,7 +1881,7 @@ mod tests {
     #[tokio::test]
     async fn transport_error_cleans_up_plugin() {
         let manager = manager_for_tests();
-        let create_bit = 1_i32 << (nri_api::Event::POST_START_CONTAINER as u32);
+        let create_bit = event_mask_bit(nri_api::Event::POST_START_CONTAINER).unwrap();
         let failing = Arc::new(FakePluginClient {
             fail_state_change: true,
             ..Default::default()
@@ -1617,8 +1905,11 @@ mod tests {
     #[tokio::test]
     async fn pending_plugin_is_not_active_until_synchronized() {
         let manager = manager_for_tests();
-        let create_bit = 1_i32 << (nri_api::Event::CREATE_CONTAINER as u32);
-        let plugin = Arc::new(FakePluginClient::default());
+        let create_bit = event_mask_bit(nri_api::Event::CREATE_CONTAINER).unwrap();
+        let plugin = Arc::new(FakePluginClient {
+            synchronize_echo_more: true,
+            ..Default::default()
+        });
 
         insert_plugin_for_test(&manager, "late", "1", create_bit, true, plugin.clone()).await;
 
@@ -1646,12 +1937,27 @@ mod tests {
         let manager = manager_for_tests();
         let subscribed = Arc::new(FakePluginClient::default());
         let unsubscribed = Arc::new(FakePluginClient::default());
-        let event_bit = 1_i32 << (nri_api::Event::UPDATE_POD_SANDBOX as u32);
+        let event_bit = event_mask_bit(nri_api::Event::UPDATE_POD_SANDBOX).unwrap();
+        let unrelated_bit = event_mask_bit(nri_api::Event::REMOVE_CONTAINER).unwrap();
 
-        insert_plugin_for_test(&manager, "subscribed", "01", event_bit, true, subscribed.clone())
-            .await;
-        insert_plugin_for_test(&manager, "unsubscribed", "02", 0, true, unsubscribed.clone())
-            .await;
+        insert_plugin_for_test(
+            &manager,
+            "subscribed",
+            "01",
+            event_bit,
+            true,
+            subscribed.clone(),
+        )
+        .await;
+        insert_plugin_for_test(
+            &manager,
+            "unsubscribed",
+            "02",
+            unrelated_bit,
+            true,
+            unsubscribed.clone(),
+        )
+        .await;
         manager
             .synchronize()
             .await
@@ -1670,14 +1976,266 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configure_events_zero_defaults_to_all_events() {
+        let manager = manager_for_tests();
+        let plugin = Arc::new(FakePluginClient {
+            synchronize_echo_more: true,
+            ..Default::default()
+        });
+
+        {
+            let mut state = manager.state.write().await;
+            upsert_plugin(
+                &mut state.plugins,
+                PluginRecord {
+                    name: "all-events".to_string(),
+                    index: "01".to_string(),
+                    events_mask: 0,
+                    socket_path: String::new(),
+                    config: String::new(),
+                },
+                true,
+                Some(plugin.clone()),
+            );
+        }
+
+        manager
+            .synchronize()
+            .await
+            .expect("synchronize should activate plugin");
+        manager
+            .post_start_container(NriContainerEvent::default())
+            .await
+            .expect("post start should be dispatched");
+
+        assert_eq!(
+            plugin.calls.lock().await.clone(),
+            vec!["synchronize", "state_change:POST_START_CONTAINER"]
+        );
+    }
+
+    #[tokio::test]
+    async fn post_update_pod_sandbox_targets_subscribed_plugins() {
+        let manager = manager_for_tests();
+        let subscribed = Arc::new(FakePluginClient::default());
+        let unsubscribed = Arc::new(FakePluginClient::default());
+        let event_bit = event_mask_bit(nri_api::Event::POST_UPDATE_POD_SANDBOX).unwrap();
+        let unrelated_bit = event_mask_bit(nri_api::Event::REMOVE_CONTAINER).unwrap();
+
+        insert_plugin_for_test(
+            &manager,
+            "subscribed",
+            "01",
+            event_bit,
+            true,
+            subscribed.clone(),
+        )
+        .await;
+        insert_plugin_for_test(
+            &manager,
+            "unsubscribed",
+            "02",
+            unrelated_bit,
+            true,
+            unsubscribed.clone(),
+        )
+        .await;
+        manager
+            .synchronize()
+            .await
+            .expect("synchronize should activate subscribed plugin");
+
+        manager
+            .post_update_pod_sandbox(NriPodEvent::default())
+            .await
+            .expect("dispatch should succeed");
+
+        assert_eq!(
+            subscribed.calls.lock().await.clone(),
+            vec!["synchronize", "state_change:POST_UPDATE_POD_SANDBOX"]
+        );
+        assert_eq!(unsubscribed.calls.lock().await.clone(), vec!["synchronize"]);
+    }
+
+    #[tokio::test]
+    async fn synchronize_splits_snapshot_and_only_accepts_updates_on_final_chunk() {
+        let snapshot = crate::nri::domain::RuntimeSnapshot {
+            pods: (0..5)
+                .map(|idx| {
+                    let mut pod = nri_api::PodSandbox::new();
+                    pod.id = format!("pod-{idx}");
+                    pod
+                })
+                .collect(),
+            containers: (0..4)
+                .map(|idx| {
+                    let mut container = nri_api::Container::new();
+                    container.id = format!("ctr-{idx}");
+                    container
+                })
+                .collect(),
+        };
+
+        let plugin = Arc::new(FakePluginClient {
+            synchronize_echo_more: true,
+            ..Default::default()
+        });
+        let manager = manager_with_domain_for_tests(Arc::new(FakeDomain {
+            snapshot,
+            ..Default::default()
+        }));
+
+        insert_plugin_for_test(
+            &manager,
+            "sync",
+            "01",
+            event_mask_bit(nri_api::Event::CREATE_CONTAINER).unwrap(),
+            true,
+            plugin.clone(),
+        )
+        .await;
+
+        manager
+            .synchronize()
+            .await
+            .expect("synchronize should succeed");
+
+        let more_flags = plugin.synchronize_more_flags.lock().await.clone();
+        assert_eq!(more_flags, vec![true, false]);
+
+        let snapshots = plugin.synchronize_snapshots.lock().await.clone();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].0.len() + snapshots[0].1.len(), 8);
+        assert_eq!(snapshots[1].0.len() + snapshots[1].1.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_plugin_rejects_invalid_index() {
+        let state = Arc::new(RwLock::new(ManagerState::default()));
+        let handler = ManagerRuntimeHandler {
+            state,
+            domain: Arc::new(NopNri),
+            registration_notify: Arc::new(Notify::new()),
+            client: None,
+            config: String::new(),
+            plugin_config_path: PathBuf::new(),
+            expected_plugin: None,
+            registered_tx: Arc::new(Mutex::new(None)),
+            connection_identity: Arc::new(Mutex::new(None)),
+        };
+
+        let mut req = nri_api::RegisterPluginRequest::new();
+        req.plugin_name = "broken".to_string();
+        req.plugin_idx = "1".to_string();
+
+        let err = handler.register_plugin(req).await.unwrap_err();
+        match err {
+            NriError::InvalidInput(message) => {
+                assert!(message.contains("must be 2 digits"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_container_merges_plugin_updates() {
+        let manager = manager_for_tests();
+        let stop_bit = event_mask_bit(nri_api::Event::STOP_CONTAINER).unwrap();
+
+        let mut first_update = nri_api::ContainerUpdate::new();
+        first_update.container_id = "sidecar".to_string();
+        let mut first_linux = nri_api::LinuxContainerUpdate::new();
+        let mut first_resources = nri_api::LinuxResources::new();
+        let mut first_cpu = nri_api::LinuxCPU::new();
+        let mut shares = nri_api::OptionalUInt64::new();
+        shares.value = 512;
+        first_cpu.shares = MessageField::some(shares);
+        first_resources.cpu = MessageField::some(first_cpu);
+        first_linux.resources = MessageField::some(first_resources);
+        first_update.linux = MessageField::some(first_linux);
+        let mut first_response = nri_api::StopContainerResponse::new();
+        first_response.update.push(first_update);
+
+        let mut second_update = nri_api::ContainerUpdate::new();
+        second_update.container_id = "sidecar".to_string();
+        let mut second_linux = nri_api::LinuxContainerUpdate::new();
+        let mut second_resources = nri_api::LinuxResources::new();
+        let mut second_memory = nri_api::LinuxMemory::new();
+        let mut limit = nri_api::OptionalInt64::new();
+        limit.value = 4096;
+        second_memory.limit = MessageField::some(limit);
+        second_resources.memory = MessageField::some(second_memory);
+        second_linux.resources = MessageField::some(second_resources);
+        second_update.linux = MessageField::some(second_linux);
+        let mut second_response = nri_api::StopContainerResponse::new();
+        second_response.update.push(second_update);
+
+        let first = Arc::new(FakePluginClient {
+            stop_response: Some(first_response),
+            ..Default::default()
+        });
+        let second = Arc::new(FakePluginClient {
+            stop_response: Some(second_response),
+            ..Default::default()
+        });
+
+        insert_plugin_for_test(&manager, "first", "01", stop_bit, true, first.clone()).await;
+        insert_plugin_for_test(&manager, "second", "02", stop_bit, true, second.clone()).await;
+        manager
+            .synchronize()
+            .await
+            .expect("synchronize should activate stop plugins");
+
+        let result = manager
+            .stop_container(test_container_event())
+            .await
+            .expect("stop dispatch should succeed");
+
+        assert_eq!(
+            first.calls.lock().await.clone(),
+            vec!["synchronize", "stop"]
+        );
+        assert_eq!(
+            second.calls.lock().await.clone(),
+            vec!["synchronize", "stop"]
+        );
+        assert_eq!(result.updates.len(), 1);
+        let update = &result.updates[0];
+        assert_eq!(update.container_id, "sidecar");
+        let resources = update
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.resources.as_ref())
+            .expect("merged resources should be present");
+        assert_eq!(
+            resources
+                .cpu
+                .as_ref()
+                .and_then(|cpu| cpu.shares.as_ref())
+                .map(|shares| shares.value),
+            Some(512)
+        );
+        assert_eq!(
+            resources
+                .memory
+                .as_ref()
+                .and_then(|memory| memory.limit.as_ref())
+                .map(|limit| limit.value),
+            Some(4096)
+        );
+    }
+
+    #[tokio::test]
     async fn create_container_merges_plugin_responses_and_validates() {
         let manager = manager_for_tests();
-        let create_bit = 1_i32 << (nri_api::Event::CREATE_CONTAINER as u32);
-        let validate_bit = 1_i32 << (nri_api::Event::VALIDATE_CONTAINER_ADJUSTMENT as u32);
+        let create_bit = event_mask_bit(nri_api::Event::CREATE_CONTAINER).unwrap();
+        let validate_bit = event_mask_bit(nri_api::Event::VALIDATE_CONTAINER_ADJUSTMENT).unwrap();
 
         let mut first_response = nri_api::CreateContainerResponse::new();
         let mut first_adjust = nri_api::ContainerAdjustment::new();
-        first_adjust.annotations.insert("a".to_string(), "1".to_string());
+        first_adjust
+            .annotations
+            .insert("a".to_string(), "1".to_string());
         first_response.adjust = MessageField::some(first_adjust);
         let mut update = nri_api::ContainerUpdate::new();
         update.container_id = "u1".to_string();
@@ -1700,6 +2258,18 @@ mod tests {
         let mut second_adjust = nri_api::ContainerAdjustment::new();
         second_adjust.args = vec![String::new(), "/bin/echo".to_string()];
         second_response.adjust = MessageField::some(second_adjust);
+        let mut second_update = nri_api::ContainerUpdate::new();
+        second_update.container_id = "u1".to_string();
+        let mut second_linux = nri_api::LinuxContainerUpdate::new();
+        let mut second_resources = nri_api::LinuxResources::new();
+        let mut second_memory = nri_api::LinuxMemory::new();
+        let mut limit = nri_api::OptionalInt64::new();
+        limit.value = 4096;
+        second_memory.limit = MessageField::some(limit);
+        second_resources.memory = MessageField::some(second_memory);
+        second_linux.resources = MessageField::some(second_resources);
+        second_update.linux = MessageField::some(second_linux);
+        second_response.update.push(second_update);
         second_response.evict.push(nri_api::ContainerEviction {
             container_id: "e1".to_string(),
             reason: "test".to_string(),
@@ -1713,29 +2283,86 @@ mod tests {
 
         insert_plugin_for_test(&manager, "p1", "01", create_bit, true, first.clone()).await;
         insert_plugin_for_test(&manager, "p2", "02", create_bit, true, second.clone()).await;
-        insert_plugin_for_test(&manager, "validator", "03", validate_bit, true, validator.clone())
-            .await;
+        insert_plugin_for_test(
+            &manager,
+            "validator",
+            "03",
+            validate_bit,
+            true,
+            validator.clone(),
+        )
+        .await;
         manager.synchronize().await.unwrap();
 
-        let result = manager.create_container(test_container_event()).await.unwrap();
+        let result = manager
+            .create_container(test_container_event())
+            .await
+            .unwrap();
 
-        assert_eq!(result.adjustment.annotations.get("a"), Some(&"1".to_string()));
+        assert_eq!(
+            result.adjustment.annotations.get("a"),
+            Some(&"1".to_string())
+        );
         assert_eq!(result.adjustment.args, vec!["/bin/echo".to_string()]);
         assert_eq!(result.updates.len(), 1);
+        let resources = result.updates[0]
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.resources.as_ref())
+            .expect("merged resources should be present");
+        assert_eq!(
+            resources
+                .cpu
+                .as_ref()
+                .and_then(|cpu| cpu.shares.as_ref())
+                .map(|shares| shares.value),
+            Some(128)
+        );
+        assert_eq!(
+            resources
+                .memory
+                .as_ref()
+                .and_then(|memory| memory.limit.as_ref())
+                .map(|limit| limit.value),
+            Some(4096)
+        );
         assert_eq!(result.evictions.len(), 1);
-        assert_eq!(first.calls.lock().await.clone(), vec!["synchronize", "create"]);
-        assert_eq!(second.calls.lock().await.clone(), vec!["synchronize", "create"]);
+        assert_eq!(
+            first.calls.lock().await.clone(),
+            vec!["synchronize", "create"]
+        );
+        assert_eq!(
+            second.calls.lock().await.clone(),
+            vec!["synchronize", "create"]
+        );
         assert_eq!(
             validator.calls.lock().await.clone(),
             vec!["synchronize", "validate"]
+        );
+        let validate_requests = validator.validate_requests.lock().await.clone();
+        assert_eq!(validate_requests.len(), 1);
+        let validate_request = &validate_requests[0];
+        assert_eq!(validate_request.update.len(), 1);
+        let owners = validate_request
+            .owners
+            .as_ref()
+            .and_then(|owners| owners.owners.get("u1"))
+            .expect("validator should receive owner metadata for merged updates");
+        assert_eq!(
+            owners.simple.get(&(nri_api::Field::CPUShares as i32)),
+            Some(&"01-p1".to_string())
+        );
+        assert_eq!(
+            owners.simple.get(&(nri_api::Field::MemLimit as i32)),
+            Some(&"02-p2".to_string())
         );
     }
 
     #[tokio::test]
     async fn create_container_rejects_protected_annotations_before_validator() {
         let manager = manager_for_tests();
-        let create_bit = 1_i32 << (nri_api::Event::CREATE_CONTAINER as u32);
-        let validate_bit = 1_i32 << (nri_api::Event::VALIDATE_CONTAINER_ADJUSTMENT as u32);
+        let create_bit = event_mask_bit(nri_api::Event::CREATE_CONTAINER).unwrap();
+        let validate_bit = event_mask_bit(nri_api::Event::VALIDATE_CONTAINER_ADJUSTMENT).unwrap();
 
         let mut response = nri_api::CreateContainerResponse::new();
         let mut adjust = nri_api::ContainerAdjustment::new();
@@ -1752,20 +2379,61 @@ mod tests {
         let validator = Arc::new(FakePluginClient::default());
 
         insert_plugin_for_test(&manager, "creator", "01", create_bit, true, creator.clone()).await;
-        insert_plugin_for_test(&manager, "validator", "02", validate_bit, true, validator.clone())
-            .await;
+        insert_plugin_for_test(
+            &manager,
+            "validator",
+            "02",
+            validate_bit,
+            true,
+            validator.clone(),
+        )
+        .await;
         manager.synchronize().await.unwrap();
 
-        let err = manager.create_container(test_container_event()).await.unwrap_err();
+        let err = manager
+            .create_container(test_container_event())
+            .await
+            .unwrap_err();
         assert!(format!("{err}").contains("protected annotation"));
-        assert_eq!(creator.calls.lock().await.clone(), vec!["synchronize", "create"]);
+        assert_eq!(
+            creator.calls.lock().await.clone(),
+            vec!["synchronize", "create"]
+        );
         assert_eq!(validator.calls.lock().await.clone(), vec!["synchronize"]);
+    }
+
+    #[tokio::test]
+    async fn create_container_rejects_updates_targeting_container_being_created() {
+        let manager = manager_for_tests();
+        let create_bit = event_mask_bit(nri_api::Event::CREATE_CONTAINER).unwrap();
+
+        let mut response = nri_api::CreateContainerResponse::new();
+        let mut update = nri_api::ContainerUpdate::new();
+        update.container_id = "ctr-1".to_string();
+        let mut linux = nri_api::LinuxContainerUpdate::new();
+        linux.resources = MessageField::some(nri_api::LinuxResources::new());
+        update.linux = MessageField::some(linux);
+        response.update.push(update);
+
+        let plugin = Arc::new(FakePluginClient {
+            create_response: Some(response),
+            ..Default::default()
+        });
+
+        insert_plugin_for_test(&manager, "creator", "01", create_bit, true, plugin).await;
+        manager.synchronize().await.unwrap();
+
+        let err = manager
+            .create_container(test_container_event())
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("targeted container ctr-1 during create"));
     }
 
     #[tokio::test]
     async fn update_container_merges_target_resources_and_side_effects() {
         let manager = manager_for_tests();
-        let update_bit = 1_i32 << (nri_api::Event::UPDATE_CONTAINER as u32);
+        let update_bit = event_mask_bit(nri_api::Event::UPDATE_CONTAINER).unwrap();
 
         let mut response = nri_api::UpdateContainerResponse::new();
         let mut target = nri_api::ContainerUpdate::new();
@@ -1827,13 +2495,16 @@ mod tests {
         assert_eq!(result.updates.len(), 1);
         assert_eq!(result.updates[0].container_id, "ctr-2");
         assert_eq!(result.evictions.len(), 1);
-        assert_eq!(plugin.calls.lock().await.clone(), vec!["synchronize", "update"]);
+        assert_eq!(
+            plugin.calls.lock().await.clone(),
+            vec!["synchronize", "update"]
+        );
     }
 
     #[tokio::test]
     async fn block_plugin_sync_prevents_sync_completion_mid_lifecycle() {
         let manager = Arc::new(manager_for_tests());
-        let create_bit = 1_i32 << (nri_api::Event::CREATE_CONTAINER as u32);
+        let create_bit = event_mask_bit(nri_api::Event::CREATE_CONTAINER).unwrap();
         let plugin = Arc::new(FakePluginClient {
             synchronize_delay: Some(Duration::from_millis(20)),
             ..Default::default()
@@ -1868,6 +2539,43 @@ mod tests {
             .expect("plugin should be active after sync completes");
         let calls = plugin.calls.lock().await.clone();
         assert_eq!(calls, vec!["synchronize", "create"]);
+    }
+
+    #[tokio::test]
+    async fn synchronize_applies_plugin_requested_updates_before_activation() {
+        let domain = Arc::new(FakeDomain::default());
+        let manager = manager_with_domain_for_tests(domain.clone());
+        let create_bit = event_mask_bit(nri_api::Event::CREATE_CONTAINER).unwrap();
+
+        let mut update = nri_api::ContainerUpdate::new();
+        update.container_id = "ctr-sync-sidecar".to_string();
+        let mut synchronize_response = nri_api::SynchronizeResponse::new();
+        synchronize_response.update.push(update);
+        let plugin = Arc::new(FakePluginClient {
+            synchronize_response: Some(synchronize_response),
+            ..Default::default()
+        });
+
+        insert_plugin_for_test(&manager, "syncer", "01", create_bit, true, plugin.clone()).await;
+
+        manager
+            .synchronize()
+            .await
+            .expect("synchronize should apply plugin updates");
+
+        assert_eq!(
+            domain.update_calls.lock().await.clone(),
+            vec![vec!["ctr-sync-sidecar".to_string()]]
+        );
+
+        manager
+            .create_container(test_container_event())
+            .await
+            .expect("plugin should activate after sync updates succeed");
+        assert_eq!(
+            plugin.calls.lock().await.clone(),
+            vec!["synchronize", "create"]
+        );
     }
 
     #[tokio::test]
@@ -1916,7 +2624,10 @@ mod tests {
         assert_eq!(plugin.calls.lock().await.clone(), vec!["synchronize"]);
         assert_eq!(
             plugin.synchronize_snapshots.lock().await.clone(),
-            vec![(vec!["pod-recovered".to_string()], vec!["ctr-recovered".to_string()])]
+            vec![(
+                vec!["pod-recovered".to_string()],
+                vec!["ctr-recovered".to_string()]
+            )]
         );
     }
 
@@ -1936,7 +2647,7 @@ mod tests {
             },
             Arc::new(NopNri),
         );
-        let event_bit = 1_i32 << (nri_api::Event::POST_START_CONTAINER as u32);
+        let event_bit = event_mask_bit(nri_api::Event::POST_START_CONTAINER).unwrap();
         let slow = Arc::new(FakePluginClient {
             state_change_delay: Some(Duration::from_millis(50)),
             ..Default::default()
@@ -1973,6 +2684,7 @@ mod tests {
             plugin_config_path: PathBuf::new(),
             expected_plugin: None,
             registered_tx: Arc::new(Mutex::new(None)),
+            connection_identity: Arc::new(Mutex::new(None)),
         };
         let mut req = nri_api::UpdateContainersRequest::new();
         let mut update = nri_api::ContainerUpdate::new();
@@ -2028,6 +2740,7 @@ mod tests {
             plugin_config_path: config_dir,
             expected_plugin: None,
             registered_tx: Arc::new(Mutex::new(None)),
+            connection_identity: Arc::new(Mutex::new(None)),
         };
         let mut req = nri_api::RegisterPluginRequest::new();
         req.plugin_name = "external".to_string();
@@ -2114,5 +2827,34 @@ mod tests {
         assert_eq!(lines[1], "01");
         assert_eq!(lines[2], "3");
         assert!(lines.iter().any(|line| *line == "fd3=open"));
+    }
+
+    #[test]
+    fn event_masks_match_upstream_nri_semantics() {
+        let create_bit = event_mask_bit(nri_api::Event::CREATE_CONTAINER).unwrap();
+        let validate_bit = event_mask_bit(nri_api::Event::VALIDATE_CONTAINER_ADJUSTMENT).unwrap();
+
+        assert_eq!(
+            create_bit,
+            1 << ((nri_api::Event::CREATE_CONTAINER.value() - 1) as u32)
+        );
+        assert_eq!(
+            validate_bit,
+            1 << ((nri_api::Event::VALIDATE_CONTAINER_ADJUSTMENT.value() - 1) as u32)
+        );
+        assert!(event_subscribed(
+            create_bit,
+            nri_api::Event::CREATE_CONTAINER
+        ));
+        assert!(!event_subscribed(
+            create_bit,
+            nri_api::Event::REMOVE_CONTAINER
+        ));
+        assert!(event_subscribed(
+            validate_bit,
+            nri_api::Event::VALIDATE_CONTAINER_ADJUSTMENT
+        ));
+        assert_eq!(normalize_events_mask(0).unwrap(), valid_events_mask());
+        assert_eq!(valid_events_mask() & validate_bit, validate_bit);
     }
 }

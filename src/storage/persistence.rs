@@ -62,6 +62,7 @@ pub fn record_to_container_status(record: &ContainerRecord) -> ContainerStatus {
 }
 
 /// 将Pod沙箱配置转换为存储记录
+#[allow(clippy::too_many_arguments)]
 pub fn pod_to_record(
     id: &str,
     state: &str,
@@ -139,6 +140,7 @@ impl PersistenceManager {
     }
 
     /// 保存容器状态
+    #[allow(clippy::too_many_arguments)]
     pub fn save_container(
         &mut self,
         id: &str,
@@ -176,6 +178,7 @@ impl PersistenceManager {
     }
 
     /// 保存Pod沙箱
+    #[allow(clippy::too_many_arguments)]
     pub fn save_pod_sandbox(
         &mut self,
         id: &str,

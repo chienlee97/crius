@@ -48,12 +48,16 @@ pub struct Process {
     pub rlimits: Option<Vec<Rlimit>>,
     /// OOM 分数调整
     pub oom_score_adj: Option<i32>,
+    /// 调度策略
+    pub scheduler: Option<Scheduler>,
     /// 进程属性
     pub no_new_privileges: Option<bool>,
     /// Apparmor配置
     pub apparmor_profile: Option<String>,
     /// SELinux标签
     pub selinux_label: Option<String>,
+    /// IO 优先级
+    pub io_priority: Option<LinuxIoPriority>,
 }
 
 /// 用户配置
@@ -83,6 +87,24 @@ pub struct LinuxCapabilities {
     pub permitted: Option<Vec<String>>,
     /// Ambient capabilities
     pub ambient: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scheduler {
+    pub policy: String,
+    pub nice: Option<i32>,
+    pub priority: Option<i32>,
+    pub flags: Option<Vec<String>>,
+    pub runtime: Option<u64>,
+    pub deadline: Option<u64>,
+    pub period: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinuxIoPriority {
+    pub class: String,
+    pub priority: i32,
 }
 
 /// Rlimit配置
@@ -153,6 +175,8 @@ pub struct Linux {
     pub gid_mappings: Option<Vec<IdMapping>>,
     /// 设备
     pub devices: Option<Vec<Device>>,
+    /// 网络设备
+    pub net_devices: Option<HashMap<String, LinuxNetDevice>>,
     /// Cgroups配置
     pub cgroups_path: Option<String>,
     /// 资源限制
@@ -166,7 +190,7 @@ pub struct Linux {
     /// 挂载标签
     pub mount_label: Option<String>,
     /// Intel RDT资源控制
-    pub intel_rdt: Option<IntelRdt>,
+    pub intel_rdt: Option<LinuxIntelRdt>,
 }
 
 /// 命名空间配置
@@ -210,6 +234,11 @@ pub struct Device {
     pub uid: Option<u32>,
     /// GID
     pub gid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinuxNetDevice {
+    pub name: String,
 }
 
 /// Linux资源限制
@@ -706,6 +735,8 @@ mod tests {
             no_new_privileges: Some(true),
             apparmor_profile: None,
             selinux_label: None,
+            scheduler: None,
+            io_priority: None,
         });
         spec.hooks = Some(Hooks {
             prestart: Some(vec![Hook {
@@ -765,6 +796,8 @@ mod tests {
             no_new_privileges: Some(true),
             apparmor_profile: None,
             selinux_label: None,
+            scheduler: None,
+            io_priority: None,
         });
         spec.linux = Some(Linux {
             namespaces: Some(vec![
@@ -805,6 +838,7 @@ mod tests {
             sysctl: None,
             mount_label: None,
             intel_rdt: None,
+            net_devices: None,
         });
         spec.hooks = Some(Hooks {
             prestart: None,

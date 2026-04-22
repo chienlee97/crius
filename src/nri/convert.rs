@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use protobuf::MessageField;
+use protobuf::{Enum, MessageField};
 
 use crate::nri_proto::api as nri_api;
 use crate::oci::spec::{LinuxMemory, Seccomp, Spec};
@@ -44,6 +44,31 @@ fn optional_bool(value: bool) -> MessageField<nri_api::OptionalBool> {
     let mut result = nri_api::OptionalBool::new();
     result.value = value;
     MessageField::some(result)
+}
+
+fn optional_string(value: impl Into<String>) -> MessageField<nri_api::OptionalString> {
+    let mut result = nri_api::OptionalString::new();
+    result.value = value.into();
+    MessageField::some(result)
+}
+
+fn optional_repeated_string(values: Vec<String>) -> MessageField<nri_api::OptionalRepeatedString> {
+    let mut result = nri_api::OptionalRepeatedString::new();
+    result.value = values;
+    MessageField::some(result)
+}
+
+fn io_prio_class(value: &str) -> nri_api::IOPrioClass {
+    nri_api::IOPrioClass::from_str(value).unwrap_or(nri_api::IOPrioClass::IOPRIO_CLASS_NONE)
+}
+
+fn scheduler_policy(value: &str) -> nri_api::LinuxSchedulerPolicy {
+    nri_api::LinuxSchedulerPolicy::from_str(value)
+        .unwrap_or(nri_api::LinuxSchedulerPolicy::SCHED_NONE)
+}
+
+fn scheduler_flag(value: &str) -> Option<nri_api::LinuxSchedulerFlag> {
+    nri_api::LinuxSchedulerFlag::from_str(value)
 }
 
 fn linux_memory(memory: &LinuxMemory) -> nri_api::LinuxMemory {
@@ -124,7 +149,9 @@ pub fn linux_resources_from_cri(resources: &LinuxContainerResources) -> nri_api:
     result
 }
 
-pub fn cri_linux_resources_from_nri(resources: &nri_api::LinuxResources) -> LinuxContainerResources {
+pub fn cri_linux_resources_from_nri(
+    resources: &nri_api::LinuxResources,
+) -> LinuxContainerResources {
     let mut result = LinuxContainerResources::default();
 
     if let Some(memory) = resources.memory.as_ref() {
@@ -193,7 +220,13 @@ fn oci_hook(hook: &crate::oci::spec::Hook) -> nri_api::Hook {
 pub fn oci_hooks(spec: &Spec) -> Option<nri_api::Hooks> {
     let hooks = spec.hooks.as_ref()?;
     let mut result = nri_api::Hooks::new();
-    result.prestart = hooks.prestart.as_ref().into_iter().flatten().map(oci_hook).collect();
+    result.prestart = hooks
+        .prestart
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .map(oci_hook)
+        .collect();
     result.create_runtime = hooks
         .create_runtime
         .as_ref()
@@ -215,8 +248,20 @@ pub fn oci_hooks(spec: &Spec) -> Option<nri_api::Hooks> {
         .flatten()
         .map(oci_hook)
         .collect();
-    result.poststart = hooks.poststart.as_ref().into_iter().flatten().map(oci_hook).collect();
-    result.poststop = hooks.poststop.as_ref().into_iter().flatten().map(oci_hook).collect();
+    result.poststart = hooks
+        .poststart
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .map(oci_hook)
+        .collect();
+    result.poststop = hooks
+        .poststop
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .map(oci_hook)
+        .collect();
     Some(result)
 }
 
@@ -369,14 +414,86 @@ pub fn oci_linux_container(spec: &Spec) -> Option<nri_api::LinuxContainer> {
         result.resources = MessageField::some(nri_resources);
     }
 
-    if let Some(oom_score_adj) = spec.process.as_ref().and_then(|process| process.oom_score_adj) {
+    if let Some(oom_score_adj) = spec
+        .process
+        .as_ref()
+        .and_then(|process| process.oom_score_adj)
+    {
         result.oom_score_adj = optional_int(oom_score_adj as i64);
+    }
+    if let Some(io_priority) = spec
+        .process
+        .as_ref()
+        .and_then(|process| process.io_priority.as_ref())
+    {
+        let mut value = nri_api::LinuxIOPriority::new();
+        value.class = io_prio_class(&io_priority.class).into();
+        value.priority = io_priority.priority;
+        result.io_priority = MessageField::some(value);
+    }
+    if let Some(scheduler) = spec
+        .process
+        .as_ref()
+        .and_then(|process| process.scheduler.as_ref())
+    {
+        let mut value = nri_api::LinuxScheduler::new();
+        value.policy = scheduler_policy(&scheduler.policy).into();
+        value.nice = scheduler.nice.unwrap_or_default();
+        value.priority = scheduler.priority.unwrap_or_default();
+        value.flags = scheduler
+            .flags
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .filter_map(|flag| scheduler_flag(flag).map(Into::into))
+            .collect();
+        value.runtime = scheduler.runtime.unwrap_or_default();
+        value.deadline = scheduler.deadline.unwrap_or_default();
+        value.period = scheduler.period.unwrap_or_default();
+        result.scheduler = MessageField::some(value);
     }
     result.cgroups_path = linux.cgroups_path.clone().unwrap_or_default();
     if let Some(seccomp) = linux.seccomp.as_ref() {
         result.seccomp_policy = MessageField::some(oci_seccomp(seccomp));
     }
     result.sysctl = linux.sysctl.clone().unwrap_or_default();
+    result.net_devices = linux
+        .net_devices
+        .as_ref()
+        .map(|devices| {
+            devices
+                .iter()
+                .map(|(host, device)| {
+                    let mut value = nri_api::LinuxNetDevice::new();
+                    value.name = device.name.clone();
+                    (host.clone(), value)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(intel_rdt) = linux.intel_rdt.as_ref() {
+        let mut rdt = nri_api::LinuxRdt::new();
+        if let Some(clos_id) = intel_rdt.clos_id.as_ref() {
+            rdt.clos_id = optional_string(clos_id.clone());
+        }
+        let mut schemata = Vec::new();
+        if let Some(value) = intel_rdt.l3_cache_schema.as_ref() {
+            schemata.push(format!("L3:{value}"));
+        }
+        if let Some(value) = intel_rdt.mem_bw_schema.as_ref() {
+            schemata.push(format!("MB:{value}"));
+        }
+        if !schemata.is_empty() {
+            rdt.schemata = optional_repeated_string(schemata);
+        }
+        match (intel_rdt.enable_cmt, intel_rdt.enable_mbm) {
+            (Some(enable_cmt), Some(enable_mbm)) if enable_cmt == enable_mbm => {
+                rdt.enable_monitoring = optional_bool(enable_cmt);
+            }
+            _ => {}
+        }
+        result.rdt = MessageField::some(rdt);
+    }
     Some(result)
 }
 
@@ -421,12 +538,16 @@ pub fn oci_user(spec: &Spec) -> Option<nri_api::User> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cri_linux_resources_from_nri, external_annotations, linux_resources_from_cri};
+    use super::{
+        cri_linux_resources_from_nri, external_annotations, linux_resources_from_cri,
+        oci_linux_container,
+    };
     use std::collections::HashMap;
 
     use protobuf::MessageField;
 
     use crate::nri_proto::api as nri_api;
+    use crate::oci::spec::{Linux, LinuxIntelRdt, Spec};
     use crate::proto::runtime::v1::LinuxContainerResources;
 
     #[test]
@@ -457,7 +578,11 @@ mod tests {
 
         let converted = linux_resources_from_cri(&resources);
         assert_eq!(
-            converted.cpu.as_ref().and_then(|cpu| cpu.quota.as_ref()).map(|q| q.value),
+            converted
+                .cpu
+                .as_ref()
+                .and_then(|cpu| cpu.quota.as_ref())
+                .map(|q| q.value),
             Some(50_000)
         );
         assert_eq!(
@@ -468,7 +593,10 @@ mod tests {
                 .map(|limit| limit.value),
             Some(1024)
         );
-        assert_eq!(converted.unified.get("memory.high"), Some(&"512".to_string()));
+        assert_eq!(
+            converted.unified.get("memory.high"),
+            Some(&"512".to_string())
+        );
     }
 
     #[test]
@@ -492,6 +620,57 @@ mod tests {
         assert_eq!(converted.cpu_shares, 512);
         assert_eq!(converted.cpuset_cpus, "0-1");
         assert_eq!(converted.memory_limit_in_bytes, 4096);
-        assert_eq!(converted.unified.get("memory.high"), Some(&"1024".to_string()));
+        assert_eq!(
+            converted.unified.get("memory.high"),
+            Some(&"1024".to_string())
+        );
+    }
+
+    #[test]
+    fn converts_oci_intel_rdt_to_nri_linux_container() {
+        let spec = Spec {
+            oci_version: "1.0.2".to_string(),
+            process: None,
+            root: None,
+            hostname: None,
+            mounts: None,
+            hooks: None,
+            linux: Some(Linux {
+                namespaces: None,
+                uid_mappings: None,
+                gid_mappings: None,
+                devices: None,
+                net_devices: None,
+                cgroups_path: None,
+                resources: None,
+                rootfs_propagation: None,
+                seccomp: None,
+                sysctl: None,
+                mount_label: None,
+                intel_rdt: Some(LinuxIntelRdt {
+                    clos_id: Some("gold".to_string()),
+                    l3_cache_schema: Some("0=ff".to_string()),
+                    mem_bw_schema: Some("0=70".to_string()),
+                    enable_cmt: Some(true),
+                    enable_mbm: Some(true),
+                }),
+            }),
+            annotations: None,
+        };
+
+        let linux = oci_linux_container(&spec).expect("linux container should be present");
+        let rdt = linux.rdt.into_option().expect("rdt should be present");
+        assert_eq!(
+            rdt.clos_id.as_ref().map(|value| value.value.as_str()),
+            Some("gold")
+        );
+        assert_eq!(
+            rdt.schemata.as_ref().map(|value| value.value.clone()),
+            Some(vec!["L3:0=ff".to_string(), "MB:0=70".to_string()])
+        );
+        assert_eq!(
+            rdt.enable_monitoring.as_ref().map(|value| value.value),
+            Some(true)
+        );
     }
 }

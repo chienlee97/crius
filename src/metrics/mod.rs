@@ -143,11 +143,7 @@ impl MetricsCollector {
     pub fn new() -> Result<Self> {
         // 检测cgroup版本
         let cgroup_v2 = Self::is_cgroup_v2();
-        let cgroup_base = if cgroup_v2 {
-            PathBuf::from("/sys/fs/cgroup")
-        } else {
-            PathBuf::from("/sys/fs/cgroup")
-        };
+        let cgroup_base = PathBuf::from("/sys/fs/cgroup");
 
         debug!("MetricsCollector initialized: cgroup_v2={}", cgroup_v2);
 
@@ -283,7 +279,7 @@ impl MetricsCollector {
                 return Some(direct_path);
             }
 
-            if let Some(found) = self.find_in_directory(&root, container_id) {
+            if let Some(found) = Self::find_in_directory(&root, container_id) {
                 return Some(found);
             }
         }
@@ -292,7 +288,7 @@ impl MetricsCollector {
     }
 
     /// 递归在目录中查找容器cgroup
-    fn find_in_directory(&self, dir: &Path, container_id: &str) -> Option<PathBuf> {
+    fn find_in_directory(dir: &Path, container_id: &str) -> Option<PathBuf> {
         // 检查当前目录是否匹配
         let container_path = dir.join(container_id);
         if container_path.exists() {
@@ -311,7 +307,7 @@ impl MetricsCollector {
                         }
                     }
                     // 递归查找
-                    if let Some(found) = self.find_in_directory(&path, container_id) {
+                    if let Some(found) = Self::find_in_directory(&path, container_id) {
                         return Some(found);
                     }
                 }
@@ -711,20 +707,12 @@ impl MetricsCollector {
 
     /// 采集PIDs统计
     fn collect_pids_stats(&self, cgroup_path: &Path) -> Result<PidsStats> {
-        let pids_current_path = cgroup_path.join(if self.cgroup_v2 {
-            "pids.current"
-        } else {
-            "pids.current"
-        });
+        let pids_current_path = cgroup_path.join("pids.current");
         let current = fs::read_to_string(&pids_current_path)?
             .trim()
             .parse::<u64>()?;
 
-        let pids_max_path = cgroup_path.join(if self.cgroup_v2 {
-            "pids.max"
-        } else {
-            "pids.max"
-        });
+        let pids_max_path = cgroup_path.join("pids.max");
         let limit_str = fs::read_to_string(&pids_max_path)?;
         let limit = if limit_str.trim() == "max" {
             u64::MAX

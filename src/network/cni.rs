@@ -286,6 +286,7 @@ impl CniManager {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_plugin_config(
         &self,
         config: &CniNetworkConfig,
@@ -328,6 +329,7 @@ impl CniManager {
         config_value
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn exec_cni_chain(
         &self,
         config: &CniNetworkConfig,

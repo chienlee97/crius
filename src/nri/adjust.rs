@@ -1,15 +1,209 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::PathBuf;
 
 use crate::nri::{NriError, Result};
 use crate::nri_proto::api as nri_api;
 use crate::oci::spec::{
-    Device, Hook, Hooks, Linux, LinuxCpu, LinuxDeviceCgroup, LinuxHugepageLimit, LinuxMemory, LinuxPids,
-    LinuxResources, Mount, Namespace, Process, Rlimit, Seccomp, SeccompArg, SeccompSyscall, Spec,
+    Device, Hook, Hooks, Linux, LinuxBlockIo, LinuxCpu, LinuxDeviceCgroup, LinuxHugepageLimit,
+    LinuxMemory, LinuxPids, LinuxResources, Mount, Namespace, Process, Rlimit, Seccomp, SeccompArg,
+    SeccompSyscall, Spec,
 };
+use serde::Deserialize;
 
 const REMOVAL_PREFIX: &str = "-";
 const INTERNAL_ANNOTATION_PREFIX: &str = "io.crius.internal/";
 const CHECKPOINT_LOCATION_ANNOTATION_KEY: &str = "io.crius.checkpoint.location";
+const DEFAULT_CDI_SPEC_DIRS: [&str; 2] = ["/etc/cdi", "/var/run/cdi"];
+const BLOCKIO_CONFIG_ENV: &str = "CRIUS_NRI_BLOCKIO_CONFIG";
+const POD_QOS_RDT_CLASS: &str = "/PodQos";
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct BlockIoClassConfig {
+    classes: HashMap<String, LinuxBlockIo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum BlockIoConfigFile {
+    Wrapped(BlockIoClassConfig),
+    Flat(HashMap<String, LinuxBlockIo>),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct CdiSpec {
+    kind: String,
+    devices: Vec<CdiDeviceSpec>,
+    container_edits: CdiContainerEdits,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct CdiDeviceSpec {
+    name: String,
+    container_edits: CdiContainerEdits,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct CdiContainerEdits {
+    env: Vec<String>,
+    device_nodes: Vec<CdiDeviceNode>,
+    hooks: Vec<CdiHook>,
+    mounts: Vec<CdiMount>,
+    intel_rdt: Option<CdiIntelRdt>,
+    additional_gids: Vec<u32>,
+    net_devices: Vec<CdiNetDevice>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct CdiDeviceNode {
+    path: String,
+    host_path: Option<String>,
+    #[serde(rename = "type")]
+    device_type: String,
+    major: i64,
+    minor: i64,
+    file_mode: Option<u32>,
+    permissions: String,
+    uid: Option<u32>,
+    gid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct CdiMount {
+    host_path: String,
+    container_path: String,
+    options: Vec<String>,
+    #[serde(rename = "type")]
+    mount_type: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct CdiHook {
+    hook_name: String,
+    path: String,
+    args: Vec<String>,
+    env: Vec<String>,
+    timeout: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct CdiIntelRdt {
+    #[serde(alias = "closID")]
+    clos_id: String,
+    l3_cache_schema: String,
+    mem_bw_schema: String,
+    schemata: Vec<String>,
+    enable_monitoring: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct CdiNetDevice {
+    host_interface_name: String,
+    name: String,
+}
+
+fn cdi_spec_dirs() -> Vec<PathBuf> {
+    std::env::var("CDI_SPEC_DIRS")
+        .ok()
+        .map(|dirs| {
+            dirs.split(':')
+                .filter(|entry| !entry.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .filter(|dirs| !dirs.is_empty())
+        .unwrap_or_else(|| DEFAULT_CDI_SPEC_DIRS.iter().map(PathBuf::from).collect())
+}
+
+fn load_cdi_specs() -> Result<Vec<CdiSpec>> {
+    let mut specs = Vec::new();
+    for dir in cdi_spec_dirs() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(NriError::Plugin(format!(
+                    "failed to read CDI directory {}: {}",
+                    dir.display(),
+                    err
+                )))
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|err| {
+                NriError::Plugin(format!(
+                    "failed to read CDI entry in {}: {}",
+                    dir.display(),
+                    err
+                ))
+            })?;
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let content = fs::read_to_string(&path).map_err(|err| {
+                NriError::Plugin(format!(
+                    "failed to read CDI spec {}: {}",
+                    path.display(),
+                    err
+                ))
+            })?;
+            let spec = serde_json::from_str::<CdiSpec>(&content).map_err(|err| {
+                NriError::Plugin(format!(
+                    "failed to parse CDI spec {}: {}",
+                    path.display(),
+                    err
+                ))
+            })?;
+            specs.push(spec);
+        }
+    }
+    Ok(specs)
+}
+
+fn merge_cdi_edits(base: &mut CdiContainerEdits, extra: &CdiContainerEdits) {
+    base.env.extend(extra.env.clone());
+    base.device_nodes.extend(extra.device_nodes.clone());
+    base.hooks.extend(extra.hooks.clone());
+    base.mounts.extend(extra.mounts.clone());
+    base.additional_gids.extend(extra.additional_gids.clone());
+    base.net_devices.extend(extra.net_devices.clone());
+    if extra.intel_rdt.is_some() {
+        base.intel_rdt = extra.intel_rdt.clone();
+    }
+}
+
+fn resolve_cdi_edits(device_ref: &str) -> Result<CdiContainerEdits> {
+    let Some((kind, name)) = device_ref.split_once('=') else {
+        return Err(NriError::Plugin(format!(
+            "invalid CDI device reference {device_ref:?}, expected <vendor>/<class>=<device>"
+        )));
+    };
+
+    for spec in load_cdi_specs()? {
+        if spec.kind != kind {
+            continue;
+        }
+        if let Some(device) = spec.devices.iter().find(|device| device.name == name) {
+            let mut edits = spec.container_edits.clone();
+            merge_cdi_edits(&mut edits, &device.container_edits);
+            return Ok(edits);
+        }
+    }
+
+    Err(NriError::Plugin(format!(
+        "CDI device {device_ref} not found in configured CDI specs"
+    )))
+}
 
 fn is_marked_for_removal(key: &str) -> Option<&str> {
     key.strip_prefix(REMOVAL_PREFIX)
@@ -23,19 +217,78 @@ fn is_protected_annotation_key(key: &str) -> bool {
     key.starts_with(INTERNAL_ANNOTATION_PREFIX) || key == CHECKPOINT_LOCATION_ANNOTATION_KEY
 }
 
-fn reject_unsupported(field: &str) -> Result<()> {
-    Err(NriError::Plugin(format!(
-        "container adjustment uses unsupported field {field}"
-    )))
+fn effective_blockio_config_path(config_path: Option<&str>) -> Option<PathBuf> {
+    config_path
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var(BLOCKIO_CONFIG_ENV)
+                .ok()
+                .filter(|path| !path.trim().is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+pub fn resolve_blockio_class(
+    class_name: &str,
+    config_path: Option<&str>,
+) -> Result<Option<LinuxBlockIo>> {
+    if class_name.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let path = effective_blockio_config_path(config_path).ok_or_else(|| {
+        NriError::Plugin(format!(
+            "blockio class '{}' requested but no blockio config path is configured",
+            class_name
+        ))
+    })?;
+    let content = fs::read_to_string(&path).map_err(|err| {
+        NriError::Plugin(format!(
+            "failed to read blockio config {}: {}",
+            path.display(),
+            err
+        ))
+    })?;
+    let classes = match serde_json::from_str::<BlockIoConfigFile>(&content).map_err(|err| {
+        NriError::Plugin(format!(
+            "failed to parse blockio config {}: {}",
+            path.display(),
+            err
+        ))
+    })? {
+        BlockIoConfigFile::Wrapped(config) => config.classes,
+        BlockIoConfigFile::Flat(classes) => classes,
+    };
+    classes
+        .get(class_name)
+        .cloned()
+        .ok_or_else(|| {
+            NriError::Plugin(format!(
+                "blockio class '{}' not found in {}",
+                class_name,
+                path.display()
+            ))
+        })
+        .map(Some)
+}
+
+pub fn resolve_rdt_class(class_name: &str) -> Option<crate::oci::spec::LinuxIntelRdt> {
+    let class_name = class_name.trim();
+    if class_name.is_empty() || class_name == POD_QOS_RDT_CLASS {
+        return None;
+    }
+
+    Some(crate::oci::spec::LinuxIntelRdt {
+        clos_id: Some(class_name.to_string()),
+        l3_cache_schema: None,
+        mem_bw_schema: None,
+        enable_cmt: None,
+        enable_mbm: None,
+    })
 }
 
 fn validate_adjustment_resources(resources: &nri_api::LinuxResources) -> Result<()> {
-    if resources.blockio_class.is_some() {
-        return reject_unsupported("linux.resources.blockio_class");
-    }
-    if resources.rdt_class.is_some() {
-        return reject_unsupported("linux.resources.rdt_class");
-    }
     for hugepage in &resources.hugepage_limits {
         if hugepage.page_size.is_empty() {
             return Err(NriError::Plugin(
@@ -85,8 +338,12 @@ pub fn validate_container_adjustment(adjustment: &nri_api::ContainerAdjustment) 
         }
     }
 
-    if !adjustment.CDI_devices.is_empty() {
-        return reject_unsupported("CDI_devices");
+    for device in &adjustment.CDI_devices {
+        if device.name.is_empty() {
+            return Err(NriError::Plugin(
+                "container adjustment CDI device name must not be empty".to_string(),
+            ));
+        }
     }
 
     if let Some(linux) = adjustment.linux.as_ref() {
@@ -99,9 +356,6 @@ pub fn validate_container_adjustment(adjustment: &nri_api::ContainerAdjustment) 
         }
         if let Some(resources) = linux.resources.as_ref() {
             validate_adjustment_resources(resources)?;
-        }
-        if linux.io_priority.is_some() {
-            return reject_unsupported("linux.io_priority");
         }
         for namespace in &linux.namespaces {
             if adjusted_key(&namespace.type_).is_empty() {
@@ -117,49 +371,12 @@ pub fn validate_container_adjustment(adjustment: &nri_api::ContainerAdjustment) 
                 ));
             }
         }
-        if !linux.net_devices.is_empty() {
-            return reject_unsupported("linux.net_devices");
-        }
-        if linux.scheduler.is_some() {
-            return reject_unsupported("linux.scheduler");
-        }
-        if linux.rdt.is_some() {
-            return reject_unsupported("linux.rdt");
-        }
     }
 
     Ok(())
 }
 
 pub fn validate_update_linux_resources(resources: &nri_api::LinuxResources) -> Result<()> {
-    if let Some(memory) = resources.memory.as_ref() {
-        if memory.reservation.is_some() {
-            return reject_unsupported("linux.resources.memory.reservation");
-        }
-        if memory.kernel.is_some() {
-            return reject_unsupported("linux.resources.memory.kernel");
-        }
-        if memory.kernel_tcp.is_some() {
-            return reject_unsupported("linux.resources.memory.kernel_tcp");
-        }
-        if memory.swappiness.is_some() {
-            return reject_unsupported("linux.resources.memory.swappiness");
-        }
-        if memory.disable_oom_killer.is_some() {
-            return reject_unsupported("linux.resources.memory.disable_oom_killer");
-        }
-        if memory.use_hierarchy.is_some() {
-            return reject_unsupported("linux.resources.memory.use_hierarchy");
-        }
-    }
-    if let Some(cpu) = resources.cpu.as_ref() {
-        if cpu.realtime_runtime.is_some() {
-            return reject_unsupported("linux.resources.cpu.realtime_runtime");
-        }
-        if cpu.realtime_period.is_some() {
-            return reject_unsupported("linux.resources.cpu.realtime_period");
-        }
-    }
     for hugepage in &resources.hugepage_limits {
         if hugepage.page_size.is_empty() {
             return Err(NriError::Plugin(
@@ -167,17 +384,17 @@ pub fn validate_update_linux_resources(resources: &nri_api::LinuxResources) -> R
             ));
         }
     }
-    if resources.blockio_class.is_some() {
-        return reject_unsupported("linux.resources.blockio_class");
-    }
-    if resources.rdt_class.is_some() {
-        return reject_unsupported("linux.resources.rdt_class");
-    }
-    if !resources.devices.is_empty() {
-        return reject_unsupported("linux.resources.devices");
-    }
-    if resources.pids.is_some() {
-        return reject_unsupported("linux.resources.pids");
+    for device in &resources.devices {
+        if device.type_.is_empty() {
+            return Err(NriError::Plugin(
+                "container update device rule must set type".to_string(),
+            ));
+        }
+        if device.access.is_empty() {
+            return Err(NriError::Plugin(
+                "container update device rule must set access".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -213,18 +430,21 @@ fn ensure_process(spec: &mut Spec) -> &mut Process {
         capabilities: None,
         rlimits: None,
         oom_score_adj: None,
+        scheduler: None,
         no_new_privileges: None,
         apparmor_profile: None,
         selinux_label: None,
+        io_priority: None,
     })
 }
 
 fn ensure_linux(spec: &mut Spec) -> &mut Linux {
-    spec.linux.get_or_insert_with(|| Linux {
+    spec.linux.get_or_insert(Linux {
         namespaces: None,
         uid_mappings: None,
         gid_mappings: None,
         devices: None,
+        net_devices: None,
         cgroups_path: None,
         resources: None,
         rootfs_propagation: None,
@@ -236,17 +456,19 @@ fn ensure_linux(spec: &mut Spec) -> &mut Linux {
 }
 
 fn ensure_linux_resources(spec: &mut Spec) -> &mut LinuxResources {
-    ensure_linux(spec).resources.get_or_insert_with(|| LinuxResources {
-        network: None,
-        pids: None,
-        memory: None,
-        cpu: None,
-        block_io: None,
-        hugepage_limits: None,
-        devices: None,
-        intel_rdt: None,
-        unified: None,
-    })
+    ensure_linux(spec)
+        .resources
+        .get_or_insert(LinuxResources {
+            network: None,
+            pids: None,
+            memory: None,
+            cpu: None,
+            block_io: None,
+            hugepage_limits: None,
+            devices: None,
+            intel_rdt: None,
+            unified: None,
+        })
 }
 
 fn env_name(entry: &str) -> &str {
@@ -279,7 +501,10 @@ fn apply_env_adjustments(spec: &mut Spec, adjustments: &[nri_api::KeyValue]) {
         }
 
         let rendered = format!("{}={}", entry.key, entry.value);
-        if let Some(existing) = entries.iter_mut().find(|current| env_name(current) == entry.key) {
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|current| env_name(current) == entry.key)
+        {
             *existing = rendered;
         } else {
             entries.push(rendered);
@@ -341,7 +566,7 @@ fn apply_hook_adjustments(spec: &mut Spec, hooks: Option<&nri_api::Hooks>) {
         return;
     };
 
-    let hooks = spec.hooks.get_or_insert_with(|| Hooks {
+    let hooks = spec.hooks.get_or_insert(Hooks {
         prestart: None,
         create_runtime: None,
         create_container: None,
@@ -382,7 +607,10 @@ fn apply_linux_devices(spec: &mut Spec, devices: &[nri_api::LinuxDevice]) {
             continue;
         }
         let updated = convert_device(device);
-        if let Some(existing) = entries.iter_mut().find(|current| current.path == updated.path) {
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|current| current.path == updated.path)
+        {
             *existing = updated;
         } else {
             entries.push(updated);
@@ -392,7 +620,7 @@ fn apply_linux_devices(spec: &mut Spec, devices: &[nri_api::LinuxDevice]) {
 }
 
 fn apply_linux_memory(resources: &mut LinuxResources, memory: &nri_api::LinuxMemory) {
-    let target = resources.memory.get_or_insert_with(|| LinuxMemory {
+    let target = resources.memory.get_or_insert(LinuxMemory {
         limit: None,
         swap: None,
         kernel: None,
@@ -429,7 +657,7 @@ fn apply_linux_memory(resources: &mut LinuxResources, memory: &nri_api::LinuxMem
 }
 
 fn apply_linux_cpu(resources: &mut LinuxResources, cpu: &nri_api::LinuxCPU) {
-    let target = resources.cpu.get_or_insert_with(|| LinuxCpu {
+    let target = resources.cpu.get_or_insert(LinuxCpu {
         shares: None,
         quota: None,
         period: None,
@@ -493,9 +721,13 @@ fn apply_hugepage_limits(resources: &mut LinuxResources, limits: &[nri_api::Huge
     }
 }
 
-fn apply_linux_resources(spec: &mut Spec, resources: Option<&nri_api::LinuxResources>) {
+fn apply_linux_resources(
+    spec: &mut Spec,
+    resources: Option<&nri_api::LinuxResources>,
+    blockio_config_path: Option<&str>,
+) -> Result<()> {
     let Some(adjustments) = resources else {
-        return;
+        return Ok(());
     };
 
     let target = ensure_linux_resources(spec);
@@ -507,7 +739,13 @@ fn apply_linux_resources(spec: &mut Spec, resources: Option<&nri_api::LinuxResou
     }
     apply_hugepage_limits(target, &adjustments.hugepage_limits);
     if !adjustments.devices.is_empty() {
-        target.devices = Some(adjustments.devices.iter().map(convert_device_cgroup).collect());
+        target.devices = Some(
+            adjustments
+                .devices
+                .iter()
+                .map(convert_device_cgroup)
+                .collect(),
+        );
     }
     if let Some(pids) = adjustments.pids.as_ref() {
         target.pids = Some(LinuxPids { limit: pids.limit });
@@ -517,6 +755,58 @@ fn apply_linux_resources(spec: &mut Spec, resources: Option<&nri_api::LinuxResou
             .unified
             .get_or_insert_with(HashMap::new)
             .extend(adjustments.unified.clone());
+    }
+    if let Some(blockio_class) = adjustments.blockio_class.as_ref() {
+        target.block_io = resolve_blockio_class(&blockio_class.value, blockio_config_path)?;
+    }
+    if let Some(rdt_class) = adjustments.rdt_class.as_ref() {
+        ensure_linux(spec).intel_rdt = resolve_rdt_class(&rdt_class.value);
+    }
+    Ok(())
+}
+
+fn apply_linux_rdt(spec: &mut Spec, rdt: &nri_api::LinuxRdt) {
+    if rdt.remove {
+        ensure_linux(spec).intel_rdt = None;
+        return;
+    }
+
+    let intel_rdt =
+        ensure_linux(spec)
+            .intel_rdt
+            .get_or_insert(crate::oci::spec::LinuxIntelRdt {
+                clos_id: None,
+                l3_cache_schema: None,
+                mem_bw_schema: None,
+                enable_cmt: None,
+                enable_mbm: None,
+            });
+    if let Some(clos_id) = rdt.clos_id.as_ref() {
+        intel_rdt.clos_id = Some(clos_id.value.clone());
+    }
+    if let Some(schemata) = rdt.schemata.as_ref() {
+        let mut l3 = None;
+        let mut mem_bw = None;
+        for entry in &schemata.value {
+            if let Some(value) = entry.strip_prefix("L3:") {
+                l3 = Some(value.to_string());
+            } else if let Some(value) = entry.strip_prefix("MB:") {
+                mem_bw = Some(value.to_string());
+            }
+        }
+        if l3.is_none() && mem_bw.is_none() && !schemata.value.is_empty() {
+            l3 = Some(schemata.value.join(";"));
+        }
+        if let Some(value) = l3 {
+            intel_rdt.l3_cache_schema = Some(value);
+        }
+        if let Some(value) = mem_bw {
+            intel_rdt.mem_bw_schema = Some(value);
+        }
+    }
+    if let Some(enable_monitoring) = rdt.enable_monitoring.as_ref() {
+        intel_rdt.enable_cmt = Some(enable_monitoring.value);
+        intel_rdt.enable_mbm = Some(enable_monitoring.value);
     }
 }
 
@@ -540,13 +830,112 @@ fn apply_linux_namespaces(spec: &mut Spec, namespaces: &[nri_api::LinuxNamespace
             continue;
         }
         let updated = convert_namespace(namespace);
-        if let Some(existing) = entries.iter_mut().find(|current| current.ns_type == updated.ns_type) {
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|current| current.ns_type == updated.ns_type)
+        {
             *existing = updated;
         } else {
             entries.push(updated);
         }
     }
     cleanup_vec(oci_namespaces);
+}
+
+fn io_priority_class_name(class: nri_api::IOPrioClass) -> String {
+    match class {
+        nri_api::IOPrioClass::IOPRIO_CLASS_RT => "IOPRIO_CLASS_RT".to_string(),
+        nri_api::IOPrioClass::IOPRIO_CLASS_BE => "IOPRIO_CLASS_BE".to_string(),
+        nri_api::IOPrioClass::IOPRIO_CLASS_IDLE => "IOPRIO_CLASS_IDLE".to_string(),
+        nri_api::IOPrioClass::IOPRIO_CLASS_NONE => "IOPRIO_CLASS_NONE".to_string(),
+    }
+}
+
+fn scheduler_policy_name(policy: nri_api::LinuxSchedulerPolicy) -> String {
+    match policy {
+        nri_api::LinuxSchedulerPolicy::SCHED_OTHER => "SCHED_OTHER".to_string(),
+        nri_api::LinuxSchedulerPolicy::SCHED_FIFO => "SCHED_FIFO".to_string(),
+        nri_api::LinuxSchedulerPolicy::SCHED_RR => "SCHED_RR".to_string(),
+        nri_api::LinuxSchedulerPolicy::SCHED_BATCH => "SCHED_BATCH".to_string(),
+        nri_api::LinuxSchedulerPolicy::SCHED_ISO => "SCHED_ISO".to_string(),
+        nri_api::LinuxSchedulerPolicy::SCHED_IDLE => "SCHED_IDLE".to_string(),
+        nri_api::LinuxSchedulerPolicy::SCHED_DEADLINE => "SCHED_DEADLINE".to_string(),
+        nri_api::LinuxSchedulerPolicy::SCHED_NONE => "SCHED_NONE".to_string(),
+    }
+}
+
+fn scheduler_flag_name(flag: nri_api::LinuxSchedulerFlag) -> String {
+    match flag {
+        nri_api::LinuxSchedulerFlag::SCHED_FLAG_RESET_ON_FORK => {
+            "SCHED_FLAG_RESET_ON_FORK".to_string()
+        }
+        nri_api::LinuxSchedulerFlag::SCHED_FLAG_RECLAIM => "SCHED_FLAG_RECLAIM".to_string(),
+        nri_api::LinuxSchedulerFlag::SCHED_FLAG_DL_OVERRUN => "SCHED_FLAG_DL_OVERRUN".to_string(),
+        nri_api::LinuxSchedulerFlag::SCHED_FLAG_KEEP_POLICY => "SCHED_FLAG_KEEP_POLICY".to_string(),
+        nri_api::LinuxSchedulerFlag::SCHED_FLAG_KEEP_PARAMS => "SCHED_FLAG_KEEP_PARAMS".to_string(),
+        nri_api::LinuxSchedulerFlag::SCHED_FLAG_UTIL_CLAMP_MIN => {
+            "SCHED_FLAG_UTIL_CLAMP_MIN".to_string()
+        }
+        nri_api::LinuxSchedulerFlag::SCHED_FLAG_UTIL_CLAMP_MAX => {
+            "SCHED_FLAG_UTIL_CLAMP_MAX".to_string()
+        }
+    }
+}
+
+fn apply_linux_io_priority(spec: &mut Spec, io_priority: &nri_api::LinuxIOPriority) {
+    ensure_process(spec).io_priority = Some(crate::oci::spec::LinuxIoPriority {
+        class: io_priority_class_name(io_priority.class.enum_value_or_default()),
+        priority: io_priority.priority,
+    });
+}
+
+fn apply_linux_scheduler(spec: &mut Spec, scheduler: &nri_api::LinuxScheduler) {
+    ensure_process(spec).scheduler = Some(crate::oci::spec::Scheduler {
+        policy: scheduler_policy_name(scheduler.policy.enum_value_or_default()),
+        nice: (scheduler.nice != 0).then_some(scheduler.nice),
+        priority: (scheduler.priority != 0).then_some(scheduler.priority),
+        flags: (!scheduler.flags.is_empty()).then(|| {
+            scheduler
+                .flags
+                .iter()
+                .map(|flag| scheduler_flag_name(flag.enum_value_or_default()))
+                .collect()
+        }),
+        runtime: (scheduler.runtime != 0).then_some(scheduler.runtime),
+        deadline: (scheduler.deadline != 0).then_some(scheduler.deadline),
+        period: (scheduler.period != 0).then_some(scheduler.period),
+    });
+}
+
+fn apply_linux_net_devices(
+    spec: &mut Spec,
+    net_devices: &HashMap<String, nri_api::LinuxNetDevice>,
+) -> Result<()> {
+    if net_devices.is_empty() {
+        return Ok(());
+    }
+
+    let entries = &mut ensure_linux(spec).net_devices;
+    let devices = entries.get_or_insert_with(HashMap::new);
+    for (host_name, device) in net_devices {
+        if let Some(name) = is_marked_for_removal(host_name) {
+            devices.remove(name);
+            continue;
+        }
+        if host_name.is_empty() || device.name.is_empty() {
+            return Err(NriError::Plugin(
+                "linux net device must set both host and container names".to_string(),
+            ));
+        }
+        devices.insert(
+            host_name.clone(),
+            crate::oci::spec::LinuxNetDevice {
+                name: device.name.clone(),
+            },
+        );
+    }
+    cleanup_map(entries);
+    Ok(())
 }
 
 fn convert_seccomp(seccomp: &nri_api::LinuxSeccomp) -> Seccomp {
@@ -556,7 +945,8 @@ fn convert_seccomp(seccomp: &nri_api::LinuxSeccomp) -> Seccomp {
         architectures: (!seccomp.architectures.is_empty()).then(|| seccomp.architectures.clone()),
         flags: (!seccomp.flags.is_empty()).then(|| seccomp.flags.clone()),
         listener_path: (!seccomp.listener_path.is_empty()).then(|| seccomp.listener_path.clone()),
-        listener_metadata: (!seccomp.listener_metadata.is_empty()).then(|| seccomp.listener_metadata.clone()),
+        listener_metadata: (!seccomp.listener_metadata.is_empty())
+            .then(|| seccomp.listener_metadata.clone()),
         syscalls: (!seccomp.syscalls.is_empty()).then(|| {
             seccomp
                 .syscalls
@@ -583,23 +973,37 @@ fn convert_seccomp(seccomp: &nri_api::LinuxSeccomp) -> Seccomp {
     }
 }
 
-fn apply_linux_adjustments(spec: &mut Spec, linux: Option<&nri_api::LinuxContainerAdjustment>) {
+fn apply_linux_adjustments(
+    spec: &mut Spec,
+    linux: Option<&nri_api::LinuxContainerAdjustment>,
+    blockio_config_path: Option<&str>,
+) -> Result<()> {
     let Some(adjustments) = linux else {
-        return;
+        return Ok(());
     };
 
     apply_linux_devices(spec, &adjustments.devices);
-    apply_linux_resources(spec, adjustments.resources.as_ref());
+    apply_linux_resources(spec, adjustments.resources.as_ref(), blockio_config_path)?;
     if !adjustments.cgroups_path.is_empty() {
         ensure_linux(spec).cgroups_path = Some(adjustments.cgroups_path.clone());
     }
     if let Some(oom_score_adj) = adjustments.oom_score_adj.as_ref() {
         ensure_process(spec).oom_score_adj = Some(oom_score_adj.value as i32);
     }
+    if let Some(io_priority) = adjustments.io_priority.as_ref() {
+        apply_linux_io_priority(spec, io_priority);
+    }
     if let Some(seccomp) = adjustments.seccomp_policy.as_ref() {
         ensure_linux(spec).seccomp = Some(convert_seccomp(seccomp));
     }
     apply_linux_namespaces(spec, &adjustments.namespaces);
+    if let Some(scheduler) = adjustments.scheduler.as_ref() {
+        apply_linux_scheduler(spec, scheduler);
+    }
+    apply_linux_net_devices(spec, &adjustments.net_devices)?;
+    if let Some(rdt) = adjustments.rdt.as_ref() {
+        apply_linux_rdt(spec, rdt);
+    }
 
     if !adjustments.sysctl.is_empty() {
         let sysctl = &mut ensure_linux(spec).sysctl;
@@ -613,6 +1017,8 @@ fn apply_linux_adjustments(spec: &mut Spec, linux: Option<&nri_api::LinuxContain
         }
         cleanup_map(sysctl);
     }
+
+    Ok(())
 }
 
 fn apply_rlimit_adjustments(spec: &mut Spec, adjustments: &[nri_api::POSIXRlimit]) {
@@ -628,13 +1034,274 @@ fn apply_rlimit_adjustments(spec: &mut Spec, adjustments: &[nri_api::POSIXRlimit
             hard: rlimit.hard,
             soft: rlimit.soft,
         };
-        if let Some(existing) = entries.iter_mut().find(|current| current.rtype == updated.rtype) {
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|current| current.rtype == updated.rtype)
+        {
             *existing = updated;
         } else {
             entries.push(updated);
         }
     }
     cleanup_vec(rlimits);
+}
+
+fn apply_cdi_env(spec: &mut Spec, env: &[String]) {
+    if env.is_empty() {
+        return;
+    }
+
+    let entries = &mut ensure_process(spec).env;
+    let current = entries.get_or_insert_with(Vec::new);
+    for rendered in env {
+        let name = env_name(rendered);
+        if let Some(existing) = current.iter_mut().find(|entry| env_name(entry) == name) {
+            *existing = rendered.clone();
+        } else {
+            current.push(rendered.clone());
+        }
+    }
+}
+
+fn apply_cdi_device_nodes(spec: &mut Spec, nodes: &[CdiDeviceNode]) -> Result<()> {
+    if nodes.is_empty() {
+        return Ok(());
+    }
+
+    for node in nodes {
+        if node.path.is_empty() {
+            return Err(NriError::Plugin(
+                "CDI device node path must not be empty".to_string(),
+            ));
+        }
+        let updated = Device {
+            device_type: if node.device_type.is_empty() {
+                "c".to_string()
+            } else {
+                node.device_type.clone()
+            },
+            path: node.path.clone(),
+            major: Some(node.major),
+            minor: Some(node.minor),
+            file_mode: node.file_mode,
+            uid: node.uid,
+            gid: node.gid,
+        };
+        {
+            let devices = &mut ensure_linux(spec).devices;
+            let entries = devices.get_or_insert_with(Vec::new);
+            if let Some(existing) = entries
+                .iter_mut()
+                .find(|device| device.path == updated.path)
+            {
+                *existing = updated;
+            } else {
+                entries.push(updated);
+            }
+        }
+
+        let resource = LinuxDeviceCgroup {
+            allow: true,
+            device_type: Some(if node.device_type.is_empty() {
+                "c".to_string()
+            } else {
+                node.device_type.clone()
+            }),
+            major: Some(node.major),
+            minor: Some(node.minor),
+            access: Some(if node.permissions.is_empty() {
+                "rwm".to_string()
+            } else {
+                node.permissions.clone()
+            }),
+        };
+        {
+            let resources = &mut ensure_linux_resources(spec).devices;
+            let resource_entries = resources.get_or_insert_with(Vec::new);
+            if let Some(existing) = resource_entries.iter_mut().find(|device| {
+                device.device_type == resource.device_type
+                    && device.major == resource.major
+                    && device.minor == resource.minor
+            }) {
+                *existing = resource;
+            } else {
+                resource_entries.push(resource);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_cdi_mounts(spec: &mut Spec, mounts: &[CdiMount]) -> Result<()> {
+    if mounts.is_empty() {
+        return Ok(());
+    }
+
+    let entries = spec.mounts.get_or_insert_with(Vec::new);
+    for mount in mounts {
+        if mount.host_path.is_empty() || mount.container_path.is_empty() {
+            return Err(NriError::Plugin(
+                "CDI mount must set both hostPath and containerPath".to_string(),
+            ));
+        }
+        let updated = Mount {
+            destination: mount.container_path.clone(),
+            source: Some(mount.host_path.clone()),
+            mount_type: (!mount.mount_type.is_empty()).then(|| mount.mount_type.clone()),
+            options: (!mount.options.is_empty()).then(|| mount.options.clone()),
+        };
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|current| current.destination == updated.destination)
+        {
+            *existing = updated;
+        } else {
+            entries.push(updated);
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_cdi_hooks(spec: &mut Spec, hooks: &[CdiHook]) -> Result<()> {
+    if hooks.is_empty() {
+        return Ok(());
+    }
+
+    let oci_hooks = spec.hooks.get_or_insert(Hooks {
+        prestart: None,
+        create_runtime: None,
+        create_container: None,
+        start_container: None,
+        poststart: None,
+        poststop: None,
+    });
+    for hook in hooks {
+        if hook.path.is_empty() {
+            return Err(NriError::Plugin(
+                "CDI hook path must not be empty".to_string(),
+            ));
+        }
+        let converted = Hook {
+            path: hook.path.clone(),
+            args: (!hook.args.is_empty()).then(|| hook.args.clone()),
+            env: (!hook.env.is_empty()).then(|| hook.env.clone()),
+            timeout: hook.timeout,
+        };
+        match hook.hook_name.as_str() {
+            "prestart" => oci_hooks
+                .prestart
+                .get_or_insert_with(Vec::new)
+                .push(converted),
+            "createRuntime" => oci_hooks
+                .create_runtime
+                .get_or_insert_with(Vec::new)
+                .push(converted),
+            "createContainer" => oci_hooks
+                .create_container
+                .get_or_insert_with(Vec::new)
+                .push(converted),
+            "startContainer" => oci_hooks
+                .start_container
+                .get_or_insert_with(Vec::new)
+                .push(converted),
+            "poststart" => oci_hooks
+                .poststart
+                .get_or_insert_with(Vec::new)
+                .push(converted),
+            "poststop" => oci_hooks
+                .poststop
+                .get_or_insert_with(Vec::new)
+                .push(converted),
+            other => {
+                return Err(NriError::Plugin(format!(
+                    "unsupported CDI hook name {other:?}"
+                )))
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_cdi_intel_rdt(spec: &mut Spec, intel_rdt: &CdiIntelRdt) {
+    ensure_linux(spec).intel_rdt = Some(crate::oci::spec::LinuxIntelRdt {
+        clos_id: (!intel_rdt.clos_id.is_empty()).then(|| intel_rdt.clos_id.clone()),
+        l3_cache_schema: (!intel_rdt.l3_cache_schema.is_empty())
+            .then(|| intel_rdt.l3_cache_schema.clone())
+            .or_else(|| (!intel_rdt.schemata.is_empty()).then(|| intel_rdt.schemata.join(";"))),
+        mem_bw_schema: (!intel_rdt.mem_bw_schema.is_empty())
+            .then(|| intel_rdt.mem_bw_schema.clone()),
+        enable_cmt: Some(intel_rdt.enable_monitoring),
+        enable_mbm: Some(intel_rdt.enable_monitoring),
+    });
+}
+
+fn apply_cdi_additional_gids(spec: &mut Spec, gids: &[u32]) {
+    if gids.is_empty() {
+        return;
+    }
+
+    let user = ensure_process(spec)
+        .user
+        .get_or_insert(crate::oci::spec::User {
+            uid: 0,
+            gid: 0,
+            additional_gids: None,
+            username: None,
+        });
+    let existing = user.additional_gids.get_or_insert_with(Vec::new);
+    let mut seen: HashSet<u32> = existing.iter().copied().collect();
+    for gid in gids {
+        if *gid != 0 && seen.insert(*gid) {
+            existing.push(*gid);
+        }
+    }
+}
+
+fn apply_cdi_net_devices(spec: &mut Spec, devices: &[CdiNetDevice]) -> Result<()> {
+    if devices.is_empty() {
+        return Ok(());
+    }
+
+    let entries = &mut ensure_linux(spec).net_devices;
+    let current = entries.get_or_insert_with(HashMap::new);
+    for device in devices {
+        if device.host_interface_name.is_empty() || device.name.is_empty() {
+            return Err(NriError::Plugin(
+                "CDI net device must set both hostInterfaceName and name".to_string(),
+            ));
+        }
+        current.insert(
+            device.host_interface_name.clone(),
+            crate::oci::spec::LinuxNetDevice {
+                name: device.name.clone(),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn apply_cdi_edits(spec: &mut Spec, edits: &CdiContainerEdits) -> Result<()> {
+    apply_cdi_env(spec, &edits.env);
+    apply_cdi_device_nodes(spec, &edits.device_nodes)?;
+    apply_cdi_mounts(spec, &edits.mounts)?;
+    apply_cdi_hooks(spec, &edits.hooks)?;
+    apply_cdi_net_devices(spec, &edits.net_devices)?;
+    if let Some(intel_rdt) = edits.intel_rdt.as_ref() {
+        apply_cdi_intel_rdt(spec, intel_rdt);
+    }
+    apply_cdi_additional_gids(spec, &edits.additional_gids);
+    Ok(())
+}
+
+fn apply_cdi_device_adjustments(spec: &mut Spec, devices: &[nri_api::CDIDevice]) -> Result<()> {
+    for device in devices {
+        let edits = resolve_cdi_edits(&device.name)?;
+        apply_cdi_edits(spec, &edits)?;
+    }
+    Ok(())
 }
 
 pub fn apply_annotation_adjustments(spec: &mut Spec, adjustments: &HashMap<String, String>) {
@@ -653,12 +1320,24 @@ pub fn apply_annotation_adjustments(spec: &mut Spec, adjustments: &HashMap<Strin
     cleanup_map(&mut spec.annotations);
 }
 
-pub fn apply_container_adjustment(spec: &mut Spec, adjustment: &nri_api::ContainerAdjustment) {
+pub fn apply_container_adjustment(
+    spec: &mut Spec,
+    adjustment: &nri_api::ContainerAdjustment,
+) -> Result<()> {
+    apply_container_adjustment_with_blockio_config(spec, adjustment, None)
+}
+
+pub fn apply_container_adjustment_with_blockio_config(
+    spec: &mut Spec,
+    adjustment: &nri_api::ContainerAdjustment,
+    blockio_config_path: Option<&str>,
+) -> Result<()> {
     apply_annotation_adjustments(spec, &adjustment.annotations);
     apply_mount_adjustments(spec, adjustment.mounts.as_slice());
     apply_env_adjustments(spec, adjustment.env.as_slice());
     apply_hook_adjustments(spec, adjustment.hooks.as_ref());
-    apply_linux_adjustments(spec, adjustment.linux.as_ref());
+    apply_cdi_device_adjustments(spec, &adjustment.CDI_devices)?;
+    apply_linux_adjustments(spec, adjustment.linux.as_ref(), blockio_config_path)?;
     apply_rlimit_adjustments(spec, adjustment.rlimits.as_slice());
 
     if !adjustment.args.is_empty() {
@@ -669,26 +1348,48 @@ pub fn apply_container_adjustment(spec: &mut Spec, adjustment: &nri_api::Contain
             adjustment.args.clone()
         };
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     use protobuf::MessageField;
+    use tempfile::tempdir;
 
     use super::{
-        apply_container_adjustment, validate_container_adjustment, validate_container_update,
+        apply_container_adjustment, apply_container_adjustment_with_blockio_config,
+        resolve_rdt_class, validate_container_adjustment, validate_container_update,
         validate_update_linux_resources, REMOVAL_PREFIX,
     };
     use crate::nri_proto::api as nri_api;
     use crate::oci::spec::{
-        Device, Linux, LinuxCpu, LinuxHugepageLimit, LinuxMemory, LinuxPids, LinuxResources, Mount, Namespace,
-        Process, Rlimit, Spec,
+        Device, Linux, LinuxCpu, LinuxHugepageLimit, LinuxMemory, LinuxPids, LinuxResources, Mount,
+        Namespace, Process, Rlimit, Spec,
     };
 
     fn removal(name: &str) -> String {
         format!("{REMOVAL_PREFIX}{name}")
+    }
+
+    fn write_blockio_config(dir: &Path) -> PathBuf {
+        let path = dir.join("blockio.json");
+        fs::write(
+            &path,
+            serde_json::json!({
+                "classes": {
+                    "gold": {
+                        "weight": 500
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        path
     }
 
     fn opt_int(value: i64) -> MessageField<nri_api::OptionalInt> {
@@ -731,9 +1432,11 @@ mod tests {
                     soft: 512,
                 }]),
                 oom_score_adj: None,
+                scheduler: None,
                 no_new_privileges: None,
                 apparmor_profile: None,
                 selinux_label: None,
+                io_priority: None,
             }),
             root: None,
             hostname: None,
@@ -766,6 +1469,7 @@ mod tests {
                     uid: None,
                     gid: None,
                 }]),
+                net_devices: None,
                 cgroups_path: Some("/old/path".to_string()),
                 resources: Some(LinuxResources {
                     network: None,
@@ -796,7 +1500,10 @@ mod tests {
                     }]),
                     devices: None,
                     intel_rdt: None,
-                    unified: Some(HashMap::from([("memory.high".to_string(), "128".to_string())])),
+                    unified: Some(HashMap::from([(
+                        "memory.high".to_string(),
+                        "128".to_string(),
+                    )])),
                 }),
                 rootfs_propagation: None,
                 seccomp: None,
@@ -854,12 +1561,24 @@ mod tests {
         adjustment.hooks = MessageField::some(hooks);
         adjustment.args = vec![String::new(), "/bin/echo".to_string(), "hi".to_string()];
 
-        apply_container_adjustment(&mut spec, &adjustment);
+        apply_container_adjustment(&mut spec, &adjustment).unwrap();
 
-        assert_eq!(spec.annotations.as_ref().unwrap().get("keep"), Some(&"new".to_string()));
+        assert_eq!(
+            spec.annotations.as_ref().unwrap().get("keep"),
+            Some(&"new".to_string())
+        );
         assert!(!spec.annotations.as_ref().unwrap().contains_key("drop"));
-        assert_eq!(spec.process.as_ref().unwrap().env.as_ref().unwrap(), &vec!["B=3".to_string()]);
-        let mount = spec.mounts.as_ref().unwrap().iter().find(|mount| mount.destination == "/data").unwrap();
+        assert_eq!(
+            spec.process.as_ref().unwrap().env.as_ref().unwrap(),
+            &vec!["B=3".to_string()]
+        );
+        let mount = spec
+            .mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|mount| mount.destination == "/data")
+            .unwrap();
         assert_eq!(mount.source.as_deref(), Some("/new"));
         assert_eq!(mount.options.as_ref().unwrap(), &vec!["rw".to_string()]);
         let hook = &spec.hooks.as_ref().unwrap().prestart.as_ref().unwrap()[0];
@@ -909,13 +1628,23 @@ mod tests {
             limit: 4,
             ..Default::default()
         });
-        resources.unified.insert("cpu.max".to_string(), "100000 100000".to_string());
-        resources.pids = Some(nri_api::LinuxPids { limit: 128, ..Default::default() }).into();
+        resources
+            .unified
+            .insert("cpu.max".to_string(), "100000 100000".to_string());
+        resources.pids = Some(nri_api::LinuxPids {
+            limit: 128,
+            ..Default::default()
+        })
+        .into();
         linux.resources = MessageField::some(resources);
         linux.cgroups_path = "/new/path".to_string();
         linux.oom_score_adj = opt_int(222);
-        linux.sysctl.insert(removal("net.ipv4.ip_forward"), String::new());
-        linux.sysctl.insert("vm.max_map_count".to_string(), "262144".to_string());
+        linux
+            .sysctl
+            .insert(removal("net.ipv4.ip_forward"), String::new());
+        linux
+            .sysctl
+            .insert("vm.max_map_count".to_string(), "262144".to_string());
         linux.namespaces.push(nri_api::LinuxNamespace {
             type_: "pid".to_string(),
             path: "/proc/1/ns/pid".to_string(),
@@ -944,17 +1673,40 @@ mod tests {
         linux.seccomp_policy = MessageField::some(seccomp);
         adjustment.linux = MessageField::some(linux);
 
-        apply_container_adjustment(&mut spec, &adjustment);
+        apply_container_adjustment(&mut spec, &adjustment).unwrap();
 
         let linux = spec.linux.as_ref().unwrap();
-        assert!(linux.devices.as_ref().unwrap().iter().all(|device| device.path != "/dev/null"));
-        let fuse = linux.devices.as_ref().unwrap().iter().find(|device| device.path == "/dev/fuse").unwrap();
+        assert!(linux
+            .devices
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|device| device.path != "/dev/null"));
+        let fuse = linux
+            .devices
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|device| device.path == "/dev/fuse")
+            .unwrap();
         assert_eq!(fuse.major, Some(10));
         assert_eq!(linux.cgroups_path.as_deref(), Some("/new/path"));
         assert_eq!(spec.process.as_ref().unwrap().oom_score_adj, Some(222));
-        assert_eq!(linux.sysctl.as_ref().unwrap().get("vm.max_map_count"), Some(&"262144".to_string()));
-        assert!(!linux.sysctl.as_ref().unwrap().contains_key("net.ipv4.ip_forward"));
-        assert!(linux.namespaces.as_ref().unwrap().iter().all(|ns| ns.ns_type != "network"));
+        assert_eq!(
+            linux.sysctl.as_ref().unwrap().get("vm.max_map_count"),
+            Some(&"262144".to_string())
+        );
+        assert!(!linux
+            .sysctl
+            .as_ref()
+            .unwrap()
+            .contains_key("net.ipv4.ip_forward"));
+        assert!(linux
+            .namespaces
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|ns| ns.ns_type != "network"));
         assert_eq!(
             linux
                 .namespaces
@@ -980,7 +1732,10 @@ mod tests {
         );
         let seccomp = linux.seccomp.as_ref().unwrap();
         assert_eq!(seccomp.default_action, "SCMP_ACT_ERRNO");
-        assert_eq!(seccomp.syscalls.as_ref().unwrap()[0].names, vec!["clone3".to_string()]);
+        assert_eq!(
+            seccomp.syscalls.as_ref().unwrap()[0].names,
+            vec!["clone3".to_string()]
+        );
     }
 
     #[test]
@@ -1000,18 +1755,106 @@ mod tests {
             ..Default::default()
         });
 
-        apply_container_adjustment(&mut spec, &adjustment);
+        apply_container_adjustment(&mut spec, &adjustment).unwrap();
 
         let rlimits = spec.process.as_ref().unwrap().rlimits.as_ref().unwrap();
         assert_eq!(rlimits.len(), 2);
         assert_eq!(
-            rlimits.iter().find(|limit| limit.rtype == "RLIMIT_NOFILE").unwrap().hard,
+            rlimits
+                .iter()
+                .find(|limit| limit.rtype == "RLIMIT_NOFILE")
+                .unwrap()
+                .hard,
             4096
         );
         assert_eq!(
-            rlimits.iter().find(|limit| limit.rtype == "RLIMIT_NPROC").unwrap().soft,
+            rlimits
+                .iter()
+                .find(|limit| limit.rtype == "RLIMIT_NPROC")
+                .unwrap()
+                .soft,
             1024
         );
+    }
+
+    #[test]
+    fn applies_rdt_class_and_linux_rdt_adjustments() {
+        let mut spec = spec_with_process();
+        let mut adjustment = nri_api::ContainerAdjustment::new();
+        let mut linux = nri_api::LinuxContainerAdjustment::new();
+        let mut resources = nri_api::LinuxResources::new();
+        let mut rdt_class = nri_api::OptionalString::new();
+        rdt_class.value = "gold".to_string();
+        resources.rdt_class = MessageField::some(rdt_class);
+        linux.resources = MessageField::some(resources);
+
+        let mut rdt = nri_api::LinuxRdt::new();
+        let mut clos_id = nri_api::OptionalString::new();
+        clos_id.value = "silver".to_string();
+        rdt.clos_id = MessageField::some(clos_id);
+        let mut schemata = nri_api::OptionalRepeatedString::new();
+        schemata.value = vec!["L3:0=ff".to_string(), "MB:0=70".to_string()];
+        rdt.schemata = MessageField::some(schemata);
+        let mut monitoring = nri_api::OptionalBool::new();
+        monitoring.value = true;
+        rdt.enable_monitoring = MessageField::some(monitoring);
+        linux.rdt = MessageField::some(rdt);
+        adjustment.linux = MessageField::some(linux);
+
+        apply_container_adjustment(&mut spec, &adjustment).unwrap();
+
+        let intel_rdt = spec
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.intel_rdt.as_ref())
+            .expect("intel_rdt should be configured");
+        assert_eq!(intel_rdt.clos_id.as_deref(), Some("silver"));
+        assert_eq!(intel_rdt.l3_cache_schema.as_deref(), Some("0=ff"));
+        assert_eq!(intel_rdt.mem_bw_schema.as_deref(), Some("0=70"));
+        assert_eq!(intel_rdt.enable_cmt, Some(true));
+        assert_eq!(intel_rdt.enable_mbm, Some(true));
+    }
+
+    #[test]
+    fn resolves_pod_qos_rdt_class_to_none() {
+        assert!(resolve_rdt_class("").is_none());
+        assert!(resolve_rdt_class("/PodQos").is_none());
+        assert_eq!(
+            resolve_rdt_class("gold")
+                .and_then(|rdt| rdt.clos_id)
+                .as_deref(),
+            Some("gold")
+        );
+    }
+
+    #[test]
+    fn applies_blockio_class_adjustments() {
+        let dir = tempdir().unwrap();
+        let config_path = write_blockio_config(dir.path());
+        let mut spec = spec_with_process();
+        let mut adjustment = nri_api::ContainerAdjustment::new();
+        let mut linux = nri_api::LinuxContainerAdjustment::new();
+        let mut resources = nri_api::LinuxResources::new();
+        let mut blockio_class = nri_api::OptionalString::new();
+        blockio_class.value = "gold".to_string();
+        resources.blockio_class = MessageField::some(blockio_class);
+        linux.resources = MessageField::some(resources);
+        adjustment.linux = MessageField::some(linux);
+
+        apply_container_adjustment_with_blockio_config(
+            &mut spec,
+            &adjustment,
+            Some(config_path.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let block_io = spec
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.resources.as_ref())
+            .and_then(|resources| resources.block_io.as_ref())
+            .expect("block io should be configured");
+        assert_eq!(block_io.weight, Some(500));
     }
 
     #[test]
@@ -1027,28 +1870,168 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_adjustment_fields() {
+    fn applies_cdi_device_edits_from_json_spec() {
+        let dir = tempdir().unwrap();
+        let spec_path = dir.path().join("vendor.json");
+        fs::write(
+            &spec_path,
+            serde_json::json!({
+                "cdiVersion": "0.7.0",
+                "kind": "vendor.com/device",
+                "containerEdits": {
+                    "env": ["FROM_SPEC=1"],
+                    "additionalGids": [2000]
+                },
+                "devices": [{
+                    "name": "gpu0",
+                    "containerEdits": {
+                        "env": ["FROM_DEVICE=1"],
+                        "deviceNodes": [{
+                            "path": "/dev/vendor0",
+                            "type": "c",
+                            "major": 10,
+                            "minor": 200,
+                            "permissions": "rw"
+                        }],
+                        "mounts": [{
+                            "hostPath": "/opt/vendor/lib.so",
+                            "containerPath": "/usr/lib/libvendor.so",
+                            "options": ["ro", "bind"],
+                            "type": "bind"
+                        }],
+                        "hooks": [{
+                            "hookName": "createContainer",
+                            "path": "/bin/cdi-hook",
+                            "args": ["hook"],
+                            "env": ["A=B"]
+                        }],
+                        "intelRdt": {
+                            "closID": "gold",
+                            "l3CacheSchema": "0=ff",
+                            "memBwSchema": "0=70",
+                            "enableMonitoring": true
+                        }
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        std::env::set_var("CDI_SPEC_DIRS", dir.path());
+        let mut spec = spec_with_process();
+        let mut adjustment = nri_api::ContainerAdjustment::new();
+        adjustment.CDI_devices.push(nri_api::CDIDevice {
+            name: "vendor.com/device=gpu0".to_string(),
+            ..Default::default()
+        });
+
+        apply_container_adjustment(&mut spec, &adjustment).unwrap();
+        std::env::remove_var("CDI_SPEC_DIRS");
+
+        let env = spec.process.as_ref().unwrap().env.as_ref().unwrap();
+        assert!(env.iter().any(|entry| entry == "FROM_SPEC=1"));
+        assert!(env.iter().any(|entry| entry == "FROM_DEVICE=1"));
+        assert_eq!(
+            spec.process
+                .as_ref()
+                .unwrap()
+                .user
+                .as_ref()
+                .and_then(|user| user.additional_gids.as_ref())
+                .unwrap(),
+            &vec![2000]
+        );
+        assert!(spec
+            .mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|mount| mount.destination == "/usr/lib/libvendor.so"));
+        assert!(spec
+            .linux
+            .as_ref()
+            .unwrap()
+            .devices
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|device| device.path == "/dev/vendor0"));
+        assert!(spec
+            .hooks
+            .as_ref()
+            .unwrap()
+            .create_container
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|hook| hook.path == "/bin/cdi-hook"));
+        let intel_rdt = spec.linux.as_ref().unwrap().intel_rdt.as_ref().unwrap();
+        assert_eq!(intel_rdt.clos_id.as_deref(), Some("gold"));
+        assert_eq!(intel_rdt.l3_cache_schema.as_deref(), Some("0=ff"));
+        assert_eq!(intel_rdt.mem_bw_schema.as_deref(), Some("0=70"));
+        assert_eq!(intel_rdt.enable_cmt, Some(true));
+        assert_eq!(intel_rdt.enable_mbm, Some(true));
+    }
+
+    #[test]
+    fn rejects_invalid_cdi_reference() {
         let mut adjustment = nri_api::ContainerAdjustment::new();
         adjustment.CDI_devices.push(nri_api::CDIDevice {
             name: "vendor.com/device".to_string(),
             ..Default::default()
         });
 
-        let err = validate_container_adjustment(&adjustment).unwrap_err();
-        assert!(format!("{err}").contains("unsupported field CDI_devices"));
+        let mut spec = spec_with_process();
+        let err = apply_container_adjustment(&mut spec, &adjustment).unwrap_err();
+        assert!(format!("{err}").contains("expected <vendor>/<class>=<device>"));
     }
 
     #[test]
-    fn rejects_unsupported_update_resources() {
+    fn rejects_invalid_linux_net_device_adjustment() {
+        let mut adjustment = nri_api::ContainerAdjustment::new();
+        adjustment.linux = Some({
+            let mut linux = nri_api::LinuxContainerAdjustment::new();
+            linux.net_devices.insert(
+                "eth0".to_string(),
+                nri_api::LinuxNetDevice {
+                    name: String::new(),
+                    ..Default::default()
+                },
+            );
+            linux
+        })
+        .into();
+
+        let mut spec = spec_with_process();
+        let err = apply_container_adjustment(&mut spec, &adjustment).unwrap_err();
+        assert!(
+            format!("{err}").contains("linux net device must set both host and container names")
+        );
+    }
+
+    #[test]
+    fn accepts_extended_update_resources() {
         let mut resources = nri_api::LinuxResources::new();
+        let mut memory = nri_api::LinuxMemory::new();
+        let mut reservation = nri_api::OptionalInt64::new();
+        reservation.value = 4096;
+        memory.reservation = protobuf::MessageField::some(reservation);
+        resources.memory = protobuf::MessageField::some(memory);
         resources.pids = Some(nri_api::LinuxPids {
             limit: 12,
             ..Default::default()
         })
         .into();
+        resources.devices.push(nri_api::LinuxDeviceCgroup {
+            allow: true,
+            type_: "c".to_string(),
+            access: "rwm".to_string(),
+            ..Default::default()
+        });
 
-        let err = validate_update_linux_resources(&resources).unwrap_err();
-        assert!(format!("{err}").contains("unsupported field linux.resources.pids"));
+        validate_update_linux_resources(&resources)
+            .expect("extended update resources should validate");
     }
 
     #[test]

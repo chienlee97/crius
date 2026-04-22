@@ -559,6 +559,20 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
         self.pods.get(pod_id).cloned()
     }
 
+    /// 更新Pod沙箱资源
+    pub async fn update_pod_sandbox_resources(
+        &mut self,
+        pod_id: &str,
+        resources: Option<LinuxContainerResources>,
+    ) -> Result<()> {
+        let Some(pod) = self.pods.get_mut(pod_id) else {
+            return Err(anyhow::anyhow!("Pod sandbox {} not found", pod_id));
+        };
+
+        pod.config.linux_resources = resources;
+        Ok(())
+    }
+
     /// 恢复Pod沙箱到内存管理器
     pub fn restore_pod_sandbox(&mut self, pod: PodSandbox) {
         self.pods.insert(pod.id.clone(), pod);
