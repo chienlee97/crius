@@ -32,7 +32,7 @@ struct PendingLogBytes {
 }
 
 /// IO配置
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct IoConfig {
     /// stdin重定向文件
     pub stdin: Option<PathBuf>,
@@ -48,20 +48,6 @@ pub struct IoConfig {
     pub resize_socket: Option<PathBuf>,
     /// reopen log socket地址
     pub reopen_socket: Option<PathBuf>,
-}
-
-impl Default for IoConfig {
-    fn default() -> Self {
-        Self {
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            terminal: false,
-            attach_socket: None,
-            resize_socket: None,
-            reopen_socket: None,
-        }
-    }
 }
 
 /// IO管理器

@@ -32,7 +32,7 @@ impl ProcessManager {
         );
 
         let output = Command::new(&self.runtime)
-            .args(&[
+            .args([
                 "create",
                 "--bundle",
                 bundle.to_str().unwrap(),
@@ -58,7 +58,7 @@ impl ProcessManager {
         info!("Starting container {}", self.container_id);
 
         let output = Command::new(&self.runtime)
-            .args(&["start", &self.container_id])
+            .args(["start", &self.container_id])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -83,7 +83,7 @@ impl ProcessManager {
 
         // 首先尝试发送SIGTERM
         let output = Command::new(&self.runtime)
-            .args(&["kill", &self.container_id, "TERM"])
+            .args(["kill", &self.container_id, "TERM"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -118,7 +118,7 @@ impl ProcessManager {
             self.container_id
         );
         let output = Command::new(&self.runtime)
-            .args(&["kill", &self.container_id, "KILL"])
+            .args(["kill", &self.container_id, "KILL"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -137,7 +137,7 @@ impl ProcessManager {
         info!("Deleting container {}", self.container_id);
 
         let output = Command::new(&self.runtime)
-            .args(&["delete", &self.container_id])
+            .args(["delete", &self.container_id])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -213,7 +213,7 @@ impl ProcessManager {
     /// 获取容器状态
     pub fn state(&self) -> Result<ContainerState> {
         let output = Command::new(&self.runtime)
-            .args(&["state", &self.container_id])
+            .args(["state", &self.container_id])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()

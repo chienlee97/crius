@@ -245,7 +245,7 @@ impl Daemon {
     fn create_terminal_container(&self) -> Result<Pid> {
         // 首先检查容器是否已经存在
         let state_output = Command::new(&self.runtime)
-            .args(&["state", &self.container_id])
+            .args(["state", &self.container_id])
             .output()?;
 
         if state_output.status.success() {
@@ -298,7 +298,7 @@ impl Daemon {
 
         // 获取容器PID
         let state_output = Command::new(&self.runtime)
-            .args(&["state", &self.container_id])
+            .args(["state", &self.container_id])
             .output()?;
 
         if !state_output.status.success() {
@@ -315,7 +315,7 @@ impl Daemon {
 
         // 启动容器
         let output = Command::new(&self.runtime)
-            .args(&["start", &self.container_id])
+            .args(["start", &self.container_id])
             .output()
             .context("Failed to execute runc start")?;
 
@@ -335,7 +335,7 @@ impl Daemon {
             .unwrap_or_default();
 
         let mut cmd = Command::new(&self.runtime);
-        cmd.args(&[
+        cmd.args([
             "run",
             "--bundle",
             self.bundle.to_str().unwrap(),
@@ -498,7 +498,7 @@ impl Daemon {
 
         // 尝试删除容器
         let output = Command::new(&self.runtime)
-            .args(&["delete", &self.container_id])
+            .args(["delete", &self.container_id])
             .output()?;
 
         if !output.status.success() {

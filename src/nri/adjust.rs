@@ -436,7 +436,7 @@ pub fn validate_container_adjustment(adjustment: &nri_api::ContainerAdjustment) 
                     "container adjustment device path must not be empty".to_string(),
                 ));
             }
-            if !is_marked_for_removal(&device.path).is_some() {
+            if is_marked_for_removal(&device.path).is_none() {
                 if device.type_.trim().is_empty() {
                     return Err(NriError::Plugin(
                         "container adjustment device type must not be empty".to_string(),

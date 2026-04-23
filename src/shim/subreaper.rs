@@ -122,21 +122,13 @@ impl SubReaper {
     pub fn reap_all_children() -> Result<usize> {
         let mut count = 0;
 
-        loop {
-            match Self::wait_any_child()? {
-                Some((pid, code, signaled)) => {
-                    if signaled {
-                        info!("Reaped child {} killed by signal, exit code {}", pid, code);
-                    } else {
-                        info!("Reaped child {} exited with code {}", pid, code);
-                    }
-                    count += 1;
-                }
-                None => {
-                    // 没有更多子进程
-                    break;
-                }
+        while let Some((pid, code, signaled)) = Self::wait_any_child()? {
+            if signaled {
+                info!("Reaped child {} killed by signal, exit code {}", pid, code);
+            } else {
+                info!("Reaped child {} exited with code {}", pid, code);
             }
+            count += 1;
         }
 
         if count > 0 {

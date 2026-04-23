@@ -761,7 +761,11 @@ impl NriManager {
         loop {
             let remaining = {
                 let state = self.state.read().await;
-                state.plugins.iter().filter(|plugin| plugin.client.is_some()).count()
+                state
+                    .plugins
+                    .iter()
+                    .filter(|plugin| plugin.client.is_some())
+                    .count()
             };
             if remaining == 0 {
                 return;
@@ -1464,14 +1468,18 @@ impl NriApi for NriManager {
                 .filter_map(|plugin| plugin.client.clone())
                 .collect::<Vec<_>>()
         };
-        log::info!("NRI shutdown notifying {} connected plugin(s)", plugins.len());
+        log::info!(
+            "NRI shutdown notifying {} connected plugin(s)",
+            plugins.len()
+        );
         for client in plugins {
             match self.call_with_timeout(client.shutdown()).await {
                 Ok(_) => log::info!("NRI plugin shutdown notification delivered"),
                 Err(err) => log::warn!("NRI plugin shutdown notification failed: {}", err),
             }
         }
-        self.wait_for_plugin_disconnects(self.config.request_timeout).await;
+        self.wait_for_plugin_disconnects(self.config.request_timeout)
+            .await;
         {
             let mut state = self.state.write().await;
             state.plugins.clear();
