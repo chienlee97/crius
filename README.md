@@ -1,89 +1,85 @@
 # crius
 
-`crius` 是一个使用 Rust 编写的 Kubernetes CRI（Container Runtime Interface）运行时实现，基于 `runc` 和 OCI 规范，提供 CRI v1 gRPC 服务、镜像管理、CNI 网络、流式 `exec/attach/port-forward`、`shim` 进程管理以及状态持久化能力。
+`crius` 是一个使用 Rust 实现的 Kubernetes CRI 运行时。项目当前提供 CRI v1 gRPC 服务、`runc`/OCI 集成、镜像管理、CNI 网络、流式 `exec/attach/port-forward`、`shim` 进程管理、SQLite 状态持久化，以及运行时侧 NRI 集成。
 
-当前仓库版本为 `v0.1.0`。从现有代码和测试覆盖来看，项目已经具备较完整的核心 CRI 路径，更适合开发、调试和集成验证场景；在直接投入生产前，仍建议补充稳定性、兼容性和长期运行验证。
+当前代码已经覆盖核心运行时链路，适合开发验证、功能联调和协议研究。若要直接用于生产环境，仍建议补充稳定性压测、异常恢复验证和与目标 Kubernetes 版本的兼容性回归。
 
-## 特性
+## 文档
 
-- 基于 `tonic` 提供 CRI v1 `RuntimeService` 和 `ImageService`
-- 基于 `runc` 创建、启动、停止、删除 Pod Sandbox 和容器
-- 支持 `exec`、`exec_sync`、`attach`、`port-forward`
-- 内置流式服务器，支持 SPDY 和 WebSocket 升级
-- 支持镜像拉取、镜像状态查询、镜像删除、镜像文件系统统计
-- 支持 CNI 网络配置、网络命名空间和端口映射
-- 支持 `crius-shim` 管理容器生命周期、IO 和退出码
-- 使用 SQLite 持久化 Pod / Container 状态，支持重启恢复
-- 支持容器资源更新、Pod/Container 统计、Pod 指标和事件流
-- 支持 checkpoint 导出与恢复流程
-- 启用了 gRPC reflection，便于调试和协议探查
+- `README.md`：项目概览、构建与运行方式
+- `docs/architecture.md`：整体架构、模块边界和主链路设计
+- `docs/nri.md`：NRI 功能说明、配置和运维边界
 
-## 组件概览
+## 功能概览
 
-- `crius`
-  主守护进程，提供 CRI gRPC 接口，默认监听 `unix:///run/crius/crius.sock`
-- `crius-shim`
-  通过 `shim` feature 构建出的 shim 二进制，负责容器进程、attach socket、日志重开和退出码跟踪
-- `runc`
-  实际执行 OCI bundle 的底层运行时
-- CNI plugins
-  负责 Pod 网络配置和清理
-- SQLite
-  持久化 Pod / Container 元数据和恢复信息
+当前仓库已实现或接入以下能力：
 
-## 仓库结构
+- CRI v1 `RuntimeService` 与 `ImageService`
+- 基于 `runc` 的 Pod Sandbox / Container 生命周期管理
+- 流式 `exec`、`exec_sync`、`attach`、`port-forward`
+- 基于 CNI 的网络配置与端口映射
+- `crius-shim` 容器进程与 IO 管理
+- 镜像拉取、查询、删除和镜像文件系统统计
+- SQLite 持久化与运行时重启恢复
+- NRI 插件注册、同步、生命周期 hook、unsolicited update、eviction
+- gRPC reflection，便于调试与协议探查
 
-- `src/main.rs`
-  `crius` 守护进程入口
-- `src/server/`
-  CRI RuntimeService 实现
-- `src/image/`
-  CRI ImageService 实现
-- `src/runtime/`
-  `runc` 集成、OCI bundle 生成、shim 管理
-- `src/streaming/`
-  `exec` / `attach` / `port-forward` 流式服务
-- `src/network/`
-  CNI、多网络和端口映射
-- `src/storage/`
-  状态持久化与本地存储
-- `src/shim/`
-  `crius-shim` 实现
-- `tests/`
-  集成测试
+## 主要组件
 
-## 运行依赖
+| 组件 | 说明 |
+| --- | --- |
+| `crius` | 主守护进程，提供 CRI gRPC 接口，默认监听 `unix:///run/crius/crius.sock` |
+| `crius-shim` | 可选二进制，负责容器进程、退出码、attach socket 和日志相关管理 |
+| `runc` | 底层 OCI runtime |
+| CNI plugins | Pod 网络配置与回收 |
+| SQLite | Pod / Container 元数据持久化 |
 
-建议在 Linux 环境下运行，并准备以下依赖：
+## 代码布局
+
+| 路径 | 说明 |
+| --- | --- |
+| `src/main.rs` | 守护进程入口 |
+| `src/server/` | CRI RuntimeService 实现 |
+| `src/image/` | CRI ImageService 实现 |
+| `src/runtime/` | `runc` 集成、bundle/spec 生成、shim 管理 |
+| `src/streaming/` | 流式服务实现 |
+| `src/network/` | CNI 与端口映射 |
+| `src/storage/` | 持久化与恢复 |
+| `src/nri/` | NRI manager、transport、merge、adjust、domain |
+| `src/shim/` | `crius-shim` 实现 |
+| `tests/` | 集成测试 |
+
+## 运行前提
+
+建议在 Linux 主机上运行，并准备以下依赖：
 
 - Rust 稳定版工具链
 - `runc`
 - `protobuf-compiler`
 - `tar`
-- `iproute`（提供 `ip` 命令）
+- `iproute2`
 - containernetworking-plugins
-- 可选：`crictl`，用于快速验证 CRI 兼容性
+- 可选：`crictl`
 
-部分测试和绝大多数真实运行路径需要 `root` 权限。
+多数真实运行路径以及一部分测试需要 `root` 权限。
 
 ## 构建
 
-仓库使用了本地 `vendor/` 依赖源，并带有一个针对 `h2` 的补丁辅助目标。首次构建时，建议按下面顺序执行：
+仓库使用本地 `vendor/` 依赖，并附带补丁检查/应用逻辑。首次构建建议按以下顺序执行：
 
 ```bash
 make check-patch
-# 如果提示未应用，再执行这一行
 make apply-patch
 cargo build --features shim --bins
 ```
 
-如果你只想快速验证主程序能否编译，也可以直接运行：
+如果只想做一次基础编译，也可以执行：
 
 ```bash
 make build
 ```
 
-但要注意，实际运行容器生命周期时通常还需要同时构建 `crius-shim`，因此更推荐使用：
+但完整运行时链路通常需要同时构建 `crius` 和 `crius-shim`，因此更推荐：
 
 ```bash
 cargo build --features shim --bins
@@ -97,7 +93,7 @@ cargo build --features shim --bins
 cargo build --features shim --bins
 ```
 
-### 2. 准备环境变量
+### 2. 准备环境
 
 ```bash
 export CRIUS_SHIM_PATH="$(pwd)/target/debug/crius-shim"
@@ -106,7 +102,7 @@ export CRIUS_CNI_CONFIG_DIRS="/etc/cni/net.d"
 export CRIUS_CNI_PLUGIN_DIRS="/usr/libexec/cni:/opt/cni/bin:/usr/lib/cni"
 ```
 
-### 3. 启动守护进程
+### 3. 启动服务
 
 ```bash
 sudo ./target/debug/crius --listen unix:///run/crius/crius.sock
@@ -120,42 +116,97 @@ sudo crictl --runtime-endpoint unix:///run/crius/crius.sock info
 sudo crictl --runtime-endpoint unix:///run/crius/crius.sock images
 ```
 
-仓库里的 `make test` 也会启动一个本地 socket 并执行一次 `crictl version` 验证。
+`make test` 会执行一次基础的 `crictl version` 联通性验证。
 
 ## 默认路径
 
-运行时默认会使用以下目录和文件：
-
-| 路径 | 说明 |
+| 路径 | 用途 |
 | --- | --- |
-| `/run/crius/crius.sock` | 默认 Unix Socket |
+| `/run/crius/crius.sock` | CRI Unix Socket |
 | `/var/lib/crius` | 运行时根目录 |
-| `/var/lib/crius/runc-bundles` | `runc` bundle 根目录 |
-| `/var/lib/crius/storage` | 镜像和运行时存储目录 |
-| `/var/lib/crius/crius.db` | SQLite 持久化数据库 |
+| `/var/lib/crius/crius.db` | SQLite 数据库 |
 | `/var/log/crius` | 日志目录 |
-| `/var/run/crius/shims` | `crius-shim` 工作目录 |
+| `/var/run/crius/shims` | shim 工作目录 |
+| `/run/crius/nri.sock` | NRI Socket |
+
+说明：部分子目录会由运行时按需创建，实际 bundle、镜像和临时文件路径会从 `root`、runtime root 和存储实现派生。
+
+## 配置
+
+默认配置文件路径为 `/etc/crius/crius.conf`。主配置结构定义在 `src/config/mod.rs::Config`，包含以下一级字段：
+
+- `root`
+- `runtime`
+- `image`
+- `network`
+- `nri`
+
+一个最小示例：
+
+```toml
+root = "/var/lib/crius"
+
+[runtime]
+runtime_type = "runc"
+runtime_path = "/usr/bin/runc"
+root = "/run/crius"
+
+[image]
+driver = "overlay"
+root = "/var/lib/containers/storage"
+
+[network]
+plugin = "cni"
+config_dir = "/etc/cni/net.d/"
+
+[nri]
+enable = false
+runtime_name = "crius"
+runtime_version = "0.1.0"
+socket_path = "/run/crius/nri.sock"
+plugin_path = "/opt/nri/plugins"
+plugin_config_path = "/etc/nri/conf.d"
+registration_timeout_ms = 5000
+request_timeout_ms = 2000
+enable_external_connections = false
+```
 
 ## 关键环境变量
 
-| 环境变量 | 作用 | 默认值 |
+| 环境变量 | 用途 | 默认行为 |
 | --- | --- | --- |
-| `CRIUS_RUNTIME_HANDLERS` | 暴露给 CRI 的 runtime handler 列表，逗号分隔 | 自动包含 `runc` |
-| `CRIUS_PAUSE_IMAGE` | Pod Sandbox 使用的 pause 镜像 | `registry.k8s.io/pause:3.9` |
-| `CRIUS_CNI_CONFIG_DIRS` | CNI 配置目录，冒号分隔 | `/etc/cni/net.d:/etc/kubernetes/cni/net.d` |
-| `CRIUS_CNI_PLUGIN_DIRS` | CNI 插件目录，冒号分隔 | `/opt/cni/bin:/usr/lib/cni:/usr/libexec/cni` |
+| `CRIUS_RUNTIME_HANDLERS` | CRI 暴露的 runtime handler 列表，逗号分隔 | 自动追加当前 runtime type |
+| `CRIUS_PAUSE_IMAGE` | Pod Sandbox pause 镜像 | `registry.k8s.io/pause:3.9` |
+| `CRIUS_CNI_CONFIG_DIRS` | CNI 配置目录，冒号分隔 | 使用代码内置默认目录 |
+| `CRIUS_CNI_PLUGIN_DIRS` | CNI 插件目录，冒号分隔 | 使用代码内置默认目录 |
 | `CRIUS_CNI_CACHE_DIR` | CNI 缓存目录 | `/var/lib/cni/cache` |
 | `CRIUS_CGROUP_DRIVER` | 强制指定 `systemd` 或 `cgroupfs` | 自动探测 |
-| `CRIUS_SHIM_PATH` | `crius-shim` 二进制路径 | 优先尝试本地 `target/debug/crius-shim`，否则查找 `PATH` |
+| `CRIUS_SHIM_PATH` | `crius-shim` 二进制路径 | 优先使用显式配置，否则尝试默认查找 |
 | `CRIUS_SHIM_DIR` | shim 工作目录 | `/var/run/crius/shims` |
-| `CRIUS_SHIM_DEBUG` | 是否开启 shim debug 日志 | `false` |
-| `CRIUS_ENABLE_HUGEPAGES_MOUNT` | 是否保留 `/dev/hugepages` 挂载 | `false` |
+| `CRIUS_SHIM_DEBUG` | 开启 shim debug 日志 | `false` |
+| `CRIUS_ENABLE_HUGEPAGES_MOUNT` | 保留 `/dev/hugepages` 挂载 | `false` |
+| `CRIUS_NRI_BLOCKIO_CONFIG` | blockio class 映射文件路径 | 未设置 |
+| `CRIUS_NRI_ALLOWED_ANNOTATION_PREFIXES` | NRI annotation allowlist 扩展入口 | 未设置 |
+| `CRIUS_NRI_CONTAINER_MIN_MEMORY_BYTES` | NRI 最小容器内存限制校验 | 未设置 |
 
-另外，`CNI_PATH` 也会作为 `CRIUS_CNI_PLUGIN_DIRS` 的后备来源。
+`CNI_PATH` 会作为 `CRIUS_CNI_PLUGIN_DIRS` 的后备来源。
 
-## systemd 运行
+## NRI
 
-仓库内提供了一个示例 unit 文件 [`crius.service`](./crius.service)。本地安装示例：
+`crius` 已实现运行时侧 NRI 集成。当前已覆盖的核心能力包括：
+
+- 插件注册、`Configure`、`Synchronize`、`Shutdown`
+- Pod / Container 生命周期 hook
+- `ValidateContainerAdjustment`
+- unsolicited `UpdateContainers`
+- eviction
+- `blockio_class`、`rdt_class`、`devices`、扩展 memory / CPU realtime / `pids` 资源更新
+
+详细说明见 `docs/nri.md`。
+
+## systemd 部署
+
+仓库提供示例 unit 文件 `crius.service`。安装示例：
 
 ```bash
 sudo install -Dm755 target/debug/crius /usr/bin/crius
@@ -165,7 +216,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now crius
 ```
 
-如果你的 CNI 插件不在 `/usr/libexec/cni`，请同步修改 unit 文件中的环境变量。
+如果 CNI 插件目录不是默认路径，需要同步调整 unit 文件中的环境变量。
 
 ## 测试
 
@@ -173,25 +224,25 @@ sudo systemctl enable --now crius
 cargo test
 ```
 
-运行需要 root、`runc`、`iproute2` 或本地 socket/TCP bind 权限的测试时，可以显式执行被标记为 `ignored` 的用例：
+需要 root、`runc` 或额外系统能力的测试可以显式运行：
 
 ```bash
 cargo test -- --ignored
 ```
 
-也可以使用仓库自带的便捷命令：
+也可以执行：
 
 ```bash
 make test
 ```
 
-## 已知注意事项
+## 当前注意事项
 
-- 命令行参数 `--listen` 已实际生效；`--config`、`--debug`、`--log` 当前已经暴露在 CLI 中，但主启动流程还没有完全接入这些参数
-- 项目依赖 `crius-shim` 参与容器生命周期管理，因此只构建主二进制通常不足以完成完整运行时链路
-- 仓库通过 `.cargo/config.toml` 使用本地 `vendor/` 依赖源，构建前建议先检查 `h2` 补丁状态
-- 项目目前更偏向开发与验证环境使用，接入真实 Kubernetes 集群前建议先做额外兼容性测试
+- `--listen` 已接入实际启动流程；`--config`、`--debug`、`--log` 虽然已暴露在 CLI 中，但当前仍未完整控制主流程行为
+- 项目运行通常依赖 `crius-shim`，只构建主二进制通常不足以覆盖完整容器链路
+- 构建依赖本地 `vendor/` 目录及补丁状态，建议先执行 `make check-patch`
+- 当前更适合开发验证和功能联调，生产接入前应补充目标环境验证
 
-## License
+## 许可证
 
 Apache-2.0

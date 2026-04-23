@@ -3454,14 +3454,18 @@ impl RuntimeServiceImpl {
         if !self.nri_config.enable {
             return Ok(());
         }
+        log::info!("Initializing NRI");
         self.nri
             .start()
             .await
             .map_err(|e| Status::internal(format!("Failed to start NRI: {}", e)))?;
+        log::info!("NRI started");
         self.nri
             .synchronize()
             .await
-            .map_err(|e| Status::internal(format!("Failed to synchronize NRI: {}", e)))
+            .map_err(|e| Status::internal(format!("Failed to synchronize NRI: {}", e)))?;
+        log::info!("NRI synchronized");
+        Ok(())
     }
 
     pub fn nri_handle(&self) -> Arc<dyn NriApi> {

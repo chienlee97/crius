@@ -11,10 +11,11 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UnixListener as TokioUnixListener;
 use tokio::sync::{oneshot, Mutex, Notify, OwnedRwLockReadGuard, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use crate::nri::transport::HostFunctionsHandler;
 use crate::nri::{
@@ -209,6 +210,7 @@ impl crate::nri::transport::RuntimeServiceHandler for ManagerRuntimeHandler {
             true,
             self.client.clone(),
         );
+        log::info!("NRI plugin registered: {}-{}", plugin_idx, plugin_name);
         *self.connection_identity.lock().await = Some((plugin_name.clone(), plugin_idx.clone()));
         self.registration_notify.notify_waiters();
         if let Some(tx) = self.registered_tx.lock().await.take() {
@@ -749,8 +751,30 @@ impl NriManager {
     }
 
     async fn unregister_plugin(&self, name: &str, index: &str) {
+        log::info!("NRI plugin unregistered: {}-{}", index, name);
         let mut state = self.state.write().await;
         state.plugins.retain(|plugin| !plugin.key_eq(name, index));
+    }
+
+    async fn wait_for_plugin_disconnects(&self, max_wait: Duration) {
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            let remaining = {
+                let state = self.state.read().await;
+                state.plugins.iter().filter(|plugin| plugin.client.is_some()).count()
+            };
+            if remaining == 0 {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                log::warn!(
+                    "NRI shutdown timed out waiting for {} plugin connection(s) to close",
+                    remaining
+                );
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
     }
 
     async fn synchronize_plugin(
@@ -930,6 +954,7 @@ impl NriManager {
         tokio::spawn(async move {
             multiplexed.close_notify.notified().await;
             if let Some((name, index)) = connection_identity.lock().await.clone() {
+                log::info!("NRI plugin connection closed: {}-{}", index, name);
                 manager.unregister_plugin(&name, &index).await;
             }
         });
@@ -1015,6 +1040,7 @@ impl NriManager {
         }
         let _ = fs::remove_file(&socket_path);
         let listener = TokioUnixListener::bind(&socket_path).map_err(io_to_plugin_error)?;
+        log::info!("NRI external listener started on {}", socket_path);
         let manager = self.clone();
         let shutdown = self.external_listener_shutdown.clone();
         let task = tokio::spawn(async move {
@@ -1424,6 +1450,12 @@ impl NriApi for NriManager {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        log::info!("NRI shutdown requested");
+        self.external_listener_shutdown.notify_waiters();
+        if let Some(task) = self.external_listener_task.lock().await.take() {
+            let _ = task.await;
+        }
+
         let plugins = {
             let state = self.state.read().await;
             state
@@ -1432,26 +1464,30 @@ impl NriApi for NriManager {
                 .filter_map(|plugin| plugin.client.clone())
                 .collect::<Vec<_>>()
         };
+        log::info!("NRI shutdown notifying {} connected plugin(s)", plugins.len());
         for client in plugins {
-            let _ = self.call_with_timeout(client.shutdown()).await;
+            match self.call_with_timeout(client.shutdown()).await {
+                Ok(_) => log::info!("NRI plugin shutdown notification delivered"),
+                Err(err) => log::warn!("NRI plugin shutdown notification failed: {}", err),
+            }
         }
+        self.wait_for_plugin_disconnects(self.config.request_timeout).await;
         {
             let mut state = self.state.write().await;
             state.plugins.clear();
         }
-        self.external_listener_shutdown.notify_waiters();
-        if let Some(task) = self.external_listener_task.lock().await.take() {
-            task.abort();
-        }
         self.stop_launched_plugins();
-        let servers = {
+        // Per-connection runtime servers share the plugin transport and are torn down
+        // when the plugin connection closes. Shutting them down here races that close path.
+        let _servers = {
             let mut guard = self.connection_servers.lock().await;
             std::mem::take(&mut *guard)
         };
-        for server in servers {
-            let _ = server.shutdown().await;
+        let result = self.runtime_server.shutdown().await;
+        if result.is_ok() {
+            log::info!("NRI shutdown completed");
         }
-        self.runtime_server.shutdown().await
+        result
     }
 
     async fn synchronize(&self) -> Result<()> {
