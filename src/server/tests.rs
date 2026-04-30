@@ -1,5 +1,6 @@
 use super::*;
 use crate::nri::{apply_container_adjustment, NriStopContainerResult, NriUpdateContainerResult};
+use crate::server::service::ContainerCreateDeadline;
 use crate::storage::ContainerRecord;
 use crate::storage::PodSandboxRecord;
 use std::collections::HashMap;
@@ -20,11 +21,118 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
         root_dir,
         runtime: "runc".to_string(),
         runtime_handlers: vec!["runc".to_string(), "kata".to_string()],
+        runtime_configs: HashMap::from([
+            (
+                "runc".to_string(),
+                crate::config::ResolvedRuntimeHandlerConfig {
+                    runtime_path: "/definitely/missing/runc".to_string(),
+                    runtime_root: "/tmp/crius-test-runtime-root".to_string(),
+                    monitor_path: "/definitely/missing/crius-shim".to_string(),
+                    monitor_env: Vec::new(),
+                    allowed_annotations: Vec::new(),
+                    default_annotations: HashMap::new(),
+                    container_create_timeout: 240,
+                },
+            ),
+            (
+                "kata".to_string(),
+                crate::config::ResolvedRuntimeHandlerConfig {
+                    runtime_path: "/definitely/missing/kata-runtime".to_string(),
+                    runtime_root: "/tmp/crius-test-kata-runtime-root".to_string(),
+                    monitor_path: "/definitely/missing/crius-shim".to_string(),
+                    monitor_env: Vec::new(),
+                    allowed_annotations: Vec::new(),
+                    default_annotations: HashMap::new(),
+                    container_create_timeout: 240,
+                },
+            ),
+        ]),
         runtime_root: PathBuf::from("/tmp/crius-test-runtime-root"),
         log_dir: PathBuf::from("/tmp/crius-test-logs"),
         runtime_path: PathBuf::from("/definitely/missing/runc"),
+        image_root: PathBuf::from("/tmp/crius-test-images"),
+        image_driver: "overlay".to_string(),
+        workloads: HashMap::new(),
+        enable_pod_events: true,
+        included_pod_metrics: vec!["all".to_string()],
+        stats_collection_period: 0,
+        pod_sandbox_metrics_collection_period: 0,
+        grpc_max_send_msg_size: 80 * 1024 * 1024,
+        grpc_max_recv_msg_size: 80 * 1024 * 1024,
+        monitor_env: Vec::new(),
+        default_env: Vec::new(),
+        default_capabilities: vec![
+            "CHOWN".to_string(),
+            "DAC_OVERRIDE".to_string(),
+            "FSETID".to_string(),
+            "FOWNER".to_string(),
+            "MKNOD".to_string(),
+            "NET_RAW".to_string(),
+            "SETGID".to_string(),
+            "SETUID".to_string(),
+            "SETFCAP".to_string(),
+            "SETPCAP".to_string(),
+            "NET_BIND_SERVICE".to_string(),
+            "SYS_CHROOT".to_string(),
+            "KILL".to_string(),
+            "AUDIT_WRITE".to_string(),
+        ],
+        default_sysctls: HashMap::new(),
+        attach_socket_dir: PathBuf::from("/tmp/crius-test-attach"),
+        container_exits_dir: PathBuf::from("/tmp/crius-test-exits"),
+        clean_shutdown_file: PathBuf::from("/tmp/crius-test-clean.shutdown"),
+        container_stop_timeout: 30,
+        version_file: PathBuf::from("/tmp/crius-test-version"),
+        version_file_persist: PathBuf::from("/tmp/crius-test-version-persist"),
+        criu_path: PathBuf::new(),
+        criu_image_path: PathBuf::new(),
+        criu_work_path: PathBuf::new(),
+        enable_criu_support: true,
+        internal_wipe: true,
+        internal_repair: true,
+        bind_mount_prefix: PathBuf::new(),
+        disable_cgroup: false,
+        tolerate_missing_hugetlb_controller: true,
+        separate_pull_cgroup: String::new(),
+        seccomp_profile: PathBuf::new(),
+        unset_seccomp_profile: "runtime/default".to_string(),
+        uid_mappings: None,
+        gid_mappings: None,
+        minimum_mappable_uid: -1,
+        minimum_mappable_gid: -1,
+        io_uid: 0,
+        io_gid: 0,
+        pids_limit: -1,
+        exec_cpu_affinity: String::new(),
+        read_only: false,
+        no_pivot: false,
         pause_image: "registry.k8s.io/pause:3.9".to_string(),
+        pause_command: "/pause".to_string(),
         cni_config: crate::network::CniConfig::default(),
+        cgroup_driver: None,
+        exec_sync_io_drain_timeout: Duration::ZERO,
+        max_container_log_line_size: 4096,
+        log_to_journald: false,
+        no_sync_log: false,
+        restrict_oom_score_adj: false,
+        enable_unprivileged_ports: false,
+        enable_unprivileged_icmp: false,
+        shim: ShimConfig {
+            shim_path: PathBuf::from("/definitely/missing/crius-shim"),
+            work_dir: PathBuf::from("/tmp/crius-test-shims"),
+            attach_socket_dir: PathBuf::from("/tmp/crius-test-attach"),
+            container_exits_dir: PathBuf::from("/tmp/crius-test-exits"),
+            io_uid: 0,
+            io_gid: 0,
+            monitor_env: Vec::new(),
+            debug: false,
+            log_to_journald: false,
+            no_sync_log: false,
+            no_pivot: false,
+            runtime_path: PathBuf::from("/definitely/missing/runc"),
+            max_container_log_line_size: 4096,
+        },
+        streaming: crate::streaming::StreamingConfig::default(),
     }
 }
 
@@ -220,6 +328,68 @@ fn sanitize_spec_runtime_resources_clears_unsupported_extended_resources() {
     assert!(cpu.realtime_runtime.is_none());
     assert!(cpu.realtime_period.is_none());
     assert!(resources.hugepage_limits.is_none());
+}
+
+#[test]
+fn validate_proto_hugetlb_limits_rejects_when_controller_missing_and_tolerance_disabled() {
+    let resources = crate::proto::runtime::v1::LinuxContainerResources {
+        hugepage_limits: vec![crate::proto::runtime::v1::HugepageLimit {
+            page_size: "2MB".to_string(),
+            limit: 1,
+        }],
+        ..Default::default()
+    };
+
+    let err = RuntimeServiceImpl::validate_proto_hugetlb_limits_with_flags(
+        Some(&resources),
+        CgroupResourceSupport {
+            swap: true,
+            hugetlb: false,
+            memory_kernel: true,
+            memory_kernel_tcp: true,
+            memory_swappiness: true,
+            memory_disable_oom_killer: true,
+            memory_use_hierarchy: true,
+            cpu_realtime: true,
+            blockio: true,
+            rdt: true,
+        },
+        false,
+        "container create",
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("hugetlb controller is missing"));
+}
+
+#[test]
+fn sanitize_proto_runtime_resources_clears_hugepages_when_tolerated() {
+    let mut resources = crate::proto::runtime::v1::LinuxContainerResources {
+        hugepage_limits: vec![crate::proto::runtime::v1::HugepageLimit {
+            page_size: "2MB".to_string(),
+            limit: 1,
+        }],
+        ..Default::default()
+    };
+
+    RuntimeServiceImpl::sanitize_proto_runtime_resources_with_flags(
+        &mut resources,
+        CgroupResourceSupport {
+            swap: true,
+            hugetlb: false,
+            memory_kernel: true,
+            memory_kernel_tcp: true,
+            memory_swappiness: true,
+            memory_disable_oom_killer: true,
+            memory_use_hierarchy: true,
+            cpu_realtime: true,
+            blockio: true,
+            rdt: true,
+        },
+        true,
+    );
+
+    assert!(resources.hugepage_limits.is_empty());
 }
 
 #[derive(Default)]
@@ -430,6 +600,16 @@ case "$cmd" in
     echo running > "$STATE_DIR/$id.state"
     echo $$ > "$STATE_DIR/$id.pid"
     ;;
+  exec)
+    id="${{1:-}}"
+    if [ "$#" -gt 0 ]; then
+      shift
+    fi
+    if [ "$#" -eq 0 ]; then
+      exit 0
+    fi
+    exec "$@"
+    ;;
   pause)
     id="${{1:-}}"
     if [ -n "$id" ]; then
@@ -524,6 +704,69 @@ exit 0
     script_path
 }
 
+fn write_fake_runtime_script_with_start_state(dir: &Path, start_state: &str) -> PathBuf {
+    let base_runtime = write_fake_runtime_script(dir);
+    let state_dir = dir.join("runtime-state");
+    let script_path = dir.join(format!("fake-runc-start-{}.sh", start_state));
+    let script = format!(
+        r#"#!/bin/bash
+set -eu
+BASE_RUNTIME="{base_runtime}"
+STATE_DIR="{state_dir}"
+cmd="${{1:-}}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+case "$cmd" in
+  start|run)
+    id="${{1:-}}"
+    if [ "$cmd" = "run" ]; then
+      id=""
+      while [ "$#" -gt 0 ]; do
+        id="$1"
+        shift
+      done
+    fi
+    echo "{start_state}" > "$STATE_DIR/$id.state"
+    if [ "{start_state}" = "running" ]; then
+      echo $$ > "$STATE_DIR/$id.pid"
+    else
+      rm -f "$STATE_DIR/$id.pid"
+    fi
+    ;;
+  *)
+    exec "$BASE_RUNTIME" "$cmd" "$@"
+    ;;
+esac
+exit 0
+"#,
+        base_runtime = base_runtime.display(),
+        state_dir = state_dir.display(),
+        start_state = start_state,
+    );
+    fs::write(&script_path, script).unwrap();
+    let mut perms = fs::metadata(&script_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script_path, perms).unwrap();
+    script_path
+}
+
+fn write_quick_exit_shim(dir: &Path) -> PathBuf {
+    let shim_path = dir.join("quick-exit-shim.sh");
+    fs::write(
+        &shim_path,
+        r#"#!/bin/sh
+set -eu
+exit 0
+"#,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&shim_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&shim_path, perms).unwrap();
+    shim_path
+}
+
 fn ensure_test_shim_binary() {
     static ONCE: std::sync::Once = std::sync::Once::new();
 
@@ -578,18 +821,130 @@ done
 }
 
 fn test_service_with_fake_runtime() -> (TempDir, RuntimeServiceImpl) {
+    ensure_test_shim_binary();
     let dir = tempdir().unwrap();
     let runtime_path = write_fake_runtime_script(dir.path());
+    test_service_with_runtime_path(dir, runtime_path)
+}
+
+fn test_service_with_runtime_path(
+    dir: TempDir,
+    runtime_path: PathBuf,
+) -> (TempDir, RuntimeServiceImpl) {
+    test_service_with_runtime_path_and_shim_path(dir, runtime_path, None)
+}
+
+fn test_service_with_runtime_path_and_shim_path(
+    dir: TempDir,
+    runtime_path: PathBuf,
+    shim_path_override: Option<PathBuf>,
+) -> (TempDir, RuntimeServiceImpl) {
+    ensure_test_shim_binary();
     let shim_work_dir = dir.path().join("shims");
+    let shim_runtime_path = runtime_path.clone();
     let config = RuntimeConfig {
         root_dir: dir.path().join("root"),
         runtime: "runc".to_string(),
         runtime_handlers: vec!["runc".to_string()],
+        runtime_configs: HashMap::from([(
+            "runc".to_string(),
+            crate::config::ResolvedRuntimeHandlerConfig {
+                runtime_path: runtime_path.display().to_string(),
+                runtime_root: dir.path().join("runtime-root").display().to_string(),
+                monitor_path: "/root/crius/target/debug/crius-shim".to_string(),
+                monitor_env: Vec::new(),
+                allowed_annotations: Vec::new(),
+                default_annotations: HashMap::new(),
+                container_create_timeout: 240,
+            },
+        )]),
         runtime_root: dir.path().join("runtime-root"),
         log_dir: dir.path().join("logs"),
         runtime_path,
+        image_root: dir.path().join("images"),
+        image_driver: "overlay".to_string(),
+        workloads: HashMap::new(),
+        enable_pod_events: true,
+        included_pod_metrics: vec!["all".to_string()],
+        stats_collection_period: 0,
+        pod_sandbox_metrics_collection_period: 0,
+        grpc_max_send_msg_size: 80 * 1024 * 1024,
+        grpc_max_recv_msg_size: 80 * 1024 * 1024,
+        monitor_env: Vec::new(),
+        default_env: Vec::new(),
+        default_capabilities: vec![
+            "CHOWN".to_string(),
+            "DAC_OVERRIDE".to_string(),
+            "FSETID".to_string(),
+            "FOWNER".to_string(),
+            "MKNOD".to_string(),
+            "NET_RAW".to_string(),
+            "SETGID".to_string(),
+            "SETUID".to_string(),
+            "SETFCAP".to_string(),
+            "SETPCAP".to_string(),
+            "NET_BIND_SERVICE".to_string(),
+            "SYS_CHROOT".to_string(),
+            "KILL".to_string(),
+            "AUDIT_WRITE".to_string(),
+        ],
+        default_sysctls: HashMap::new(),
+        attach_socket_dir: dir.path().join("attach"),
+        container_exits_dir: dir.path().join("exits"),
+        clean_shutdown_file: dir.path().join("clean.shutdown"),
+        container_stop_timeout: 30,
+        version_file: dir.path().join("version"),
+        version_file_persist: dir.path().join("version-persist"),
+        criu_path: PathBuf::new(),
+        criu_image_path: PathBuf::new(),
+        criu_work_path: PathBuf::new(),
+        enable_criu_support: true,
+        internal_wipe: true,
+        internal_repair: true,
+        bind_mount_prefix: PathBuf::new(),
+        disable_cgroup: false,
+        tolerate_missing_hugetlb_controller: true,
+        separate_pull_cgroup: String::new(),
+        seccomp_profile: PathBuf::new(),
+        unset_seccomp_profile: "runtime/default".to_string(),
+        uid_mappings: None,
+        gid_mappings: None,
+        minimum_mappable_uid: -1,
+        minimum_mappable_gid: -1,
+        io_uid: 0,
+        io_gid: 0,
+        pids_limit: -1,
+        exec_cpu_affinity: String::new(),
+        read_only: false,
+        no_pivot: false,
         pause_image: "registry.k8s.io/pause:3.9".to_string(),
+        pause_command: "/pause".to_string(),
         cni_config: crate::network::CniConfig::default(),
+        cgroup_driver: None,
+        exec_sync_io_drain_timeout: Duration::ZERO,
+        max_container_log_line_size: 4096,
+        log_to_journald: false,
+        no_sync_log: false,
+        restrict_oom_score_adj: false,
+        enable_unprivileged_ports: false,
+        enable_unprivileged_icmp: false,
+        shim: ShimConfig {
+            shim_path: shim_path_override
+                .unwrap_or_else(|| PathBuf::from("/root/crius/target/debug/crius-shim")),
+            work_dir: shim_work_dir.clone(),
+            attach_socket_dir: dir.path().join("attach"),
+            container_exits_dir: dir.path().join("exits"),
+            io_uid: 0,
+            io_gid: 0,
+            monitor_env: Vec::new(),
+            debug: false,
+            log_to_journald: false,
+            no_sync_log: false,
+            no_pivot: false,
+            runtime_path: shim_runtime_path,
+            max_container_log_line_size: 4096,
+        },
+        streaming: crate::streaming::StreamingConfig::default(),
     };
     let nri_config = NriConfig {
         blockio_config_path: write_blockio_config(&dir).display().to_string(),
@@ -631,19 +986,121 @@ fn write_blockio_config(dir: &TempDir) -> PathBuf {
 fn test_service_with_fake_runtime_and_nri(
     fake_nri: Arc<dyn NriApi>,
 ) -> (TempDir, RuntimeServiceImpl) {
+    test_service_with_fake_runtime_and_nri_and_shim(fake_nri, None)
+}
+
+fn test_service_with_fake_runtime_and_nri_and_shim(
+    fake_nri: Arc<dyn NriApi>,
+    shim_path_override: Option<PathBuf>,
+) -> (TempDir, RuntimeServiceImpl) {
     ensure_test_shim_binary();
     let dir = tempdir().unwrap();
     let runtime_path = write_fake_runtime_script(dir.path());
     let shim_work_dir = dir.path().join("shims");
+    let shim_runtime_path = runtime_path.clone();
     let config = RuntimeConfig {
         root_dir: dir.path().join("root"),
         runtime: "runc".to_string(),
         runtime_handlers: vec!["runc".to_string()],
+        runtime_configs: HashMap::from([(
+            "runc".to_string(),
+            crate::config::ResolvedRuntimeHandlerConfig {
+                runtime_path: runtime_path.display().to_string(),
+                runtime_root: dir.path().join("runtime-root").display().to_string(),
+                monitor_path: "/root/crius/target/debug/crius-shim".to_string(),
+                monitor_env: Vec::new(),
+                allowed_annotations: Vec::new(),
+                default_annotations: HashMap::new(),
+                container_create_timeout: 240,
+            },
+        )]),
         runtime_root: dir.path().join("runtime-root"),
         log_dir: dir.path().join("logs"),
         runtime_path,
+        image_root: dir.path().join("images"),
+        image_driver: "overlay".to_string(),
+        workloads: HashMap::new(),
+        enable_pod_events: true,
+        included_pod_metrics: vec!["all".to_string()],
+        stats_collection_period: 0,
+        pod_sandbox_metrics_collection_period: 0,
+        grpc_max_send_msg_size: 80 * 1024 * 1024,
+        grpc_max_recv_msg_size: 80 * 1024 * 1024,
+        monitor_env: Vec::new(),
+        default_env: Vec::new(),
+        default_capabilities: vec![
+            "CHOWN".to_string(),
+            "DAC_OVERRIDE".to_string(),
+            "FSETID".to_string(),
+            "FOWNER".to_string(),
+            "MKNOD".to_string(),
+            "NET_RAW".to_string(),
+            "SETGID".to_string(),
+            "SETUID".to_string(),
+            "SETFCAP".to_string(),
+            "SETPCAP".to_string(),
+            "NET_BIND_SERVICE".to_string(),
+            "SYS_CHROOT".to_string(),
+            "KILL".to_string(),
+            "AUDIT_WRITE".to_string(),
+        ],
+        default_sysctls: HashMap::new(),
+        attach_socket_dir: dir.path().join("attach"),
+        container_exits_dir: dir.path().join("exits"),
+        clean_shutdown_file: dir.path().join("clean.shutdown"),
+        container_stop_timeout: 30,
+        version_file: dir.path().join("version"),
+        version_file_persist: dir.path().join("version-persist"),
+        criu_path: PathBuf::new(),
+        criu_image_path: PathBuf::new(),
+        criu_work_path: PathBuf::new(),
+        enable_criu_support: true,
+        internal_wipe: true,
+        internal_repair: true,
+        bind_mount_prefix: PathBuf::new(),
+        disable_cgroup: false,
+        tolerate_missing_hugetlb_controller: true,
+        separate_pull_cgroup: String::new(),
+        seccomp_profile: PathBuf::new(),
+        unset_seccomp_profile: "runtime/default".to_string(),
+        uid_mappings: None,
+        gid_mappings: None,
+        minimum_mappable_uid: -1,
+        minimum_mappable_gid: -1,
+        io_uid: 0,
+        io_gid: 0,
+        pids_limit: -1,
+        exec_cpu_affinity: String::new(),
+        read_only: false,
+        no_pivot: false,
         pause_image: "registry.k8s.io/pause:3.9".to_string(),
+        pause_command: "/pause".to_string(),
         cni_config: crate::network::CniConfig::default(),
+        cgroup_driver: None,
+        exec_sync_io_drain_timeout: Duration::ZERO,
+        max_container_log_line_size: 4096,
+        log_to_journald: false,
+        no_sync_log: false,
+        restrict_oom_score_adj: false,
+        enable_unprivileged_ports: false,
+        enable_unprivileged_icmp: false,
+        shim: ShimConfig {
+            shim_path: shim_path_override
+                .unwrap_or_else(|| PathBuf::from("/root/crius/target/debug/crius-shim")),
+            work_dir: shim_work_dir.clone(),
+            attach_socket_dir: dir.path().join("attach"),
+            container_exits_dir: dir.path().join("exits"),
+            io_uid: 0,
+            io_gid: 0,
+            monitor_env: Vec::new(),
+            debug: false,
+            log_to_journald: false,
+            no_sync_log: false,
+            no_pivot: false,
+            runtime_path: shim_runtime_path,
+            max_container_log_line_size: 4096,
+        },
+        streaming: crate::streaming::StreamingConfig::default(),
     };
     let nri_config = NriConfig {
         enable: true,
@@ -938,6 +1395,7 @@ async fn update_pod_sandbox_resources_updates_pause_container_and_notifies_nri()
                 run_as_group: None,
                 supplemental_groups: Vec::new(),
                 readonly_rootfs: false,
+                pids_limit: None,
                 no_new_privileges: None,
                 apparmor_profile: None,
                 selinux_label: None,
@@ -1127,6 +1585,7 @@ async fn update_pod_sandbox_resources_succeeds_when_nri_post_update_fails() {
                 run_as_group: None,
                 supplemental_groups: Vec::new(),
                 readonly_rootfs: false,
+                pids_limit: None,
                 no_new_privileges: None,
                 apparmor_profile: None,
                 selinux_label: None,
@@ -1160,6 +1619,306 @@ async fn update_pod_sandbox_resources_succeeds_when_nri_post_update_fails() {
         fake_nri.calls.lock().await.clone(),
         vec!["update_pod", "post_update_pod"]
     );
+}
+
+#[tokio::test]
+async fn update_pod_sandbox_resources_fails_when_cgroup_support_is_disabled() {
+    let (_dir, mut service) = test_service_with_fake_runtime();
+    service.config.disable_cgroup = true;
+
+    let err = RuntimeService::update_pod_sandbox_resources(
+        &service,
+        Request::new(UpdatePodSandboxResourcesRequest {
+            pod_sandbox_id: "pod-any".to_string(),
+            overhead: None,
+            resources: Some(crate::proto::runtime::v1::LinuxContainerResources {
+                cpu_shares: 128,
+                ..Default::default()
+            }),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("disable_cgroup"));
+}
+
+#[tokio::test]
+async fn update_pod_sandbox_resources_fails_when_pod_is_not_ready() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (_dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+    let pod_id = "pod-update-not-ready".to_string();
+    let pause_id = "pause-pod-update-not-ready".to_string();
+    let netns_path = "/var/run/netns/pod-update-not-ready".to_string();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            pause_container_id: Some(pause_id.clone()),
+            netns_path: Some(netns_path.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service.pod_sandboxes.lock().await.insert(
+        pod_id.clone(),
+        crate::proto::runtime::v1::PodSandbox {
+            id: pod_id.clone(),
+            state: PodSandboxState::SandboxNotready as i32,
+            annotations,
+            ..test_pod(&pod_id, HashMap::new())
+        },
+    );
+    {
+        let mut pod_manager = service.pod_manager.lock().await;
+        pod_manager.restore_pod_sandbox(crate::pod::PodSandbox {
+            id: pod_id.clone(),
+            config: PodSandboxConfig {
+                name: "pod-update-not-ready".to_string(),
+                namespace: "default".to_string(),
+                uid: "uid-update-not-ready".to_string(),
+                hostname: "pod-update-not-ready".to_string(),
+                log_directory: None,
+                runtime_handler: "runc".to_string(),
+                labels: Vec::new(),
+                annotations: Vec::new(),
+                dns_config: None,
+                port_mappings: Vec::new(),
+                network_config: None,
+                cgroup_parent: None,
+                sysctls: HashMap::new(),
+                namespace_options: None,
+                privileged: false,
+                run_as_user: None,
+                run_as_group: None,
+                supplemental_groups: Vec::new(),
+                readonly_rootfs: false,
+                pids_limit: None,
+                no_new_privileges: None,
+                apparmor_profile: None,
+                selinux_label: None,
+                seccomp_profile: None,
+                linux_resources: None,
+            },
+            netns_path: PathBuf::from(&netns_path),
+            pause_container_id: pause_id,
+            state: crate::pod::PodSandboxState::NotReady,
+            created_at: 0,
+            ip: String::new(),
+            network_status: None,
+        });
+    }
+
+    let err = RuntimeService::update_pod_sandbox_resources(
+        &service,
+        Request::new(UpdatePodSandboxResourcesRequest {
+            pod_sandbox_id: pod_id,
+            overhead: None,
+            resources: Some(crate::proto::runtime::v1::LinuxContainerResources {
+                cpu_shares: 256,
+                ..Default::default()
+            }),
+        }),
+    )
+    .await
+    .expect_err("not ready pod should reject resource updates");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("not ready"));
+    assert!(fake_nri.calls.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn update_pod_sandbox_resources_fails_when_pause_container_is_missing() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (_dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+    let pod_id = "pod-update-missing-pause".to_string();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            pause_container_id: None,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service.pod_sandboxes.lock().await.insert(
+        pod_id.clone(),
+        crate::proto::runtime::v1::PodSandbox {
+            id: pod_id.clone(),
+            state: PodSandboxState::SandboxReady as i32,
+            annotations,
+            ..test_pod(&pod_id, HashMap::new())
+        },
+    );
+    {
+        let mut pod_manager = service.pod_manager.lock().await;
+        pod_manager.restore_pod_sandbox(crate::pod::PodSandbox {
+            id: pod_id.clone(),
+            config: PodSandboxConfig {
+                name: "pod-update-missing-pause".to_string(),
+                namespace: "default".to_string(),
+                uid: "uid-update-missing-pause".to_string(),
+                hostname: "pod-update-missing-pause".to_string(),
+                log_directory: None,
+                runtime_handler: "runc".to_string(),
+                labels: Vec::new(),
+                annotations: Vec::new(),
+                dns_config: None,
+                port_mappings: Vec::new(),
+                network_config: None,
+                cgroup_parent: None,
+                sysctls: HashMap::new(),
+                namespace_options: None,
+                privileged: false,
+                run_as_user: None,
+                run_as_group: None,
+                supplemental_groups: Vec::new(),
+                readonly_rootfs: false,
+                pids_limit: None,
+                no_new_privileges: None,
+                apparmor_profile: None,
+                selinux_label: None,
+                seccomp_profile: None,
+                linux_resources: None,
+            },
+            netns_path: PathBuf::new(),
+            pause_container_id: String::new(),
+            state: crate::pod::PodSandboxState::Ready,
+            created_at: 0,
+            ip: String::new(),
+            network_status: None,
+        });
+    }
+
+    let err = RuntimeService::update_pod_sandbox_resources(
+        &service,
+        Request::new(UpdatePodSandboxResourcesRequest {
+            pod_sandbox_id: pod_id,
+            overhead: None,
+            resources: Some(crate::proto::runtime::v1::LinuxContainerResources {
+                cpu_shares: 256,
+                ..Default::default()
+            }),
+        }),
+    )
+    .await
+    .expect_err("ready pod without pause container should reject resource updates");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("pause container"));
+    assert!(fake_nri.calls.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn update_pod_sandbox_resources_overhead_only_updates_pause_container() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+    let pod_id = "pod-update-overhead-only".to_string();
+    let pause_id = "pause-pod-update-overhead-only".to_string();
+    let netns_path = "/var/run/netns/pod-update-overhead-only".to_string();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            pause_container_id: Some(pause_id.clone()),
+            netns_path: Some(netns_path.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service.pod_sandboxes.lock().await.insert(
+        pod_id.clone(),
+        crate::proto::runtime::v1::PodSandbox {
+            id: pod_id.clone(),
+            state: PodSandboxState::SandboxReady as i32,
+            annotations: annotations.clone(),
+            runtime_handler: "runc".to_string(),
+            ..test_pod(&pod_id, HashMap::new())
+        },
+    );
+    {
+        let mut pod_manager = service.pod_manager.lock().await;
+        pod_manager.restore_pod_sandbox(crate::pod::PodSandbox {
+            id: pod_id.clone(),
+            config: PodSandboxConfig {
+                name: "pod-update-overhead-only".to_string(),
+                namespace: "default".to_string(),
+                uid: "uid-update-overhead-only".to_string(),
+                hostname: "pod-update-overhead-only".to_string(),
+                log_directory: None,
+                runtime_handler: "runc".to_string(),
+                labels: Vec::new(),
+                annotations: Vec::new(),
+                dns_config: None,
+                port_mappings: Vec::new(),
+                network_config: None,
+                cgroup_parent: None,
+                sysctls: HashMap::new(),
+                namespace_options: None,
+                privileged: false,
+                run_as_user: None,
+                run_as_group: None,
+                supplemental_groups: Vec::new(),
+                readonly_rootfs: false,
+                pids_limit: None,
+                no_new_privileges: None,
+                apparmor_profile: None,
+                selinux_label: None,
+                seccomp_profile: None,
+                linux_resources: None,
+            },
+            netns_path: PathBuf::from(&netns_path),
+            pause_container_id: pause_id.clone(),
+            state: crate::pod::PodSandboxState::Ready,
+            created_at: 0,
+            ip: String::new(),
+            network_status: None,
+        });
+    }
+
+    RuntimeService::update_pod_sandbox_resources(
+        &service,
+        Request::new(UpdatePodSandboxResourcesRequest {
+            pod_sandbox_id: pod_id.clone(),
+            overhead: Some(crate::proto::runtime::v1::LinuxContainerResources {
+                cpu_shares: 321,
+                ..Default::default()
+            }),
+            resources: None,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let update_payload: serde_json::Value =
+        serde_json::from_slice(&fs::read(fake_runtime_update_path(&dir, &pause_id)).unwrap())
+            .unwrap();
+    assert_eq!(update_payload["cpu"]["shares"], 321);
+
+    let updated_pod = service
+        .pod_sandboxes
+        .lock()
+        .await
+        .get(&pod_id)
+        .cloned()
+        .unwrap();
+    let state = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
+        &updated_pod.annotations,
+        INTERNAL_POD_STATE_KEY,
+    )
+    .unwrap();
+    assert_eq!(state.overhead_linux_resources.unwrap().cpu_shares, 321);
+    assert_eq!(state.linux_resources.unwrap().cpu_shares, 321);
 }
 
 #[tokio::test]
@@ -1345,6 +2104,7 @@ async fn nri_create_result_applies_adjustments_and_side_effects() {
         stdin_once: false,
         log_path: None,
         readonly_rootfs: false,
+        pids_limit: None,
         no_new_privileges: None,
         apparmor_profile: None,
         selinux_label: None,
@@ -1525,6 +2285,32 @@ fn enrich_container_annotations_adds_upstream_runtime_metadata() {
 }
 
 #[test]
+fn apply_runtime_handler_default_annotations_injects_missing_values_only() {
+    let mut service = test_service();
+    service
+        .config
+        .runtime_configs
+        .get_mut("kata")
+        .unwrap()
+        .default_annotations = HashMap::from([
+        ("io.example/default".to_string(), "kata".to_string()),
+        ("existing".to_string(), "from-default".to_string()),
+    ]);
+    let mut annotations = HashMap::from([("existing".to_string(), "user-value".to_string())]);
+
+    service.apply_runtime_handler_default_annotations(&mut annotations, "kata");
+
+    assert_eq!(
+        annotations.get("io.example/default").map(String::as_str),
+        Some("kata")
+    );
+    assert_eq!(
+        annotations.get("existing").map(String::as_str),
+        Some("user-value")
+    );
+}
+
+#[test]
 fn nri_allowed_annotation_prefixes_include_existing_annotations() {
     let (_dir, service) = test_service_with_fake_runtime();
     let annotations = HashMap::from([
@@ -1535,7 +2321,9 @@ fn nri_allowed_annotation_prefixes_include_existing_annotations() {
         ),
     ]);
 
-    let allowed = service.nri_allowed_annotation_prefixes(&annotations, &annotations, "runc");
+    let allowed = service
+        .nri_allowed_annotation_prefixes(&annotations, &annotations, "runc")
+        .unwrap();
     assert!(allowed.iter().any(|item| item == "existing.annotation"));
     assert!(!allowed
         .iter()
@@ -1551,8 +2339,9 @@ fn filter_nri_annotation_adjustments_drops_unlisted_keys() {
         ("disallowed.annotation".to_string(), "value".to_string()),
     ]);
 
-    let filtered =
-        service.filter_nri_annotation_adjustments(&existing, &adjustments, &existing, "runc");
+    let filtered = service
+        .filter_nri_annotation_adjustments(&existing, &adjustments, &existing, "runc")
+        .unwrap();
     assert_eq!(
         filtered,
         HashMap::from([("existing.annotation".to_string(), "updated".to_string())])
@@ -1579,16 +2368,150 @@ fn nri_allowed_annotation_prefixes_include_runtime_and_workload_overrides() {
         HashMap::from([("workload.example/class".to_string(), "latency".to_string())]);
     let existing_annotations = HashMap::new();
 
-    let allowed = service.nri_allowed_annotation_prefixes(
-        &activation_annotations,
-        &existing_annotations,
-        "kata",
-    );
+    let allowed = service
+        .nri_allowed_annotation_prefixes(&activation_annotations, &existing_annotations, "kata")
+        .unwrap();
 
     assert!(allowed
         .iter()
         .any(|item| item == "io.kubernetes.cri-o.RuntimeHandler.kata"));
     assert!(allowed.iter().any(|item| item == "workload.example/"));
+}
+
+#[test]
+fn nri_allowed_annotation_prefixes_include_runtime_workload_profile_allowed_annotations() {
+    let (_dir, mut service) = test_service_with_fake_runtime();
+    service.config.workloads.insert(
+        "management".to_string(),
+        crate::config::RuntimeWorkloadConfig {
+            activation_annotation: "target.workload.openshift.io/management".to_string(),
+            annotation_prefix: "resources.workload.openshift.io".to_string(),
+            allowed_annotations: vec!["workload.profile/".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let activation_annotations = HashMap::from([(
+        "target.workload.openshift.io/management".to_string(),
+        "{\"effect\":\"PreferredDuringScheduling\"}".to_string(),
+    )]);
+    let allowed = service
+        .nri_allowed_annotation_prefixes(&activation_annotations, &HashMap::new(), "runc")
+        .unwrap();
+
+    assert!(allowed.iter().any(|item| item == "workload.profile/"));
+}
+
+#[test]
+fn nri_allowed_annotation_prefixes_include_runtime_handler_allowed_annotations() {
+    let mut service = test_service();
+    service
+        .config
+        .runtime_configs
+        .get_mut("kata")
+        .unwrap()
+        .allowed_annotations = vec!["io.example.runtime/".to_string()];
+
+    let allowed = service
+        .nri_allowed_annotation_prefixes(&HashMap::new(), &HashMap::new(), "kata")
+        .unwrap();
+
+    assert!(allowed.iter().any(|item| item == "io.example.runtime/"));
+}
+
+#[test]
+fn workload_resources_from_annotation_merges_defaults_and_overrides() {
+    let (_dir, mut service) = test_service_with_fake_runtime();
+    service.config.workloads.insert(
+        "management".to_string(),
+        crate::config::RuntimeWorkloadConfig {
+            activation_annotation: "target.workload.openshift.io/management".to_string(),
+            annotation_prefix: "resources.workload.openshift.io".to_string(),
+            resources: crate::config::RuntimeWorkloadResources {
+                cpu_shares: 1024,
+                cpu_period: 100_000,
+                cpu_limit: 1500,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    let annotations = HashMap::from([
+        (
+            "target.workload.openshift.io/management".to_string(),
+            "{\"effect\":\"PreferredDuringScheduling\"}".to_string(),
+        ),
+        (
+            "resources.workload.openshift.io/main".to_string(),
+            "{\"cpushares\":2048,\"cpuset\":\"0-2\"}".to_string(),
+        ),
+    ]);
+
+    let resources = service
+        .workload_resources_from_annotation(&annotations, "main")
+        .unwrap()
+        .expect("workload resources should be present");
+    assert_eq!(resources.cpu_shares, 2048);
+    assert_eq!(resources.cpu_period, 100_000);
+    assert_eq!(resources.cpu_limit, 1500);
+    assert_eq!(resources.cpuset_cpus, "0-2");
+}
+
+#[test]
+fn apply_workload_resources_overrides_cpu_settings() {
+    let mut resources = StoredLinuxResources::default();
+    RuntimeServiceImpl::apply_workload_resources(
+        &mut resources,
+        &crate::config::RuntimeWorkloadResources {
+            cpu_shares: 2048,
+            cpu_period: 100_000,
+            cpu_limit: 1500,
+            cpuset_cpus: "0-2".to_string(),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(resources.cpu_shares, 2048);
+    assert_eq!(resources.cpu_period, 100_000);
+    assert_eq!(resources.cpu_quota, 150_000);
+    assert_eq!(resources.cpuset_cpus, "0-2");
+}
+
+#[test]
+fn selected_workload_profile_rejects_multiple_activations() {
+    let (_dir, mut service) = test_service_with_fake_runtime();
+    service.config.workloads.insert(
+        "management".to_string(),
+        crate::config::RuntimeWorkloadConfig {
+            activation_annotation: "target.workload.openshift.io/management".to_string(),
+            annotation_prefix: "resources.workload.openshift.io".to_string(),
+            ..Default::default()
+        },
+    );
+    service.config.workloads.insert(
+        "latency".to_string(),
+        crate::config::RuntimeWorkloadConfig {
+            activation_annotation: "target.workload.openshift.io/latency".to_string(),
+            annotation_prefix: "resources.workload.openshift.io".to_string(),
+            ..Default::default()
+        },
+    );
+
+    let err = service
+        .selected_workload_profile(&HashMap::from([
+            (
+                "target.workload.openshift.io/management".to_string(),
+                "{}".to_string(),
+            ),
+            (
+                "target.workload.openshift.io/latency".to_string(),
+                "{}".to_string(),
+            ),
+        ]))
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("multiple workload profiles"));
 }
 
 #[test]
@@ -1779,6 +2702,80 @@ fn test_pod(
     }
 }
 
+fn host_network_run_pod_sandbox_request(
+    name: &str,
+    namespace: &str,
+    uid: &str,
+    annotations: HashMap<String, String>,
+) -> RunPodSandboxRequest {
+    RunPodSandboxRequest {
+        config: Some(crate::proto::runtime::v1::PodSandboxConfig {
+            metadata: Some(PodSandboxMetadata {
+                name: name.to_string(),
+                uid: uid.to_string(),
+                namespace: namespace.to_string(),
+                attempt: 1,
+            }),
+            hostname: name.to_string(),
+            labels: HashMap::new(),
+            annotations,
+            log_directory: String::new(),
+            dns_config: None,
+            port_mappings: Vec::new(),
+            linux: Some(crate::proto::runtime::v1::LinuxPodSandboxConfig {
+                security_context: Some(crate::proto::runtime::v1::LinuxSandboxSecurityContext {
+                    namespace_options: Some(NamespaceOption {
+                        network: NamespaceMode::Node as i32,
+                        pid: NamespaceMode::Pod as i32,
+                        ipc: NamespaceMode::Pod as i32,
+                        target_id: String::new(),
+                        userns_options: None,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        runtime_handler: String::new(),
+    }
+}
+
+fn pod_sandbox_request_with_namespace_options(
+    name: &str,
+    namespace: &str,
+    uid: &str,
+    annotations: HashMap<String, String>,
+    runtime_handler: &str,
+    namespace_options: NamespaceOption,
+) -> RunPodSandboxRequest {
+    RunPodSandboxRequest {
+        config: Some(crate::proto::runtime::v1::PodSandboxConfig {
+            metadata: Some(PodSandboxMetadata {
+                name: name.to_string(),
+                uid: uid.to_string(),
+                namespace: namespace.to_string(),
+                attempt: 1,
+            }),
+            hostname: name.to_string(),
+            labels: HashMap::new(),
+            annotations,
+            log_directory: String::new(),
+            dns_config: None,
+            port_mappings: Vec::new(),
+            linux: Some(crate::proto::runtime::v1::LinuxPodSandboxConfig {
+                security_context: Some(crate::proto::runtime::v1::LinuxSandboxSecurityContext {
+                    namespace_options: Some(namespace_options),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        runtime_handler: runtime_handler.to_string(),
+    }
+}
+
 #[test]
 fn pod_network_status_keeps_primary_and_additional_ips() {
     let state = StoredPodState {
@@ -1800,6 +2797,515 @@ fn pod_network_status_keeps_primary_and_additional_ips() {
 }
 
 #[test]
+fn uid_map_parser_distinguishes_initial_and_nested_user_namespaces() {
+    assert!(!RuntimeServiceImpl::uid_map_indicates_user_namespace(
+        "0 0 4294967295"
+    ));
+    assert!(RuntimeServiceImpl::uid_map_indicates_user_namespace(
+        "0 1000 65536"
+    ));
+    assert!(RuntimeServiceImpl::uid_map_indicates_user_namespace(""));
+    assert!(!RuntimeServiceImpl::uid_map_indicates_user_namespace(
+        "garbage"
+    ));
+}
+
+#[test]
+fn effective_pod_sysctls_adds_unprivileged_defaults_for_non_host_network_pods() {
+    let mut service = test_service();
+    service.config.enable_unprivileged_ports = true;
+    service.config.enable_unprivileged_icmp = true;
+    service.config.default_sysctls = HashMap::from([(
+        "kernel.shm_rmid_forced".to_string(),
+        "1".to_string(),
+    )]);
+
+    let namespace_options = NamespaceOption {
+        network: NamespaceMode::Pod as i32,
+        pid: NamespaceMode::Pod as i32,
+        ipc: NamespaceMode::Pod as i32,
+        target_id: String::new(),
+        userns_options: None,
+    };
+    let effective = service.effective_pod_sysctls(None, Some(&namespace_options));
+
+    assert_eq!(
+        effective.get("net.ipv4.ip_unprivileged_port_start"),
+        Some(&"0".to_string())
+    );
+    assert_eq!(
+        effective.get("net.ipv4.ping_group_range"),
+        Some(&"0 2147483647".to_string())
+    );
+    assert_eq!(
+        effective.get("kernel.shm_rmid_forced"),
+        Some(&"1".to_string())
+    );
+}
+
+#[test]
+fn effective_pod_sysctls_preserves_user_overrides_and_skips_host_network_defaults() {
+    let mut service = test_service();
+    service.config.enable_unprivileged_ports = true;
+    service.config.enable_unprivileged_icmp = true;
+    service.config.default_sysctls = HashMap::from([(
+        "kernel.shm_rmid_forced".to_string(),
+        "1".to_string(),
+    )]);
+
+    let requested = HashMap::from([
+        (
+            "net.ipv4.ip_unprivileged_port_start".to_string(),
+            "500".to_string(),
+        ),
+        (
+            "net.ipv4.ping_group_range".to_string(),
+            "1 1000".to_string(),
+        ),
+        (
+            "kernel.shm_rmid_forced".to_string(),
+            "0".to_string(),
+        ),
+    ]);
+    let host_network = NamespaceOption {
+        network: NamespaceMode::Node as i32,
+        pid: NamespaceMode::Pod as i32,
+        ipc: NamespaceMode::Pod as i32,
+        target_id: String::new(),
+        userns_options: None,
+    };
+    let effective = service.effective_pod_sysctls(Some(&requested), Some(&host_network));
+
+    assert_eq!(effective, requested);
+}
+
+#[test]
+fn effective_pod_sysctls_skips_icmp_default_for_userns_pods() {
+    let mut service = test_service();
+    service.config.enable_unprivileged_icmp = true;
+
+    let namespace_options = NamespaceOption {
+        network: NamespaceMode::Pod as i32,
+        pid: NamespaceMode::Pod as i32,
+        ipc: NamespaceMode::Pod as i32,
+        target_id: String::new(),
+        userns_options: Some(crate::proto::runtime::v1::UserNamespace {
+            mode: NamespaceMode::Pod as i32,
+            uids: vec![crate::proto::runtime::v1::IdMapping {
+                container_id: 0,
+                host_id: 100000,
+                length: 65536,
+            }],
+            gids: vec![crate::proto::runtime::v1::IdMapping {
+                container_id: 0,
+                host_id: 100000,
+                length: 65536,
+            }],
+        }),
+    };
+    let effective = service.effective_pod_sysctls(None, Some(&namespace_options));
+
+    assert!(!effective.contains_key("net.ipv4.ping_group_range"));
+}
+
+#[test]
+fn clamp_proto_oom_score_adj_respects_daemon_floor_when_enabled() {
+    let current = crate::runtime::RuncRuntime::daemon_oom_score_adj().unwrap();
+    let mut service = test_service();
+    service.config.restrict_oom_score_adj = true;
+    let mut resources = crate::proto::runtime::v1::LinuxContainerResources {
+        oom_score_adj: current - 1,
+        ..Default::default()
+    };
+
+    service.clamp_proto_oom_score_adj(&mut resources).unwrap();
+
+    assert_eq!(resources.oom_score_adj, current);
+}
+
+#[test]
+fn effective_container_stop_timeout_enforces_configured_minimum() {
+    let mut service = test_service();
+    service.config.container_stop_timeout = 30;
+
+    assert_eq!(service.effective_container_stop_timeout(0), 30);
+    assert_eq!(service.effective_container_stop_timeout(5), 30);
+    assert_eq!(service.effective_container_stop_timeout(45), 45);
+}
+
+#[test]
+fn effective_readonly_rootfs_honors_daemon_default() {
+    let mut service = test_service();
+    service.config.read_only = true;
+
+    assert!(service.effective_readonly_rootfs(false));
+    assert!(service.effective_readonly_rootfs(true));
+
+    service.config.read_only = false;
+    assert!(!service.effective_readonly_rootfs(false));
+    assert!(service.effective_readonly_rootfs(true));
+}
+
+#[test]
+fn effective_pids_limit_honors_daemon_default_and_explicit_override() {
+    let mut service = test_service();
+    service.config.pids_limit = 1024;
+
+    assert_eq!(service.effective_pids_limit(None).unwrap(), Some(1024));
+    assert_eq!(service.effective_pids_limit(Some(0)).unwrap(), Some(1024));
+    assert_eq!(service.effective_pids_limit(Some(42)).unwrap(), Some(42));
+    assert_eq!(service.effective_pids_limit(Some(-1)).unwrap(), None);
+
+    let err = service.effective_pids_limit(Some(-2)).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("pids_limit"));
+}
+
+#[test]
+fn stored_linux_resources_to_nri_preserves_pids_limit() {
+    let resources = StoredLinuxResources {
+        pids_limit: Some(321),
+        ..Default::default()
+    };
+
+    let nri = resources.to_nri();
+    assert_eq!(nri.pids.as_ref().map(|pids| pids.limit), Some(321));
+}
+
+#[test]
+fn effective_userns_options_injects_daemon_default_mappings() {
+    let mut service = test_service();
+    service.config.uid_mappings = Some(vec![crate::proto::runtime::v1::IdMapping {
+        host_id: 100000,
+        container_id: 0,
+        length: 65536,
+    }]);
+    service.config.gid_mappings = Some(vec![crate::proto::runtime::v1::IdMapping {
+        host_id: 200000,
+        container_id: 0,
+        length: 65536,
+    }]);
+
+    let options = service
+        .effective_userns_options(None)
+        .expect("daemon defaults should inject namespace options");
+    let userns = options
+        .userns_options
+        .expect("userns options should be present");
+    assert_eq!(userns.mode, NamespaceMode::Pod as i32);
+    assert_eq!(userns.uids[0].host_id, 100000);
+    assert_eq!(userns.gids[0].host_id, 200000);
+}
+
+#[test]
+fn effective_userns_options_preserves_explicit_node_request() {
+    let mut service = test_service();
+    service.config.uid_mappings = Some(vec![crate::proto::runtime::v1::IdMapping {
+        host_id: 100000,
+        container_id: 0,
+        length: 65536,
+    }]);
+    service.config.gid_mappings = Some(vec![crate::proto::runtime::v1::IdMapping {
+        host_id: 200000,
+        container_id: 0,
+        length: 65536,
+    }]);
+    let requested = NamespaceOption {
+        network: NamespaceMode::Pod as i32,
+        pid: NamespaceMode::Pod as i32,
+        ipc: NamespaceMode::Pod as i32,
+        target_id: String::new(),
+        userns_options: Some(crate::proto::runtime::v1::UserNamespace {
+            mode: NamespaceMode::Node as i32,
+            ..Default::default()
+        }),
+    };
+
+    let options = service
+        .effective_userns_options(Some(&requested))
+        .expect("explicit node mode should be preserved");
+    assert_eq!(
+        options.userns_options.as_ref().map(|userns| userns.mode),
+        Some(NamespaceMode::Node as i32)
+    );
+}
+
+#[test]
+fn effective_userns_options_preserves_explicit_request_mappings() {
+    let mut service = test_service();
+    service.config.uid_mappings = Some(vec![crate::proto::runtime::v1::IdMapping {
+        host_id: 100000,
+        container_id: 0,
+        length: 65536,
+    }]);
+    service.config.gid_mappings = Some(vec![crate::proto::runtime::v1::IdMapping {
+        host_id: 200000,
+        container_id: 0,
+        length: 65536,
+    }]);
+    let requested = NamespaceOption {
+        network: NamespaceMode::Pod as i32,
+        pid: NamespaceMode::Pod as i32,
+        ipc: NamespaceMode::Pod as i32,
+        target_id: String::new(),
+        userns_options: Some(crate::proto::runtime::v1::UserNamespace {
+            mode: NamespaceMode::Pod as i32,
+            uids: vec![crate::proto::runtime::v1::IdMapping {
+                host_id: 300000,
+                container_id: 0,
+                length: 65536,
+            }],
+            gids: vec![crate::proto::runtime::v1::IdMapping {
+                host_id: 400000,
+                container_id: 0,
+                length: 65536,
+            }],
+        }),
+    };
+
+    let options = service
+        .effective_userns_options(Some(&requested))
+        .expect("explicit mappings should be preserved");
+    let userns = options
+        .userns_options
+        .expect("userns options should be present");
+    assert_eq!(userns.uids[0].host_id, 300000);
+    assert_eq!(userns.gids[0].host_id, 400000);
+}
+
+#[test]
+fn resolve_pod_runtime_handler_uses_untrusted_runtime_for_legacy_annotation() {
+    let mut service = test_service();
+    service
+        .config
+        .runtime_handlers
+        .push("untrusted".to_string());
+
+    let config = crate::proto::runtime::v1::PodSandboxConfig {
+        annotations: HashMap::from([(
+            CONTAINERD_UNTRUSTED_WORKLOAD_ANNOTATION.to_string(),
+            "true".to_string(),
+        )]),
+        ..Default::default()
+    };
+
+    let handler = service
+        .resolve_pod_runtime_handler(
+            &config,
+            "",
+            Some(&NamespaceOption {
+                network: NamespaceMode::Pod as i32,
+                pid: NamespaceMode::Pod as i32,
+                ipc: NamespaceMode::Pod as i32,
+                target_id: String::new(),
+                userns_options: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(handler, "untrusted");
+}
+
+#[test]
+fn resolve_pod_runtime_handler_rejects_conflicting_handler_for_untrusted_workload() {
+    let mut service = test_service();
+    service
+        .config
+        .runtime_handlers
+        .push("untrusted".to_string());
+    service.config.runtime_handlers.push("kata".to_string());
+
+    let config = crate::proto::runtime::v1::PodSandboxConfig {
+        annotations: HashMap::from([(
+            CONTAINERD_UNTRUSTED_WORKLOAD_ANNOTATION.to_string(),
+            "true".to_string(),
+        )]),
+        ..Default::default()
+    };
+
+    let err = service
+        .resolve_pod_runtime_handler(
+            &config,
+            "kata",
+            Some(&NamespaceOption {
+                network: NamespaceMode::Pod as i32,
+                pid: NamespaceMode::Pod as i32,
+                ipc: NamespaceMode::Pod as i32,
+                target_id: String::new(),
+                userns_options: None,
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("explicit runtime handler"));
+}
+
+#[test]
+fn resolve_pod_runtime_handler_rejects_host_access_for_untrusted_workload() {
+    let mut service = test_service();
+    service
+        .config
+        .runtime_handlers
+        .push("untrusted".to_string());
+
+    let config = crate::proto::runtime::v1::PodSandboxConfig {
+        annotations: HashMap::from([(
+            CONTAINERD_UNTRUSTED_WORKLOAD_ANNOTATION.to_string(),
+            "true".to_string(),
+        )]),
+        ..Default::default()
+    };
+
+    let err = service
+        .resolve_pod_runtime_handler(
+            &config,
+            "",
+            Some(&NamespaceOption {
+                network: NamespaceMode::Node as i32,
+                pid: NamespaceMode::Pod as i32,
+                ipc: NamespaceMode::Pod as i32,
+                target_id: String::new(),
+                userns_options: None,
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("host access"));
+}
+
+#[test]
+fn validate_minimum_mappable_ids_rejects_non_root_uid_mapping_below_minimum() {
+    let mut service = test_service();
+    service.config.minimum_mappable_uid = 100000;
+
+    let err = service
+        .validate_minimum_mappable_ids(
+            Some(&NamespaceOption {
+                network: NamespaceMode::Pod as i32,
+                pid: NamespaceMode::Pod as i32,
+                ipc: NamespaceMode::Pod as i32,
+                target_id: String::new(),
+                userns_options: Some(crate::proto::runtime::v1::UserNamespace {
+                    mode: NamespaceMode::Pod as i32,
+                    uids: vec![crate::proto::runtime::v1::IdMapping {
+                        host_id: 99999,
+                        container_id: 0,
+                        length: 65536,
+                    }],
+                    gids: vec![crate::proto::runtime::v1::IdMapping {
+                        host_id: 200000,
+                        container_id: 0,
+                        length: 65536,
+                    }],
+                }),
+            }),
+            Some("1000"),
+            None,
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("minimum mappable uid"));
+}
+
+#[test]
+fn validate_minimum_mappable_ids_rejects_non_root_gid_mapping_below_minimum() {
+    let mut service = test_service();
+    service.config.minimum_mappable_gid = 200000;
+
+    let err = service
+        .validate_minimum_mappable_ids(
+            Some(&NamespaceOption {
+                network: NamespaceMode::Pod as i32,
+                pid: NamespaceMode::Pod as i32,
+                ipc: NamespaceMode::Pod as i32,
+                target_id: String::new(),
+                userns_options: Some(crate::proto::runtime::v1::UserNamespace {
+                    mode: NamespaceMode::Pod as i32,
+                    uids: vec![crate::proto::runtime::v1::IdMapping {
+                        host_id: 100000,
+                        container_id: 0,
+                        length: 65536,
+                    }],
+                    gids: vec![crate::proto::runtime::v1::IdMapping {
+                        host_id: 199999,
+                        container_id: 0,
+                        length: 65536,
+                    }],
+                }),
+            }),
+            Some("1000"),
+            Some(1000),
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("minimum mappable gid"));
+}
+
+#[test]
+fn validate_minimum_mappable_ids_allows_root_user_namespace_mappings_below_minimum() {
+    let mut service = test_service();
+    service.config.minimum_mappable_uid = 100000;
+    service.config.minimum_mappable_gid = 200000;
+
+    service
+        .validate_minimum_mappable_ids(
+            Some(&NamespaceOption {
+                network: NamespaceMode::Pod as i32,
+                pid: NamespaceMode::Pod as i32,
+                ipc: NamespaceMode::Pod as i32,
+                target_id: String::new(),
+                userns_options: Some(crate::proto::runtime::v1::UserNamespace {
+                    mode: NamespaceMode::Pod as i32,
+                    uids: vec![crate::proto::runtime::v1::IdMapping {
+                        host_id: 1,
+                        container_id: 0,
+                        length: 1,
+                    }],
+                    gids: vec![crate::proto::runtime::v1::IdMapping {
+                        host_id: 1,
+                        container_id: 0,
+                        length: 1,
+                    }],
+                }),
+            }),
+            Some("0"),
+            Some(0),
+            &[0],
+        )
+        .expect("root user namespace mappings should bypass minimum mappable checks");
+}
+
+#[test]
+fn validate_minimum_mappable_ids_ignores_node_mode() {
+    let mut service = test_service();
+    service.config.minimum_mappable_uid = 100000;
+
+    service
+        .validate_minimum_mappable_ids(
+            Some(&NamespaceOption {
+                network: NamespaceMode::Pod as i32,
+                pid: NamespaceMode::Pod as i32,
+                ipc: NamespaceMode::Pod as i32,
+                target_id: String::new(),
+                userns_options: Some(crate::proto::runtime::v1::UserNamespace {
+                    mode: NamespaceMode::Node as i32,
+                    uids: vec![crate::proto::runtime::v1::IdMapping {
+                        host_id: 1,
+                        container_id: 0,
+                        length: 1,
+                    }],
+                    gids: vec![],
+                }),
+            }),
+            Some("1000"),
+            None,
+            &[],
+        )
+        .expect("node mode should bypass minimum mappable checks");
+}
+
+#[test]
 fn pod_network_status_promotes_first_additional_ip_when_primary_missing() {
     let state = StoredPodState {
         additional_ips: vec!["fd00::10".to_string(), "10.88.0.11".to_string()],
@@ -1811,6 +3317,71 @@ fn pod_network_status_promotes_first_additional_ip_when_primary_missing() {
     assert_eq!(status.ip, "fd00::10");
     assert_eq!(status.additional_ips.len(), 1);
     assert_eq!(status.additional_ips[0].ip, "10.88.0.11");
+}
+
+#[test]
+fn pod_linux_status_preserves_host_pid_and_host_ipc_namespace_modes() {
+    let state = StoredPodState {
+        namespace_options: Some(StoredNamespaceOptions {
+            network: NamespaceMode::Pod as i32,
+            pid: NamespaceMode::Node as i32,
+            ipc: NamespaceMode::Node as i32,
+            target_id: String::new(),
+            userns_options: None,
+        }),
+        ..Default::default()
+    };
+
+    let linux_status =
+        RuntimeServiceImpl::pod_linux_status_from_state(Some(&state)).expect("linux status");
+    let options = linux_status
+        .namespaces
+        .and_then(|namespaces| namespaces.options)
+        .expect("namespace options");
+
+    assert_eq!(options.network, NamespaceMode::Pod as i32);
+    assert_eq!(options.pid, NamespaceMode::Node as i32);
+    assert_eq!(options.ipc, NamespaceMode::Node as i32);
+}
+
+#[test]
+fn pod_linux_status_preserves_userns_options() {
+    let state = StoredPodState {
+        namespace_options: Some(StoredNamespaceOptions {
+            network: NamespaceMode::Pod as i32,
+            pid: NamespaceMode::Pod as i32,
+            ipc: NamespaceMode::Pod as i32,
+            target_id: String::new(),
+            userns_options: Some(StoredUserNamespace {
+                mode: NamespaceMode::Pod as i32,
+                uids: vec![StoredIdMapping {
+                    host_id: 100000,
+                    container_id: 0,
+                    length: 65536,
+                }],
+                gids: vec![StoredIdMapping {
+                    host_id: 200000,
+                    container_id: 0,
+                    length: 65536,
+                }],
+            }),
+        }),
+        ..Default::default()
+    };
+
+    let linux_status =
+        RuntimeServiceImpl::pod_linux_status_from_state(Some(&state)).expect("linux status");
+    let options = linux_status
+        .namespaces
+        .and_then(|namespaces| namespaces.options)
+        .expect("namespace options");
+    let userns = options
+        .userns_options
+        .expect("userns options should be preserved");
+
+    assert_eq!(userns.mode, NamespaceMode::Pod as i32);
+    assert_eq!(userns.uids[0].host_id, 100000);
+    assert_eq!(userns.gids[0].host_id, 200000);
 }
 
 #[test]
@@ -1870,6 +3441,122 @@ fn build_container_status_snapshot_uses_internal_timestamps_and_exit_code() {
     assert_eq!(status.message, "container exited with code 42");
     assert_eq!(status.mounts.len(), 1);
     assert_eq!(status.mounts[0].container_path, "/data");
+}
+
+#[test]
+fn build_container_status_snapshot_masks_stale_exit_fields_for_created_and_running() {
+    let mut annotations = HashMap::new();
+    let stored = StoredContainerState {
+        started_at: Some(5),
+        finished_at: Some(8),
+        exit_code: Some(42),
+        ..Default::default()
+    };
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &stored,
+    )
+    .expect("store internal state");
+
+    let container = Container {
+        id: "container-1".to_string(),
+        metadata: Some(ContainerMetadata {
+            name: "c1".to_string(),
+            attempt: 1,
+        }),
+        image: Some(ImageSpec {
+            image: "busybox:latest".to_string(),
+            ..Default::default()
+        }),
+        image_ref: "busybox:latest".to_string(),
+        annotations,
+        created_at: 1,
+        ..Default::default()
+    };
+
+    let created = RuntimeServiceImpl::build_container_status_snapshot(
+        &container,
+        ContainerState::ContainerCreated as i32,
+    );
+    assert_eq!(created.started_at, 0);
+    assert_eq!(created.finished_at, 0);
+    assert_eq!(created.exit_code, 0);
+    assert_eq!(created.reason, "Created");
+
+    let running = RuntimeServiceImpl::build_container_status_snapshot(
+        &container,
+        ContainerState::ContainerRunning as i32,
+    );
+    assert_eq!(
+        running.started_at,
+        RuntimeServiceImpl::normalize_timestamp_nanos(5)
+    );
+    assert_eq!(running.finished_at, 0);
+    assert_eq!(running.exit_code, 0);
+    assert_eq!(running.reason, "Running");
+}
+
+#[test]
+fn build_container_status_snapshot_uses_minus_one_when_exited_exit_code_is_unknown() {
+    let mut annotations = HashMap::new();
+    let stored = StoredContainerState {
+        started_at: Some(5),
+        finished_at: Some(8),
+        exit_code: None,
+        ..Default::default()
+    };
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &stored,
+    )
+    .expect("store internal state");
+
+    let container = Container {
+        id: "container-unknown-exit".to_string(),
+        metadata: Some(ContainerMetadata {
+            name: "c1".to_string(),
+            attempt: 1,
+        }),
+        image: Some(ImageSpec {
+            image: "busybox:latest".to_string(),
+            ..Default::default()
+        }),
+        image_ref: "busybox:latest".to_string(),
+        annotations,
+        created_at: 1,
+        ..Default::default()
+    };
+
+    let status = RuntimeServiceImpl::build_container_status_snapshot(
+        &container,
+        ContainerState::ContainerExited as i32,
+    );
+    assert_eq!(status.exit_code, -1);
+    assert_eq!(status.reason, "Error");
+    assert_eq!(status.message, "container exited with unknown exit code");
+}
+
+#[test]
+fn record_to_container_status_uses_minus_one_for_missing_stopped_exit_code() {
+    let record = crate::storage::ContainerRecord {
+        id: "container-1".to_string(),
+        pod_id: "pod-1".to_string(),
+        state: "stopped".to_string(),
+        image: "busybox:latest".to_string(),
+        command: "sleep 1".to_string(),
+        created_at: 1,
+        labels: "{}".to_string(),
+        annotations: "{}".to_string(),
+        exit_code: None,
+        exit_time: Some(2),
+    };
+
+    assert_eq!(
+        crate::storage::persistence::record_to_container_status(&record),
+        crate::runtime::ContainerStatus::Stopped(-1)
+    );
 }
 
 #[test]
@@ -2266,6 +3953,31 @@ fn seccomp_profile_from_proto_supports_localhost_and_unconfined() {
     ));
 }
 
+#[test]
+fn effective_seccomp_profile_uses_configured_unset_fallback() {
+    let mut service = test_service();
+    service.config.unset_seccomp_profile = "runtime/default".to_string();
+
+    let profile = service.effective_seccomp_profile_from_proto(None, "");
+    assert!(matches!(profile, Some(SeccompProfile::RuntimeDefault)));
+}
+
+#[test]
+fn effective_seccomp_profile_does_not_override_explicit_unconfined() {
+    let mut service = test_service();
+    service.config.unset_seccomp_profile = "runtime/default".to_string();
+
+    let profile = service.effective_seccomp_profile_from_proto(
+        Some(&crate::proto::runtime::v1::SecurityProfile {
+            profile_type: crate::proto::runtime::v1::security_profile::ProfileType::Unconfined
+                as i32,
+            localhost_ref: String::new(),
+        }),
+        "",
+    );
+    assert!(matches!(profile, Some(SeccompProfile::Unconfined)));
+}
+
 #[tokio::test]
 async fn resolve_container_id_handles_zero_single_and_multiple_matches() {
     let service = test_service();
@@ -2332,6 +4044,473 @@ async fn resolve_pod_sandbox_id_handles_zero_single_and_multiple_matches() {
             .code(),
         tonic::Code::InvalidArgument
     );
+}
+
+#[test]
+fn reserve_pod_name_rejects_duplicate_and_allows_reuse_after_release() {
+    let service = test_service();
+    let pod_metadata = PodSandboxMetadata {
+        name: "dup-pod".to_string(),
+        uid: "dup-pod-uid".to_string(),
+        namespace: "default".to_string(),
+        attempt: 1,
+    };
+    let pod_name_key = RuntimeServiceImpl::pod_name_key(&pod_metadata);
+
+    let mut guard = service.reserve_pod_name("pod-1", &pod_name_key).unwrap();
+    let err = service
+        .reserve_pod_name("pod-2", &pod_name_key)
+        .expect_err("duplicate pod name should be rejected");
+    assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    assert!(err.message().contains("already exists"));
+
+    guard.disarm();
+    service.release_pod_name("pod-1");
+    service
+        .reserve_pod_name("pod-2", &pod_name_key)
+        .expect("pod name should be reusable after release");
+}
+
+#[test]
+fn reserve_container_name_rejects_duplicate_and_allows_reuse_after_release() {
+    let service = test_service();
+    let pod_metadata = PodSandboxMetadata {
+        name: "pod-create-dup".to_string(),
+        uid: "pod-create-dup-uid".to_string(),
+        namespace: "default".to_string(),
+        attempt: 1,
+    };
+    let container_metadata = ContainerMetadata {
+        name: "dup-container".to_string(),
+        attempt: 1,
+    };
+    let container_name_key =
+        RuntimeServiceImpl::container_name_key(&container_metadata, &pod_metadata);
+
+    let mut guard = service
+        .reserve_container_name("container-1", &container_name_key)
+        .unwrap();
+    let err = service
+        .reserve_container_name("container-2", &container_name_key)
+        .expect_err("duplicate container name should be rejected");
+    assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    assert!(err.message().contains("already exists"));
+
+    guard.disarm();
+    service.release_container_name("container-1");
+    service
+        .reserve_container_name("container-2", &container_name_key)
+        .expect("container name should be reusable after release");
+}
+
+#[tokio::test]
+async fn create_container_rejects_missing_image_spec() {
+    let service = test_service();
+    service.pod_sandboxes.lock().await.insert(
+        "pod-missing-image".to_string(),
+        test_pod("pod-missing-image", HashMap::new()),
+    );
+
+    let err = RuntimeService::create_container(
+        &service,
+        Request::new(CreateContainerRequest {
+            pod_sandbox_id: "pod-missing-image".to_string(),
+            config: Some(crate::proto::runtime::v1::ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "missing-image".to_string(),
+                    attempt: 1,
+                }),
+                image: None,
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect_err("missing image spec should be rejected");
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("ContainerConfig.Image is nil"));
+    let pod_metadata = service
+        .pod_sandboxes
+        .lock()
+        .await
+        .get("pod-missing-image")
+        .and_then(|pod| pod.metadata.clone())
+        .unwrap();
+    let name_key = RuntimeServiceImpl::container_name_key(
+        &ContainerMetadata {
+            name: "missing-image".to_string(),
+            attempt: 1,
+        },
+        &pod_metadata,
+    );
+    assert!(
+        service.container_id_for_reserved_name(&name_key).is_none(),
+        "invalid request must not reserve container names"
+    );
+}
+
+#[tokio::test]
+async fn create_container_rejects_empty_image_ref() {
+    let service = test_service();
+    service.pod_sandboxes.lock().await.insert(
+        "pod-empty-image".to_string(),
+        test_pod("pod-empty-image", HashMap::new()),
+    );
+
+    let err = RuntimeService::create_container(
+        &service,
+        Request::new(CreateContainerRequest {
+            pod_sandbox_id: "pod-empty-image".to_string(),
+            config: Some(crate::proto::runtime::v1::ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "empty-image".to_string(),
+                    attempt: 1,
+                }),
+                image: Some(ImageSpec {
+                    image: "   ".to_string(),
+                    user_specified_image: String::new(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect_err("empty image ref should be rejected");
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("Image.Image is empty"));
+    let pod_metadata = service
+        .pod_sandboxes
+        .lock()
+        .await
+        .get("pod-empty-image")
+        .and_then(|pod| pod.metadata.clone())
+        .unwrap();
+    let name_key = RuntimeServiceImpl::container_name_key(
+        &ContainerMetadata {
+            name: "empty-image".to_string(),
+            attempt: 1,
+        },
+        &pod_metadata,
+    );
+    assert!(
+        service.container_id_for_reserved_name(&name_key).is_none(),
+        "invalid request must not reserve container names"
+    );
+}
+
+#[test]
+fn build_container_status_snapshot_preserves_empty_legacy_image_ref() {
+    let container = Container {
+        id: "legacy-empty-image".to_string(),
+        pod_sandbox_id: "pod-1".to_string(),
+        state: ContainerState::ContainerCreated as i32,
+        metadata: Some(ContainerMetadata {
+            name: "legacy".to_string(),
+            attempt: 1,
+        }),
+        image: None,
+        image_ref: String::new(),
+        annotations: HashMap::new(),
+        created_at: RuntimeServiceImpl::now_nanos(),
+        ..Default::default()
+    };
+
+    let status = RuntimeServiceImpl::build_container_status_snapshot(
+        &container,
+        ContainerState::ContainerCreated as i32,
+    );
+    assert_eq!(status.image_ref, "");
+    assert_eq!(
+        status.image.as_ref().map(|image| image.image.as_str()),
+        Some("")
+    );
+}
+
+#[test]
+fn resolve_container_log_path_joins_relative_path_under_sandbox_log_directory() {
+    let path = RuntimeServiceImpl::resolve_container_log_path(
+        Some("/var/log/pods/default_demo_uid"),
+        "workload/0.log",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        path,
+        PathBuf::from("/var/log/pods/default_demo_uid").join("workload/0.log")
+    );
+}
+
+#[test]
+fn resolve_container_log_path_rejects_absolute_path_when_sandbox_log_directory_is_set() {
+    let err = RuntimeServiceImpl::resolve_container_log_path(
+        Some("/var/log/pods/default_demo_uid"),
+        "/var/log/pods/default_demo_uid/workload/0.log",
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("must be relative"));
+}
+
+#[test]
+fn resolve_container_log_path_rejects_parent_dir_escape_when_sandbox_log_directory_is_set() {
+    let err = RuntimeServiceImpl::resolve_container_log_path(
+        Some("/var/log/pods/default_demo_uid"),
+        "../escape.log",
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("must not escape"));
+}
+
+#[test]
+fn resolve_container_log_path_requires_absolute_path_without_sandbox_log_directory() {
+    let err = RuntimeServiceImpl::resolve_container_log_path(None, "relative.log").unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("must be absolute"));
+
+    let absolute = RuntimeServiceImpl::resolve_container_log_path(
+        None,
+        "/var/log/pods/default_demo_uid/workload/0.log",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        absolute,
+        PathBuf::from("/var/log/pods/default_demo_uid/workload/0.log")
+    );
+}
+
+#[tokio::test]
+async fn recover_state_rebuilds_reserved_pod_and_container_names() {
+    let (_dir, service) = test_service_with_fake_runtime();
+    let pod_metadata = PodSandboxMetadata {
+        name: "recover-pod".to_string(),
+        uid: "recover-pod-uid".to_string(),
+        namespace: "default".to_string(),
+        attempt: 1,
+    };
+    let pod_name_key = RuntimeServiceImpl::pod_name_key(&pod_metadata);
+    let mut pod_annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut pod_annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            pause_container_id: Some("pause-recover-name".to_string()),
+            runtime_handler: "runc".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .save_pod_sandbox(
+            "pod-recover-name",
+            "ready",
+            &pod_metadata.name,
+            &pod_metadata.namespace,
+            &pod_metadata.uid,
+            "",
+            &HashMap::new(),
+            &pod_annotations,
+            Some("pause-recover-name"),
+            None,
+        )
+        .unwrap();
+
+    let container_metadata = ContainerMetadata {
+        name: "recover-container".to_string(),
+        attempt: 1,
+    };
+    let container_name_key =
+        RuntimeServiceImpl::container_name_key(&container_metadata, &pod_metadata);
+    let mut container_annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut container_annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            metadata_name: Some(container_metadata.name.clone()),
+            metadata_attempt: Some(container_metadata.attempt),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-recover-name",
+            "pod-recover-name",
+            crate::runtime::ContainerStatus::Created,
+            "busybox:latest",
+            &["sleep".to_string(), "1".to_string()],
+            &HashMap::new(),
+            &container_annotations,
+        )
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    assert_eq!(
+        service.pod_id_for_reserved_name(&pod_name_key).as_deref(),
+        Some("pod-recover-name")
+    );
+    assert_eq!(
+        service
+            .container_id_for_reserved_name(&container_name_key)
+            .as_deref(),
+        Some("container-recover-name")
+    );
+}
+
+#[tokio::test]
+async fn run_pod_sandbox_surfaces_pause_image_not_present_locally() {
+    let (_dir, service) = test_service_with_fake_runtime();
+    let err = RuntimeService::run_pod_sandbox(
+        &service,
+        Request::new(host_network_run_pod_sandbox_request(
+            "pause-missing",
+            "default",
+            "pause-missing-uid",
+            HashMap::new(),
+        )),
+    )
+    .await
+    .expect_err("missing local pause image should fail sandbox creation");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("pause image"));
+    assert!(err.message().contains("registry.k8s.io/pause:3.9"));
+    assert!(err
+        .message()
+        .contains("pull it before starting the pod sandbox"));
+}
+
+#[tokio::test]
+async fn run_pod_sandbox_surfaces_overridden_pause_image_not_present_locally() {
+    let (_dir, service) = test_service_with_fake_runtime();
+    let err = RuntimeService::run_pod_sandbox(
+        &service,
+        Request::new(host_network_run_pod_sandbox_request(
+            "pause-custom-missing",
+            "default",
+            "pause-custom-missing-uid",
+            HashMap::from([(
+                "io.kubernetes.cri.sandbox-image".to_string(),
+                "registry.example/pause:custom".to_string(),
+            )]),
+        )),
+    )
+    .await
+    .expect_err("missing overridden pause image should fail sandbox creation");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("registry.example/pause:custom"));
+    assert!(err
+        .message()
+        .contains("pull it before starting the pod sandbox"));
+}
+
+#[tokio::test]
+async fn run_pod_sandbox_rejects_untrusted_workload_when_untrusted_handler_is_not_configured() {
+    let (_dir, service) = test_service_with_fake_runtime();
+    let err = RuntimeService::run_pod_sandbox(
+        &service,
+        Request::new(pod_sandbox_request_with_namespace_options(
+            "untrusted-missing-handler",
+            "default",
+            "untrusted-missing-handler-uid",
+            HashMap::from([(
+                CONTAINERD_UNTRUSTED_WORKLOAD_ANNOTATION.to_string(),
+                "true".to_string(),
+            )]),
+            "",
+            NamespaceOption {
+                network: NamespaceMode::Pod as i32,
+                pid: NamespaceMode::Pod as i32,
+                ipc: NamespaceMode::Pod as i32,
+                target_id: String::new(),
+                userns_options: None,
+            },
+        )),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err
+        .message()
+        .contains("unsupported runtime handler: untrusted"));
+}
+
+#[tokio::test]
+async fn run_pod_sandbox_rejects_untrusted_workload_with_host_access() {
+    let (_dir, mut service) = test_service_with_fake_runtime();
+    service
+        .config
+        .runtime_handlers
+        .push("untrusted".to_string());
+
+    let err = RuntimeService::run_pod_sandbox(
+        &service,
+        Request::new(host_network_run_pod_sandbox_request(
+            "untrusted-host-access",
+            "default",
+            "untrusted-host-access-uid",
+            HashMap::from([(
+                CONTAINERD_UNTRUSTED_WORKLOAD_ANNOTATION.to_string(),
+                "true".to_string(),
+            )]),
+        )),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("host access"));
+}
+
+#[tokio::test]
+async fn run_pod_sandbox_rejects_untrusted_workload_with_conflicting_handler() {
+    let (_dir, mut service) = test_service_with_fake_runtime();
+    service
+        .config
+        .runtime_handlers
+        .push("untrusted".to_string());
+    service.config.runtime_handlers.push("kata".to_string());
+
+    let err = RuntimeService::run_pod_sandbox(
+        &service,
+        Request::new(pod_sandbox_request_with_namespace_options(
+            "untrusted-conflicting-handler",
+            "default",
+            "untrusted-conflicting-handler-uid",
+            HashMap::from([(
+                CONTAINERD_UNTRUSTED_WORKLOAD_ANNOTATION.to_string(),
+                "true".to_string(),
+            )]),
+            "kata",
+            NamespaceOption {
+                network: NamespaceMode::Pod as i32,
+                pid: NamespaceMode::Pod as i32,
+                ipc: NamespaceMode::Pod as i32,
+                target_id: String::new(),
+                userns_options: None,
+            },
+        )),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("explicit runtime handler"));
 }
 
 #[tokio::test]
@@ -2497,6 +4676,259 @@ async fn exec_sync_validates_container_is_streamable() {
     .unwrap()
     .into_inner();
     assert_eq!(response.exit_code, 0);
+    assert!(response.stdout.is_empty());
+    assert!(response.stderr.is_empty());
+}
+
+#[tokio::test]
+async fn exec_sync_returns_stdout_and_stderr_when_io_drains_cleanly() {
+    let (dir, service) = test_service_with_fake_runtime();
+
+    service.containers.lock().await.insert(
+        "container-running".to_string(),
+        test_container("container-running", "pod-1", HashMap::new()),
+    );
+    set_fake_runtime_state(&dir, "container-running", "running");
+
+    let response = RuntimeService::exec_sync(
+        &service,
+        Request::new(ExecSyncRequest {
+            container_id: "container-running".to_string(),
+            cmd: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf hello-stdout; printf hello-stderr >&2".to_string(),
+            ],
+            timeout: 0,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    assert_eq!(response.exit_code, 0);
+    assert_eq!(response.stdout, b"hello-stdout");
+    assert_eq!(response.stderr, b"hello-stderr");
+}
+
+#[tokio::test]
+async fn exec_sync_returns_deadline_exceeded_when_io_drain_timeout_expires() {
+    let dir = tempdir().unwrap();
+    let runtime_path = write_fake_runtime_script(dir.path());
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime_path = runtime_path;
+    config.exec_sync_io_drain_timeout = Duration::from_millis(50);
+    let service = RuntimeServiceImpl::new(config);
+
+    service.containers.lock().await.insert(
+        "container-running".to_string(),
+        test_container("container-running", "pod-1", HashMap::new()),
+    );
+    set_fake_runtime_state(&dir, "container-running", "running");
+
+    let err = RuntimeService::exec_sync(
+        &service,
+        Request::new(ExecSyncRequest {
+            container_id: "container-running".to_string(),
+            cmd: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "(trap '' HUP; sleep 5) & printf held-open".to_string(),
+            ],
+            timeout: 0,
+        }),
+    )
+    .await
+    .expect_err("io drain timeout should be surfaced");
+
+    assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+    assert!(err.message().contains("Exec sync stdout drain timed out"));
+}
+
+#[tokio::test]
+async fn exec_sync_uses_runtime_binary_for_non_default_handler() {
+    let dir = tempdir().unwrap();
+    let runc_dir = dir.path().join("runc");
+    let kata_dir = dir.path().join("kata");
+    fs::create_dir_all(&runc_dir).unwrap();
+    fs::create_dir_all(&kata_dir).unwrap();
+    let runc_runtime_path = write_fake_runtime_script(&runc_dir);
+    let kata_runtime_path = write_fake_runtime_script(&kata_dir);
+
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime_path = runc_runtime_path.clone();
+    config.runtime_root = dir.path().join("runtime-root-runc");
+    config.runtime_configs = HashMap::from([
+        (
+            "runc".to_string(),
+            crate::config::ResolvedRuntimeHandlerConfig {
+                runtime_path: runc_runtime_path.display().to_string(),
+                runtime_root: config.runtime_root.display().to_string(),
+                monitor_path: "/definitely/missing/crius-shim".to_string(),
+                monitor_env: Vec::new(),
+                allowed_annotations: Vec::new(),
+                default_annotations: HashMap::new(),
+                container_create_timeout: 240,
+            },
+        ),
+        (
+            "kata".to_string(),
+            crate::config::ResolvedRuntimeHandlerConfig {
+                runtime_path: kata_runtime_path.display().to_string(),
+                runtime_root: dir.path().join("runtime-root-kata").display().to_string(),
+                monitor_path: "/definitely/missing/crius-shim".to_string(),
+                monitor_env: Vec::new(),
+                allowed_annotations: Vec::new(),
+                default_annotations: HashMap::new(),
+                container_create_timeout: 240,
+            },
+        ),
+    ]);
+    let service = RuntimeServiceImpl::new(config);
+
+    let mut annotations = HashMap::new();
+    annotations.insert(
+        "io.kubernetes.cri-o.RuntimeHandler".to_string(),
+        "kata".to_string(),
+    );
+    annotations.insert(
+        "io.containerd.cri.runtime-handler".to_string(),
+        "kata".to_string(),
+    );
+    service.containers.lock().await.insert(
+        "container-kata".to_string(),
+        test_container("container-kata", "pod-1", annotations),
+    );
+    fs::write(
+        kata_dir.join("runtime-state").join("container-kata.state"),
+        "running",
+    )
+    .unwrap();
+
+    let response = RuntimeService::exec_sync(
+        &service,
+        Request::new(ExecSyncRequest {
+            container_id: "container-kata".to_string(),
+            cmd: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf from-kata-runtime".to_string(),
+            ],
+            timeout: 0,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    assert_eq!(response.exit_code, 0);
+    assert_eq!(response.stdout, b"from-kata-runtime");
+    assert!(response.stderr.is_empty());
+}
+
+#[tokio::test]
+async fn exec_sync_uses_first_cpu_affinity_from_container_cpuset() {
+    let dir = tempdir().unwrap();
+    let runtime_path = dir.path().join("fake-runtime-affinity.sh");
+    let affinity_path = dir.path().join("affinity.txt");
+    fs::write(
+        &runtime_path,
+        format!(
+            r#"#!/bin/bash
+set -eu
+STATE_DIR="{state_dir}"
+cmd="${{1:-}}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+case "$cmd" in
+  state)
+    id="${{1:-}}"
+    file="$STATE_DIR/$id.state"
+    if [ ! -f "$file" ]; then
+      exit 1
+    fi
+    status="$(cat "$file")"
+    pid=0
+    if [ -f "$STATE_DIR/$id.pid" ]; then
+      pid="$(cat "$STATE_DIR/$id.pid")"
+    fi
+    printf '{{"ociVersion":"1.0.2","id":"%s","status":"%s","pid":%s,"bundle":"%s","rootfs":"%s","created":"2024-01-01T00:00:00Z","owner":"root"}}\n' "$id" "$status" "$pid" "$STATE_DIR/bundle" "$STATE_DIR/rootfs"
+    ;;
+  exec)
+    id="${{1:-}}"
+    if [ "$#" -gt 0 ]; then
+      shift
+    fi
+    awk '/Cpus_allowed_list/ {{print $2}}' /proc/self/status > "{affinity_path}"
+    printf affinity-ok
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+            state_dir = dir.path().join("runtime-state").display(),
+            affinity_path = affinity_path.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&runtime_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&runtime_path, perms).unwrap();
+
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime_path = runtime_path.clone();
+    config.runtime_root = dir.path().join("runtime-root");
+    config.runtime_configs.insert(
+        "runc".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            runtime_path: runtime_path.display().to_string(),
+            runtime_root: config.runtime_root.display().to_string(),
+            monitor_path: "/definitely/missing/crius-shim".to_string(),
+            monitor_env: Vec::new(),
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            container_create_timeout: 240,
+        },
+    );
+    config.exec_cpu_affinity = "first".to_string();
+    let service = RuntimeServiceImpl::new(config);
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            linux_resources: Some(StoredLinuxResources {
+                cpuset_cpus: "0-3".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service.containers.lock().await.insert(
+        "container-running".to_string(),
+        test_container("container-running", "pod-1", annotations),
+    );
+    set_fake_runtime_state(&dir, "container-running", "running");
+
+    let response = RuntimeService::exec_sync(
+        &service,
+        Request::new(ExecSyncRequest {
+            container_id: "container-running".to_string(),
+            cmd: vec!["true".to_string()],
+            timeout: 0,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    assert_eq!(response.exit_code, 0);
+    assert_eq!(response.stdout, b"affinity-ok");
+    assert_eq!(fs::read_to_string(&affinity_path).unwrap().trim(), "0");
 }
 
 #[tokio::test]
@@ -2682,21 +5114,31 @@ async fn attach_uses_log_stream_fallback_for_read_only_tty_when_socket_is_missin
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn attach_recreates_tty_shim_when_socket_is_missing() {
+async fn attach_read_only_tty_fallback_does_not_attempt_shim_restore() {
     let _guard = env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
     let runtime_path = write_fake_runtime_script(dir.path());
     let shim_work_dir = dir.path().join("shims");
-    let fake_shim_path = dir.path().join("fake-shim.sh");
+    let fake_shim_path = dir.path().join("fake-shim-readonly.sh");
     fs::write(
         &fake_shim_path,
         r#"#!/bin/sh
 set -eu
+id=""
 exit_code_file=""
+attach_socket_dir=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --id)
+      id="${2:-}"
+      shift 2
+      ;;
     --exit-code-file)
       exit_code_file="${2:-}"
+      shift 2
+      ;;
+    --attach-socket-dir)
+      attach_socket_dir="${2:-}"
       shift 2
       ;;
     *)
@@ -2704,7 +5146,11 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
-shim_dir="$(dirname "$exit_code_file")"
+if [ -n "$attach_socket_dir" ] && [ -n "$id" ]; then
+  shim_dir="$attach_socket_dir/$id"
+else
+  shim_dir="$(dirname "$exit_code_file")"
+fi
 mkdir -p "$shim_dir"
 : > "$shim_dir/attach.sock"
 : > "$shim_dir/resize.sock"
@@ -2716,22 +5162,326 @@ sleep 1
     perms.set_mode(0o755);
     fs::set_permissions(&fake_shim_path, perms).unwrap();
 
-    std::env::set_var("CRIUS_SHIM_PATH", &fake_shim_path);
     let service = RuntimeServiceImpl::new_with_shim_work_dir(
         RuntimeConfig {
             root_dir: dir.path().join("root"),
             runtime: "runc".to_string(),
             runtime_handlers: vec!["runc".to_string()],
+            runtime_configs: HashMap::from([(
+                "runc".to_string(),
+                crate::config::ResolvedRuntimeHandlerConfig {
+                    runtime_path: runtime_path.display().to_string(),
+                    runtime_root: dir.path().join("runtime-root").display().to_string(),
+                    monitor_path: fake_shim_path.display().to_string(),
+                    monitor_env: Vec::new(),
+                    allowed_annotations: Vec::new(),
+                    default_annotations: HashMap::new(),
+                    container_create_timeout: 240,
+                },
+            )]),
             runtime_root: dir.path().join("runtime-root"),
             log_dir: dir.path().join("logs"),
             runtime_path,
+            image_root: dir.path().join("images"),
+            image_driver: "overlay".to_string(),
+            workloads: HashMap::new(),
+            enable_pod_events: true,
+            included_pod_metrics: vec!["all".to_string()],
+            stats_collection_period: 0,
+            pod_sandbox_metrics_collection_period: 0,
+            grpc_max_send_msg_size: 80 * 1024 * 1024,
+            grpc_max_recv_msg_size: 80 * 1024 * 1024,
+            monitor_env: Vec::new(),
+            default_env: Vec::new(),
+            default_capabilities: vec![
+                "CHOWN".to_string(),
+                "DAC_OVERRIDE".to_string(),
+                "FSETID".to_string(),
+                "FOWNER".to_string(),
+                "MKNOD".to_string(),
+                "NET_RAW".to_string(),
+                "SETGID".to_string(),
+                "SETUID".to_string(),
+                "SETFCAP".to_string(),
+                "SETPCAP".to_string(),
+                "NET_BIND_SERVICE".to_string(),
+                "SYS_CHROOT".to_string(),
+                "KILL".to_string(),
+                "AUDIT_WRITE".to_string(),
+            ],
+            default_sysctls: HashMap::new(),
+            attach_socket_dir: dir.path().join("attach"),
+            container_exits_dir: dir.path().join("exits"),
+            clean_shutdown_file: dir.path().join("clean.shutdown"),
+            container_stop_timeout: 30,
+            version_file: dir.path().join("version"),
+            version_file_persist: dir.path().join("version-persist"),
+            criu_path: PathBuf::new(),
+            criu_image_path: PathBuf::new(),
+            criu_work_path: PathBuf::new(),
+            enable_criu_support: true,
+            internal_wipe: true,
+            internal_repair: true,
+            bind_mount_prefix: PathBuf::new(),
+            disable_cgroup: false,
+            tolerate_missing_hugetlb_controller: true,
+            separate_pull_cgroup: String::new(),
+            seccomp_profile: PathBuf::new(),
+            unset_seccomp_profile: "runtime/default".to_string(),
+            uid_mappings: None,
+            gid_mappings: None,
+            minimum_mappable_uid: -1,
+            minimum_mappable_gid: -1,
+            io_uid: 0,
+            io_gid: 0,
+            pids_limit: -1,
+            exec_cpu_affinity: String::new(),
+            read_only: false,
+            no_pivot: false,
             pause_image: "registry.k8s.io/pause:3.9".to_string(),
+            pause_command: "/pause".to_string(),
             cni_config: crate::network::CniConfig::default(),
+            cgroup_driver: None,
+            exec_sync_io_drain_timeout: Duration::ZERO,
+            max_container_log_line_size: 4096,
+            log_to_journald: false,
+            no_sync_log: false,
+            restrict_oom_score_adj: false,
+            enable_unprivileged_ports: false,
+            enable_unprivileged_icmp: false,
+            shim: ShimConfig {
+                shim_path: fake_shim_path.clone(),
+                work_dir: shim_work_dir.clone(),
+                attach_socket_dir: dir.path().join("attach"),
+                container_exits_dir: dir.path().join("exits"),
+                io_uid: 0,
+                io_gid: 0,
+                monitor_env: Vec::new(),
+                debug: false,
+                log_to_journald: false,
+                no_sync_log: false,
+                no_pivot: false,
+                runtime_path: PathBuf::from("/definitely/missing/runc"),
+                max_container_log_line_size: 4096,
+            },
+            streaming: crate::streaming::StreamingConfig::default(),
         },
         NriConfig::default(),
         shim_work_dir.clone(),
     );
-    std::env::remove_var("CRIUS_SHIM_PATH");
+    service
+        .set_streaming_server(crate::streaming::StreamingServer::for_test(
+            "http://127.0.0.1:12345",
+        ))
+        .await;
+
+    set_fake_runtime_state(&dir, "tty-readonly-no-restore", "running");
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            tty: true,
+            log_path: Some(
+                dir.path()
+                    .join("logs")
+                    .join("tty-readonly.log")
+                    .display()
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service.containers.lock().await.insert(
+        "tty-readonly-no-restore".to_string(),
+        Container {
+            state: ContainerState::ContainerRunning as i32,
+            ..test_container("tty-readonly-no-restore", "pod-1", annotations)
+        },
+    );
+
+    let response = RuntimeService::attach(
+        &service,
+        Request::new(AttachRequest {
+            container_id: "tty-readonly-no-restore".to_string(),
+            stdin: false,
+            stdout: true,
+            stderr: false,
+            tty: true,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert!(response.url.contains("/attach/"));
+    assert!(
+        !dir.path()
+            .join("attach")
+            .join("tty-readonly-no-restore")
+            .join("attach.sock")
+            .exists(),
+        "read-only tty fallback should not recreate attach shim sockets"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn attach_recreates_tty_shim_when_socket_is_missing() {
+    let _guard = env_lock().lock().unwrap();
+    let dir = tempdir().unwrap();
+    let runtime_path = write_fake_runtime_script(dir.path());
+    let shim_work_dir = dir.path().join("shims");
+    let fake_shim_path = dir.path().join("fake-shim.sh");
+    fs::write(
+        &fake_shim_path,
+        r#"#!/bin/sh
+set -eu
+id=""
+exit_code_file=""
+attach_socket_dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --id)
+      id="${2:-}"
+      shift 2
+      ;;
+    --exit-code-file)
+      exit_code_file="${2:-}"
+      shift 2
+      ;;
+    --attach-socket-dir)
+      attach_socket_dir="${2:-}"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [ -n "$attach_socket_dir" ] && [ -n "$id" ]; then
+  shim_dir="$attach_socket_dir/$id"
+else
+  shim_dir="$(dirname "$exit_code_file")"
+fi
+mkdir -p "$shim_dir"
+: > "$shim_dir/attach.sock"
+: > "$shim_dir/resize.sock"
+sleep 1
+"#,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&fake_shim_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&fake_shim_path, perms).unwrap();
+
+    let service = RuntimeServiceImpl::new_with_shim_work_dir(
+        RuntimeConfig {
+            root_dir: dir.path().join("root"),
+            runtime: "runc".to_string(),
+            runtime_handlers: vec!["runc".to_string()],
+            runtime_configs: HashMap::from([(
+                "runc".to_string(),
+                crate::config::ResolvedRuntimeHandlerConfig {
+                    runtime_path: runtime_path.display().to_string(),
+                    runtime_root: dir.path().join("runtime-root").display().to_string(),
+                    monitor_path: fake_shim_path.display().to_string(),
+                    monitor_env: Vec::new(),
+                    allowed_annotations: Vec::new(),
+                    default_annotations: HashMap::new(),
+                    container_create_timeout: 240,
+                },
+            )]),
+            runtime_root: dir.path().join("runtime-root"),
+            log_dir: dir.path().join("logs"),
+            runtime_path,
+            image_root: dir.path().join("images"),
+            image_driver: "overlay".to_string(),
+            workloads: HashMap::new(),
+            enable_pod_events: true,
+            included_pod_metrics: vec!["all".to_string()],
+            stats_collection_period: 0,
+            pod_sandbox_metrics_collection_period: 0,
+            grpc_max_send_msg_size: 80 * 1024 * 1024,
+            grpc_max_recv_msg_size: 80 * 1024 * 1024,
+            monitor_env: Vec::new(),
+            default_env: Vec::new(),
+            default_capabilities: vec![
+                "CHOWN".to_string(),
+                "DAC_OVERRIDE".to_string(),
+                "FSETID".to_string(),
+                "FOWNER".to_string(),
+                "MKNOD".to_string(),
+                "NET_RAW".to_string(),
+                "SETGID".to_string(),
+                "SETUID".to_string(),
+                "SETFCAP".to_string(),
+                "SETPCAP".to_string(),
+                "NET_BIND_SERVICE".to_string(),
+                "SYS_CHROOT".to_string(),
+                "KILL".to_string(),
+                "AUDIT_WRITE".to_string(),
+            ],
+            default_sysctls: HashMap::new(),
+            attach_socket_dir: dir.path().join("attach"),
+            container_exits_dir: dir.path().join("exits"),
+            clean_shutdown_file: dir.path().join("clean.shutdown"),
+            container_stop_timeout: 30,
+            version_file: dir.path().join("version"),
+            version_file_persist: dir.path().join("version-persist"),
+            criu_path: PathBuf::new(),
+            criu_image_path: PathBuf::new(),
+            criu_work_path: PathBuf::new(),
+            enable_criu_support: true,
+            internal_wipe: true,
+            internal_repair: true,
+            bind_mount_prefix: PathBuf::new(),
+            disable_cgroup: false,
+            tolerate_missing_hugetlb_controller: true,
+            separate_pull_cgroup: String::new(),
+            seccomp_profile: PathBuf::new(),
+            unset_seccomp_profile: "runtime/default".to_string(),
+            uid_mappings: None,
+            gid_mappings: None,
+            minimum_mappable_uid: -1,
+            minimum_mappable_gid: -1,
+            io_uid: 0,
+            io_gid: 0,
+            pids_limit: -1,
+            exec_cpu_affinity: String::new(),
+            read_only: false,
+            no_pivot: false,
+            pause_image: "registry.k8s.io/pause:3.9".to_string(),
+            pause_command: "/pause".to_string(),
+            cni_config: crate::network::CniConfig::default(),
+            cgroup_driver: None,
+            exec_sync_io_drain_timeout: Duration::ZERO,
+            max_container_log_line_size: 4096,
+            log_to_journald: false,
+            no_sync_log: false,
+            restrict_oom_score_adj: false,
+            enable_unprivileged_ports: false,
+            enable_unprivileged_icmp: false,
+            shim: ShimConfig {
+                shim_path: fake_shim_path.clone(),
+                work_dir: shim_work_dir.clone(),
+                attach_socket_dir: dir.path().join("attach"),
+                container_exits_dir: dir.path().join("exits"),
+                io_uid: 0,
+                io_gid: 0,
+                monitor_env: Vec::new(),
+                debug: false,
+                log_to_journald: false,
+                no_sync_log: false,
+                no_pivot: false,
+                runtime_path: PathBuf::from("/definitely/missing/runc"),
+                max_container_log_line_size: 4096,
+            },
+            streaming: crate::streaming::StreamingConfig::default(),
+        },
+        NriConfig::default(),
+        shim_work_dir.clone(),
+    );
     service
         .set_streaming_server(crate::streaming::StreamingServer::for_test(
             "http://127.0.0.1:12345",
@@ -2785,8 +5535,241 @@ sleep 1
     .unwrap()
     .into_inner();
     assert!(response.url.contains("/attach/"));
-    assert!(shim_work_dir
+    assert!(dir
+        .path()
+        .join("attach")
         .join("tty-restore")
+        .join("attach.sock")
+        .exists());
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn attach_recovers_tty_shim_after_recover_state_when_socket_is_missing() {
+    let _guard = env_lock().lock().unwrap();
+    let dir = tempdir().unwrap();
+    let runtime_path = write_fake_runtime_script(dir.path());
+    let shim_work_dir = dir.path().join("shims");
+    let fake_shim_path = dir.path().join("fake-shim-recover.sh");
+    fs::write(
+        &fake_shim_path,
+        r#"#!/bin/sh
+set -eu
+id=""
+exit_code_file=""
+attach_socket_dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --id)
+      id="${2:-}"
+      shift 2
+      ;;
+    --exit-code-file)
+      exit_code_file="${2:-}"
+      shift 2
+      ;;
+    --attach-socket-dir)
+      attach_socket_dir="${2:-}"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [ -n "$attach_socket_dir" ] && [ -n "$id" ]; then
+  shim_dir="$attach_socket_dir/$id"
+else
+  shim_dir="$(dirname "$exit_code_file")"
+fi
+mkdir -p "$shim_dir"
+: > "$shim_dir/attach.sock"
+: > "$shim_dir/resize.sock"
+sleep 1
+"#,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&fake_shim_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&fake_shim_path, perms).unwrap();
+
+    let service = RuntimeServiceImpl::new_with_shim_work_dir(
+        RuntimeConfig {
+            root_dir: dir.path().join("root"),
+            runtime: "runc".to_string(),
+            runtime_handlers: vec!["runc".to_string()],
+            runtime_configs: HashMap::from([(
+                "runc".to_string(),
+                crate::config::ResolvedRuntimeHandlerConfig {
+                    runtime_path: runtime_path.display().to_string(),
+                    runtime_root: dir.path().join("runtime-root").display().to_string(),
+                    monitor_path: fake_shim_path.display().to_string(),
+                    monitor_env: Vec::new(),
+                    allowed_annotations: Vec::new(),
+                    default_annotations: HashMap::new(),
+                    container_create_timeout: 240,
+                },
+            )]),
+            runtime_root: dir.path().join("runtime-root"),
+            log_dir: dir.path().join("logs"),
+            runtime_path,
+            image_root: dir.path().join("images"),
+            image_driver: "overlay".to_string(),
+            workloads: HashMap::new(),
+            enable_pod_events: true,
+            included_pod_metrics: vec!["all".to_string()],
+            stats_collection_period: 0,
+            pod_sandbox_metrics_collection_period: 0,
+            grpc_max_send_msg_size: 80 * 1024 * 1024,
+            grpc_max_recv_msg_size: 80 * 1024 * 1024,
+            monitor_env: Vec::new(),
+            default_env: Vec::new(),
+            default_capabilities: vec![
+                "CHOWN".to_string(),
+                "DAC_OVERRIDE".to_string(),
+                "FSETID".to_string(),
+                "FOWNER".to_string(),
+                "MKNOD".to_string(),
+                "NET_RAW".to_string(),
+                "SETGID".to_string(),
+                "SETUID".to_string(),
+                "SETFCAP".to_string(),
+                "SETPCAP".to_string(),
+                "NET_BIND_SERVICE".to_string(),
+                "SYS_CHROOT".to_string(),
+                "KILL".to_string(),
+                "AUDIT_WRITE".to_string(),
+            ],
+            default_sysctls: HashMap::new(),
+            attach_socket_dir: dir.path().join("attach"),
+            container_exits_dir: dir.path().join("exits"),
+            clean_shutdown_file: dir.path().join("clean.shutdown"),
+            container_stop_timeout: 30,
+            version_file: dir.path().join("version"),
+            version_file_persist: dir.path().join("version-persist"),
+            criu_path: PathBuf::new(),
+            criu_image_path: PathBuf::new(),
+            criu_work_path: PathBuf::new(),
+            enable_criu_support: true,
+            internal_wipe: true,
+            internal_repair: true,
+            bind_mount_prefix: PathBuf::new(),
+            disable_cgroup: false,
+            tolerate_missing_hugetlb_controller: true,
+            separate_pull_cgroup: String::new(),
+            seccomp_profile: PathBuf::new(),
+            unset_seccomp_profile: "runtime/default".to_string(),
+            uid_mappings: None,
+            gid_mappings: None,
+            minimum_mappable_uid: -1,
+            minimum_mappable_gid: -1,
+            io_uid: 0,
+            io_gid: 0,
+            pids_limit: -1,
+            exec_cpu_affinity: String::new(),
+            read_only: false,
+            no_pivot: false,
+            pause_image: "registry.k8s.io/pause:3.9".to_string(),
+            pause_command: "/pause".to_string(),
+            cni_config: crate::network::CniConfig::default(),
+            cgroup_driver: None,
+            exec_sync_io_drain_timeout: Duration::ZERO,
+            max_container_log_line_size: 4096,
+            log_to_journald: false,
+            no_sync_log: false,
+            restrict_oom_score_adj: false,
+            enable_unprivileged_ports: false,
+            enable_unprivileged_icmp: false,
+            shim: ShimConfig {
+                shim_path: fake_shim_path.clone(),
+                work_dir: shim_work_dir.clone(),
+                attach_socket_dir: dir.path().join("attach"),
+                container_exits_dir: dir.path().join("exits"),
+                io_uid: 0,
+                io_gid: 0,
+                monitor_env: Vec::new(),
+                debug: false,
+                log_to_journald: false,
+                no_sync_log: false,
+                no_pivot: false,
+                runtime_path: PathBuf::from("/definitely/missing/runc"),
+                max_container_log_line_size: 4096,
+            },
+            streaming: crate::streaming::StreamingConfig::default(),
+        },
+        NriConfig::default(),
+        shim_work_dir.clone(),
+    );
+    service
+        .set_streaming_server(crate::streaming::StreamingServer::for_test(
+            "http://127.0.0.1:12345",
+        ))
+        .await;
+
+    set_fake_runtime_state(&dir, "tty-recover-after-restart", "running");
+    let bundle_dir = dir
+        .path()
+        .join("runtime-root")
+        .join("tty-recover-after-restart");
+    fs::create_dir_all(&bundle_dir).unwrap();
+    fs::write(
+        bundle_dir.join("config.json"),
+        serde_json::json!({
+            "ociVersion": "1.0.2",
+            "process": {
+                "terminal": true
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            tty: true,
+            metadata_name: Some("tty-recover-after-restart".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "tty-recover-after-restart",
+            "pod-1",
+            crate::runtime::ContainerStatus::Running,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    let response = RuntimeService::attach(
+        &service,
+        Request::new(AttachRequest {
+            container_id: "tty-recover-after-restart".to_string(),
+            stdin: true,
+            stdout: true,
+            stderr: false,
+            tty: true,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert!(response.url.contains("/attach/"));
+    assert!(dir
+        .path()
+        .join("attach")
+        .join("tty-recover-after-restart")
         .join("attach.sock")
         .exists());
 }
@@ -2898,9 +5881,27 @@ async fn pod_sandbox_status_verbose_returns_json_info() {
         &mut annotations,
         INTERNAL_POD_STATE_KEY,
         &StoredPodState {
+            hostname: Some("pod-hostname".to_string()),
+            port_mappings: vec![StoredPortMapping {
+                protocol: "TCP".to_string(),
+                container_port: 80,
+                host_port: 8080,
+                host_ip: "127.0.0.1".to_string(),
+            }],
+            supplemental_groups: vec![2000, 2001],
+            raw_cni_result: Some(serde_json::json!({
+                "cniVersion": "1.0.0",
+                "ips": [
+                    {"address": "10.88.0.10/16"},
+                    {"address": "10.88.0.11/16"}
+                ]
+            })),
+            ip: Some("10.88.0.10".to_string()),
+            additional_ips: vec!["10.88.0.11".to_string()],
             netns_path: Some("/var/run/netns/test-pod".to_string()),
             pause_container_id: Some("pause-1".to_string()),
             log_directory: Some("/var/log/pods/test-pod".to_string()),
+            readonly_rootfs: true,
             ..Default::default()
         },
     )
@@ -2939,6 +5940,16 @@ async fn pod_sandbox_status_verbose_returns_json_info() {
     assert!(response.info.contains_key("info"));
     let info: serde_json::Value = serde_json::from_str(response.info.get("info").unwrap()).unwrap();
     assert_eq!(info["id"], "pod-1");
+    assert_eq!(info["hostname"], "pod-hostname");
+    assert_eq!(info["ip"], "10.88.0.10");
+    assert_eq!(info["additionalIPs"][0], "10.88.0.11");
+    assert_eq!(info["supplementalGroups"][0], 2000);
+    assert_eq!(info["supplementalGroups"][1], 2001);
+    assert_eq!(info["readonlyRootfs"], true);
+    assert_eq!(info["rawCniResult"]["cniVersion"], "1.0.0");
+    assert_eq!(info["portMappings"][0]["protocol"], "TCP");
+    assert_eq!(info["portMappings"][0]["containerPort"], 80);
+    assert_eq!(info["portMappings"][0]["hostPort"], 8080);
     assert_eq!(info["image"], "registry.k8s.io/pause:3.10");
     assert_eq!(info["pauseContainerId"], "pause-1");
     assert!(info["pid"].is_number());
@@ -2946,8 +5957,141 @@ async fn pod_sandbox_status_verbose_returns_json_info() {
 }
 
 #[tokio::test]
-async fn status_verbose_returns_structured_config() {
+async fn pod_sandbox_status_verbose_normalizes_ip_fields_from_stored_state() {
     let service = test_service();
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            pause_container_id: Some("pause-ip".to_string()),
+            additional_ips: vec![
+                "fd00::10".to_string(),
+                "10.88.0.11".to_string(),
+                "fd00::10".to_string(),
+            ],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service
+        .pod_sandboxes
+        .lock()
+        .await
+        .insert("pod-ip".to_string(), test_pod("pod-ip", annotations));
+
+    let response = RuntimeService::pod_sandbox_status(
+        &service,
+        Request::new(PodSandboxStatusRequest {
+            pod_sandbox_id: "pod-ip".to_string(),
+            verbose: true,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let info: serde_json::Value = serde_json::from_str(response.info.get("info").unwrap()).unwrap();
+
+    assert_eq!(info["ip"], "fd00::10");
+    assert_eq!(info["additionalIPs"][0], "10.88.0.11");
+}
+
+#[tokio::test]
+async fn pod_sandbox_status_snapshot_uses_stored_ip_as_network_status() {
+    let service = test_service();
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            ip: Some("10.88.0.20".to_string()),
+            additional_ips: vec!["fd00::20".to_string()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service
+        .pod_sandboxes
+        .lock()
+        .await
+        .insert("pod-net".to_string(), test_pod("pod-net", annotations));
+
+    let response = RuntimeService::pod_sandbox_status(
+        &service,
+        Request::new(PodSandboxStatusRequest {
+            pod_sandbox_id: "pod-net".to_string(),
+            verbose: false,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let network = response
+        .status
+        .and_then(|status| status.network)
+        .expect("network status should be populated from stored state");
+    assert_eq!(network.ip, "10.88.0.20");
+    assert_eq!(network.additional_ips[0].ip, "fd00::20");
+}
+
+#[tokio::test]
+async fn status_verbose_returns_structured_config() {
+    let mut service = test_service();
+    service.config.grpc_max_send_msg_size = 12_345;
+    service.config.grpc_max_recv_msg_size = 23_456;
+    service.config.streaming.enable_tls = true;
+    service.config.streaming.tls_cert_file = "/etc/crius/tls/tls.crt".to_string();
+    service.config.streaming.tls_key_file = "/etc/crius/tls/tls.key".to_string();
+    service.config.streaming.tls_ca_file = "/etc/crius/tls/ca.crt".to_string();
+    service.config.streaming.tls_min_version = "VersionTLS13".to_string();
+    service.config.default_env = vec![
+        ("HTTP_PROXY".to_string(), "http://proxy.internal".to_string()),
+        ("LANG".to_string(), "C.UTF-8".to_string()),
+    ];
+    service.config.default_capabilities =
+        vec!["CAP_CHOWN".to_string(), "CAP_NET_BIND_SERVICE".to_string()];
+    service.config.default_sysctls = HashMap::from([(
+        "kernel.shm_rmid_forced".to_string(),
+        "1".to_string(),
+    )]);
+    service
+        .config
+        .runtime_configs
+        .get_mut("kata")
+        .unwrap()
+        .container_create_timeout = 45;
+    service
+        .config
+        .runtime_configs
+        .get_mut("kata")
+        .unwrap()
+        .allowed_annotations = vec!["io.example.runtime/".to_string()];
+    service
+        .config
+        .runtime_configs
+        .get_mut("kata")
+        .unwrap()
+        .default_annotations = HashMap::from([(
+        "io.example.runtime/default".to_string(),
+        "kata".to_string(),
+    )]);
+    service
+        .config
+        .cni_config
+        .set_netns_mount_dir(PathBuf::from("/tmp/crius-test-runtime-root/netns"));
+    service
+        .config
+        .cni_config
+        .set_netns_mounts_under_state_dir(true);
+    service
+        .config
+        .cni_config
+        .set_handler_config_dirs("kata", vec![PathBuf::from("/etc/cni/kata.d")]);
+    service
+        .config
+        .cni_config
+        .set_handler_max_conf_num("kata", 2);
     let response = RuntimeService::status(&service, Request::new(StatusRequest { verbose: true }))
         .await
         .unwrap()
@@ -2957,18 +6101,230 @@ async fn status_verbose_returns_structured_config() {
     let config: serde_json::Value =
         serde_json::from_str(response.info.get("config").unwrap()).unwrap();
     assert_eq!(config["runtimeName"], "crius");
+    assert_eq!(config["defaultRuntimeHandler"], "runc");
     assert!(!config["runtimeHandlers"].as_array().unwrap().is_empty());
+    assert_eq!(config["imageRoot"], "/tmp/crius-test-images");
+    assert_eq!(config["imageDriver"], "overlay");
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["runtimePath"],
+        "/definitely/missing/kata-runtime"
+    );
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["monitorPath"],
+        "/definitely/missing/crius-shim"
+    );
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["runc"]["runtimeRoot"],
+        "/tmp/crius-test-runtime-root"
+    );
+    assert!(config["monitorEnv"].as_array().unwrap().is_empty());
+    assert_eq!(
+        config["defaultEnv"][0],
+        "HTTP_PROXY=http://proxy.internal"
+    );
+    assert_eq!(
+        config["defaultCapabilities"][0],
+        "CAP_CHOWN"
+    );
+    assert_eq!(
+        config["defaultSysctls"]["kernel.shm_rmid_forced"],
+        "1"
+    );
+    assert_eq!(config["grpcMaxSendMsgSize"], 12345);
+    assert_eq!(config["grpcMaxRecvMsgSize"], 23456);
+    assert_eq!(config["streaming"]["enableTls"], true);
+    assert_eq!(
+        config["streaming"]["tlsCertFile"],
+        "/etc/crius/tls/tls.crt"
+    );
+    assert_eq!(
+        config["streaming"]["tlsMinVersion"],
+        "VersionTLS13"
+    );
+    assert_eq!(config["reload"]["strategy"], "restart-only");
+    assert_eq!(config["reload"]["signalReload"], false);
+    assert_eq!(
+        config["reload"]["runtimeConfigApiOnly"][0],
+        "UpdateRuntimeConfig.network_config.pod_cidr"
+    );
+    assert!(config["runtimeHandlerConfigs"]["runc"]["monitorEnv"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(config["runtimeHandlerConfigs"]["kata"]["monitorEnv"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["allowedAnnotations"][0],
+        "io.example.runtime/"
+    );
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["defaultAnnotations"]["io.example.runtime/default"],
+        "kata"
+    );
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["containerCreateTimeoutSeconds"],
+        45
+    );
+    assert_eq!(
+        config["netnsMountDir"],
+        "/tmp/crius-test-runtime-root/netns"
+    );
+    assert_eq!(config["netnsMountsUnderStateDir"], true);
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["cniConfDir"],
+        "/etc/cni/kata.d"
+    );
+    assert_eq!(config["runtimeHandlerConfigs"]["kata"]["cniMaxConfNum"], 2);
+    assert_eq!(config["runtimeHandlerConfigs"]["runc"]["cniMaxConfNum"], 0);
+    assert!(config["runtimeHandlerConfigs"]["runc"]["cniConfDir"].is_null());
+    assert_eq!(
+        config["workloads"]
+            .as_object()
+            .map(|workloads| workloads.len()),
+        Some(0)
+    );
+    assert_eq!(config["attachSocketDir"], "/tmp/crius-test-attach");
+    assert_eq!(config["containerExitsDir"], "/tmp/crius-test-exits");
+    assert_eq!(config["containerStopTimeoutSeconds"], 30);
+    assert_eq!(
+        config["cleanShutdownFile"],
+        "/tmp/crius-test-clean.shutdown"
+    );
+    assert_eq!(config["versionFile"], "/tmp/crius-test-version");
+    assert_eq!(
+        config["versionFilePersist"],
+        "/tmp/crius-test-version-persist"
+    );
+    assert_eq!(config["criuPath"], "");
+    assert_eq!(config["criuImagePath"], "");
+    assert_eq!(config["criuWorkPath"], "");
+    assert_eq!(config["enableCriuSupport"], true);
+    assert_eq!(config["internalWipe"], true);
+    assert_eq!(config["internalRepair"], true);
+    assert_eq!(config["bindMountPrefix"], "");
+    assert!(config["uidMappings"].as_array().unwrap().is_empty());
+    assert!(config["gidMappings"].as_array().unwrap().is_empty());
+    assert_eq!(config["minimumMappableUid"], -1);
+    assert_eq!(config["minimumMappableGid"], -1);
+    assert_eq!(config["ioUid"], 0);
+    assert_eq!(config["ioGid"], 0);
+    assert_eq!(config["disableCgroup"], false);
+    assert_eq!(config["tolerateMissingHugetlbController"], true);
+    assert_eq!(config["separatePullCgroup"], "");
+    assert_eq!(config["pidsLimit"], -1);
+    assert_eq!(config["execCpuAffinity"], "");
+    assert_eq!(config["readOnly"], false);
+    assert_eq!(config["noPivot"], false);
+    assert_eq!(config["pauseImage"], "registry.k8s.io/pause:3.9");
+    assert_eq!(config["pauseCommand"], "/pause");
+    assert_eq!(config["logToJournald"], false);
+    assert_eq!(config["noSyncLog"], false);
+    assert_eq!(config["enablePodEvents"], true);
+    assert_eq!(config["includedPodMetrics"], serde_json::json!(["all"]));
+    assert_eq!(config["statsCollectionPeriodSeconds"], 0);
+    assert_eq!(config["podSandboxMetricsCollectionPeriodSeconds"], 0);
+    assert_eq!(config["restrictOomScoreAdj"], false);
+    assert_eq!(config["enableUnprivilegedPorts"], false);
+    assert_eq!(config["enableUnprivilegedIcmp"], false);
+    assert_eq!(config["cniMaxConfNum"], 0);
+    assert!(config["cniConfTemplate"].is_null());
+    assert_eq!(config["cniIpPref"], "cni");
+    assert_eq!(config["disableHostportMapping"], false);
+    assert_eq!(config["maxContainerLogLineSize"], 4096);
+    assert_eq!(config["execSyncIoDrainTimeoutMillis"], 0);
+    assert_eq!(config["streaming"]["address"], "127.0.0.1");
+    assert_eq!(config["streaming"]["port"], 0);
+    assert_eq!(config["streaming"]["requestTokenTtlSeconds"], 30);
+    assert_eq!(
+        config["streaming"]["portForwardStreamCreationTimeoutSeconds"],
+        30
+    );
+    assert_eq!(config["streaming"]["portForwardIdleTimeoutSeconds"], 14400);
+    assert!(config["lastCniLoadStatus"]["checked_at_unix_millis"].is_number());
+    assert!(config["lastCniLoadStatus"]["ready"].is_boolean());
+    assert!(config["lastCniLoadStatus"]["reason"].is_string());
+    assert!(config["lastCniLoadStatus"]["message"].is_string());
     assert_eq!(config["recovery"]["startupReconcile"], true);
     assert_eq!(config["recovery"]["eventReplayOnRecovery"], false);
+    assert!(config["recovery"]["lastStartupWasCleanShutdown"].is_null());
+    assert!(config["recovery"]["lastStartupDetectedReboot"].is_null());
+    assert!(config["recovery"]["lastStartupDetectedUpgrade"].is_null());
+    assert!(config["recovery"]["lastStartupAttemptedRepair"].is_null());
+    assert!(config["recovery"]["lastStartupRepairSucceeded"].is_null());
+    assert_eq!(config["recovery"]["internalWipe"], true);
+    assert_eq!(config["recovery"]["internalRepair"], true);
     assert_eq!(config["runtimeFeatures"]["updateContainerResources"], true);
     assert_eq!(config["runtimeFeatures"]["containerStats"], true);
     assert_eq!(config["runtimeFeatures"]["podSandboxStats"], true);
     assert_eq!(config["runtimeFeatures"]["podSandboxMetrics"], true);
+    assert_eq!(config["runtimeFeatures"]["podLifecycleEvents"], true);
+    assert_eq!(config["runtimeFeatures"]["checkpointContainer"], true);
     assert_eq!(
         response.status.unwrap().conditions.len(),
         2,
         "expected runtime and network conditions"
     );
+}
+
+#[test]
+fn runtime_registry_returns_handler_specific_create_timeout() {
+    let runtime = RuntimeRegistry::new(
+        "runc".to_string(),
+        HashMap::from([(
+            "runc".to_string(),
+            RuncRuntime::new(
+                PathBuf::from("/definitely/missing/runc"),
+                PathBuf::from("/tmp/crius-test-runtime-root"),
+            ),
+        )]),
+        HashMap::from([
+            ("runc".to_string(), 240),
+            ("kata".to_string(), 600),
+        ]),
+    );
+
+    assert_eq!(runtime.container_create_timeout_for_handler(""), 240);
+    assert_eq!(runtime.container_create_timeout_for_handler("kata"), 600);
+}
+
+#[tokio::test]
+async fn run_container_create_phase_until_returns_deadline_exceeded() {
+    let service = test_service();
+    let err = service
+        .run_container_create_phase_until(
+            ContainerCreateDeadline {
+                timeout_secs: 1,
+                deadline: std::time::Instant::now() + Duration::from_millis(1),
+            },
+            "prepare_rootfs",
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok::<_, Status>(())
+            },
+        )
+        .await
+        .expect_err("phase exceeding deadline must fail");
+
+    assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+    assert!(err.message().contains("prepare_rootfs"));
+}
+
+#[tokio::test]
+async fn status_verbose_reports_cgroup_disable_runtime_feature_state() {
+    let mut service = test_service();
+    service.config.disable_cgroup = true;
+
+    let response = RuntimeService::status(&service, Request::new(StatusRequest { verbose: true }))
+        .await
+        .unwrap()
+        .into_inner();
+    let config: serde_json::Value =
+        serde_json::from_str(response.info.get("config").unwrap()).unwrap();
+
+    assert_eq!(config["disableCgroup"], true);
+    assert_eq!(config["runtimeFeatures"]["updateContainerResources"], false);
 }
 
 #[tokio::test]
@@ -2990,10 +6346,21 @@ exit 0
     perms.set_mode(0o755);
     fs::set_permissions(&runtime_path, perms).unwrap();
 
-    let service = RuntimeServiceImpl::new(RuntimeConfig {
-        runtime_path: runtime_path.clone(),
-        ..test_runtime_config(dir.path().join("root"))
-    });
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime_path = runtime_path.clone();
+    config.runtime_configs.insert(
+        "runc".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            runtime_path: runtime_path.display().to_string(),
+            runtime_root: config.runtime_root.display().to_string(),
+            monitor_path: "/definitely/missing/crius-shim".to_string(),
+            monitor_env: Vec::new(),
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            container_create_timeout: 240,
+        },
+    );
+    let service = RuntimeServiceImpl::new(config);
     let response = RuntimeService::version(
         &service,
         Request::new(VersionRequest {
@@ -3031,10 +6398,21 @@ async fn status_reports_runtime_not_ready_when_binary_is_not_executable() {
     perms.set_mode(0o644);
     fs::set_permissions(&runtime_path, perms).unwrap();
 
-    let service = RuntimeServiceImpl::new(RuntimeConfig {
-        runtime_path: runtime_path.clone(),
-        ..test_runtime_config(dir.path().join("root"))
-    });
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime_path = runtime_path.clone();
+    config.runtime_configs.insert(
+        "runc".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            runtime_path: runtime_path.display().to_string(),
+            runtime_root: config.runtime_root.display().to_string(),
+            monitor_path: "/definitely/missing/crius-shim".to_string(),
+            monitor_env: Vec::new(),
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            container_create_timeout: 240,
+        },
+    );
+    let service = RuntimeServiceImpl::new(config);
     let response = RuntimeService::status(&service, Request::new(StatusRequest { verbose: false }))
         .await
         .unwrap()
@@ -3061,6 +6439,23 @@ async fn runtime_config_reports_detected_cgroup_driver() {
     assert_eq!(
         response.linux.unwrap().cgroup_driver,
         service.cgroup_driver() as i32
+    );
+}
+
+#[tokio::test]
+async fn runtime_config_prefers_configured_cgroup_driver() {
+    let mut runtime_config = test_runtime_config(tempdir().unwrap().keep());
+    runtime_config.cgroup_driver = Some(CgroupDriver::Cgroupfs);
+    let service = RuntimeServiceImpl::new(runtime_config);
+
+    let response = RuntimeService::runtime_config(&service, Request::new(RuntimeConfigRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(
+        response.linux.unwrap().cgroup_driver,
+        CgroupDriver::Cgroupfs as i32
     );
 }
 
@@ -3102,6 +6497,125 @@ async fn update_runtime_config_persists_network_config_and_exposes_it_via_status
         reloaded_config["runtimeNetworkConfig"]["podCIDR"],
         "10.244.0.0/16"
     );
+}
+
+#[tokio::test]
+async fn update_runtime_config_renders_cni_config_template_from_pod_cidrs() {
+    let root_dir = tempdir().unwrap().keep();
+    let config_dir = root_dir.join("net.d");
+    let cache_dir = root_dir.join("cache");
+    let template_path = root_dir.join("template.conflist");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        &template_path,
+        r#"
+{
+  "name": "test-pod-network",
+  "cniVersion": "1.0.0",
+  "plugins": [
+    {
+      "type": "ptp",
+      "ipam": {
+        "type": "host-local",
+        "subnet": "{{.PodCIDR}}",
+        "ranges": [{{range $i, $range := .PodCIDRRanges}}{{if $i}}, {{end}}[{"subnet": "{{$range}}"}]{{end}}],
+        "routes": [{{range $i, $route := .Routes}}{{if $i}}, {{end}}{"dst": "{{$route}}"}{{end}}]
+      }
+    }
+  ]
+}
+"#,
+    )
+    .unwrap();
+
+    let mut config = test_runtime_config(root_dir.clone());
+    let mut cni_config = crate::network::CniConfig::new(
+        vec![config_dir.clone()],
+        Vec::new(),
+        cache_dir,
+        0,
+        crate::network::MainIpPreference::Cni,
+        None,
+        false,
+    );
+    cni_config.set_conf_template(Some(template_path));
+    config.cni_config = cni_config;
+    let service = RuntimeServiceImpl::new(config);
+
+    RuntimeService::update_runtime_config(
+        &service,
+        Request::new(UpdateRuntimeConfigRequest {
+            runtime_config: Some(crate::proto::runtime::v1::RuntimeConfig {
+                network_config: Some(crate::proto::runtime::v1::NetworkConfig {
+                    pod_cidr: "10.0.0.0/24, 2001:4860:4860::/64".to_string(),
+                }),
+            }),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let rendered = fs::read_to_string(config_dir.join("10-crius-net.conflist")).unwrap();
+    assert_eq!(
+        rendered.trim(),
+        r#"{
+  "name": "test-pod-network",
+  "cniVersion": "1.0.0",
+  "plugins": [
+    {
+      "type": "ptp",
+      "ipam": {
+        "type": "host-local",
+        "subnet": "10.0.0.0/24",
+        "ranges": [[{"subnet": "10.0.0.0/24"}], [{"subnet": "2001:4860:4860::/64"}]],
+        "routes": [{"dst": "0.0.0.0/0"}, {"dst": "::/0"}]
+      }
+    }
+  ]
+}"#
+    );
+}
+
+#[tokio::test]
+async fn update_runtime_config_rejects_invalid_pod_cidr_for_cni_template() {
+    let root_dir = tempdir().unwrap().keep();
+    let config_dir = root_dir.join("net.d");
+    let template_path = root_dir.join("template.conflist");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(&template_path, r#"{"subnet":"{{.PodCIDR}}"}"#).unwrap();
+
+    let mut config = test_runtime_config(root_dir.clone());
+    let mut cni_config = crate::network::CniConfig::new(
+        vec![config_dir.clone()],
+        Vec::new(),
+        root_dir.join("cache"),
+        0,
+        crate::network::MainIpPreference::Cni,
+        None,
+        false,
+    );
+    cni_config.set_conf_template(Some(template_path));
+    config.cni_config = cni_config;
+    let service = RuntimeServiceImpl::new(config);
+
+    let err = RuntimeService::update_runtime_config(
+        &service,
+        Request::new(UpdateRuntimeConfigRequest {
+            runtime_config: Some(crate::proto::runtime::v1::RuntimeConfig {
+                network_config: Some(crate::proto::runtime::v1::NetworkConfig {
+                    pod_cidr: "not-a-cidr".to_string(),
+                }),
+            }),
+        }),
+    )
+    .await
+    .expect_err("invalid CIDR should reject template rendering");
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err
+        .message()
+        .contains("Failed to render CNI config template"));
+    assert!(!config_dir.join("10-crius-net.conflist").exists());
 }
 
 #[tokio::test]
@@ -3155,8 +6669,48 @@ async fn run_pod_sandbox_persists_runtime_pod_cidr_in_verbose_info() {
     assert_eq!(info["runtimePodCIDR"], "10.88.0.0/16");
 }
 
-#[test]
-fn network_health_requires_declared_plugin_binary() {
+#[tokio::test]
+async fn host_network_pod_verbose_info_omits_managed_netns_and_runtime_pod_cidr() {
+    let service = test_service();
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            runtime_handler: "runc".to_string(),
+            namespace_options: Some(StoredNamespaceOptions {
+                network: NamespaceMode::Node as i32,
+                pid: NamespaceMode::Pod as i32,
+                ipc: NamespaceMode::Pod as i32,
+                target_id: String::new(),
+                userns_options: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service.pod_sandboxes.lock().await.insert(
+        "pod-host-network".to_string(),
+        test_pod("pod-host-network", annotations),
+    );
+
+    let response = RuntimeService::pod_sandbox_status(
+        &service,
+        Request::new(PodSandboxStatusRequest {
+            pod_sandbox_id: "pod-host-network".to_string(),
+            verbose: true,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let info: serde_json::Value = serde_json::from_str(response.info.get("info").unwrap()).unwrap();
+    assert!(info["netnsPath"].is_null());
+    assert!(info["runtimePodCIDR"].is_null());
+}
+
+#[tokio::test]
+async fn network_health_requires_declared_plugin_binary() {
     let _guard = env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
     let config_dir = dir.path().join("cni-conf");
@@ -3172,17 +6726,20 @@ fn network_health_requires_declared_plugin_binary() {
     std::env::set_var("CRIUS_CNI_CONFIG_DIRS", config_dir.display().to_string());
     std::env::set_var("CRIUS_CNI_PLUGIN_DIRS", plugin_dir.display().to_string());
     let service = test_service_with_env_cni();
-    let (ready, reason, message) = service.network_health();
+    let status = service.probe_cni_load_status().await;
     std::env::remove_var("CRIUS_CNI_CONFIG_DIRS");
     std::env::remove_var("CRIUS_CNI_PLUGIN_DIRS");
 
-    assert!(!ready);
-    assert_eq!(reason, "CNIPluginMissing");
-    assert!(message.contains("bridge"));
+    assert!(!status.ready);
+    assert_eq!(status.reason, "CNIPluginMissing");
+    assert!(status.message.contains("bridge"));
+    assert_eq!(status.loaded_networks, vec!["test"]);
+    assert_eq!(status.declared_plugins, vec!["bridge"]);
+    assert_eq!(status.missing_plugin_binaries, vec!["bridge"]);
 }
 
-#[test]
-fn network_health_requires_plugin_to_be_executable() {
+#[tokio::test]
+async fn network_health_requires_plugin_to_be_executable() {
     let _guard = env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
     let config_dir = dir.path().join("cni-conf");
@@ -3203,14 +6760,16 @@ fn network_health_requires_plugin_to_be_executable() {
     std::env::set_var("CRIUS_CNI_CONFIG_DIRS", config_dir.display().to_string());
     std::env::set_var("CRIUS_CNI_PLUGIN_DIRS", plugin_dir.display().to_string());
     let service = test_service_with_env_cni();
-    let (ready, reason, message) = service.network_health();
+    let status = service.probe_cni_load_status().await;
     std::env::remove_var("CRIUS_CNI_CONFIG_DIRS");
     std::env::remove_var("CRIUS_CNI_PLUGIN_DIRS");
 
-    assert!(!ready);
-    assert_eq!(reason, "CNIPluginMissing");
-    assert!(message.contains("bridge"));
-    assert!(message.contains("non-executable"));
+    assert!(!status.ready);
+    assert_eq!(status.reason, "CNIPluginMissing");
+    assert!(status.message.contains("bridge"));
+    assert!(status
+        .missing_plugin_binaries
+        .contains(&"bridge".to_string()));
 }
 
 #[tokio::test]
@@ -3274,6 +6833,12 @@ async fn checkpoint_container_writes_checkpoint_artifact() {
         artifact["ociConfig"]["root"]["path"],
         rootfs_dir.display().to_string()
     );
+    assert_eq!(artifact["manifest"]["rootfsSnapshot"]["path"], "rootfs.tar");
+    assert_eq!(artifact["manifest"]["rootfsSnapshot"]["format"], "tar");
+    assert_eq!(
+        artifact["manifest"]["rootfsSnapshot"]["restorePolicy"],
+        "replace"
+    );
     let checkpoint_image_path = PathBuf::from(
         artifact["manifest"]["checkpointImagePath"]
             .as_str()
@@ -3281,6 +6846,61 @@ async fn checkpoint_container_writes_checkpoint_artifact() {
     );
     assert!(checkpoint_image_path.join("checkpoint.json").exists());
     assert!(checkpoint_image_path.join("rootfs.tar").exists());
+}
+
+#[tokio::test]
+async fn checkpoint_container_uses_configured_criu_staging_paths() {
+    let (dir, mut service) = test_service_with_fake_runtime();
+    service.config.criu_image_path = dir.path().join("criu-images");
+    service.config.criu_work_path = dir.path().join("criu-work");
+
+    service.containers.lock().await.insert(
+        "container-running".to_string(),
+        test_container("container-running", "pod-1", HashMap::new()),
+    );
+    set_fake_runtime_state(&dir, "container-running", "running");
+
+    let bundle_dir = dir.path().join("runtime-root").join("container-running");
+    fs::create_dir_all(&bundle_dir).unwrap();
+    let rootfs_dir = dir.path().join("checkpoint-rootfs-custom");
+    fs::create_dir_all(&rootfs_dir).unwrap();
+    fs::write(
+        bundle_dir.join("config.json"),
+        serde_json::json!({
+            "ociVersion": "1.0.2",
+            "root": {
+                "path": rootfs_dir.display().to_string()
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let artifact_path = dir.path().join("checkpoint.tar");
+    let expected_image_path = service.checkpoint_runtime_image_path(&artifact_path);
+    let expected_work_path = service.checkpoint_runtime_work_path(&artifact_path);
+    RuntimeService::checkpoint_container(
+        &service,
+        Request::new(CheckpointContainerRequest {
+            container_id: "container-running".to_string(),
+            location: artifact_path.display().to_string(),
+            timeout: 30,
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(expected_image_path.join("checkpoint.json").exists());
+    assert!(expected_image_path.join("rootfs.tar").exists());
+    assert!(expected_work_path.is_dir());
+    assert!(
+        expected_image_path.starts_with(dir.path().join("criu-images")),
+        "checkpoint image staging path should honor runtime.criu_image_path"
+    );
+    assert!(
+        expected_work_path.starts_with(dir.path().join("criu-work")),
+        "checkpoint work staging path should honor runtime.criu_work_path"
+    );
 }
 
 #[tokio::test]
@@ -3345,12 +6965,134 @@ async fn checkpoint_container_writes_tar_export_when_location_is_archive() {
 }
 
 #[tokio::test]
+async fn checkpoint_container_fails_when_criu_support_is_disabled() {
+    let (dir, mut service) = test_service_with_fake_runtime();
+    service.config.enable_criu_support = false;
+
+    service.containers.lock().await.insert(
+        "container-running".to_string(),
+        test_container("container-running", "pod-1", HashMap::new()),
+    );
+    set_fake_runtime_state(&dir, "container-running", "running");
+
+    let err = RuntimeService::checkpoint_container(
+        &service,
+        Request::new(CheckpointContainerRequest {
+            container_id: "container-running".to_string(),
+            location: dir.path().join("checkpoint.json").display().to_string(),
+            timeout: 30,
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("CRIU support is disabled"));
+}
+
+#[test]
+fn validate_checkpoint_rootfs_snapshot_manifest_rejects_unsupported_format() {
+    let dir = tempdir().unwrap();
+    let checkpoint_image_path = dir.path().join("checkpoint");
+    fs::create_dir_all(&checkpoint_image_path).unwrap();
+    fs::write(checkpoint_image_path.join("rootfs.tar"), "placeholder").unwrap();
+
+    let manifest = serde_json::json!({
+        "rootfsSnapshot": {
+            "path": "rootfs.tar",
+            "format": "cpio",
+            "restorePolicy": "replace",
+        }
+    });
+
+    let err = RuntimeServiceImpl::validate_checkpoint_rootfs_snapshot_manifest(
+        &manifest,
+        &checkpoint_image_path,
+    )
+    .expect_err("unsupported rootfs snapshot format must be rejected");
+    assert!(err
+        .to_string()
+        .contains("checkpoint rootfsSnapshot.format must be tar"));
+}
+
+#[test]
+fn checkpoint_restore_from_artifact_requires_manifest_image_ref() {
+    let (dir, service) = test_service_with_fake_runtime();
+    let checkpoint_location = dir.path().join("restore-artifact.json");
+    let checkpoint_image_path = service.checkpoint_runtime_image_path(&checkpoint_location);
+    fs::create_dir_all(&checkpoint_image_path).unwrap();
+    fs::write(checkpoint_image_path.join("rootfs.tar"), "placeholder").unwrap();
+    fs::write(
+        &checkpoint_location,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "manifest": {
+                "rootfsSnapshot": {
+                    "path": "rootfs.tar",
+                    "format": "tar",
+                    "restorePolicy": "replace",
+                }
+            },
+            "ociConfig": {
+                "ociVersion": "1.0.2",
+                "root": { "path": "/tmp/rootfs" }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let err = service
+        .checkpoint_restore_from_artifact(&checkpoint_location)
+        .expect_err("restore artifact without imageRef must be rejected");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("manifest.imageRef"));
+}
+
+#[test]
+fn checkpoint_restore_from_artifact_ignores_manifest_bundle_paths() {
+    let (dir, service) = test_service_with_fake_runtime();
+    let checkpoint_location = dir.path().join("restore-artifact.json");
+    let checkpoint_image_path = service.checkpoint_runtime_image_path(&checkpoint_location);
+    fs::create_dir_all(&checkpoint_image_path).unwrap();
+    fs::write(checkpoint_image_path.join("rootfs.tar"), "placeholder").unwrap();
+    fs::write(
+        &checkpoint_location,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "manifest": {
+                "imageRef": "busybox:latest",
+                "bundlePath": "/definitely/stale/bundle",
+                "configPath": "/definitely/stale/config.json",
+                "rootfsSnapshot": {
+                    "path": "rootfs.tar",
+                    "format": "tar",
+                    "restorePolicy": "replace",
+                }
+            },
+            "ociConfig": {
+                "ociVersion": "1.0.2",
+                "root": { "path": "/tmp/rootfs" }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let restore = service
+        .checkpoint_restore_from_artifact(&checkpoint_location)
+        .expect("bundle/config export paths are informational only");
+    assert_eq!(restore.image_ref, "busybox:latest");
+    assert_eq!(
+        restore.checkpoint_image_path,
+        checkpoint_image_path.display().to_string()
+    );
+}
+
+#[tokio::test]
 async fn start_container_restores_from_checkpoint_artifact_and_clears_pending_marker() {
     let (dir, service) = test_service_with_fake_runtime();
 
     let checkpoint_location = dir.path().join("restore-artifact.json");
-    let checkpoint_image_path =
-        RuntimeServiceImpl::checkpoint_runtime_image_path(&checkpoint_location);
+    let checkpoint_image_path = service.checkpoint_runtime_image_path(&checkpoint_location);
     fs::create_dir_all(&checkpoint_image_path).unwrap();
     fs::write(checkpoint_image_path.join("checkpoint.json"), "{}").unwrap();
     fs::write(
@@ -3502,14 +7244,87 @@ async fn start_container_restores_from_checkpoint_artifact_and_clears_pending_ma
     .unwrap();
     assert!(bundle_container_state.started_at.is_some());
 
-    let exit_code_path = dir
-        .path()
-        .join("shims")
-        .join("restore-container")
-        .join("exit_code");
+    let exit_code_path = dir.path().join("exits").join("restore-container");
     fs::create_dir_all(exit_code_path.parent().unwrap()).unwrap();
     fs::write(&exit_code_path, "0").unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
+}
+
+#[tokio::test]
+async fn start_container_rejects_checkpoint_restore_when_criu_support_is_disabled() {
+    let (dir, mut service) = test_service_with_fake_runtime();
+    service.config.enable_criu_support = false;
+
+    let checkpoint_location = dir.path().join("restore-artifact.json");
+    let checkpoint_image_path = service.checkpoint_runtime_image_path(&checkpoint_location);
+    fs::create_dir_all(&checkpoint_image_path).unwrap();
+    fs::write(checkpoint_image_path.join("checkpoint.json"), "{}").unwrap();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState::default(),
+    )
+    .unwrap();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CHECKPOINT_RESTORE_KEY,
+        &StoredCheckpointRestore {
+            checkpoint_location: checkpoint_location.display().to_string(),
+            checkpoint_image_path: checkpoint_image_path.display().to_string(),
+            oci_config: serde_json::json!({
+                "ociVersion": "1.0.2",
+                "root": { "path": "/tmp/rootfs" }
+            }),
+            image_ref: "busybox:latest".to_string(),
+        },
+    )
+    .unwrap();
+
+    service.containers.lock().await.insert(
+        "restore-container".to_string(),
+        Container {
+            state: ContainerState::ContainerCreated as i32,
+            ..test_container("restore-container", "pod-1", annotations.clone())
+        },
+    );
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "restore-container",
+            "pod-1",
+            crate::runtime::ContainerStatus::Created,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+
+    let err = RuntimeService::start_container(
+        &service,
+        Request::new(StartContainerRequest {
+            container_id: "restore-container".to_string(),
+        }),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("CRIU support is disabled"));
+    let container = service
+        .containers
+        .lock()
+        .await
+        .get("restore-container")
+        .cloned()
+        .unwrap();
+    assert!(container
+        .annotations
+        .contains_key(INTERNAL_CHECKPOINT_RESTORE_KEY));
 }
 
 #[tokio::test]
@@ -3649,13 +7464,213 @@ async fn start_container_succeeds_when_nri_post_start_fails() {
 }
 
 #[tokio::test]
+async fn start_container_falls_back_to_persistence_when_memory_state_is_missing() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            metadata_name: Some("persisted-start".to_string()),
+            metadata_attempt: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service.pod_sandboxes.lock().await.insert(
+        "pod-persisted-start".to_string(),
+        test_pod("pod-persisted-start", HashMap::new()),
+    );
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-persisted-start",
+            "pod-persisted-start",
+            crate::runtime::ContainerStatus::Created,
+            "busybox:latest",
+            &["sleep".to_string(), "10".to_string()],
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+    write_test_bundle_config(&dir, "container-persisted-start", &annotations);
+
+    RuntimeService::start_container(
+        &service,
+        Request::new(StartContainerRequest {
+            container_id: "container-persisted-start".to_string(),
+        }),
+    )
+    .await
+    .expect("start should rehydrate persisted created containers");
+
+    assert_eq!(
+        fake_nri.calls.lock().await.clone(),
+        vec!["start_container", "post_start_container"]
+    );
+    let container = service
+        .containers
+        .lock()
+        .await
+        .get("container-persisted-start")
+        .cloned()
+        .expect("start should load persisted container into memory");
+    assert_eq!(container.state, ContainerState::ContainerRunning as i32);
+
+    let persisted = service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_container("container-persisted-start")
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.state, "running");
+}
+
+#[tokio::test]
+async fn start_container_rejects_repeated_start_for_running_container() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState::default(),
+    )
+    .unwrap();
+
+    service.pod_sandboxes.lock().await.insert(
+        "pod-start-repeat".to_string(),
+        test_pod("pod-start-repeat", HashMap::new()),
+    );
+    service.containers.lock().await.insert(
+        "container-start-repeat".to_string(),
+        test_container(
+            "container-start-repeat",
+            "pod-start-repeat",
+            annotations.clone(),
+        ),
+    );
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-start-repeat",
+            "pod-start-repeat",
+            crate::runtime::ContainerStatus::Created,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+    write_test_bundle_config(&dir, "container-start-repeat", &annotations);
+
+    RuntimeService::start_container(
+        &service,
+        Request::new(StartContainerRequest {
+            container_id: "container-start-repeat".to_string(),
+        }),
+    )
+    .await
+    .expect("first start should succeed");
+
+    let err = RuntimeService::start_container(
+        &service,
+        Request::new(StartContainerRequest {
+            container_id: "container-start-repeat".to_string(),
+        }),
+    )
+    .await
+    .expect_err("repeated start should be rejected");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("already running"));
+    assert_eq!(
+        fake_nri.calls.lock().await.clone(),
+        vec!["start_container", "post_start_container"]
+    );
+}
+
+#[tokio::test]
+async fn start_container_rejects_exited_container_with_failed_precondition() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            exit_code: Some(17),
+            finished_at: Some(RuntimeServiceImpl::now_nanos()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service.pod_sandboxes.lock().await.insert(
+        "pod-start-exited".to_string(),
+        test_pod("pod-start-exited", HashMap::new()),
+    );
+    let mut container = test_container(
+        "container-start-exited",
+        "pod-start-exited",
+        annotations.clone(),
+    );
+    container.state = ContainerState::ContainerExited as i32;
+    service
+        .containers
+        .lock()
+        .await
+        .insert("container-start-exited".to_string(), container);
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-start-exited",
+            "pod-start-exited",
+            crate::runtime::ContainerStatus::Stopped(17),
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+    set_fake_runtime_state(&dir, "container-start-exited", "stopped");
+
+    let err = RuntimeService::start_container(
+        &service,
+        Request::new(StartContainerRequest {
+            container_id: "container-start-exited".to_string(),
+        }),
+    )
+    .await
+    .expect_err("exited containers must not be startable again");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("already exited"));
+    assert!(fake_nri.calls.lock().await.is_empty());
+}
+
+#[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn start_container_undoes_nri_when_runtime_start_fails() {
     let _guard = env_lock().lock().unwrap();
-    std::env::set_var("CRIUS_SHIM_PATH", "/definitely/missing/crius-shim");
     let fake_nri = Arc::new(FakeNri::default());
-    let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
-    std::env::remove_var("CRIUS_SHIM_PATH");
+    let (dir, service) = test_service_with_fake_runtime_and_nri_and_shim(
+        fake_nri.clone(),
+        Some(PathBuf::from("/definitely/missing/crius-shim")),
+    );
 
     let mut annotations = HashMap::new();
     RuntimeServiceImpl::insert_internal_state(
@@ -3763,16 +7778,306 @@ async fn start_container_undoes_nri_when_runtime_start_fails() {
     )
     .unwrap();
     assert_eq!(sidecar_update_payload["cpu"]["shares"], 256);
+
+    let persisted = service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_container("container-start-fail")
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.state, "created");
+    let bundle_config: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            dir.path()
+                .join("runtime-root")
+                .join("container-start-fail")
+                .join("config.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let bundle_annotations = bundle_config
+        .get("annotations")
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let bundle_state: StoredContainerState = serde_json::from_str(
+        bundle_annotations
+            .get(INTERNAL_CONTAINER_STATE_KEY)
+            .and_then(|value| value.as_str())
+            .expect("bundle should persist internal container state after failed start"),
+    )
+    .unwrap();
+    assert!(bundle_state.nri_stop_notified);
+    assert!(bundle_state.started_at.is_none());
+    assert!(bundle_state.finished_at.is_none());
+}
+
+#[tokio::test]
+async fn start_container_fails_when_runtime_keeps_container_in_created_state() {
+    let dir = tempdir().unwrap();
+    let runtime_path = write_fake_runtime_script_with_start_state(dir.path(), "created");
+    let shim_path = write_quick_exit_shim(dir.path());
+    let (dir, mut service) =
+        test_service_with_runtime_path_and_shim_path(dir, runtime_path.clone(), Some(shim_path));
+    service.runtime = RuntimeRegistry::new(
+        "runc".to_string(),
+        HashMap::from([(
+            "runc".to_string(),
+            RuncRuntime::new(runtime_path.clone(), dir.path().join("runtime-root")),
+        )]),
+        HashMap::from([("runc".to_string(), 240)]),
+    );
+    let mut rx = service.events.subscribe();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState::default(),
+    )
+    .unwrap();
+    service.pod_sandboxes.lock().await.insert(
+        "pod-start-created".to_string(),
+        test_pod("pod-start-created", HashMap::new()),
+    );
+    service.containers.lock().await.insert(
+        "container-start-created".to_string(),
+        test_container(
+            "container-start-created",
+            "pod-start-created",
+            annotations.clone(),
+        ),
+    );
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-start-created",
+            "pod-start-created",
+            crate::runtime::ContainerStatus::Created,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+    write_test_bundle_config(&dir, "container-start-created", &annotations);
+
+    let err = RuntimeService::start_container(
+        &service,
+        Request::new(StartContainerRequest {
+            container_id: "container-start-created".to_string(),
+        }),
+    )
+    .await
+    .expect_err("container that stays created should fail start");
+    assert_eq!(err.code(), tonic::Code::Internal);
+    assert!(err.message().contains("did not reach running"));
+
+    let container = service
+        .containers
+        .lock()
+        .await
+        .get("container-start-created")
+        .cloned()
+        .unwrap();
+    assert_eq!(container.state, ContainerState::ContainerCreated as i32);
+    let state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+        &container.annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+    )
+    .unwrap();
+    assert!(state.nri_stop_notified);
+    assert!(state.started_at.is_none());
+    assert!(state.finished_at.is_none());
+    let persisted = service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_container("container-start-created")
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.state, "created");
+    assert!(matches!(
+        timeout(Duration::from_millis(50), rx.recv()).await,
+        Err(_)
+    ));
+}
+
+#[tokio::test]
+async fn start_container_fails_when_runtime_exits_immediately_and_persists_exit_state() {
+    let dir = tempdir().unwrap();
+    let runtime_path = write_fake_runtime_script_with_start_state(dir.path(), "stopped");
+    let shim_path = write_quick_exit_shim(dir.path());
+    let (dir, mut service) =
+        test_service_with_runtime_path_and_shim_path(dir, runtime_path.clone(), Some(shim_path));
+    service.runtime = RuntimeRegistry::new(
+        "runc".to_string(),
+        HashMap::from([(
+            "runc".to_string(),
+            RuncRuntime::new(runtime_path.clone(), dir.path().join("runtime-root")),
+        )]),
+        HashMap::from([("runc".to_string(), 240)]),
+    );
+    let mut rx = service.events.subscribe();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState::default(),
+    )
+    .unwrap();
+    service.pod_sandboxes.lock().await.insert(
+        "pod-start-stopped".to_string(),
+        test_pod("pod-start-stopped", HashMap::new()),
+    );
+    service.containers.lock().await.insert(
+        "container-start-stopped".to_string(),
+        test_container(
+            "container-start-stopped",
+            "pod-start-stopped",
+            annotations.clone(),
+        ),
+    );
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-start-stopped",
+            "pod-start-stopped",
+            crate::runtime::ContainerStatus::Created,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+    write_test_bundle_config(&dir, "container-start-stopped", &annotations);
+
+    let err = RuntimeService::start_container(
+        &service,
+        Request::new(StartContainerRequest {
+            container_id: "container-start-stopped".to_string(),
+        }),
+    )
+    .await
+    .expect_err("container that exits immediately should fail start");
+    assert_eq!(err.code(), tonic::Code::Internal);
+    assert!(err.message().contains("exited"));
+
+    let container = service
+        .containers
+        .lock()
+        .await
+        .get("container-start-stopped")
+        .cloned()
+        .unwrap();
+    assert_eq!(container.state, ContainerState::ContainerExited as i32);
+    let state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+        &container.annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+    )
+    .unwrap();
+    assert!(state.nri_stop_notified);
+    assert_eq!(state.exit_code, Some(0));
+    assert!(state.finished_at.is_some());
+    let persisted = service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_container("container-start-stopped")
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.state, "stopped");
+    let event = timeout(Duration::from_millis(200), rx.recv())
+        .await
+        .expect("stopped event should be published")
+        .expect("stopped event receiver should succeed");
+    assert_eq!(
+        event.container_event_type,
+        ContainerEventType::ContainerStoppedEvent as i32
+    );
+}
+
+#[tokio::test]
+async fn finalize_container_stop_state_only_sets_finished_at_for_exited_state() {
+    let service = test_service();
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            started_at: Some(11),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service.containers.lock().await.insert(
+        "container-stop-finalize".to_string(),
+        test_container("container-stop-finalize", "pod-1", annotations),
+    );
+    let persisted_annotations = service
+        .containers
+        .lock()
+        .await
+        .get("container-stop-finalize")
+        .unwrap()
+        .annotations
+        .clone();
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-stop-finalize",
+            "pod-1",
+            crate::runtime::ContainerStatus::Created,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &persisted_annotations,
+        )
+        .unwrap();
+
+    service
+        .finalize_container_stop_state("container-stop-finalize", ContainerStatus::Created)
+        .await
+        .unwrap();
+
+    let container = service
+        .containers
+        .lock()
+        .await
+        .get("container-stop-finalize")
+        .cloned()
+        .unwrap();
+    let state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+        &container.annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+    )
+    .unwrap();
+    assert_eq!(state.started_at, Some(11));
+    assert!(state.finished_at.is_none());
+    assert!(state.exit_code.is_none());
 }
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn remove_after_failed_start_does_not_repeat_nri_stop() {
     let _guard = env_lock().lock().unwrap();
-    std::env::set_var("CRIUS_SHIM_PATH", "/definitely/missing/crius-shim");
     let fake_nri = Arc::new(FakeNri::default());
-    let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
-    std::env::remove_var("CRIUS_SHIM_PATH");
+    let (dir, service) = test_service_with_fake_runtime_and_nri_and_shim(
+        fake_nri.clone(),
+        Some(PathBuf::from("/definitely/missing/crius-shim")),
+    );
 
     let mut annotations = HashMap::new();
     RuntimeServiceImpl::insert_internal_state(
@@ -4076,6 +8381,139 @@ async fn stop_container_skips_nri_for_already_exited_container() {
 }
 
 #[tokio::test]
+async fn stop_container_falls_back_to_persistence_when_memory_state_is_missing() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            metadata_name: Some("persisted-stop".to_string()),
+            metadata_attempt: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-persisted-stop",
+            "pod-persisted-stop",
+            crate::runtime::ContainerStatus::Running,
+            "busybox:latest",
+            &["sleep".to_string(), "10".to_string()],
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+    set_fake_runtime_state(&dir, "container-persisted-stop", "running");
+
+    RuntimeService::stop_container(
+        &service,
+        Request::new(StopContainerRequest {
+            container_id: "container-persisted-stop".to_string(),
+            timeout: 1,
+        }),
+    )
+    .await
+    .expect("fallback stop should succeed");
+
+    assert_eq!(fake_nri.calls.lock().await.clone(), vec!["stop_container"]);
+    assert!(
+        fake_runtime_state_path(&dir, "container-persisted-stop").exists(),
+        "runtime stop should leave a stopped runtime state artifact"
+    );
+
+    let container = service
+        .containers
+        .lock()
+        .await
+        .get("container-persisted-stop")
+        .cloned()
+        .expect("fallback stop should rehydrate container into memory");
+    assert_eq!(container.state, ContainerState::ContainerExited as i32);
+    let state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+        &container.annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+    )
+    .unwrap();
+    assert!(state.nri_stop_notified);
+    assert!(state.finished_at.is_some());
+    assert_eq!(state.exit_code, Some(0));
+
+    let persisted = service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_container("container-persisted-stop")
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.state, "stopped");
+    assert_eq!(persisted.exit_code, Some(0));
+}
+
+#[tokio::test]
+async fn stop_container_fallback_is_idempotent_across_repeated_calls() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            metadata_name: Some("persisted-repeat-stop".to_string()),
+            metadata_attempt: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-persisted-repeat-stop",
+            "pod-persisted-repeat-stop",
+            crate::runtime::ContainerStatus::Running,
+            "busybox:latest",
+            &["sleep".to_string(), "10".to_string()],
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+    set_fake_runtime_state(&dir, "container-persisted-repeat-stop", "running");
+
+    RuntimeService::stop_container(
+        &service,
+        Request::new(StopContainerRequest {
+            container_id: "container-persisted-repeat-stop".to_string(),
+            timeout: 1,
+        }),
+    )
+    .await
+    .expect("first fallback stop should succeed");
+    RuntimeService::stop_container(
+        &service,
+        Request::new(StopContainerRequest {
+            container_id: "container-persisted-repeat-stop".to_string(),
+            timeout: 1,
+        }),
+    )
+    .await
+    .expect("second fallback stop should succeed");
+
+    assert_eq!(fake_nri.calls.lock().await.clone(), vec!["stop_container"]);
+}
+
+#[tokio::test]
 async fn remove_container_notifies_nri_only_once_across_repeat_calls() {
     let fake_nri = Arc::new(FakeNri::default());
     let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
@@ -4242,6 +8680,137 @@ async fn remove_container_notifies_nri_stop_before_remove_for_running_container(
     assert_eq!(
         fake_nri.calls.lock().await.clone(),
         vec!["stop_container", "remove_container"]
+    );
+}
+
+#[tokio::test]
+async fn remove_container_falls_back_to_persistence_when_memory_state_is_missing() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            metadata_name: Some("persisted-remove".to_string()),
+            metadata_attempt: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-persisted-remove",
+            "pod-persisted-remove",
+            crate::runtime::ContainerStatus::Stopped(0),
+            "busybox:latest",
+            &["sleep".to_string(), "10".to_string()],
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+    set_fake_runtime_state(&dir, "container-persisted-remove", "stopped");
+
+    RuntimeService::remove_container(
+        &service,
+        Request::new(RemoveContainerRequest {
+            container_id: "container-persisted-remove".to_string(),
+        }),
+    )
+    .await
+    .expect("fallback remove should succeed");
+
+    assert_eq!(
+        fake_nri.calls.lock().await.clone(),
+        vec!["remove_container"]
+    );
+    assert!(
+        !dir.path()
+            .join("runtime-root")
+            .join("container-persisted-remove")
+            .exists(),
+        "bundle directory should be removed"
+    );
+    assert!(
+        service
+            .containers
+            .lock()
+            .await
+            .get("container-persisted-remove")
+            .is_none(),
+        "fallback remove should clean rehydrated memory state"
+    );
+    assert!(
+        service
+            .persistence
+            .lock()
+            .await
+            .storage()
+            .get_container("container-persisted-remove")
+            .unwrap()
+            .is_none(),
+        "fallback remove should delete persisted state"
+    );
+}
+
+#[tokio::test]
+async fn remove_container_fallback_is_idempotent_across_repeated_calls() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            metadata_name: Some("persisted-repeat-remove".to_string()),
+            metadata_attempt: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-persisted-repeat-remove",
+            "pod-persisted-repeat-remove",
+            crate::runtime::ContainerStatus::Stopped(0),
+            "busybox:latest",
+            &["sleep".to_string(), "10".to_string()],
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+    set_fake_runtime_state(&dir, "container-persisted-repeat-remove", "stopped");
+
+    RuntimeService::remove_container(
+        &service,
+        Request::new(RemoveContainerRequest {
+            container_id: "container-persisted-repeat-remove".to_string(),
+        }),
+    )
+    .await
+    .expect("first fallback remove should succeed");
+    RuntimeService::remove_container(
+        &service,
+        Request::new(RemoveContainerRequest {
+            container_id: "container-persisted-repeat-remove".to_string(),
+        }),
+    )
+    .await
+    .expect("second fallback remove should succeed");
+
+    assert_eq!(
+        fake_nri.calls.lock().await.clone(),
+        vec!["remove_container"]
     );
 }
 
@@ -4473,8 +9042,8 @@ async fn reopen_container_log_validates_running_state_and_log_path() {
     )
     .await
     .unwrap_err();
-    assert_eq!(running.code(), tonic::Code::Internal);
-    assert!(running.message().contains("reopen log socket"));
+    assert_eq!(running.code(), tonic::Code::FailedPrecondition);
+    assert!(running.message().contains("reopen log control socket"));
 }
 
 #[tokio::test]
@@ -4663,6 +9232,140 @@ async fn update_container_resources_validates_state_and_persists_resources() {
     .unwrap();
     assert_eq!(update_payload["cpu"]["shares"], 256);
     assert_eq!(update_payload["memory"]["limit"], 128 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn update_container_resources_fails_when_cgroup_support_is_disabled() {
+    let (_dir, mut service) = test_service_with_fake_runtime();
+    service.config.disable_cgroup = true;
+
+    let err = RuntimeService::update_container_resources(
+        &service,
+        Request::new(UpdateContainerResourcesRequest {
+            container_id: "container-running".to_string(),
+            linux: Some(crate::proto::runtime::v1::LinuxContainerResources {
+                cpu_shares: 2,
+                ..Default::default()
+            }),
+            windows: None,
+            annotations: HashMap::new(),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("disable_cgroup"));
+}
+
+#[tokio::test]
+async fn update_container_resources_fails_when_hugetlb_is_missing_and_tolerance_is_disabled() {
+    let (dir, service) = test_service_with_fake_runtime();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState::default(),
+    )
+    .unwrap();
+    service.containers.lock().await.insert(
+        "container-running".to_string(),
+        test_container("container-running", "pod-1", annotations.clone()),
+    );
+    set_fake_runtime_state(&dir, "container-running", "running");
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-running",
+            "pod-1",
+            crate::runtime::ContainerStatus::Running,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+
+    let err = RuntimeServiceImpl::validate_proto_hugetlb_limits_with_flags(
+        Some(&crate::proto::runtime::v1::LinuxContainerResources {
+            hugepage_limits: vec![crate::proto::runtime::v1::HugepageLimit {
+                page_size: "2MB".to_string(),
+                limit: 1,
+            }],
+            ..Default::default()
+        }),
+        CgroupResourceSupport {
+            swap: true,
+            hugetlb: false,
+            memory_kernel: true,
+            memory_kernel_tcp: true,
+            memory_swappiness: true,
+            memory_disable_oom_killer: true,
+            memory_use_hierarchy: true,
+            cpu_realtime: true,
+            blockio: true,
+            rdt: true,
+        },
+        false,
+        "container resource update",
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn update_container_resources_accepts_paused_container() {
+    let (dir, service) = test_service_with_fake_runtime();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState::default(),
+    )
+    .unwrap();
+    service.containers.lock().await.insert(
+        "container-paused".to_string(),
+        test_container("container-paused", "pod-1", annotations.clone()),
+    );
+    set_fake_runtime_state(&dir, "container-paused", "paused");
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-paused",
+            "pod-1",
+            crate::runtime::ContainerStatus::Running,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+
+    RuntimeService::update_container_resources(
+        &service,
+        Request::new(UpdateContainerResourcesRequest {
+            container_id: "container-paused".to_string(),
+            linux: Some(crate::proto::runtime::v1::LinuxContainerResources {
+                cpu_shares: 777,
+                ..Default::default()
+            }),
+            windows: None,
+            annotations: HashMap::new(),
+        }),
+    )
+    .await
+    .expect("paused container should accept resource updates");
+
+    let update_payload: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(fake_runtime_update_path(&dir, "container-paused")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(update_payload["cpu"]["shares"], 777);
 }
 
 #[tokio::test]
@@ -5765,6 +10468,114 @@ async fn list_container_stats_applies_id_pod_and_label_filters() {
     );
 }
 
+#[test]
+fn convert_to_proto_container_stats_preserves_optional_fields() {
+    let service = test_service();
+    let stats = crate::metrics::ContainerStats {
+        container_id: "container-stats-proto".to_string(),
+        cpu: Some(crate::metrics::CpuStats {
+            usage_total: 11,
+            usage_user: 7,
+            usage_kernel: 5,
+            ..Default::default()
+        }),
+        memory: Some(crate::metrics::MemoryStats {
+            usage: 101,
+            limit: 1000,
+            rss: 55,
+            pgfault: 9,
+            pgmajfault: 3,
+            swap: 77,
+            ..Default::default()
+        }),
+        timestamp: 1234,
+        ..Default::default()
+    };
+
+    let proto = service.convert_to_proto_container_stats(stats);
+    assert_eq!(
+        proto
+            .cpu
+            .as_ref()
+            .and_then(|cpu| cpu.usage_core_nano_seconds.as_ref())
+            .map(|value| value.value),
+        Some(11)
+    );
+    assert_eq!(
+        proto
+            .cpu
+            .as_ref()
+            .and_then(|cpu| cpu.usage_nano_cores.as_ref())
+            .map(|value| value.value),
+        Some(12)
+    );
+    assert_eq!(
+        proto
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.working_set_bytes.as_ref())
+            .map(|value| value.value),
+        Some(101)
+    );
+    assert_eq!(
+        proto
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.available_bytes.as_ref())
+            .map(|value| value.value),
+        Some(899)
+    );
+    assert_eq!(
+        proto
+            .swap
+            .as_ref()
+            .and_then(|swap| swap.swap_usage_bytes.as_ref())
+            .map(|value| value.value),
+        Some(77)
+    );
+}
+
+#[test]
+fn stats_cache_is_fresh_only_within_positive_period() {
+    let now = std::time::Instant::now();
+    let just_before = now - std::time::Duration::from_secs(4);
+    let just_after = now - std::time::Duration::from_secs(6);
+
+    assert!(RuntimeServiceImpl::stats_cache_is_fresh(
+        just_before,
+        5,
+        now
+    ));
+    assert!(!RuntimeServiceImpl::stats_cache_is_fresh(
+        just_after, 5, now
+    ));
+    assert!(!RuntimeServiceImpl::stats_cache_is_fresh(
+        just_before,
+        0,
+        now
+    ));
+}
+
+#[test]
+fn build_pod_metrics_returns_all_metrics_when_configured_with_all() {
+    let service = test_service();
+    let metrics = service.build_pod_metrics("pod-all", 1, 10, 20, 30, 40, 50, 60, 70);
+    let names: Vec<&str> = metrics.iter().map(|metric| metric.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "container_cpu_usage_seconds_total",
+            "container_memory_working_set_bytes",
+            "container_memory_usage_bytes",
+            "container_spec_memory_limit_bytes",
+            "container_pids_current",
+            "container_filesystem_usage_bytes",
+            "pod_network_receive_bytes_total",
+            "pod_network_transmit_bytes_total",
+        ]
+    );
+}
+
 #[tokio::test]
 async fn list_containers_returns_empty_when_short_id_filter_is_ambiguous() {
     let service = test_service();
@@ -5992,6 +10803,36 @@ async fn pod_sandbox_stats_resolves_short_id_and_hides_internal_annotations() {
     );
 }
 
+#[test]
+fn parse_network_stats_from_procfs_aggregates_non_loopback_interfaces() {
+    let raw = "\
+Inter-|   Receive                                                |  Transmit\n\
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
+    lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0\n\
+  eth0: 200 2 3 4 0 0 0 0 300 5 6 7 0 0 0 0\n\
+  eth1: 400 8 9 10 0 0 0 0 500 11 12 13 0 0 0 0\n";
+
+    let stats = RuntimeServiceImpl::parse_network_stats_from_procfs(raw)
+        .expect("non-loopback interfaces should produce network stats");
+    assert_eq!(stats.rx_bytes, 600);
+    assert_eq!(stats.rx_packets, 10);
+    assert_eq!(stats.rx_errors, 12);
+    assert_eq!(stats.rx_dropped, 14);
+    assert_eq!(stats.tx_bytes, 800);
+    assert_eq!(stats.tx_packets, 16);
+    assert_eq!(stats.tx_errors, 18);
+    assert_eq!(stats.tx_dropped, 20);
+}
+
+#[tokio::test]
+async fn collect_pod_stats_returns_none_when_pod_has_no_collectable_containers() {
+    let service = test_service();
+    let pod = test_pod("pod-no-stats", HashMap::new());
+
+    let stats = service.collect_pod_stats("pod-no-stats", &pod).await;
+    assert!(stats.is_none());
+}
+
 #[tokio::test]
 async fn list_pod_sandbox_stats_returns_empty_when_short_id_filter_is_ambiguous() {
     let service = test_service();
@@ -6100,6 +10941,27 @@ async fn list_pod_sandbox_metrics_returns_pod_and_container_entries() {
     assert!(
         !pod_metrics.container_metrics[0].metrics.is_empty(),
         "container-level metrics should not be empty"
+    );
+}
+
+#[tokio::test]
+async fn list_pod_sandbox_metrics_respects_included_pod_metrics_configuration() {
+    let mut service = test_service();
+    service.config.included_pod_metrics = vec!["cpu".to_string(), "network".to_string()];
+
+    let pod_metrics =
+        service.build_pod_metrics("pod-metrics-filtered", 1, 10, 20, 30, 40, 50, 60, 70);
+    let metric_names: Vec<&str> = pod_metrics
+        .iter()
+        .map(|metric| metric.name.as_str())
+        .collect();
+    assert_eq!(
+        metric_names,
+        vec![
+            "container_cpu_usage_seconds_total",
+            "pod_network_receive_bytes_total",
+            "pod_network_transmit_bytes_total",
+        ]
     );
 }
 
@@ -6260,6 +11122,31 @@ async fn pod_events_use_pause_container_id_when_available_and_preserve_order() {
 }
 
 #[tokio::test]
+async fn pod_events_can_be_disabled() {
+    let mut service = test_service();
+    service.config.enable_pod_events = false;
+
+    let pod = test_pod("pod-event-disabled", HashMap::new());
+    let mut stream =
+        RuntimeService::get_container_events(&service, Request::new(GetEventsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+    service
+        .emit_pod_event(ContainerEventType::ContainerCreatedEvent, &pod, Vec::new())
+        .await;
+
+    assert!(
+        matches!(
+            timeout(Duration::from_millis(100), stream.next()).await,
+            Err(_)
+        ),
+        "disabled pod events should not enqueue stream items"
+    );
+}
+
+#[tokio::test]
 async fn publish_event_without_subscribers_does_not_panic() {
     let service = test_service();
     service.publish_event(ContainerEventResponse {
@@ -6351,11 +11238,7 @@ async fn exit_monitor_publishes_async_stop_events() {
             .unwrap()
             .into_inner();
 
-    let exit_code_path = dir
-        .path()
-        .join("shims")
-        .join("async-stop")
-        .join("exit_code");
+    let exit_code_path = dir.path().join("exits").join("async-stop");
     fs::create_dir_all(exit_code_path.parent().unwrap()).unwrap();
     fs::write(&exit_code_path, "17").unwrap();
 
@@ -6500,6 +11383,85 @@ async fn port_forward_requires_existing_netns_and_returns_stream_url() {
     .unwrap()
     .into_inner();
     assert!(response.url.contains("/portforward/"));
+
+    let mut host_network_annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut host_network_annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            runtime_handler: "runc".to_string(),
+            namespace_options: Some(StoredNamespaceOptions {
+                network: NamespaceMode::Node as i32,
+                pid: NamespaceMode::Pod as i32,
+                ipc: NamespaceMode::Pod as i32,
+                target_id: String::new(),
+                userns_options: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service.pod_sandboxes.lock().await.insert(
+        "pod-host-network".to_string(),
+        test_pod("pod-host-network", host_network_annotations),
+    );
+    let host_network = RuntimeService::port_forward(
+        &service,
+        Request::new(PortForwardRequest {
+            pod_sandbox_id: "pod-host-network".to_string(),
+            port: vec![80],
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert!(host_network.url.contains("/portforward/"));
+
+    let multi_port = RuntimeService::port_forward(
+        &service,
+        Request::new(PortForwardRequest {
+            pod_sandbox_id: "pod-ready".to_string(),
+            port: vec![80, 443],
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert!(multi_port.url.contains("/portforward/"));
+}
+
+#[tokio::test]
+async fn port_forward_rejects_invalid_ports() {
+    let service = test_service();
+    service
+        .pod_sandboxes
+        .lock()
+        .await
+        .insert("pod-1".to_string(), test_pod("pod-1", HashMap::new()));
+
+    let zero = RuntimeService::port_forward(
+        &service,
+        Request::new(PortForwardRequest {
+            pod_sandbox_id: "pod-1".to_string(),
+            port: vec![0],
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(zero.code(), tonic::Code::InvalidArgument);
+    assert!(zero.message().contains("1..=65535"));
+
+    let too_large = RuntimeService::port_forward(
+        &service,
+        Request::new(PortForwardRequest {
+            pod_sandbox_id: "pod-1".to_string(),
+            port: vec![65536],
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(too_large.code(), tonic::Code::InvalidArgument);
+    assert!(too_large.message().contains("1..=65535"));
 }
 
 #[tokio::test]
@@ -6652,6 +11614,251 @@ async fn stop_and_remove_existing_pod_support_repeat_calls() {
     )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn stop_pod_sandbox_notifies_nri_only_once_across_repeat_calls() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+    set_fake_runtime_state(&dir, "pause-repeat", "running");
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            runtime_handler: "runc".to_string(),
+            pause_container_id: Some("pause-repeat".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let pod = test_pod("pod-repeat", annotations.clone());
+    service
+        .pod_sandboxes
+        .lock()
+        .await
+        .insert("pod-repeat".to_string(), pod);
+    {
+        let mut pod_manager = service.pod_manager.lock().await;
+        pod_manager.restore_pod_sandbox(crate::pod::PodSandbox {
+            id: "pod-repeat".to_string(),
+            config: crate::pod::PodSandboxConfig {
+                name: "pod-repeat".to_string(),
+                namespace: "default".to_string(),
+                uid: "uid-repeat".to_string(),
+                hostname: "pod-repeat".to_string(),
+                log_directory: None,
+                runtime_handler: "runc".to_string(),
+                labels: vec![],
+                annotations: vec![],
+                dns_config: None,
+                port_mappings: vec![],
+                network_config: None,
+                cgroup_parent: None,
+                sysctls: HashMap::new(),
+                namespace_options: None,
+                privileged: false,
+                run_as_user: None,
+                run_as_group: None,
+                supplemental_groups: vec![],
+                readonly_rootfs: false,
+                pids_limit: None,
+                no_new_privileges: None,
+                apparmor_profile: None,
+                selinux_label: None,
+                seccomp_profile: None,
+                linux_resources: None,
+            },
+            netns_path: PathBuf::from("/var/run/netns/pod-repeat"),
+            pause_container_id: "pause-repeat".to_string(),
+            state: crate::pod::PodSandboxState::Ready,
+            created_at: RuntimeServiceImpl::now_nanos(),
+            ip: String::new(),
+            network_status: None,
+        });
+    }
+    service
+        .persistence
+        .lock()
+        .await
+        .save_pod_sandbox(
+            "pod-repeat",
+            "ready",
+            "pod-repeat",
+            "default",
+            "uid-repeat",
+            "/var/run/netns/pod-repeat",
+            &HashMap::new(),
+            &annotations,
+            Some("pause-repeat"),
+            None,
+        )
+        .unwrap();
+
+    RuntimeService::stop_pod_sandbox(
+        &service,
+        Request::new(StopPodSandboxRequest {
+            pod_sandbox_id: "pod-repeat".to_string(),
+        }),
+    )
+    .await
+    .unwrap();
+    RuntimeService::stop_pod_sandbox(
+        &service,
+        Request::new(StopPodSandboxRequest {
+            pod_sandbox_id: "pod-repeat".to_string(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(fake_nri.stop_pod_events.lock().await.len(), 1);
+    assert_eq!(fake_nri.calls.lock().await.clone(), vec!["stop_pod"]);
+    let persisted = service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_pod_sandbox("pod-repeat")
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.state, "notready");
+    let persisted_annotations: HashMap<String, String> =
+        serde_json::from_str(&persisted.annotations).unwrap();
+    let persisted_state = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
+        &persisted_annotations,
+        INTERNAL_POD_STATE_KEY,
+    )
+    .unwrap();
+    assert!(persisted_state.stop_notified);
+}
+
+#[tokio::test]
+async fn stop_pod_sandbox_fallback_cleans_pause_when_pod_manager_state_missing() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "pause-fallback-stop", "running");
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            runtime_handler: "runc".to_string(),
+            pause_container_id: Some("pause-fallback-stop".to_string()),
+            netns_path: Some("/var/run/netns/pod-fallback-stop".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service.pod_sandboxes.lock().await.insert(
+        "pod-fallback-stop".to_string(),
+        test_pod("pod-fallback-stop", annotations.clone()),
+    );
+    service
+        .persistence
+        .lock()
+        .await
+        .save_pod_sandbox(
+            "pod-fallback-stop",
+            "ready",
+            "pod-fallback-stop",
+            "default",
+            "uid-fallback-stop",
+            "/var/run/netns/pod-fallback-stop",
+            &HashMap::new(),
+            &annotations,
+            Some("pause-fallback-stop"),
+            None,
+        )
+        .unwrap();
+
+    RuntimeService::stop_pod_sandbox(
+        &service,
+        Request::new(StopPodSandboxRequest {
+            pod_sandbox_id: "pod-fallback-stop".to_string(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(!fake_runtime_state_path(&dir, "pause-fallback-stop").exists());
+    let persisted = service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_pod_sandbox("pod-fallback-stop")
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.state, "notready");
+}
+
+#[tokio::test]
+async fn remove_pod_sandbox_fallback_cleans_workspace_when_pod_manager_state_missing() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "pause-fallback-remove", "running");
+    let pod_workspace = dir
+        .path()
+        .join("root")
+        .join("pods")
+        .join("pod-fallback-remove");
+    fs::create_dir_all(&pod_workspace).unwrap();
+    fs::write(pod_workspace.join("marker"), "workspace").unwrap();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            runtime_handler: "runc".to_string(),
+            pause_container_id: Some("pause-fallback-remove".to_string()),
+            netns_path: Some("/var/run/netns/pod-fallback-remove".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service.pod_sandboxes.lock().await.insert(
+        "pod-fallback-remove".to_string(),
+        test_pod("pod-fallback-remove", annotations.clone()),
+    );
+    service
+        .persistence
+        .lock()
+        .await
+        .save_pod_sandbox(
+            "pod-fallback-remove",
+            "ready",
+            "pod-fallback-remove",
+            "default",
+            "uid-fallback-remove",
+            "/var/run/netns/pod-fallback-remove",
+            &HashMap::new(),
+            &annotations,
+            Some("pause-fallback-remove"),
+            None,
+        )
+        .unwrap();
+
+    RuntimeService::remove_pod_sandbox(
+        &service,
+        Request::new(RemovePodSandboxRequest {
+            pod_sandbox_id: "pod-fallback-remove".to_string(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(!fake_runtime_state_path(&dir, "pause-fallback-remove").exists());
+    assert!(!pod_workspace.exists());
+    assert!(service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_pod_sandbox("pod-fallback-remove")
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -6858,11 +12065,7 @@ async fn recover_state_re_registers_exit_monitor_for_running_container() {
 
     service.recover_state().await.unwrap();
 
-    let exit_code_path = dir
-        .path()
-        .join("shims")
-        .join("recover-running")
-        .join("exit_code");
+    let exit_code_path = dir.path().join("exits").join("recover-running");
     fs::create_dir_all(exit_code_path.parent().unwrap()).unwrap();
     fs::write(&exit_code_path, "23").unwrap();
 
@@ -7020,6 +12223,237 @@ async fn recover_state_supports_inspect_and_list_after_restart() {
     let info: serde_json::Value =
         serde_json::from_str(container_status.info.get("info").unwrap()).unwrap();
     assert_eq!(info["sandboxID"], "pod-recover");
+}
+
+#[tokio::test]
+async fn recover_state_restores_pod_hostname_from_internal_state() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "pause-recover", "running");
+    let netns_path = dir.path().join("recover-hostname.netns");
+    fs::write(&netns_path, "netns").unwrap();
+
+    let mut pod_annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut pod_annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            hostname: Some("restored-hostname".to_string()),
+            port_mappings: vec![StoredPortMapping {
+                protocol: "TCP".to_string(),
+                container_port: 80,
+                host_port: 8080,
+                host_ip: String::new(),
+            }],
+            raw_cni_result: Some(serde_json::json!({
+                "cniVersion": "1.0.0",
+                "ips": [
+                    {"address": "fd00::10/64"},
+                    {"address": "10.88.0.11/16"}
+                ]
+            })),
+            runtime_handler: "runc".to_string(),
+            netns_path: Some(netns_path.display().to_string()),
+            pause_container_id: Some("pause-recover".to_string()),
+            readonly_rootfs: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .storage_mut()
+        .save_pod_sandbox(&PodSandboxRecord {
+            id: "pod-recover".to_string(),
+            state: "ready".to_string(),
+            name: "pod-name".to_string(),
+            namespace: "default".to_string(),
+            uid: "uid-recover".to_string(),
+            created_at: RuntimeServiceImpl::now_nanos(),
+            netns_path: netns_path.display().to_string(),
+            labels: "{}".to_string(),
+            annotations: serde_json::to_string(&pod_annotations).unwrap(),
+            pause_container_id: Some("pause-recover".to_string()),
+            ip: None,
+        })
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    let pod = {
+        let pod_manager = service.pod_manager.lock().await;
+        pod_manager
+            .get_pod_sandbox_cloned("pod-recover")
+            .expect("pod should be recovered")
+    };
+    assert_eq!(pod.config.hostname, "restored-hostname");
+    assert_eq!(pod.config.port_mappings.len(), 1);
+    assert_eq!(pod.config.port_mappings[0].host_port, 8080);
+    assert!(pod.config.readonly_rootfs);
+    let network_status = pod
+        .network_status
+        .expect("raw cni result should restore network");
+    assert_eq!(network_status.ip.unwrap().to_string(), "fd00::10");
+    assert_eq!(
+        network_status.interfaces[0].ip.unwrap().to_string(),
+        "10.88.0.11"
+    );
+}
+
+#[tokio::test]
+async fn recover_state_uses_configured_ipv4_preference_when_primary_ip_is_missing() {
+    let (dir, mut service) = test_service_with_fake_runtime();
+    service.config.cni_config = crate::network::CniConfig::new(
+        Vec::new(),
+        Vec::new(),
+        dir.path().join("cache"),
+        0,
+        crate::network::MainIpPreference::Ipv4,
+        None,
+        false,
+    );
+    set_fake_runtime_state(&dir, "pause-recover-ip-pref", "running");
+    let netns_path = dir.path().join("recover-ip-pref.netns");
+    fs::write(&netns_path, "netns").unwrap();
+
+    let mut pod_annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut pod_annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            runtime_handler: "runc".to_string(),
+            raw_cni_result: Some(serde_json::json!({
+                "cniVersion": "1.0.0",
+                "ips": [
+                    {"address": "fd00::10/64"},
+                    {"address": "10.88.0.11/16"},
+                    {"address": "fd00::12/64"}
+                ]
+            })),
+            netns_path: Some(netns_path.display().to_string()),
+            pause_container_id: Some("pause-recover-ip-pref".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .storage_mut()
+        .save_pod_sandbox(&PodSandboxRecord {
+            id: "pod-recover-ip-pref".to_string(),
+            state: "ready".to_string(),
+            name: "pod-ip-pref".to_string(),
+            namespace: "default".to_string(),
+            uid: "uid-recover-ip-pref".to_string(),
+            created_at: RuntimeServiceImpl::now_nanos(),
+            netns_path: netns_path.display().to_string(),
+            labels: "{}".to_string(),
+            annotations: serde_json::to_string(&pod_annotations).unwrap(),
+            pause_container_id: Some("pause-recover-ip-pref".to_string()),
+            ip: None,
+        })
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    let pod = {
+        let pod_manager = service.pod_manager.lock().await;
+        pod_manager
+            .get_pod_sandbox_cloned("pod-recover-ip-pref")
+            .expect("pod should be recovered")
+    };
+    let network_status = pod
+        .network_status
+        .expect("raw cni result should restore network");
+    assert_eq!(network_status.ip.unwrap().to_string(), "10.88.0.11");
+    assert_eq!(network_status.interfaces.len(), 2);
+    assert_eq!(
+        network_status.interfaces[0].ip.unwrap().to_string(),
+        "fd00::10"
+    );
+    assert_eq!(
+        network_status.interfaces[1].ip.unwrap().to_string(),
+        "fd00::12"
+    );
+}
+
+#[tokio::test]
+async fn recover_state_restores_pod_userns_options_from_internal_state() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "pause-recover-userns", "running");
+    let netns_path = dir.path().join("recover-userns.netns");
+    fs::write(&netns_path, "netns").unwrap();
+
+    let mut pod_annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut pod_annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            runtime_handler: "runc".to_string(),
+            netns_path: Some(netns_path.display().to_string()),
+            pause_container_id: Some("pause-recover-userns".to_string()),
+            namespace_options: Some(StoredNamespaceOptions {
+                network: NamespaceMode::Pod as i32,
+                pid: NamespaceMode::Pod as i32,
+                ipc: NamespaceMode::Pod as i32,
+                target_id: String::new(),
+                userns_options: Some(StoredUserNamespace {
+                    mode: NamespaceMode::Pod as i32,
+                    uids: vec![StoredIdMapping {
+                        host_id: 100000,
+                        container_id: 0,
+                        length: 65536,
+                    }],
+                    gids: vec![StoredIdMapping {
+                        host_id: 200000,
+                        container_id: 0,
+                        length: 65536,
+                    }],
+                }),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .storage_mut()
+        .save_pod_sandbox(&PodSandboxRecord {
+            id: "pod-recover-userns".to_string(),
+            state: "ready".to_string(),
+            name: "pod-userns".to_string(),
+            namespace: "default".to_string(),
+            uid: "uid-recover-userns".to_string(),
+            created_at: RuntimeServiceImpl::now_nanos(),
+            netns_path: netns_path.display().to_string(),
+            labels: "{}".to_string(),
+            annotations: serde_json::to_string(&pod_annotations).unwrap(),
+            pause_container_id: Some("pause-recover-userns".to_string()),
+            ip: None,
+        })
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    let pod = {
+        let pod_manager = service.pod_manager.lock().await;
+        pod_manager
+            .get_pod_sandbox_cloned("pod-recover-userns")
+            .expect("pod should be recovered")
+    };
+    let userns = pod
+        .config
+        .namespace_options
+        .and_then(|options| options.userns_options)
+        .expect("userns options should be restored");
+    assert_eq!(userns.mode, NamespaceMode::Pod as i32);
+    assert_eq!(userns.uids[0].host_id, 100000);
+    assert_eq!(userns.gids[0].host_id, 200000);
 }
 
 #[tokio::test]
@@ -7410,5 +12844,232 @@ async fn recover_state_ignores_stale_shim_metadata_artifacts() {
     assert!(
         !stale_dir.exists(),
         "recover_state should clean orphaned shim artifacts"
+    );
+}
+
+#[tokio::test]
+async fn recover_state_skips_orphan_sweeps_after_clean_shutdown_marker() {
+    let (dir, service) = test_service_with_fake_runtime();
+    service.record_startup_clean_shutdown(true);
+
+    let stale_shim_dir = dir.path().join("shims").join("orphan");
+    let stale_attach_dir = dir.path().join("attach").join("orphan");
+    fs::create_dir_all(&stale_shim_dir).unwrap();
+    fs::create_dir_all(&stale_attach_dir).unwrap();
+    fs::write(stale_shim_dir.join("shim.json"), "{}").unwrap();
+    fs::write(stale_attach_dir.join("attach.sock"), "stale").unwrap();
+
+    service.recover_state().await.unwrap();
+
+    assert!(stale_shim_dir.exists());
+    assert!(stale_attach_dir.exists());
+}
+
+#[tokio::test]
+async fn recover_state_does_not_skip_orphan_sweeps_after_reboot_even_if_last_shutdown_was_clean() {
+    let (dir, service) = test_service_with_fake_runtime();
+    service.record_startup_clean_shutdown(true);
+    service.record_startup_detected_reboot(true);
+
+    let stale_shim_dir = dir.path().join("shims").join("orphan");
+    let stale_attach_dir = dir.path().join("attach").join("orphan");
+    fs::create_dir_all(&stale_shim_dir).unwrap();
+    fs::create_dir_all(&stale_attach_dir).unwrap();
+    fs::write(stale_shim_dir.join("shim.json"), "{}").unwrap();
+    fs::write(stale_attach_dir.join("attach.sock"), "stale").unwrap();
+
+    service.recover_state().await.unwrap();
+
+    assert!(!stale_shim_dir.exists());
+    assert!(!stale_attach_dir.exists());
+}
+
+#[tokio::test]
+async fn recover_state_does_not_skip_orphan_sweeps_after_upgrade_even_if_last_shutdown_was_clean() {
+    let (dir, service) = test_service_with_fake_runtime();
+    service.record_startup_clean_shutdown(true);
+    service.record_startup_detected_upgrade(true);
+
+    let stale_shim_dir = dir.path().join("shims").join("orphan");
+    let stale_attach_dir = dir.path().join("attach").join("orphan");
+    fs::create_dir_all(&stale_shim_dir).unwrap();
+    fs::create_dir_all(&stale_attach_dir).unwrap();
+    fs::write(stale_shim_dir.join("shim.json"), "{}").unwrap();
+    fs::write(stale_attach_dir.join("attach.sock"), "stale").unwrap();
+
+    service.recover_state().await.unwrap();
+
+    assert!(!stale_shim_dir.exists());
+    assert!(!stale_attach_dir.exists());
+}
+
+#[tokio::test]
+async fn recover_state_skips_orphan_sweeps_when_internal_wipe_is_disabled() {
+    let (dir, mut service) = test_service_with_fake_runtime();
+    service.config.internal_wipe = false;
+
+    let stale_shim_dir = dir.path().join("shims").join("orphan");
+    let stale_attach_dir = dir.path().join("attach").join("orphan");
+    fs::create_dir_all(&stale_shim_dir).unwrap();
+    fs::create_dir_all(&stale_attach_dir).unwrap();
+    fs::write(stale_shim_dir.join("shim.json"), "{}").unwrap();
+    fs::write(stale_attach_dir.join("attach.sock"), "stale").unwrap();
+
+    service.recover_state().await.unwrap();
+
+    assert!(stale_shim_dir.exists());
+    assert!(stale_attach_dir.exists());
+}
+
+#[tokio::test]
+async fn recover_state_cleans_orphaned_attach_socket_artifacts_from_separate_directory() {
+    let (dir, mut service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "recover-container", "running");
+    service.attach_socket_dir = dir.path().join("attach");
+
+    let attach_dir = service.attach_socket_dir.join("orphan");
+    let shim_dir = dir.path().join("shims").join("orphan");
+    fs::create_dir_all(&attach_dir).unwrap();
+    fs::create_dir_all(&shim_dir).unwrap();
+    fs::write(attach_dir.join("attach.sock"), "stale").unwrap();
+    fs::write(
+        shim_dir.join("shim.json"),
+        serde_json::to_vec_pretty(&crate::runtime::ShimProcess {
+            container_id: "orphan".to_string(),
+            shim_pid: 999_999,
+            exit_code_file: shim_dir.join("exit_code"),
+            log_file: shim_dir.join("shim.log"),
+            socket_path: attach_dir.join("attach.sock"),
+            bundle_path: dir.path().join("bundles").join("orphan"),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "recover-container",
+            "pod-1",
+            crate::runtime::ContainerStatus::Running,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    assert!(
+        !attach_dir.exists(),
+        "recover_state should clean orphaned attach socket directories"
+    );
+}
+
+#[tokio::test]
+async fn recover_state_cleans_orphaned_runtime_bundles_but_keeps_recovered_ones() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "recover-container", "running");
+
+    let recovered_bundle = dir.path().join("runtime-root").join("recover-container");
+    let orphan_bundle = dir.path().join("runtime-root").join("orphan-bundle");
+    let live_orphan_bundle = dir.path().join("runtime-root").join("live-orphan");
+    fs::create_dir_all(&recovered_bundle).unwrap();
+    fs::create_dir_all(&orphan_bundle).unwrap();
+    fs::create_dir_all(&live_orphan_bundle).unwrap();
+    fs::write(recovered_bundle.join("config.json"), "{}").unwrap();
+    fs::write(orphan_bundle.join("config.json"), "{}").unwrap();
+    fs::write(live_orphan_bundle.join("config.json"), "{}").unwrap();
+    set_fake_runtime_state(&dir, "live-orphan", "running");
+
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "recover-container",
+            "pod-1",
+            crate::runtime::ContainerStatus::Running,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    assert!(
+        recovered_bundle.exists(),
+        "recover_state should keep recovered runtime bundles"
+    );
+    assert!(
+        !orphan_bundle.exists(),
+        "recover_state should clean orphaned runtime bundles"
+    );
+    assert!(
+        live_orphan_bundle.exists(),
+        "recover_state should not delete live runtime bundles that still have runtime state"
+    );
+}
+
+#[tokio::test]
+async fn recover_state_cleans_orphaned_pod_workspaces_but_keeps_recovered_ones() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "pause-recover", "running");
+
+    let recovered_workspace = dir.path().join("root").join("pods").join("pod-recover");
+    let orphan_workspace = dir.path().join("root").join("pods").join("orphan-pod");
+    fs::create_dir_all(&recovered_workspace).unwrap();
+    fs::create_dir_all(&orphan_workspace).unwrap();
+    fs::write(
+        recovered_workspace.join("resolv.conf"),
+        "nameserver 8.8.8.8",
+    )
+    .unwrap();
+    fs::write(orphan_workspace.join("marker"), "stale").unwrap();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            runtime_handler: "runc".to_string(),
+            pause_container_id: Some("pause-recover".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service
+        .persistence
+        .lock()
+        .await
+        .save_pod_sandbox(
+            "pod-recover",
+            "ready",
+            "pod-recover-name",
+            "default",
+            "pod-recover-uid",
+            "",
+            &HashMap::new(),
+            &annotations,
+            Some("pause-recover"),
+            None,
+        )
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    assert!(
+        recovered_workspace.exists(),
+        "recover_state should keep recovered pod workspaces"
+    );
+    assert!(
+        !orphan_workspace.exists(),
+        "recover_state should clean orphaned pod workspaces"
     );
 }
