@@ -34,6 +34,18 @@ struct Args {
     #[clap(short, long)]
     debug: bool,
 
+    /// Duplicate container output to journald in addition to CRI log file
+    #[clap(long)]
+    log_to_journald: bool,
+
+    /// Skip syncing CRI log files on reopen and container exit
+    #[clap(long)]
+    no_sync_log: bool,
+
+    /// Disable pivot_root and use MS_MOVE instead
+    #[clap(long)]
+    no_pivot: bool,
+
     /// Log file path
     #[clap(short, long)]
     log: Option<PathBuf>,
@@ -41,6 +53,22 @@ struct Args {
     /// Exit code file path
     #[clap(long)]
     exit_code_file: Option<PathBuf>,
+
+    /// Attach/resize socket root directory
+    #[clap(long)]
+    attach_socket_dir: Option<PathBuf>,
+
+    /// Owner UID for shim-created host IO artifacts
+    #[clap(long, default_value_t = 0)]
+    io_uid: u32,
+
+    /// Owner GID for shim-created host IO artifacts
+    #[clap(long, default_value_t = 0)]
+    io_gid: u32,
+
+    /// Maximum CRI container log line size in bytes
+    #[clap(long, default_value_t = 4096)]
+    max_container_log_line_size: usize,
 }
 
 fn main() -> Result<()> {
@@ -73,7 +101,19 @@ fn main() -> Result<()> {
     // rootfs 不再要求位于 bundle/rootfs，实际路径以 OCI config.json 的 root.path 为准。
 
     // 创建并运行shim守护进程
-    let daemon = Daemon::new(args.id, args.bundle, args.runtime, args.exit_code_file);
+    let daemon = Daemon::new(
+        args.id,
+        args.bundle,
+        args.runtime,
+        args.exit_code_file,
+        args.attach_socket_dir,
+        args.io_uid,
+        args.io_gid,
+        args.max_container_log_line_size,
+        args.log_to_journald,
+        args.no_sync_log,
+        args.no_pivot,
+    );
 
     daemon.run()
 }

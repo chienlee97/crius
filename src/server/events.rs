@@ -8,7 +8,7 @@ impl RuntimeServiceImpl {
         exit_code_path: PathBuf,
         config: RuntimeConfig,
         nri_config: NriConfig,
-        runtime: RuncRuntime,
+        runtime: RuntimeRegistry,
         nri: Arc<dyn NriApi>,
         containers: Arc<Mutex<HashMap<String, Container>>>,
         pod_sandboxes: Arc<Mutex<HashMap<String, crate::proto::runtime::v1::PodSandbox>>>,
@@ -90,7 +90,7 @@ impl RuntimeServiceImpl {
     }
 
     pub(super) fn exit_code_path(&self, container_id: &str) -> PathBuf {
-        self.shim_work_dir.join(container_id).join("exit_code")
+        self.container_exits_dir.join(container_id)
     }
 
     pub(super) fn ensure_exit_monitor_registered(&self, container_id: &str) {
@@ -329,6 +329,61 @@ impl RuntimeServiceImpl {
                 );
             }
         }
+
+        if self.attach_socket_dir == self.shim_work_dir {
+            return;
+        }
+
+        let Ok(entries) = std::fs::read_dir(&self.attach_socket_dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+
+            if known_container_ids.contains(id) || known_pause_ids.contains(id) {
+                continue;
+            }
+
+            let metadata = std::fs::read(self.shim_work_dir.join(id).join("shim.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<ShimProcess>(&raw).ok());
+            let live_process = metadata
+                .as_ref()
+                .map(|process| {
+                    PathBuf::from("/proc")
+                        .join(process.shim_pid.to_string())
+                        .exists()
+                })
+                .unwrap_or(false);
+
+            if live_process {
+                log::warn!(
+                    "Keeping orphaned attach socket directory {} because shim pid {} still appears live",
+                    path.display(),
+                    metadata
+                        .as_ref()
+                        .map(|process| process.shim_pid)
+                        .unwrap_or_default()
+                );
+                continue;
+            }
+
+            if let Err(err) = std::fs::remove_dir_all(&path) {
+                log::warn!(
+                    "Failed to remove orphaned attach socket directory {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -426,6 +481,9 @@ impl RuntimeServiceImpl {
         pod_sandbox: &crate::proto::runtime::v1::PodSandbox,
         containers_statuses: Vec<CriContainerStatus>,
     ) {
+        if !self.config.enable_pod_events {
+            return;
+        }
         self.publish_event(ContainerEventResponse {
             container_id: Self::pod_event_container_id(pod_sandbox),
             container_event_type: event_type as i32,
@@ -450,7 +508,7 @@ impl RuntimeServiceImpl {
         exit_code: i32,
         config: &RuntimeConfig,
         nri_config: &NriConfig,
-        runtime: &RuncRuntime,
+        runtime: &RuntimeRegistry,
         nri: &dyn NriApi,
         containers: &Arc<Mutex<HashMap<String, Container>>>,
         pod_sandboxes: &Arc<Mutex<HashMap<String, crate::proto::runtime::v1::PodSandbox>>>,
@@ -783,7 +841,7 @@ impl RuntimeServiceImpl {
 
     #[allow(dead_code)]
     pub(super) async fn refresh_runtime_state_and_publish_events(
-        runtime: &RuncRuntime,
+        runtime: &RuntimeRegistry,
         config: &RuntimeConfig,
         containers: &Arc<Mutex<HashMap<String, Container>>>,
         pod_sandboxes: &Arc<Mutex<HashMap<String, crate::proto::runtime::v1::PodSandbox>>>,

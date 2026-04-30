@@ -6,10 +6,11 @@ use anyhow::{Context, Result};
 use log::{debug, error, info};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tokio::process::Command;
+use thiserror::Error;
 
 use crate::network::{
     CniConfig, DefaultNetworkManager, NetworkInterface, NetworkManager, NetworkStatus,
+    PortMapping as HostPortMapping, PortMappingManager, Protocol,
 };
 use crate::proto::runtime::v1::{LinuxContainerResources, NamespaceOption};
 use crate::runtime::{
@@ -35,6 +36,16 @@ const CONTAINERD_SANDBOX_NAMESPACE_ANNOTATION: &str = "io.kubernetes.cri.sandbox
 const CONTAINERD_SANDBOX_UID_ANNOTATION: &str = "io.kubernetes.cri.sandbox-uid";
 const CONTAINERD_RUNTIME_HANDLER_ANNOTATION: &str = "io.containerd.cri.runtime-handler";
 const CONTAINER_TYPE_SANDBOX: &str = "sandbox";
+
+#[derive(Debug, Error)]
+pub enum PodSandboxError {
+    #[error(
+        "pause image {image} is not available locally; pull it before starting the pod sandbox"
+    )]
+    PauseImageNotPresentLocally { image: String },
+    #[error("pause image {image} is invalid or incomplete: {detail}")]
+    PauseImageInvalid { image: String, detail: String },
+}
 
 /// Pod沙箱配置
 #[derive(Debug, Clone)]
@@ -73,6 +84,7 @@ pub struct PodSandboxConfig {
     pub run_as_group: Option<u32>,
     pub supplemental_groups: Vec<u32>,
     pub readonly_rootfs: bool,
+    pub pids_limit: Option<i64>,
     pub no_new_privileges: Option<bool>,
     pub apparmor_profile: Option<String>,
     pub selinux_label: Option<String>,
@@ -135,30 +147,132 @@ pub enum PodSandboxState {
 }
 
 /// Pod沙箱管理器
-pub struct PodSandboxManager<R: ContainerRuntime> {
+pub struct PodSandboxManager<R: ContainerRuntime, N: NetworkManager = DefaultNetworkManager> {
     /// 运行时
     runtime: R,
     /// 网络管理器
-    network_manager: DefaultNetworkManager,
+    network_manager: N,
+    /// host port 管理器
+    port_mapper: Box<dyn PodPortMapper>,
+    /// 是否禁用 hostPort 映射。
+    disable_hostport_mapping: bool,
     /// Pod沙箱根目录
     root_dir: PathBuf,
+    /// 受管 netns 的挂载根目录。
+    netns_mount_dir: PathBuf,
     /// 默认pause镜像（CRI-O风格：由运行时配置提供）
     pause_image: String,
+    /// pause 镜像内的 infra 命令路径。
+    pause_command: String,
     /// 运行中的Pod沙箱
     pods: HashMap<String, PodSandbox>,
 }
 
-impl<R: ContainerRuntime> std::fmt::Debug for PodSandboxManager<R> {
+impl<R: ContainerRuntime, N: NetworkManager> std::fmt::Debug for PodSandboxManager<R, N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PodSandboxManager")
             .field("root_dir", &self.root_dir)
             .field("pause_image", &self.pause_image)
+            .field("pause_command", &self.pause_command)
             .field("pods", &self.pods)
             .finish()
     }
 }
 
-impl<R: ContainerRuntime> PodSandboxManager<R> {
+impl<R: ContainerRuntime> PodSandboxManager<R, DefaultNetworkManager> {
+    /// 创建新的Pod沙箱管理器
+    pub fn new(
+        runtime: R,
+        root_dir: PathBuf,
+        pause_image: String,
+        pause_command: String,
+        cni_config: CniConfig,
+    ) -> Self {
+        let disable_hostport_mapping = cni_config.disable_hostport_mapping();
+        let netns_mount_dir = cni_config.netns_mount_dir().to_path_buf();
+        let mut manager = Self::with_network_manager(
+            runtime,
+            DefaultNetworkManager::from_cni_config(cni_config),
+            Box::new(DefaultPodPortMapper),
+            disable_hostport_mapping,
+            root_dir,
+            pause_image,
+            pause_command,
+        );
+        manager.netns_mount_dir = netns_mount_dir;
+        manager
+    }
+}
+
+pub(crate) trait PodPortMapper: Send + Sync {
+    fn add_port_mapping(&self, mapping: &HostPortMapping) -> Result<()>;
+    fn remove_port_mapping(&self, mapping: &HostPortMapping) -> Result<()>;
+    fn cleanup_all(&self) -> Result<()>;
+}
+
+struct DefaultPodPortMapper;
+
+impl PodPortMapper for DefaultPodPortMapper {
+    fn add_port_mapping(&self, mapping: &HostPortMapping) -> Result<()> {
+        PortMappingManager::auto()?.add_port_mapping(mapping)
+    }
+
+    fn remove_port_mapping(&self, mapping: &HostPortMapping) -> Result<()> {
+        PortMappingManager::auto()?.remove_port_mapping(mapping)
+    }
+
+    fn cleanup_all(&self) -> Result<()> {
+        PortMappingManager::auto()?.cleanup_all_rules()
+    }
+}
+
+impl<R: ContainerRuntime, N: NetworkManager> PodSandboxManager<R, N> {
+    fn classify_pause_image_error(
+        err: &anyhow::Error,
+        pause_image: &str,
+    ) -> Option<PodSandboxError> {
+        for cause in err.chain() {
+            let message = cause.to_string();
+            if message.contains("is not available locally; pull it before creating the container") {
+                return Some(PodSandboxError::PauseImageNotPresentLocally {
+                    image: pause_image.to_string(),
+                });
+            }
+            if message.contains("has no unpackable layers") {
+                return Some(PodSandboxError::PauseImageInvalid {
+                    image: pause_image.to_string(),
+                    detail: message,
+                });
+            }
+            if let Some(image_error) =
+                cause.downcast_ref::<crate::runtime::ImageAvailabilityError>()
+            {
+                return Some(match image_error {
+                    crate::runtime::ImageAvailabilityError::NotPresentLocally { .. } => {
+                        PodSandboxError::PauseImageNotPresentLocally {
+                            image: pause_image.to_string(),
+                        }
+                    }
+                    crate::runtime::ImageAvailabilityError::NoLayers { .. } => {
+                        PodSandboxError::PauseImageInvalid {
+                            image: pause_image.to_string(),
+                            detail: image_error.to_string(),
+                        }
+                    }
+                });
+            }
+        }
+        None
+    }
+
+    fn pod_requires_managed_netns(config: &PodSandboxConfig) -> bool {
+        config
+            .namespace_options
+            .as_ref()
+            .map(|options| options.network != crate::proto::runtime::v1::NamespaceMode::Node as i32)
+            .unwrap_or(true)
+    }
+
     fn pod_resolv_path(&self, pod_id: &str) -> PathBuf {
         self.root_dir.join(pod_id).join("resolv.conf")
     }
@@ -206,23 +320,57 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
         Ok(resolv_path)
     }
 
-    async fn discover_netns_interfaces(&self, netns_name: &str) -> Vec<NetworkInterface> {
-        let output = match Command::new("ip")
-            .args(["-n", netns_name, "-o", "addr", "show"])
-            .output()
-            .await
+    async fn discover_netns_interfaces(&self, netns_path: &Path) -> Vec<NetworkInterface> {
+        let netns_path = netns_path.to_path_buf();
+        let netns_path_for_log = netns_path.clone();
+        let output = match tokio::task::spawn_blocking(move || {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+
+            let netns_file = std::fs::File::open(&netns_path)?;
+            let netns_fd = netns_file.as_raw_fd();
+            let mut command = std::process::Command::new("ip");
+            command.args(["-o", "addr", "show"]);
+            unsafe {
+                command.pre_exec(move || {
+                    nix::sched::setns(netns_fd, nix::sched::CloneFlags::CLONE_NEWNET).map_err(
+                        |err| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("failed to enter network namespace: {err}"),
+                            )
+                        },
+                    )?;
+                    Ok(())
+                });
+            }
+            command.output()
+        })
+        .await
         {
-            Ok(output) if output.status.success() => output,
-            Ok(output) => {
+            Ok(Ok(output)) if output.status.success() => output,
+            Ok(Ok(output)) => {
                 debug!(
                     "Failed to probe netns addresses for {}: status {:?}",
-                    netns_name,
+                    netns_path_for_log.display(),
                     output.status.code()
                 );
                 return Vec::new();
             }
+            Ok(Err(e)) => {
+                debug!(
+                    "Failed to execute ip addr in netns {}: {}",
+                    netns_path_for_log.display(),
+                    e
+                );
+                return Vec::new();
+            }
             Err(e) => {
-                debug!("Failed to execute ip addr in netns {}: {}", netns_name, e);
+                debug!(
+                    "Netns interface probe task failed for {}: {}",
+                    netns_path_for_log.display(),
+                    e
+                );
                 return Vec::new();
             }
         };
@@ -264,8 +412,6 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
     }
 
     fn resolve_pause_image(&self, pod_config: &PodSandboxConfig) -> Result<String> {
-        // Match CRI-O behavior: configured pause image is the default source.
-        // Allow kubelet-provided sandbox image annotation to override when present.
         for (k, v) in &pod_config.annotations {
             if k == "io.kubernetes.cri.sandbox-image" && !v.trim().is_empty() {
                 return Ok(v.clone());
@@ -278,22 +424,236 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
         Ok(self.pause_image.clone())
     }
 
-    /// 创建新的Pod沙箱管理器
-    pub fn new(runtime: R, root_dir: PathBuf, pause_image: String, cni_config: CniConfig) -> Self {
-        let network_manager = DefaultNetworkManager::from_cni_config(cni_config);
+    fn resolve_pause_command(&self) -> Result<String> {
+        if self.pause_command.trim().is_empty() {
+            return Err(anyhow::anyhow!("pause command is not configured"));
+        }
+        Ok(self.pause_command.clone())
+    }
 
+    pub(crate) fn with_network_manager(
+        runtime: R,
+        network_manager: N,
+        port_mapper: Box<dyn PodPortMapper>,
+        disable_hostport_mapping: bool,
+        root_dir: PathBuf,
+        pause_image: String,
+        pause_command: String,
+    ) -> Self {
         Self {
             runtime,
             network_manager,
+            port_mapper,
+            disable_hostport_mapping,
             root_dir,
+            netns_mount_dir: PathBuf::from("/var/run/netns"),
             pause_image,
+            pause_command,
             pods: HashMap::new(),
+        }
+    }
+
+    fn host_port_mappings(
+        &self,
+        pod: &PodSandboxConfig,
+        pod_ip: &str,
+    ) -> Result<Vec<HostPortMapping>> {
+        if pod_ip.trim().is_empty() || !Self::pod_requires_managed_netns(pod) {
+            return Ok(Vec::new());
+        }
+
+        let container_ip: IpAddr = pod_ip
+            .parse()
+            .with_context(|| format!("invalid pod IP for port mappings: {pod_ip}"))?;
+
+        pod.port_mappings
+            .iter()
+            .filter(|mapping| mapping.host_port > 0 && mapping.container_port > 0)
+            .map(|mapping| {
+                let protocol = match mapping.protocol.to_ascii_uppercase().as_str() {
+                    "TCP" => Protocol::Tcp,
+                    "UDP" => Protocol::Udp,
+                    "SCTP" => {
+                        return Err(anyhow::anyhow!("SCTP hostPort mapping is not supported"))
+                    }
+                    other => {
+                        return Err(anyhow::anyhow!("unsupported hostPort protocol {}", other))
+                    }
+                };
+                let host_ip = if mapping.host_ip.trim().is_empty() {
+                    None
+                } else {
+                    Some(
+                        mapping
+                            .host_ip
+                            .parse()
+                            .with_context(|| format!("invalid host IP {}", mapping.host_ip))?,
+                    )
+                };
+                Ok(HostPortMapping {
+                    protocol,
+                    container_port: u16::try_from(mapping.container_port)
+                        .context("container_port out of range")?,
+                    host_port: u16::try_from(mapping.host_port)
+                        .context("host_port out of range")?,
+                    host_ip,
+                    container_ip,
+                })
+            })
+            .collect()
+    }
+
+    fn apply_port_mappings(
+        &self,
+        pod: &PodSandboxConfig,
+        pod_ip: &str,
+    ) -> Result<Vec<HostPortMapping>> {
+        if self.disable_hostport_mapping {
+            debug!(
+                "hostPort mapping is disabled; skipping add for pod {}",
+                pod.name
+            );
+            return Ok(Vec::new());
+        }
+        let mappings = self.host_port_mappings(pod, pod_ip)?;
+        let mut applied = Vec::new();
+        for mapping in mappings {
+            if let Err(err) = self.port_mapper.add_port_mapping(&mapping) {
+                for existing in applied.iter().rev() {
+                    let _ = self.port_mapper.remove_port_mapping(existing);
+                }
+                return Err(err)
+                    .with_context(|| format!("failed to add hostPort mapping {:?}", mapping));
+            }
+            applied.push(mapping);
+        }
+        Ok(applied)
+    }
+
+    fn remove_port_mappings(&self, pod: &PodSandboxConfig, pod_ip: &str) {
+        if self.disable_hostport_mapping {
+            debug!(
+                "hostPort mapping is disabled; skipping cleanup for pod {}",
+                pod.name
+            );
+            return;
+        }
+        match self.host_port_mappings(pod, pod_ip) {
+            Ok(mappings) => {
+                for mapping in mappings.iter().rev() {
+                    if let Err(err) = self.port_mapper.remove_port_mapping(mapping) {
+                        debug!("Failed to remove hostPort mapping {:?}: {}", mapping, err);
+                    }
+                }
+            }
+            Err(err) => debug!("Failed to build hostPort mappings for cleanup: {}", err),
+        }
+    }
+
+    pub(crate) fn rebuild_port_mappings(&self) {
+        if self.disable_hostport_mapping {
+            debug!("hostPort mapping is disabled; skipping rebuild");
+            return;
+        }
+        if let Err(err) = self.port_mapper.cleanup_all() {
+            debug!(
+                "Failed to cleanup existing hostPort rules before rebuild: {}",
+                err
+            );
+        }
+
+        for pod in self.pods.values() {
+            if let Err(err) = self.apply_port_mappings(&pod.config, &pod.ip) {
+                debug!(
+                    "Failed to rebuild hostPort mappings for pod {}: {}",
+                    pod.id, err
+                );
+            }
+        }
+    }
+
+    async fn rollback_create_pod_sandbox(
+        &mut self,
+        pod_id: &str,
+        pod_dir: &Path,
+        netns_name: &str,
+        netns_path: &Path,
+        config: &PodSandboxConfig,
+        pause_container_id: Option<&str>,
+        network_attempted: bool,
+        netns_created: bool,
+        pod_ip: Option<&str>,
+    ) {
+        if let Some(pause_container_id) = pause_container_id {
+            if let Err(err) = self.runtime.stop_container(pause_container_id, None) {
+                debug!(
+                    "Failed to stop pause container {} during pod rollback: {}",
+                    pause_container_id, err
+                );
+            }
+            if let Err(err) = self.runtime.remove_container(pause_container_id) {
+                debug!(
+                    "Failed to remove pause container {} during pod rollback: {}",
+                    pause_container_id, err
+                );
+            }
+        }
+
+        if let Some(pod_ip) = pod_ip {
+            self.remove_port_mappings(config, pod_ip);
+        }
+
+        if network_attempted {
+            if let Err(err) = self
+                .network_manager
+                .teardown_pod_network(
+                    pod_id,
+                    &netns_path.to_string_lossy(),
+                    &config.namespace,
+                    &config.name,
+                    &config.runtime_handler,
+                )
+                .await
+            {
+                debug!("Failed to teardown pod network during rollback: {}", err);
+            }
+        }
+
+        if netns_created {
+            if let Err(err) = self
+                .network_manager
+                .remove_network_namespace(netns_name)
+                .await
+            {
+                debug!(
+                    "Failed to remove network namespace {} during rollback: {}",
+                    netns_name, err
+                );
+            }
+        }
+
+        if pod_dir.exists() {
+            if let Err(err) = tokio::fs::remove_dir_all(pod_dir).await {
+                debug!(
+                    "Failed to remove pod workspace {} during rollback: {}",
+                    pod_dir.display(),
+                    err
+                );
+            }
         }
     }
 
     /// 创建Pod沙箱
     pub async fn create_pod_sandbox(&mut self, config: PodSandboxConfig) -> Result<String> {
         let pod_id = uuid::Uuid::new_v4().to_simple().to_string();
+        self.create_pod_sandbox_with_id(pod_id, config).await
+    }
+
+    pub async fn create_pod_sandbox_with_id(
+        &mut self,
+        pod_id: String,
+        config: PodSandboxConfig,
+    ) -> Result<String> {
         info!(
             "Creating pod sandbox {} (name: {}, namespace: {})",
             pod_id, config.name, config.namespace
@@ -302,70 +662,183 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
         // 1. 创建Pod目录
         let pod_dir = self.root_dir.join(&pod_id);
         tokio::fs::create_dir_all(&pod_dir).await?;
+        let mut netns_created = false;
+        let mut network_attempted = false;
 
         // 1.1 为 Pod 准备 resolv.conf，参考 CRI-O 的 pod 级 DNS 文件做法。
-        self.create_resolv_conf(&pod_id, config.dns_config.as_ref())
+        if let Err(err) = self
+            .create_resolv_conf(&pod_id, config.dns_config.as_ref())
             .await
-            .context("Failed to create pod resolv.conf")?;
+            .context("Failed to create pod resolv.conf")
+        {
+            self.rollback_create_pod_sandbox(
+                &pod_id,
+                &pod_dir,
+                "",
+                Path::new(""),
+                &config,
+                None,
+                network_attempted,
+                netns_created,
+                None,
+            )
+            .await;
+            return Err(err);
+        }
 
         // 2. 创建网络命名空间
+        let managed_netns = Self::pod_requires_managed_netns(&config);
         let netns_name = format!("crius-{}-{}", config.namespace, config.name);
-        let netns_path = PathBuf::from(format!("/var/run/netns/{}", netns_name));
+        let netns_path = if managed_netns {
+            self.netns_mount_dir.join(&netns_name)
+        } else {
+            PathBuf::new()
+        };
 
-        debug!("Creating network namespace: {}", netns_name);
-        self.network_manager
-            .create_network_namespace(&netns_name)
-            .await
-            .context("Failed to create network namespace")?;
+        let network_status = if managed_netns {
+            debug!("Creating network namespace: {}", netns_name);
+            if let Err(err) = self
+                .network_manager
+                .create_network_namespace(&netns_name)
+                .await
+                .context("Failed to create network namespace")
+            {
+                self.rollback_create_pod_sandbox(
+                    &pod_id,
+                    &pod_dir,
+                    &netns_name,
+                    &netns_path,
+                    &config,
+                    None,
+                    network_attempted,
+                    netns_created,
+                    None,
+                )
+                .await;
+                return Err(err);
+            }
+            netns_created = true;
 
-        // 3. 设置Pod网络（CNI）
-        debug!("Setting up pod network for {}", pod_id);
-        let mut network_status = self
-            .network_manager
-            .setup_pod_network(
-                &pod_id,
-                &netns_path.to_string_lossy(),
-                &config.name,
-                &config.namespace,
-                config
-                    .network_config
-                    .as_ref()
-                    .map(|network| network.pod_cidr.as_str()),
-            )
-            .await?;
-        let discovered_interfaces = self.discover_netns_interfaces(&netns_name).await;
-        if network_status.ip.is_none() {
-            network_status.ip = discovered_interfaces
-                .iter()
-                .find_map(|iface| iface.ip.as_ref().copied());
-        }
-        if !discovered_interfaces.is_empty() {
-            network_status.interfaces = discovered_interfaces;
-        }
+            debug!("Setting up pod network for {}", pod_id);
+            network_attempted = true;
+            let mut network_status = match self
+                .network_manager
+                .setup_pod_network(
+                    &pod_id,
+                    &netns_path.to_string_lossy(),
+                    &config.name,
+                    &config.namespace,
+                    &config.runtime_handler,
+                    config
+                        .network_config
+                        .as_ref()
+                        .map(|network| network.pod_cidr.as_str()),
+                )
+                .await
+            {
+                Ok(status) => status,
+                Err(err) => {
+                    self.rollback_create_pod_sandbox(
+                        &pod_id,
+                        &pod_dir,
+                        &netns_name,
+                        &netns_path,
+                        &config,
+                        None,
+                        network_attempted,
+                        netns_created,
+                        None,
+                    )
+                    .await;
+                    return Err(err.into());
+                }
+            };
+            let discovered_interfaces = self.discover_netns_interfaces(&netns_path).await;
+            if network_status.ip.is_none() {
+                network_status.ip = discovered_interfaces
+                    .iter()
+                    .find_map(|iface| iface.ip.as_ref().copied());
+            }
+            if !discovered_interfaces.is_empty() {
+                network_status.interfaces = discovered_interfaces;
+            }
+            Some(network_status)
+        } else {
+            None
+        };
 
         // 4. 创建pause容器
         debug!("Creating pause container for pod {}", pod_id);
-        let pause_container_id = self
+        let created_pause_container_id = match self
             .create_pause_container(&pod_id, &config, &netns_path)
             .await
-            .context("Failed to create pause container")?;
+        {
+            Ok(container_id) => container_id,
+            Err(err) => {
+                self.rollback_create_pod_sandbox(
+                    &pod_id,
+                    &pod_dir,
+                    &netns_name,
+                    &netns_path,
+                    &config,
+                    None,
+                    network_attempted,
+                    netns_created,
+                    network_status
+                        .as_ref()
+                        .and_then(|status| status.ip.as_ref())
+                        .map(|ip| ip.to_string())
+                        .as_deref(),
+                )
+                .await;
+                let has_specialized_pause_error = err
+                    .chain()
+                    .any(|cause| cause.downcast_ref::<PodSandboxError>().is_some());
+                return if has_specialized_pause_error {
+                    Err(err)
+                } else {
+                    Err(err).context("Failed to create pause container")
+                };
+            }
+        };
+
+        let pod_ip = network_status
+            .as_ref()
+            .and_then(|status| status.ip.as_ref())
+            .map(|ip| ip.to_string())
+            .unwrap_or_default();
+        if let Err(err) = self.apply_port_mappings(&config, &pod_ip) {
+            self.rollback_create_pod_sandbox(
+                &pod_id,
+                &pod_dir,
+                &netns_name,
+                &netns_path,
+                &config,
+                Some(&created_pause_container_id),
+                network_attempted,
+                netns_created,
+                Some(&pod_ip),
+            )
+            .await;
+            return Err(err).context("Failed to apply pod port mappings");
+        }
 
         // 5. 创建Pod沙箱对象
         let pod = PodSandbox {
             id: pod_id.clone(),
             config: config.clone(),
             netns_path: netns_path.clone(),
-            pause_container_id: pause_container_id.clone(),
+            pause_container_id: created_pause_container_id.clone(),
             state: PodSandboxState::Ready,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64,
             ip: network_status
-                .ip
                 .as_ref()
+                .and_then(|status| status.ip.as_ref())
                 .map(|ip| ip.to_string())
                 .unwrap_or_default(),
-            network_status: Some(network_status),
+            network_status,
         };
 
         self.pods.insert(pod_id.clone(), pod);
@@ -382,6 +855,7 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
         netns_path: &Path,
     ) -> Result<String> {
         let pause_image = self.resolve_pause_image(pod_config)?;
+        let pause_command = self.resolve_pause_command()?;
         let mut pause_mounts = Vec::new();
         let pause_name = format!("pause-{}", pod_id);
         let mut pause_annotations = pod_config.annotations.clone();
@@ -464,7 +938,7 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
         let pause_config = ContainerConfig {
             name: pause_name.clone(),
             image: pause_image,
-            command: vec!["/pause".to_string()],
+            command: vec![pause_command],
             args: vec![],
             env: vec![],
             working_dir: None,
@@ -481,6 +955,7 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
             stdin_once: false,
             log_path: pause_log_path,
             readonly_rootfs: pod_config.readonly_rootfs,
+            pids_limit: pod_config.pids_limit,
             no_new_privileges: pod_config.no_new_privileges,
             apparmor_profile: pod_config.apparmor_profile.clone(),
             selinux_label: pod_config.selinux_label.clone(),
@@ -490,7 +965,7 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
             sysctls: pod_config.sysctls.clone(),
             namespace_options: pod_config.namespace_options.clone(),
             namespace_paths: NamespacePaths {
-                network: Some(netns_path.to_path_buf()),
+                network: (!netns_path.as_os_str().is_empty()).then(|| netns_path.to_path_buf()),
                 ..Default::default()
             },
             linux_resources: pod_config.linux_resources.clone(),
@@ -501,14 +976,18 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
 
         // 创建 pause 容器，ID 由上层（pod 管理器）统一分配，避免 runtime 二次生成。
         let container_id = pause_name;
-        self.runtime
-            .create_container(&container_id, &pause_config)
-            .context("Failed to create pause container")?;
+        if let Err(err) = self.runtime.create_container(&container_id, &pause_config) {
+            if let Some(classified) = Self::classify_pause_image_error(&err, &pause_config.image) {
+                return Err(classified.into());
+            }
+            return Err(err).context("Failed to create pause container");
+        }
 
         // 启动pause容器
-        self.runtime
-            .start_container(&container_id)
-            .context("Failed to start pause container")?;
+        if let Err(err) = self.runtime.start_container(&container_id) {
+            let _ = self.runtime.remove_container(&container_id);
+            return Err(err).context("Failed to start pause container");
+        }
 
         // 验证pause容器运行状态
         match self.runtime.container_status(&container_id)? {
@@ -536,36 +1015,42 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
         info!("Stopping pod sandbox {}", pod_id);
 
         if let Some(pod) = self.pods.get(pod_id) {
+            if pod.state == PodSandboxState::Terminated {
+                return Ok(());
+            }
             // 1. 停止pause容器
             debug!("Stopping pause container {}", pod.pause_container_id);
-            let _ = self
-                .runtime
-                .stop_container(&pod.pause_container_id, Some(30));
+            let _ = self.runtime.stop_container(&pod.pause_container_id, None);
             let _ = self.runtime.remove_container(&pod.pause_container_id);
+
+            self.remove_port_mappings(&pod.config, &pod.ip);
 
             // 2. 清理网络
             debug!("Tearing down pod network for {}", pod_id);
-            let _ = self
-                .network_manager
-                .teardown_pod_network(
-                    pod_id,
-                    &pod.netns_path.to_string_lossy(),
-                    &pod.config.namespace,
-                    &pod.config.name,
-                )
-                .await;
-
-            // 3. 删除网络命名空间
-            let netns_name = pod
-                .netns_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            if !netns_name.is_empty() {
+            if Self::pod_requires_managed_netns(&pod.config) {
                 let _ = self
                     .network_manager
-                    .remove_network_namespace(netns_name)
+                    .teardown_pod_network(
+                        pod_id,
+                        &pod.netns_path.to_string_lossy(),
+                        &pod.config.namespace,
+                        &pod.config.name,
+                        &pod.config.runtime_handler,
+                    )
                     .await;
+
+                // 3. 删除网络命名空间
+                let netns_name = pod
+                    .netns_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if !netns_name.is_empty() {
+                    let _ = self
+                        .network_manager
+                        .remove_network_namespace(netns_name)
+                        .await;
+                }
             }
 
             // 4. 更新Pod状态
@@ -629,7 +1114,10 @@ impl<R: ContainerRuntime> PodSandboxManager<R> {
 
     /// 获取Pod网络命名空间路径
     pub fn get_pod_netns(&self, pod_id: &str) -> Option<PathBuf> {
-        self.pods.get(pod_id).map(|p| p.netns_path.clone())
+        self.pods
+            .get(pod_id)
+            .map(|p| p.netns_path.clone())
+            .filter(|path| !path.as_os_str().is_empty())
     }
 
     /// 获取Pod沙箱信息
@@ -675,18 +1163,30 @@ pub struct PodSandboxStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::NetworkError;
     use crate::runtime::RuncRuntime;
+    use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     #[derive(Clone, Default)]
     struct RecordingRuntime {
         created: Arc<Mutex<Vec<(String, ContainerConfig)>>>,
+        removed: Arc<Mutex<Vec<String>>>,
+        fail_start: Arc<Mutex<bool>>,
     }
 
     impl RecordingRuntime {
         fn take_created(&self) -> Vec<(String, ContainerConfig)> {
             self.created.lock().unwrap().clone()
+        }
+
+        fn take_removed(&self) -> Vec<String> {
+            self.removed.lock().unwrap().clone()
+        }
+
+        fn set_fail_start(&self, value: bool) {
+            *self.fail_start.lock().unwrap() = value;
         }
     }
 
@@ -700,6 +1200,9 @@ mod tests {
         }
 
         fn start_container(&self, _container_id: &str) -> Result<()> {
+            if *self.fail_start.lock().unwrap() {
+                return Err(anyhow::anyhow!("start failed"));
+            }
             Ok(())
         }
 
@@ -707,7 +1210,8 @@ mod tests {
             Ok(())
         }
 
-        fn remove_container(&self, _container_id: &str) -> Result<()> {
+        fn remove_container(&self, container_id: &str) -> Result<()> {
+            self.removed.lock().unwrap().push(container_id.to_string());
             Ok(())
         }
 
@@ -737,6 +1241,185 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingNetworkManager {
+        calls: Arc<Mutex<Vec<String>>>,
+        fail_setup: Arc<Mutex<bool>>,
+        fail_teardown: Arc<Mutex<bool>>,
+    }
+
+    impl RecordingNetworkManager {
+        fn take_calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn set_fail_setup(&self, value: bool) {
+            *self.fail_setup.lock().unwrap() = value;
+        }
+
+        fn set_fail_teardown(&self, value: bool) {
+            *self.fail_teardown.lock().unwrap() = value;
+        }
+    }
+
+    #[async_trait]
+    impl NetworkManager for RecordingNetworkManager {
+        async fn init(&self) -> std::result::Result<(), NetworkError> {
+            Ok(())
+        }
+
+        async fn create_network_namespace(
+            &self,
+            ns_path: &str,
+        ) -> std::result::Result<(), NetworkError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("create_netns:{ns_path}"));
+            Ok(())
+        }
+
+        async fn remove_network_namespace(
+            &self,
+            ns_path: &str,
+        ) -> std::result::Result<(), NetworkError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("remove_netns:{ns_path}"));
+            Ok(())
+        }
+
+        async fn setup_pod_network(
+            &self,
+            pod_id: &str,
+            _netns: &str,
+            _pod_name: &str,
+            _pod_namespace: &str,
+            _runtime_handler: &str,
+            _pod_cidr: Option<&str>,
+        ) -> std::result::Result<NetworkStatus, NetworkError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("setup_network:{pod_id}"));
+            if *self.fail_setup.lock().unwrap() {
+                return Err(NetworkError::Other("setup failed".to_string()));
+            }
+            Ok(NetworkStatus {
+                name: "test".to_string(),
+                ip: Some("10.88.0.2".parse().unwrap()),
+                mac: None,
+                interfaces: vec![],
+                raw_result: None,
+            })
+        }
+
+        async fn teardown_pod_network(
+            &self,
+            pod_id: &str,
+            _netns: &str,
+            _pod_namespace: &str,
+            _pod_name: &str,
+            _runtime_handler: &str,
+        ) -> std::result::Result<(), NetworkError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("teardown_network:{pod_id}"));
+            if *self.fail_teardown.lock().unwrap() {
+                return Err(NetworkError::Other("teardown failed".to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingPortMapper {
+        added: Arc<Mutex<Vec<HostPortMapping>>>,
+        removed: Arc<Mutex<Vec<HostPortMapping>>>,
+        fail_add_after: Arc<Mutex<Option<usize>>>,
+        cleanup_calls: Arc<Mutex<usize>>,
+    }
+
+    impl RecordingPortMapper {
+        fn take_added(&self) -> Vec<HostPortMapping> {
+            self.added.lock().unwrap().clone()
+        }
+
+        fn take_removed(&self) -> Vec<HostPortMapping> {
+            self.removed.lock().unwrap().clone()
+        }
+
+        fn fail_add_after(&self, count: usize) {
+            *self.fail_add_after.lock().unwrap() = Some(count);
+        }
+
+        fn cleanup_calls(&self) -> usize {
+            *self.cleanup_calls.lock().unwrap()
+        }
+    }
+
+    impl PodPortMapper for RecordingPortMapper {
+        fn add_port_mapping(&self, mapping: &HostPortMapping) -> Result<()> {
+            let mut added = self.added.lock().unwrap();
+            if self
+                .fail_add_after
+                .lock()
+                .unwrap()
+                .map(|limit| added.len() >= limit)
+                .unwrap_or(false)
+            {
+                return Err(anyhow::anyhow!("port mapping add failed"));
+            }
+            added.push(mapping.clone());
+            Ok(())
+        }
+
+        fn remove_port_mapping(&self, mapping: &HostPortMapping) -> Result<()> {
+            self.removed.lock().unwrap().push(mapping.clone());
+            Ok(())
+        }
+
+        fn cleanup_all(&self) -> Result<()> {
+            *self.cleanup_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    fn test_pod_config() -> PodSandboxConfig {
+        PodSandboxConfig {
+            name: "test-pod".to_string(),
+            namespace: "default".to_string(),
+            uid: "uid-1".to_string(),
+            hostname: "test-host".to_string(),
+            log_directory: None,
+            runtime_handler: "runc".to_string(),
+            labels: vec![],
+            annotations: vec![],
+            dns_config: None,
+            port_mappings: vec![],
+            network_config: Some(NetworkConfig {
+                network_namespace: "crius-default-test-pod".to_string(),
+                pod_cidr: "10.88.0.0/16".to_string(),
+            }),
+            cgroup_parent: None,
+            sysctls: HashMap::new(),
+            namespace_options: None,
+            privileged: false,
+            run_as_user: None,
+            run_as_group: None,
+            supplemental_groups: vec![],
+            readonly_rootfs: false,
+            pids_limit: None,
+            no_new_privileges: None,
+            apparmor_profile: None,
+            selinux_label: None,
+            seccomp_profile: None,
+            linux_resources: None,
+        }
+    }
+
     #[tokio::test]
     async fn create_resolv_conf_copies_host_config_when_dns_unspecified() {
         let temp_dir = tempdir().unwrap();
@@ -745,6 +1428,7 @@ mod tests {
             runtime,
             temp_dir.path().join("pods"),
             "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
             CniConfig::default(),
         );
         tokio::fs::create_dir_all(temp_dir.path().join("pods").join("pod-1"))
@@ -765,6 +1449,7 @@ mod tests {
             runtime,
             temp_dir.path().join("pods"),
             "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
             CniConfig::default(),
         );
         tokio::fs::create_dir_all(temp_dir.path().join("pods").join("pod-1"))
@@ -796,6 +1481,7 @@ mod tests {
             runtime.clone(),
             temp_dir.path().join("pods"),
             "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
             CniConfig::default(),
         );
         tokio::fs::create_dir_all(temp_dir.path().join("pods").join("pod-1"))
@@ -828,6 +1514,7 @@ mod tests {
             run_as_group: Some(1000),
             supplemental_groups: vec![2000],
             readonly_rootfs: true,
+            pids_limit: Some(128),
             no_new_privileges: Some(true),
             apparmor_profile: Some("runtime/default".to_string()),
             selinux_label: Some("system_u:system_r:container_t:s0".to_string()),
@@ -847,6 +1534,11 @@ mod tests {
         let (container_id, pause_config) = &created[0];
         assert_eq!(container_id, "pause-pod-1");
         assert_eq!(pause_config.image, "registry.example/pause:custom");
+        assert_eq!(pause_config.command, vec!["/pause".to_string()]);
+        assert_eq!(pause_config.hostname.as_deref(), Some("test-host"));
+        assert_eq!(pause_config.supplemental_groups, vec![2000]);
+        assert!(pause_config.readonly_rootfs);
+        assert_eq!(pause_config.pids_limit, Some(128));
         assert_eq!(pause_config.labels, pod_config.labels);
         assert!(pause_config
             .annotations
@@ -935,6 +1627,502 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn create_pause_container_uses_configured_pause_command() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RecordingRuntime::default();
+        let manager = PodSandboxManager::new(
+            runtime.clone(),
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            "/custom/pause".to_string(),
+            CniConfig::default(),
+        );
+        tokio::fs::create_dir_all(temp_dir.path().join("pods").join("pod-1"))
+            .await
+            .unwrap();
+
+        manager
+            .create_pause_container(
+                "pod-1",
+                &test_pod_config(),
+                Path::new("/var/run/netns/pod-1"),
+            )
+            .await
+            .unwrap();
+
+        let created = runtime.take_created();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].1.command, vec!["/custom/pause".to_string()]);
+        assert!(created[0].1.args.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_pod_sandbox_rolls_back_workspace_and_netns_when_network_setup_fails() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RecordingRuntime::default();
+        let network = RecordingNetworkManager::default();
+        network.set_fail_setup(true);
+        let mut manager = PodSandboxManager::with_network_manager(
+            runtime,
+            network.clone(),
+            Box::new(RecordingPortMapper::default()),
+            false,
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
+        );
+
+        let err = manager
+            .create_pod_sandbox(test_pod_config())
+            .await
+            .expect_err("network failure should rollback pod sandbox creation");
+        assert!(err.to_string().contains("setup failed"));
+
+        let calls = network.take_calls();
+        assert!(calls.iter().any(|call| call.starts_with("create_netns:")));
+        assert!(calls.iter().any(|call| call.starts_with("setup_network:")));
+        assert!(calls
+            .iter()
+            .any(|call| call.starts_with("teardown_network:")));
+        assert!(calls.iter().any(|call| call.starts_with("remove_netns:")));
+        assert!(manager.pods.is_empty());
+        assert!(std::fs::read_dir(temp_dir.path().join("pods"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn create_pod_sandbox_rolls_back_network_and_workspace_when_pause_start_fails() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RecordingRuntime::default();
+        runtime.set_fail_start(true);
+        let network = RecordingNetworkManager::default();
+        let mut manager = PodSandboxManager::with_network_manager(
+            runtime.clone(),
+            network.clone(),
+            Box::new(RecordingPortMapper::default()),
+            false,
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
+        );
+
+        let err = manager
+            .create_pod_sandbox(test_pod_config())
+            .await
+            .expect_err("pause failure should rollback pod sandbox creation");
+        assert!(err.to_string().contains("Failed to create pause container"));
+
+        let calls = network.take_calls();
+        assert!(calls.iter().any(|call| call.starts_with("setup_network:")));
+        assert!(calls
+            .iter()
+            .any(|call| call.starts_with("teardown_network:")));
+        assert!(calls.iter().any(|call| call.starts_with("remove_netns:")));
+        let removed = runtime.take_removed();
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].starts_with("pause-"));
+        assert!(manager.pods.is_empty());
+        assert!(std::fs::read_dir(temp_dir.path().join("pods"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn create_pod_sandbox_continues_cleanup_when_network_teardown_fails() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RecordingRuntime::default();
+        runtime.set_fail_start(true);
+        let network = RecordingNetworkManager::default();
+        network.set_fail_teardown(true);
+        let mut manager = PodSandboxManager::with_network_manager(
+            runtime,
+            network.clone(),
+            Box::new(RecordingPortMapper::default()),
+            false,
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
+        );
+
+        let err = manager
+            .create_pod_sandbox(test_pod_config())
+            .await
+            .expect_err("pause failure should still cleanup when teardown fails");
+        assert!(err.to_string().contains("Failed to create pause container"));
+
+        let calls = network.take_calls();
+        assert!(calls
+            .iter()
+            .any(|call| call.starts_with("teardown_network:")));
+        assert!(calls.iter().any(|call| call.starts_with("remove_netns:")));
+        assert!(manager.pods.is_empty());
+        assert!(std::fs::read_dir(temp_dir.path().join("pods"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn create_pod_sandbox_host_network_skips_managed_netns_and_cni() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RecordingRuntime::default();
+        let network = RecordingNetworkManager::default();
+        let mut manager = PodSandboxManager::with_network_manager(
+            runtime.clone(),
+            network.clone(),
+            Box::new(RecordingPortMapper::default()),
+            false,
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
+        );
+
+        let mut config = test_pod_config();
+        config.namespace_options = Some(NamespaceOption {
+            network: crate::proto::runtime::v1::NamespaceMode::Node as i32,
+            pid: crate::proto::runtime::v1::NamespaceMode::Pod as i32,
+            ipc: crate::proto::runtime::v1::NamespaceMode::Pod as i32,
+            target_id: String::new(),
+            userns_options: None,
+        });
+
+        let pod_id = manager
+            .create_pod_sandbox(config)
+            .await
+            .expect("host network pod sandbox should be created");
+
+        assert!(network.take_calls().is_empty());
+        let pod = manager
+            .get_pod_sandbox(&pod_id)
+            .expect("pod sandbox should be stored");
+        assert!(pod.netns_path.as_os_str().is_empty());
+        assert!(pod.network_status.is_none());
+
+        let created = runtime.take_created();
+        assert_eq!(created.len(), 1);
+        assert!(created[0].1.namespace_paths.network.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_pause_container_propagates_host_pid_and_ipc_namespace_modes() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RecordingRuntime::default();
+        let manager = PodSandboxManager::new(
+            runtime.clone(),
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
+            CniConfig::default(),
+        );
+        tokio::fs::create_dir_all(temp_dir.path().join("pods").join("pod-1"))
+            .await
+            .unwrap();
+
+        let mut pod_config = test_pod_config();
+        pod_config.namespace_options = Some(NamespaceOption {
+            network: crate::proto::runtime::v1::NamespaceMode::Pod as i32,
+            pid: crate::proto::runtime::v1::NamespaceMode::Node as i32,
+            ipc: crate::proto::runtime::v1::NamespaceMode::Node as i32,
+            target_id: String::new(),
+            userns_options: None,
+        });
+
+        manager
+            .create_pause_container("pod-1", &pod_config, Path::new("/var/run/netns/pod-1"))
+            .await
+            .unwrap();
+
+        let created = runtime.take_created();
+        assert_eq!(created.len(), 1);
+        let pause_config = &created[0].1;
+        let namespace_options = pause_config
+            .namespace_options
+            .as_ref()
+            .expect("pause config should include namespace options");
+        assert_eq!(
+            namespace_options.pid,
+            crate::proto::runtime::v1::NamespaceMode::Node as i32
+        );
+        assert_eq!(
+            namespace_options.ipc,
+            crate::proto::runtime::v1::NamespaceMode::Node as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn create_pod_sandbox_applies_port_mappings_and_stop_removes_them() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RecordingRuntime::default();
+        let network = RecordingNetworkManager::default();
+        let port_mapper = RecordingPortMapper::default();
+        let mut manager = PodSandboxManager::with_network_manager(
+            runtime,
+            network,
+            Box::new(port_mapper.clone()),
+            false,
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
+        );
+
+        let mut config = test_pod_config();
+        config.port_mappings = vec![PortMapping {
+            protocol: "TCP".to_string(),
+            container_port: 80,
+            host_port: 8080,
+            host_ip: "127.0.0.1".to_string(),
+        }];
+
+        let pod_id = manager.create_pod_sandbox(config).await.unwrap();
+        let added = port_mapper.take_added();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].host_port, 8080);
+
+        manager.stop_pod_sandbox(&pod_id).await.unwrap();
+        let removed = port_mapper.take_removed();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].host_port, 8080);
+    }
+
+    #[tokio::test]
+    async fn create_pod_sandbox_skips_port_mappings_when_hostport_mapping_is_disabled() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RecordingRuntime::default();
+        let network = RecordingNetworkManager::default();
+        let port_mapper = RecordingPortMapper::default();
+        port_mapper.fail_add_after(0);
+        let mut manager = PodSandboxManager::with_network_manager(
+            runtime,
+            network,
+            Box::new(port_mapper.clone()),
+            false,
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
+        );
+        manager.disable_hostport_mapping = true;
+
+        let mut config = test_pod_config();
+        config.port_mappings = vec![PortMapping {
+            protocol: "TCP".to_string(),
+            container_port: 80,
+            host_port: 8080,
+            host_ip: String::new(),
+        }];
+
+        let pod_id = manager
+            .create_pod_sandbox(config)
+            .await
+            .expect("hostPort-disabled sandbox creation should succeed");
+        manager
+            .stop_pod_sandbox(&pod_id)
+            .await
+            .expect("hostPort-disabled stop should succeed");
+
+        assert!(port_mapper.take_added().is_empty());
+        assert!(port_mapper.take_removed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_pod_sandbox_rolls_back_applied_port_mappings_when_mapper_fails() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RecordingRuntime::default();
+        let network = RecordingNetworkManager::default();
+        let port_mapper = RecordingPortMapper::default();
+        port_mapper.fail_add_after(1);
+        let mut manager = PodSandboxManager::with_network_manager(
+            runtime,
+            network.clone(),
+            Box::new(port_mapper.clone()),
+            false,
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
+        );
+
+        let mut config = test_pod_config();
+        config.port_mappings = vec![
+            PortMapping {
+                protocol: "TCP".to_string(),
+                container_port: 80,
+                host_port: 8080,
+                host_ip: String::new(),
+            },
+            PortMapping {
+                protocol: "UDP".to_string(),
+                container_port: 53,
+                host_port: 5353,
+                host_ip: String::new(),
+            },
+        ];
+
+        let err = manager
+            .create_pod_sandbox(config)
+            .await
+            .expect_err("port mapping failure should rollback pod sandbox creation");
+        assert!(err
+            .to_string()
+            .contains("Failed to apply pod port mappings"));
+        assert_eq!(port_mapper.take_added().len(), 1);
+        let removed = port_mapper.take_removed();
+        assert!(removed.iter().any(|mapping| mapping.host_port == 8080));
+        let calls = network.take_calls();
+        assert!(calls
+            .iter()
+            .any(|call| call.starts_with("teardown_network:")));
+        assert!(calls.iter().any(|call| call.starts_with("remove_netns:")));
+        assert!(manager.pods.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restored_pod_sandbox_remove_cleans_up_port_mappings() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RecordingRuntime::default();
+        let network = RecordingNetworkManager::default();
+        let port_mapper = RecordingPortMapper::default();
+        let mut manager = PodSandboxManager::with_network_manager(
+            runtime,
+            network,
+            Box::new(port_mapper.clone()),
+            false,
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
+        );
+
+        manager.restore_pod_sandbox(PodSandbox {
+            id: "pod-1".to_string(),
+            config: PodSandboxConfig {
+                port_mappings: vec![PortMapping {
+                    protocol: "TCP".to_string(),
+                    container_port: 80,
+                    host_port: 8080,
+                    host_ip: String::new(),
+                }],
+                ..test_pod_config()
+            },
+            netns_path: PathBuf::from("/var/run/netns/pod-1"),
+            pause_container_id: "pause-pod-1".to_string(),
+            state: PodSandboxState::Ready,
+            created_at: 1,
+            ip: "10.88.0.2".to_string(),
+            network_status: Some(NetworkStatus {
+                name: "test".to_string(),
+                ip: Some("10.88.0.2".parse().unwrap()),
+                mac: None,
+                interfaces: vec![],
+                raw_result: None,
+            }),
+        });
+
+        manager.remove_pod_sandbox("pod-1").await.unwrap();
+        let removed = port_mapper.take_removed();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].container_ip.to_string(), "10.88.0.2");
+        assert_eq!(removed[0].host_port, 8080);
+    }
+
+    #[tokio::test]
+    async fn rebuild_port_mappings_skips_cleanup_when_hostport_mapping_is_disabled() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RecordingRuntime::default();
+        let network = RecordingNetworkManager::default();
+        let port_mapper = RecordingPortMapper::default();
+        let mut manager = PodSandboxManager::with_network_manager(
+            runtime,
+            network,
+            Box::new(port_mapper.clone()),
+            false,
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
+        );
+        manager.disable_hostport_mapping = true;
+
+        manager.restore_pod_sandbox(PodSandbox {
+            id: "pod-1".to_string(),
+            config: PodSandboxConfig {
+                port_mappings: vec![PortMapping {
+                    protocol: "TCP".to_string(),
+                    container_port: 80,
+                    host_port: 8080,
+                    host_ip: String::new(),
+                }],
+                ..test_pod_config()
+            },
+            netns_path: PathBuf::from("/var/run/netns/pod-1"),
+            pause_container_id: "pause-pod-1".to_string(),
+            state: PodSandboxState::Ready,
+            created_at: 1,
+            ip: "10.88.0.2".to_string(),
+            network_status: Some(NetworkStatus {
+                name: "test".to_string(),
+                ip: Some("10.88.0.2".parse().unwrap()),
+                mac: None,
+                interfaces: vec![],
+                raw_result: None,
+            }),
+        });
+
+        manager.rebuild_port_mappings();
+
+        assert_eq!(port_mapper.cleanup_calls(), 0);
+        assert!(port_mapper.take_added().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rebuild_port_mappings_cleans_existing_rules_before_reapplying_recovered_pods() {
+        let temp_dir = tempdir().unwrap();
+        let runtime = RecordingRuntime::default();
+        let network = RecordingNetworkManager::default();
+        let port_mapper = RecordingPortMapper::default();
+        let mut manager = PodSandboxManager::with_network_manager(
+            runtime,
+            network,
+            Box::new(port_mapper.clone()),
+            false,
+            temp_dir.path().join("pods"),
+            "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
+        );
+
+        manager.restore_pod_sandbox(PodSandbox {
+            id: "pod-1".to_string(),
+            config: PodSandboxConfig {
+                port_mappings: vec![PortMapping {
+                    protocol: "TCP".to_string(),
+                    container_port: 80,
+                    host_port: 8080,
+                    host_ip: String::new(),
+                }],
+                ..test_pod_config()
+            },
+            netns_path: PathBuf::from("/var/run/netns/pod-1"),
+            pause_container_id: "pause-pod-1".to_string(),
+            state: PodSandboxState::Ready,
+            created_at: 1,
+            ip: "10.88.0.2".to_string(),
+            network_status: Some(NetworkStatus {
+                name: "test".to_string(),
+                ip: Some("10.88.0.2".parse().unwrap()),
+                mac: None,
+                interfaces: vec![],
+                raw_result: None,
+            }),
+        });
+
+        manager.rebuild_port_mappings();
+
+        assert_eq!(port_mapper.cleanup_calls(), 1);
+        let added = port_mapper.take_added();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].host_port, 8080);
+    }
+
     // 注意：这些测试需要root权限和runc环境
     #[tokio::test]
     #[ignore = "requires root and runc"]
@@ -946,6 +2134,7 @@ mod tests {
             runtime,
             temp_dir.path().join("pods"),
             "registry.k8s.io/pause:3.9".to_string(),
+            "/pause".to_string(),
             CniConfig::default(),
         );
 
@@ -969,6 +2158,7 @@ mod tests {
             run_as_group: None,
             supplemental_groups: vec![],
             readonly_rootfs: false,
+            pids_limit: None,
             no_new_privileges: None,
             apparmor_profile: None,
             selinux_label: None,

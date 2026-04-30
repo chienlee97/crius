@@ -1,19 +1,22 @@
 use anyhow::{Context, Result};
 use log::{debug, error, info};
+use nix::libc;
 use nix::sys::stat::{major, makedev, minor, mknod, stat, Mode, SFlag};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::os::unix::net::UnixStream as StdUnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
+use thiserror::Error;
 
 use crate::cgroups::{to_oci_resources, CgroupManager, CpuLimit, MemoryLimit, ResourceLimits};
 use crate::oci::spec::{
-    Device as OciDevice, Linux, LinuxCapabilities, LinuxDeviceCgroup, LinuxResources, Mount,
-    Namespace as OciNamespace, Process, Root, Spec, User,
+    Device as OciDevice, Linux, LinuxCapabilities, LinuxDeviceCgroup, LinuxPids, LinuxResources,
+    Mount, Namespace as OciNamespace, Process, Root, Spec, User,
 };
 use crate::proto::runtime::v1::{
     Capability, LinuxContainerResources, NamespaceMode, NamespaceOption,
@@ -24,6 +27,30 @@ pub use shim_manager::{default_shim_work_dir, ShimConfig, ShimManager, ShimProce
 
 const INTERNAL_CHECKPOINT_RESTORE_KEY: &str = "io.crius.internal/checkpoint-restore";
 const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";
+const DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS: u32 = 240;
+const STOP_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+const STOP_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+const STOP_KILL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug, Error)]
+pub enum ImageAvailabilityError {
+    #[error("image {image_ref} is not available locally; pull it before creating the container")]
+    NotPresentLocally { image_ref: String },
+    #[error("image {image_ref} has no unpackable layers in {image_dir}")]
+    NoLayers {
+        image_ref: String,
+        image_dir: PathBuf,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum LogReopenError {
+    #[error("container {container_id} reopen log control socket {socket_path} is missing")]
+    MissingSocket {
+        container_id: String,
+        socket_path: PathBuf,
+    },
+}
 
 /// 容器运行时接口
 pub trait ContainerRuntime {
@@ -78,6 +105,7 @@ pub struct ContainerConfig {
     pub stdin_once: bool,
     pub log_path: Option<PathBuf>,
     pub readonly_rootfs: bool,
+    pub pids_limit: Option<i64>,
     pub no_new_privileges: Option<bool>,
     pub apparmor_profile: Option<String>,
     pub selinux_label: Option<String>,
@@ -170,9 +198,85 @@ pub struct RuncRuntime {
     root: PathBuf,
     image_storage_root: PathBuf,
     shim_manager: Option<Arc<ShimManager>>,
+    default_env: Vec<(String, String)>,
+    default_capabilities: Vec<String>,
+    default_sysctls: HashMap<String, String>,
+    container_create_timeout_secs: u32,
+    container_stop_timeout_secs: u32,
+    criu_path: PathBuf,
+    restrict_oom_score_adj: bool,
+    bind_mount_prefix: PathBuf,
+    disable_cgroup: bool,
+    default_seccomp_profile_path: Option<PathBuf>,
+    exec_cpu_affinity: String,
+    no_pivot: bool,
 }
 
 impl RuncRuntime {
+    fn ensure_container_create_not_expired(
+        &self,
+        deadline: std::time::Instant,
+        phase: &str,
+    ) -> Result<()> {
+        if std::time::Instant::now() > deadline {
+            return Err(anyhow::anyhow!(
+                "container create phase {} exceeded runtime create timeout of {}s",
+                phase,
+                self.container_create_timeout_secs
+            ));
+        }
+        Ok(())
+    }
+
+    fn wait_for_container_stop_until(
+        &self,
+        container_id: &str,
+        deadline: std::time::Instant,
+    ) -> Result<bool> {
+        let mut backoff = STOP_INITIAL_BACKOFF;
+
+        loop {
+            match self.get_runc_state(container_id)? {
+                None => return Ok(true),
+                Some(state) if state.status == "stopped" => return Ok(true),
+                _ => {}
+            }
+
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return Ok(false);
+            };
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+
+            std::thread::sleep(std::cmp::min(backoff, remaining));
+            backoff = std::cmp::min(backoff.saturating_mul(2), STOP_MAX_BACKOFF);
+        }
+    }
+
+    fn stop_shim_if_running(&self, container_id: &str) -> Result<()> {
+        if let Some(shim_manager) = &self.shim_manager {
+            if shim_manager.is_shim_running(container_id) {
+                shim_manager.stop_shim(container_id)?;
+                info!("Shim for container {} stopped", container_id);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn daemon_oom_score_adj() -> Result<i64> {
+        let raw = std::fs::read_to_string("/proc/self/oom_score_adj")
+            .context("could not get the daemon oom_score_adj")?;
+        raw.trim()
+            .parse::<i64>()
+            .context("could not get the daemon oom_score_adj")
+    }
+
+    pub(crate) fn restrict_oom_score_adj_floor(preferred: i64) -> Result<i64> {
+        let current = Self::daemon_oom_score_adj()?;
+        Ok(preferred.max(current))
+    }
+
     fn insert_label_annotation(
         annotations: &mut std::collections::HashMap<String, String>,
         labels: &[(String, String)],
@@ -369,12 +473,45 @@ impl RuncRuntime {
         }
     }
 
+    fn merged_env(&self, requested: &[(String, String)]) -> Vec<(String, String)> {
+        let mut merged = self.default_env.clone();
+        for (key, value) in requested {
+            if let Some((_, existing_value)) =
+                merged.iter_mut().find(|(existing_key, _)| existing_key == key)
+            {
+                *existing_value = value.clone();
+            } else {
+                merged.push((key.clone(), value.clone()));
+            }
+        }
+        merged
+    }
+
+    fn merged_sysctls(&self, requested: &HashMap<String, String>) -> HashMap<String, String> {
+        let mut merged = self.default_sysctls.clone();
+        for (key, value) in requested {
+            merged.insert(key.clone(), value.clone());
+        }
+        merged
+    }
+
     fn build_user(config: &ContainerConfig) -> Option<User> {
-        let user = config.user.as_ref()?;
         let additional_gids = if config.supplemental_groups.is_empty() {
             None
         } else {
             Some(config.supplemental_groups.clone())
+        };
+
+        let Some(user) = config.user.as_ref() else {
+            if config.run_as_group.is_none() && additional_gids.is_none() {
+                return None;
+            }
+            return Some(User {
+                uid: 0,
+                gid: config.run_as_group.unwrap_or(0),
+                additional_gids,
+                username: None,
+            });
         };
 
         if let Ok(uid) = user.parse::<u32>() {
@@ -468,13 +605,262 @@ impl RuncRuntime {
         namespaces
     }
 
+    fn build_user_namespace_mappings(
+        config: &ContainerConfig,
+    ) -> Result<(
+        Option<Vec<crate::oci::spec::IdMapping>>,
+        Option<Vec<crate::oci::spec::IdMapping>>,
+    )> {
+        let Some(userns) = config
+            .namespace_options
+            .as_ref()
+            .and_then(|options| options.userns_options.as_ref())
+        else {
+            return Ok((None, None));
+        };
+
+        match userns.mode {
+            mode if mode == NamespaceMode::Node as i32 => {
+                if !userns.uids.is_empty() || !userns.gids.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "user namespace mode NODE must not include uid/gid mappings"
+                    ));
+                }
+                Ok((None, None))
+            }
+            mode if mode == NamespaceMode::Pod as i32 => {
+                if userns.uids.is_empty() || userns.gids.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "user namespace mode POD requires both uid and gid mappings"
+                    ));
+                }
+
+                let uid_mappings = userns
+                    .uids
+                    .iter()
+                    .map(|mapping| crate::oci::spec::IdMapping {
+                        container_id: mapping.container_id,
+                        host_id: mapping.host_id,
+                        size: mapping.length,
+                    })
+                    .collect();
+                let gid_mappings = userns
+                    .gids
+                    .iter()
+                    .map(|mapping| crate::oci::spec::IdMapping {
+                        container_id: mapping.container_id,
+                        host_id: mapping.host_id,
+                        size: mapping.length,
+                    })
+                    .collect();
+                Ok((Some(uid_mappings), Some(gid_mappings)))
+            }
+            other => Err(anyhow::anyhow!("unsupported user namespace mode {}", other)),
+        }
+    }
+
+    fn host_ipc_enabled(config: &ContainerConfig) -> bool {
+        matches!(
+            config.namespace_options.as_ref().map(|options| options.ipc),
+            Some(mode) if mode == NamespaceMode::Node as i32
+        )
+    }
+
+    fn requested_oom_score_adj(config: &ContainerConfig) -> Option<i64> {
+        config
+            .linux_resources
+            .as_ref()
+            .map(|resources| resources.oom_score_adj)
+            .filter(|oom_score_adj| *oom_score_adj != 0)
+    }
+
+    fn normalized_oom_score_adj(&self, preferred: i64) -> Result<i32> {
+        let adjusted = if self.restrict_oom_score_adj {
+            Self::restrict_oom_score_adj_floor(preferred)?
+        } else {
+            preferred
+        };
+        i32::try_from(adjusted)
+            .with_context(|| format!("oom_score_adj {adjusted} does not fit in i32"))
+    }
+
+    fn apply_oom_score_adj_policy(&self, spec: &mut Spec, requested: Option<i64>) -> Result<()> {
+        let preferred = requested.or_else(|| {
+            spec.process
+                .as_ref()
+                .and_then(|process| process.oom_score_adj.map(i64::from))
+        });
+        let Some(preferred) = preferred else {
+            return Ok(());
+        };
+        let process = spec
+            .process
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("OCI spec is missing process configuration"))?;
+        process.oom_score_adj = Some(self.normalized_oom_score_adj(preferred)?);
+        Ok(())
+    }
+
+    pub fn enforce_oom_score_adj_policy(&self, spec: &mut Spec) -> Result<()> {
+        self.apply_oom_score_adj_policy(spec, None)
+    }
+
+    fn prefixed_bind_mount_source(&self, source: &Path) -> PathBuf {
+        if self.bind_mount_prefix.as_os_str().is_empty() {
+            return source.to_path_buf();
+        }
+
+        if source.is_absolute() {
+            let suffix = source.strip_prefix(Path::new("/")).unwrap_or(source);
+            self.bind_mount_prefix.join(suffix)
+        } else {
+            self.bind_mount_prefix.join(source)
+        }
+    }
+
+    fn build_mounts(&self, config: &ContainerConfig, keep_hugepages_mount: bool) -> Vec<Mount> {
+        let custom_mounts: Vec<Mount> = config
+            .mounts
+            .iter()
+            .map(|m| Mount {
+                destination: m.destination.to_string_lossy().to_string(),
+                source: Some(
+                    self.prefixed_bind_mount_source(&m.source)
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                mount_type: Some("bind".to_string()),
+                options: if m.read_only {
+                    Some(if m.source.is_dir() {
+                        vec!["rbind".to_string(), "ro".to_string()]
+                    } else {
+                        vec!["bind".to_string(), "ro".to_string()]
+                    })
+                } else {
+                    Some(if m.source.is_dir() {
+                        vec!["rbind".to_string(), "rw".to_string()]
+                    } else {
+                        vec!["bind".to_string(), "rw".to_string()]
+                    })
+                },
+            })
+            .collect();
+
+        let mut overridden_destinations: HashSet<String> = custom_mounts
+            .iter()
+            .map(|mount| mount.destination.clone())
+            .collect();
+        if Self::host_ipc_enabled(config) {
+            overridden_destinations.insert("/dev/shm".to_string());
+            overridden_destinations.insert("/dev/mqueue".to_string());
+        }
+
+        let mut mounts: Vec<Mount> = Spec::default_mounts()
+            .into_iter()
+            .filter(|mount| {
+                !overridden_destinations.contains(&mount.destination)
+                    && mount.destination != "/sys/fs/cgroup"
+                    && (keep_hugepages_mount || mount.destination != "/dev/hugepages")
+            })
+            .collect();
+
+        if Self::host_ipc_enabled(config) {
+            mounts.push(Mount {
+                destination: "/dev/shm".to_string(),
+                source: Some(
+                    self.prefixed_bind_mount_source(Path::new("/dev/shm"))
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                mount_type: Some("bind".to_string()),
+                options: Some(vec!["rbind".to_string(), "rw".to_string()]),
+            });
+            mounts.push(Mount {
+                destination: "/dev/mqueue".to_string(),
+                source: Some(
+                    self.prefixed_bind_mount_source(Path::new("/dev/mqueue"))
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                mount_type: Some("bind".to_string()),
+                options: Some(vec!["rbind".to_string(), "rw".to_string()]),
+            });
+        }
+
+        mounts.extend(custom_mounts);
+        mounts
+    }
+
+    pub(crate) fn first_cpu_from_cpuset(cpuset: &str) -> Option<usize> {
+        cpuset
+            .split(',')
+            .map(str::trim)
+            .find(|entry| !entry.is_empty())
+            .and_then(|entry| {
+                entry
+                    .split_once('-')
+                    .map(|(start, _)| start)
+                    .or(Some(entry))
+            })
+            .and_then(|entry| entry.parse::<usize>().ok())
+    }
+
+    pub(crate) fn apply_exec_cpu_affinity_to_std_command(
+        command: &mut Command,
+        cpu: Option<usize>,
+    ) {
+        let Some(cpu) = cpu else {
+            return;
+        };
+        unsafe {
+            command.pre_exec(move || {
+                let mut set = nix::sched::CpuSet::new();
+                set.set(cpu)
+                    .map_err(|err| std::io::Error::other(err.to_string()))?;
+                nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set)
+                    .map_err(|err| std::io::Error::other(err.to_string()))?;
+                Ok(())
+            });
+        }
+    }
+
+    pub(crate) fn apply_exec_cpu_affinity_to_tokio_command(
+        command: &mut tokio::process::Command,
+        cpu: Option<usize>,
+    ) {
+        let Some(cpu) = cpu else {
+            return;
+        };
+        unsafe {
+            command.pre_exec(move || {
+                let mut set = nix::sched::CpuSet::new();
+                set.set(cpu)
+                    .map_err(|err| std::io::Error::other(err.to_string()))?;
+                nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set)
+                    .map_err(|err| std::io::Error::other(err.to_string()))?;
+                Ok(())
+            });
+        }
+    }
+
     fn load_seccomp_profile(
         &self,
         profile: Option<&SeccompProfile>,
     ) -> Result<Option<crate::oci::spec::Seccomp>> {
         match profile {
             None => Ok(None),
-            Some(SeccompProfile::RuntimeDefault) => Ok(None),
+            Some(SeccompProfile::RuntimeDefault) => {
+                if let Some(path) = self.default_seccomp_profile_path.as_ref() {
+                    let content = std::fs::read_to_string(path).with_context(|| {
+                        format!("Failed to read default seccomp profile from {:?}", path)
+                    })?;
+                    let seccomp = serde_json::from_str(&content).with_context(|| {
+                        format!("Failed to parse default seccomp profile JSON from {:?}", path)
+                    })?;
+                    return Ok(Some(seccomp));
+                }
+                Ok(Some(Self::builtin_runtime_default_seccomp()))
+            }
             Some(SeccompProfile::Unconfined) => Ok(None),
             Some(SeccompProfile::Localhost(path)) => {
                 let content = std::fs::read_to_string(path)
@@ -484,6 +870,47 @@ impl RuncRuntime {
                 })?;
                 Ok(Some(seccomp))
             }
+        }
+    }
+
+    fn builtin_runtime_default_seccomp() -> crate::oci::spec::Seccomp {
+        let architectures = match std::env::consts::ARCH {
+            "x86_64" => vec![
+                "SCMP_ARCH_X86_64".to_string(),
+                "SCMP_ARCH_X86".to_string(),
+                "SCMP_ARCH_X32".to_string(),
+            ],
+            "aarch64" => vec!["SCMP_ARCH_AARCH64".to_string(), "SCMP_ARCH_ARM".to_string()],
+            "riscv64" => vec!["SCMP_ARCH_RISCV64".to_string()],
+            "s390x" => vec!["SCMP_ARCH_S390X".to_string(), "SCMP_ARCH_S390".to_string()],
+            _ => Vec::new(),
+        };
+        crate::oci::spec::Seccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
+            architectures: (!architectures.is_empty()).then_some(architectures),
+            flags: None,
+            listener_path: None,
+            listener_metadata: None,
+            syscalls: Some(vec![crate::oci::spec::SeccompSyscall {
+                action: "SCMP_ACT_ERRNO".to_string(),
+                names: vec![
+                    "fsconfig".to_string(),
+                    "fsmount".to_string(),
+                    "fsopen".to_string(),
+                    "fspick".to_string(),
+                    "mount".to_string(),
+                    "mount_setattr".to_string(),
+                    "move_mount".to_string(),
+                    "open_tree".to_string(),
+                    "pivot_root".to_string(),
+                    "setns".to_string(),
+                    "umount2".to_string(),
+                    "unshare".to_string(),
+                ],
+                args: None,
+                errno_ret: Some(libc::EPERM as u32),
+            }]),
         }
     }
 
@@ -624,6 +1051,12 @@ impl RuncRuntime {
 
     fn resolve_image_dir(&self, image_ref: &str) -> Result<PathBuf> {
         let images_dir = self.image_storage_root.join("images");
+        if !images_dir.exists() {
+            return Err(ImageAvailabilityError::NotPresentLocally {
+                image_ref: image_ref.to_string(),
+            }
+            .into());
+        }
         let entries = std::fs::read_dir(&images_dir)
             .with_context(|| format!("Failed to read images directory: {:?}", images_dir))?;
 
@@ -665,10 +1098,10 @@ impl RuncRuntime {
             }
         }
 
-        Err(anyhow::anyhow!(
-            "Image not found locally for reference: {}",
-            image_ref
-        ))
+        Err(ImageAvailabilityError::NotPresentLocally {
+            image_ref: image_ref.to_string(),
+        }
+        .into())
     }
 
     fn prepare_rootfs_from_image(
@@ -698,11 +1131,11 @@ impl RuncRuntime {
         });
 
         if layer_files.is_empty() {
-            return Err(anyhow::anyhow!(
-                "No image layers found in {:?} for image {}",
-                image_dir,
-                image_ref
-            ));
+            return Err(ImageAvailabilityError::NoLayers {
+                image_ref: image_ref.to_string(),
+                image_dir: image_dir.clone(),
+            }
+            .into());
         }
 
         for layer_file in &layer_files {
@@ -765,10 +1198,10 @@ impl RuncRuntime {
                 args.extend(config.args.clone());
                 process.args = args;
             }
-            if !config.env.is_empty() {
+            let merged_env = self.merged_env(&config.env);
+            if !merged_env.is_empty() {
                 process.env = Some(
-                    config
-                        .env
+                    merged_env
                         .iter()
                         .map(|(key, value)| format!("{}={}", key, value))
                         .collect(),
@@ -776,14 +1209,33 @@ impl RuncRuntime {
             }
         }
 
-        if let Some(linux) = spec.linux.as_mut() {
-            linux.namespaces = Some(self.build_namespaces(config));
-            linux.cgroups_path = config.cgroup_parent.clone();
-            linux.seccomp = self.load_seccomp_profile(config.seccomp_profile.as_ref())?;
-            linux.mount_label = config.selinux_label.clone();
-            if !config.sysctls.is_empty() {
-                linux.sysctl = Some(config.sysctls.clone());
-            }
+        let linux = spec.linux.get_or_insert_with(|| Linux {
+            namespaces: None,
+            uid_mappings: None,
+            gid_mappings: None,
+            devices: None,
+            net_devices: None,
+            cgroups_path: None,
+            resources: None,
+            rootfs_propagation: None,
+            seccomp: None,
+            sysctl: None,
+            mount_label: None,
+            intel_rdt: None,
+        });
+        linux.namespaces = Some(self.build_namespaces(config));
+        linux.cgroups_path = if self.disable_cgroup {
+            None
+        } else {
+            config.cgroup_parent.clone()
+        };
+        linux.seccomp = self.load_seccomp_profile(config.seccomp_profile.as_ref())?;
+        linux.mount_label = config.selinux_label.clone();
+        let merged_sysctls = self.merged_sysctls(&config.sysctls);
+        if !merged_sysctls.is_empty() {
+            linux.sysctl = Some(merged_sysctls);
+        }
+        if !self.disable_cgroup {
             if let Some(resources) = config
                 .linux_resources
                 .as_ref()
@@ -791,7 +1243,24 @@ impl RuncRuntime {
             {
                 linux.resources = Some(resources);
             }
+            if let Some(limit) = config.pids_limit {
+                linux
+                    .resources
+                    .get_or_insert_with(|| LinuxResources {
+                        network: None,
+                        pids: None,
+                        memory: None,
+                        cpu: None,
+                        block_io: None,
+                        hugepage_limits: None,
+                        devices: None,
+                        intel_rdt: None,
+                        unified: None,
+                    })
+                    .pids = Some(LinuxPids { limit });
+            }
         }
+        self.apply_oom_score_adj_policy(&mut spec, Self::requested_oom_score_adj(config))?;
 
         let mut annotations = spec.annotations.unwrap_or_default();
         annotations.insert(
@@ -807,8 +1276,12 @@ impl RuncRuntime {
         Ok(spec)
     }
 
-    pub fn checkpoint_container(&self, container_id: &str, image_path: &Path) -> Result<()> {
-        let work_path = image_path.join("work");
+    pub fn checkpoint_container(
+        &self,
+        container_id: &str,
+        image_path: &Path,
+        work_path: &Path,
+    ) -> Result<()> {
         std::fs::create_dir_all(image_path).with_context(|| {
             format!(
                 "Failed to create checkpoint image directory {}",
@@ -822,16 +1295,24 @@ impl RuncRuntime {
             )
         })?;
 
-        self.runc_exec(&[
+        let image_path = image_path.to_string_lossy().to_string();
+        let work_path = work_path.to_string_lossy().to_string();
+        let mut checkpoint_args = vec![
             "checkpoint",
             "--file-locks",
             "--image-path",
-            &image_path.to_string_lossy(),
+            image_path.as_str(),
             "--work-path",
-            &work_path.to_string_lossy(),
+            work_path.as_str(),
             "--leave-running",
-            container_id,
-        ])
+        ];
+        let criu_path = self.criu_path.to_string_lossy().to_string();
+        if !criu_path.is_empty() {
+            checkpoint_args.push("--criu");
+            checkpoint_args.push(criu_path.as_str());
+        }
+        checkpoint_args.push(container_id);
+        self.runc_exec(&checkpoint_args)
     }
 
     pub fn pause_container(&self, container_id: &str) -> Result<()> {
@@ -871,8 +1352,8 @@ impl RuncRuntime {
         &self,
         container_id: &str,
         image_path: &Path,
+        work_path: &Path,
     ) -> Result<()> {
-        let work_path = image_path.join("work");
         std::fs::create_dir_all(&work_path).with_context(|| {
             format!(
                 "Failed to create restore work directory {}",
@@ -883,18 +1364,29 @@ impl RuncRuntime {
 
         self.restore_rootfs_snapshot(container_id, image_path)?;
 
-        self.runc_exec(&[
+        let image_path = image_path.to_string_lossy().to_string();
+        let work_path = work_path.to_string_lossy().to_string();
+        let bundle_path = bundle_path.to_string_lossy().to_string();
+        let mut restore_args = vec![
             "restore",
             "-d",
             "--image-path",
-            &image_path.to_string_lossy(),
+            image_path.as_str(),
             "--work-path",
-            &work_path.to_string_lossy(),
+            work_path.as_str(),
             "--bundle",
-            &bundle_path.to_string_lossy(),
-            "--no-pivot",
-            container_id,
-        ])
+            bundle_path.as_str(),
+        ];
+        let criu_path = self.criu_path.to_string_lossy().to_string();
+        if !criu_path.is_empty() {
+            restore_args.push("--criu");
+            restore_args.push(criu_path.as_str());
+        }
+        if self.no_pivot {
+            restore_args.push("--no-pivot");
+        }
+        restore_args.push(container_id);
+        self.runc_exec(&restore_args)
     }
 
     pub fn restore_attach_shim(&self, container_id: &str) -> Result<()> {
@@ -932,6 +1424,18 @@ impl RuncRuntime {
             root,
             image_storage_root,
             shim_manager: None,
+            default_env: Vec::new(),
+            default_capabilities: Self::default_capabilities(),
+            default_sysctls: HashMap::new(),
+            container_create_timeout_secs: DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS,
+            container_stop_timeout_secs: 30,
+            criu_path: PathBuf::new(),
+            restrict_oom_score_adj: false,
+            bind_mount_prefix: PathBuf::new(),
+            disable_cgroup: false,
+            default_seccomp_profile_path: None,
+            exec_cpu_affinity: String::new(),
+            no_pivot: false,
         }
     }
 
@@ -950,18 +1454,83 @@ impl RuncRuntime {
         image_storage_root: PathBuf,
         shim_config: ShimConfig,
     ) -> Self {
+        let no_pivot = shim_config.no_pivot;
         let shim_manager = Arc::new(ShimManager::new(shim_config));
         Self {
             runtime_path,
             root,
             image_storage_root,
             shim_manager: Some(shim_manager),
+            default_env: Vec::new(),
+            default_capabilities: Self::default_capabilities(),
+            default_sysctls: HashMap::new(),
+            container_create_timeout_secs: DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS,
+            container_stop_timeout_secs: 30,
+            criu_path: PathBuf::new(),
+            restrict_oom_score_adj: false,
+            bind_mount_prefix: PathBuf::new(),
+            disable_cgroup: false,
+            default_seccomp_profile_path: None,
+            exec_cpu_affinity: String::new(),
+            no_pivot,
         }
     }
 
     /// 启用shim支持
     pub fn enable_shim(&mut self, config: ShimConfig) {
+        self.no_pivot = config.no_pivot;
         self.shim_manager = Some(Arc::new(ShimManager::new(config)));
+    }
+
+    pub fn set_restrict_oom_score_adj(&mut self, restrict: bool) {
+        self.restrict_oom_score_adj = restrict;
+    }
+
+    pub fn set_container_stop_timeout_secs(&mut self, timeout_secs: u32) {
+        self.container_stop_timeout_secs = timeout_secs;
+    }
+
+    pub fn set_container_create_timeout_secs(&mut self, timeout_secs: u32) {
+        self.container_create_timeout_secs = timeout_secs;
+    }
+
+    pub fn set_default_env(&mut self, default_env: Vec<(String, String)>) {
+        self.default_env = default_env;
+    }
+
+    pub fn set_default_capabilities(&mut self, default_capabilities: Vec<String>) {
+        self.default_capabilities = default_capabilities
+            .into_iter()
+            .map(|capability| Self::normalize_capability_name(&capability))
+            .collect();
+    }
+
+    pub fn set_default_sysctls(&mut self, default_sysctls: HashMap<String, String>) {
+        self.default_sysctls = default_sysctls;
+    }
+
+    pub fn set_criu_path(&mut self, criu_path: PathBuf) {
+        self.criu_path = criu_path;
+    }
+
+    pub fn set_bind_mount_prefix(&mut self, bind_mount_prefix: PathBuf) {
+        self.bind_mount_prefix = bind_mount_prefix;
+    }
+
+    pub fn set_disable_cgroup(&mut self, disable_cgroup: bool) {
+        self.disable_cgroup = disable_cgroup;
+    }
+
+    pub fn set_default_seccomp_profile_path(&mut self, path: PathBuf) {
+        self.default_seccomp_profile_path = (!path.as_os_str().is_empty()).then_some(path);
+    }
+
+    pub fn set_exec_cpu_affinity(&mut self, exec_cpu_affinity: String) {
+        self.exec_cpu_affinity = exec_cpu_affinity;
+    }
+
+    pub fn set_no_pivot(&mut self, no_pivot: bool) {
+        self.no_pivot = no_pivot;
     }
 
     /// 检查是否启用了shim
@@ -972,6 +1541,18 @@ impl RuncRuntime {
     /// 获取容器的bundle目录
     fn bundle_path(&self, container_id: &str) -> PathBuf {
         self.root.join(container_id)
+    }
+
+    pub fn bundle_path_for(&self, container_id: &str) -> PathBuf {
+        self.bundle_path(container_id)
+    }
+
+    pub fn runtime_root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn runtime_path(&self) -> &Path {
+        &self.runtime_path
     }
 
     /// 获取容器的config.json路径
@@ -1056,8 +1637,8 @@ impl RuncRuntime {
         }
 
         // 转换环境变量为字符串格式
-        let env: Vec<String> = config
-            .env
+        let env: Vec<String> = self
+            .merged_env(&config.env)
             .iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
@@ -1073,7 +1654,7 @@ impl RuncRuntime {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "/".to_string()),
             capabilities: Some(Self::apply_capability_overrides(
-                &Self::default_capabilities(),
+                &self.default_capabilities,
                 config.capabilities.as_ref(),
             )),
             rlimits: None,
@@ -1084,47 +1665,16 @@ impl RuncRuntime {
             selinux_label: config.selinux_label.clone(),
             io_priority: None,
         });
+        self.apply_oom_score_adj_policy(&mut spec, Self::requested_oom_score_adj(config))?;
 
         // 设置主机名
         spec.hostname = config.hostname.clone();
 
         // 设置挂载点
-        let default_mounts = Spec::default_mounts();
-        let custom_mounts: Vec<Mount> = config
-            .mounts
-            .iter()
-            .map(|m| Mount {
-                destination: m.destination.to_string_lossy().to_string(),
-                source: Some(m.source.to_string_lossy().to_string()),
-                mount_type: Some("bind".to_string()),
-                options: if m.read_only {
-                    Some(if m.source.is_dir() {
-                        vec!["rbind".to_string(), "ro".to_string()]
-                    } else {
-                        vec!["bind".to_string(), "ro".to_string()]
-                    })
-                } else {
-                    Some(if m.source.is_dir() {
-                        vec!["rbind".to_string(), "rw".to_string()]
-                    } else {
-                        vec!["bind".to_string(), "rw".to_string()]
-                    })
-                },
-            })
-            .collect();
-
         let keep_hugepages_mount = std::env::var("CRIUS_ENABLE_HUGEPAGES_MOUNT")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let mut all_mounts: Vec<Mount> = default_mounts
-            .into_iter()
-            .filter(|m| {
-                m.destination != "/sys/fs/cgroup"
-                    && (keep_hugepages_mount || m.destination != "/dev/hugepages")
-            })
-            .collect();
-        all_mounts.extend(custom_mounts);
-        spec.mounts = Some(all_mounts);
+        spec.mounts = Some(self.build_mounts(config, keep_hugepages_mount));
 
         // 设置Linux配置
         let mut devices = if config.privileged {
@@ -1157,6 +1707,10 @@ impl RuncRuntime {
             resources.devices = Some(extra_cgroup_rules);
         }
 
+        if let Some(limit) = config.pids_limit {
+            resources.pids = Some(LinuxPids { limit });
+        }
+
         if resources.devices.is_none() {
             resources.devices = Some(vec![LinuxDeviceCgroup {
                 allow: true,
@@ -1167,24 +1721,46 @@ impl RuncRuntime {
             }]);
         }
 
+        let mut namespaces = self.build_namespaces(config);
+        let (uid_mappings, gid_mappings) = Self::build_user_namespace_mappings(config)?;
+        if uid_mappings.is_some()
+            && !namespaces
+                .iter()
+                .any(|namespace| namespace.ns_type == "user")
+        {
+            namespaces.push(OciNamespace {
+                ns_type: "user".to_string(),
+                path: None,
+            });
+        }
+
         spec.linux = Some(Linux {
-            namespaces: Some(self.build_namespaces(config)),
-            uid_mappings: None,
-            gid_mappings: None,
+            namespaces: Some(namespaces),
+            uid_mappings,
+            gid_mappings,
             devices: Some(devices),
             net_devices: None,
-            cgroups_path: config.cgroup_parent.clone(),
-            resources: Some(resources),
-            rootfs_propagation: None,
-            seccomp: self.load_seccomp_profile(config.seccomp_profile.as_ref())?,
-            sysctl: if config.sysctls.is_empty() {
+            cgroups_path: if self.disable_cgroup {
                 None
             } else {
-                Some(config.sysctls.clone())
+                config.cgroup_parent.clone()
+            },
+            resources: if self.disable_cgroup {
+                None
+            } else {
+                Some(resources)
+            },
+            rootfs_propagation: None,
+            seccomp: self.load_seccomp_profile(config.seccomp_profile.as_ref())?,
+            sysctl: if self.merged_sysctls(&config.sysctls).is_empty() {
+                None
+            } else {
+                Some(self.merged_sysctls(&config.sysctls))
             },
             mount_label: config.selinux_label.clone(),
             intel_rdt: None,
         });
+        self.apply_oom_score_adj_policy(&mut spec, Self::requested_oom_score_adj(config))?;
 
         // 设置注解
         let mut annotations = std::collections::HashMap::new();
@@ -1313,7 +1889,14 @@ impl RuncRuntime {
             .shim_manager
             .as_ref()
             .context("container log reopen requires shim-enabled runtime")?;
-        let socket_path = shim_manager.socket_path(container_id, "reopen.sock");
+        let socket_path = shim_manager.shim_socket_path(container_id, "reopen.sock");
+        if !socket_path.exists() {
+            return Err(LogReopenError::MissingSocket {
+                container_id: container_id.to_string(),
+                socket_path,
+            }
+            .into());
+        }
         let mut stream = StdUnixStream::connect(&socket_path).with_context(|| {
             format!(
                 "Failed to connect reopen log socket {}",
@@ -1363,11 +1946,16 @@ impl RuncRuntime {
 impl ContainerRuntime for RuncRuntime {
     fn create_container(&self, container_id: &str, config: &ContainerConfig) -> Result<String> {
         info!("Creating container {}", container_id);
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(self.container_create_timeout_secs as u64);
 
         // 分步 create 链路：prepare_rootfs -> build_spec -> write_bundle。
         self.prepare_rootfs(container_id, config)?;
+        self.ensure_container_create_not_expired(deadline, "prepare_rootfs")?;
         let spec = self.build_spec(container_id, config)?;
+        self.ensure_container_create_not_expired(deadline, "build_spec")?;
         self.write_bundle(container_id, &config.rootfs, &spec)?;
+        self.ensure_container_create_not_expired(deadline, "write_bundle")?;
 
         // 延迟到start阶段再调用runc，避免create阶段阻塞导致CRI超时。
         info!("Container {} bundle prepared successfully", container_id);
@@ -1392,14 +1980,13 @@ impl ContainerRuntime for RuncRuntime {
                 None => {
                     // runc run -d is used when this container has not been created in runc yet.
                     let bundle_path = self.bundle_path(container_id);
-                    self.runc_exec(&[
-                        "run",
-                        "-d",
-                        "--bundle",
-                        &bundle_path.to_string_lossy(),
-                        "--no-pivot",
-                        container_id,
-                    ])?;
+                    let bundle_path = bundle_path.to_string_lossy().to_string();
+                    let mut run_args = vec!["run", "-d", "--bundle", bundle_path.as_str()];
+                    if self.no_pivot {
+                        run_args.push("--no-pivot");
+                    }
+                    run_args.push(container_id);
+                    self.runc_exec(&run_args)?;
                     info!("Container {} started via runc run -d", container_id);
                 }
                 Some(s) if s.status == "created" => {
@@ -1422,57 +2009,77 @@ impl ContainerRuntime for RuncRuntime {
     fn stop_container(&self, container_id: &str, timeout: Option<u32>) -> Result<()> {
         info!("Stopping container {}", container_id);
 
-        // 如果启用了shim，先停止shim
-        if let Some(ref shim_manager) = self.shim_manager {
-            if shim_manager.is_shim_running(container_id) {
-                shim_manager.stop_shim(container_id)?;
-                info!("Shim for container {} stopped", container_id);
-            }
-        }
-
         // 获取当前状态
         let state = self.get_runc_state(container_id)?;
 
         match state {
             None => {
+                self.stop_shim_if_running(container_id)?;
                 info!("Container {} not found, already stopped", container_id);
                 return Ok(());
             }
             Some(s) => {
                 if s.status == "stopped" {
+                    self.stop_shim_if_running(container_id)?;
                     info!("Container {} already stopped", container_id);
                     return Ok(());
+                }
+                if s.status == "paused" {
+                    self.resume_container(container_id)?;
                 }
             }
         }
 
-        // 发送SIGTERM信号
-        let signal = "TERM";
-        self.runc_exec(&["kill", container_id, signal])?;
+        let timeout_secs = timeout.unwrap_or(self.container_stop_timeout_secs);
+        self.runc_exec(&["kill", container_id, "TERM"])?;
 
-        // 等待容器停止
-        let timeout_secs = timeout.unwrap_or(10);
-        for _ in 0..timeout_secs {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+        let graceful_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+        if self.wait_for_container_stop_until(container_id, graceful_deadline)? {
+            self.stop_shim_if_running(container_id)?;
+            info!("Container {} stopped gracefully", container_id);
+            return Ok(());
+        }
 
+        info!(
+            "Container {} did not stop gracefully, entering SIGKILL retry loop",
+            container_id
+        );
+        let kill_deadline = std::time::Instant::now() + STOP_KILL_WAIT_TIMEOUT;
+        let mut backoff = STOP_INITIAL_BACKOFF;
+        loop {
             match self.get_runc_state(container_id)? {
                 None => break,
-                Some(s) if s.status == "stopped" => break,
-                _ => continue,
+                Some(state) if state.status == "stopped" => break,
+                _ => {}
             }
-        }
 
-        // 如果还在运行，发送SIGKILL
-        if let Ok(Some(state)) = self.get_runc_state(container_id) {
-            if state.status != "stopped" {
-                info!(
-                    "Container {} did not stop gracefully, sending SIGKILL",
+            if std::time::Instant::now() >= kill_deadline {
+                return Err(anyhow::anyhow!(
+                    "container {} did not stop after SIGKILL retries",
                     container_id
-                );
-                let _ = self.runc_exec(&["kill", container_id, "KILL"]);
+                ));
             }
+
+            if let Err(err) = self.runc_exec(&["kill", container_id, "KILL"]) {
+                match self.get_runc_state(container_id)? {
+                    None => break,
+                    Some(state) if state.status == "stopped" => break,
+                    _ => debug!(
+                        "SIGKILL retry for container {} failed but container is still present: {}",
+                        container_id, err
+                    ),
+                }
+            }
+
+            let remaining = kill_deadline
+                .checked_duration_since(std::time::Instant::now())
+                .unwrap_or_default();
+            std::thread::sleep(std::cmp::min(backoff, remaining));
+            backoff = std::cmp::min(backoff.saturating_mul(2), STOP_MAX_BACKOFF);
         }
 
+        self.stop_shim_if_running(container_id)?;
         info!("Container {} stopped", container_id);
         Ok(())
     }
@@ -1481,7 +2088,7 @@ impl ContainerRuntime for RuncRuntime {
         info!("Removing container {}", container_id);
 
         // 首先停止容器（如果还在运行）
-        let _ = self.stop_container(container_id, Some(5));
+        let _ = self.stop_container(container_id, None);
 
         // 删除容器
         let output = self.run_command_output(&["delete", container_id])?;
@@ -1561,6 +2168,23 @@ impl ContainerRuntime for RuncRuntime {
             cmd.arg(arg);
         }
 
+        let affinity_cpu = if self.exec_cpu_affinity == "first" {
+            self.load_bundle_config_value(container_id)
+                .ok()
+                .and_then(|config| {
+                    config
+                        .get("linux")
+                        .and_then(|linux| linux.get("resources"))
+                        .and_then(|resources| resources.get("cpu"))
+                        .and_then(|cpu| cpu.get("cpus"))
+                        .and_then(|cpus| cpus.as_str())
+                        .and_then(Self::first_cpu_from_cpuset)
+                })
+        } else {
+            None
+        };
+        Self::apply_exec_cpu_affinity_to_std_command(&mut cmd, affinity_cpu);
+
         // 执行命令并等待结果
         let output = cmd.output().context("Failed to execute runc exec")?;
 
@@ -1583,6 +2207,11 @@ impl ContainerRuntime for RuncRuntime {
         container_id: &str,
         resources: &LinuxContainerResources,
     ) -> Result<()> {
+        if self.disable_cgroup {
+            return Err(anyhow::anyhow!(
+                "cgroup support is disabled; container resource updates are unavailable"
+            ));
+        }
         info!(
             "Updating container {} resources: CPU shares={}, Memory limit={}",
             container_id, resources.cpu_shares, resources.memory_limit_in_bytes
@@ -1608,15 +2237,144 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
     use std::thread;
     use tempfile::tempdir;
 
     fn create_test_runtime() -> (RuncRuntime, tempfile::TempDir) {
+        create_test_runtime_with_restrict(false)
+    }
+
+    fn create_test_runtime_with_restrict(restrict: bool) -> (RuncRuntime, tempfile::TempDir) {
         let temp_dir = tempdir().unwrap();
-        let runtime = RuncRuntime::new(PathBuf::from("runc"), temp_dir.path().join("containers"));
+        let mut runtime =
+            RuncRuntime::new(PathBuf::from("runc"), temp_dir.path().join("containers"));
+        runtime.set_restrict_oom_score_adj(restrict);
         (runtime, temp_dir)
+    }
+
+    fn write_arg_capture_runtime_script(dir: &Path, args_path: &Path) -> PathBuf {
+        let script_path = dir.join("fake-runtime-args.sh");
+        fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+set -eu
+cmd="${{1:-}}"
+shift || true
+printf '%s\n' "$@" > "{}"
+case "$cmd" in
+  run|restore)
+    exit 0
+    ;;
+  delete)
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+                args_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+        script_path
+    }
+
+    fn write_checkpoint_restore_arg_capture_runtime_script(
+        dir: &Path,
+        checkpoint_args_path: &Path,
+        restore_args_path: &Path,
+    ) -> PathBuf {
+        let script_path = dir.join("fake-runtime-checkpoint-restore-args.sh");
+        fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+set -eu
+cmd="${{1:-}}"
+shift || true
+case "$cmd" in
+  checkpoint)
+    printf '%s\n' "$@" > "{checkpoint_args}"
+    exit 0
+    ;;
+  restore)
+    printf '%s\n' "$@" > "{restore_args}"
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+                checkpoint_args = checkpoint_args_path.display(),
+                restore_args = restore_args_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+        script_path
+    }
+
+    fn write_stop_runtime_script(
+        dir: &Path,
+        command_log_path: &Path,
+        initial_state: &str,
+    ) -> PathBuf {
+        let script_path = dir.join("fake-runtime-stop.sh");
+        let state_dir = dir.join("runtime-state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(state_dir.join("container-1.state"), initial_state).unwrap();
+        fs::write(state_dir.join("container-1.pid"), "4242").unwrap();
+        fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+set -eu
+STATE_DIR="{state_dir}"
+LOG_PATH="{log_path}"
+cmd="${{1:-}}"
+shift || true
+case "$cmd" in
+  state)
+    id="${{1:-}}"
+    file="$STATE_DIR/$id.state"
+    if [ ! -f "$file" ]; then
+      exit 1
+    fi
+    status="$(cat "$file")"
+    printf '{{"ociVersion":"1.0.2","id":"%s","status":"%s","pid":4242,"bundle":"%s","rootfs":"%s","created":"2024-01-01T00:00:00Z","owner":"root"}}\n' "$id" "$status" "$STATE_DIR/bundle" "$STATE_DIR/rootfs"
+    ;;
+  resume)
+    id="${{1:-}}"
+    printf 'resume\n' >> "$LOG_PATH"
+    echo running > "$STATE_DIR/$id.state"
+    ;;
+  kill)
+    id="${{1:-}}"
+    sig="${{2:-}}"
+    printf 'kill:%s\n' "$sig" >> "$LOG_PATH"
+    if [ "$sig" = "KILL" ]; then
+      echo stopped > "$STATE_DIR/$id.state"
+    fi
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+                state_dir = state_dir.display(),
+                log_path = command_log_path.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+        script_path
     }
 
     fn create_test_config() -> ContainerConfig {
@@ -1640,6 +2398,7 @@ mod tests {
             stdin_once: false,
             log_path: None,
             readonly_rootfs: false,
+            pids_limit: None,
             no_new_privileges: None,
             apparmor_profile: None,
             selinux_label: None,
@@ -1733,6 +2492,26 @@ mod tests {
     }
 
     #[test]
+    fn test_spec_applies_bind_mount_prefix_to_custom_mount_sources() {
+        let (mut runtime, _temp) = create_test_runtime();
+        runtime.set_bind_mount_prefix(PathBuf::from("/host"));
+        let mut config = create_test_config();
+        config.mounts = vec![MountConfig {
+            source: PathBuf::from("/var/lib/data"),
+            destination: PathBuf::from("/container/path"),
+            read_only: true,
+        }];
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let mounts = spec.mounts.unwrap();
+
+        assert!(mounts.iter().any(|mount| {
+            mount.destination == "/container/path"
+                && mount.source.as_deref() == Some("/host/var/lib/data")
+        }));
+    }
+
+    #[test]
     fn test_spec_excludes_hugepages_mount_by_default() {
         let (runtime, _temp) = create_test_runtime();
         let config = create_test_config();
@@ -1755,6 +2534,22 @@ mod tests {
 
         assert_eq!(user.uid, 1000);
         assert_eq!(user.gid, 1000);
+    }
+
+    #[test]
+    fn test_spec_with_supplemental_groups_without_explicit_user() {
+        let (runtime, _temp) = create_test_runtime();
+        let mut config = create_test_config();
+        config.run_as_group = Some(3000);
+        config.supplemental_groups = vec![2000, 2001];
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let process = spec.process.unwrap();
+        let user = process.user.unwrap();
+
+        assert_eq!(user.uid, 0);
+        assert_eq!(user.gid, 3000);
+        assert_eq!(user.additional_gids, Some(vec![2000, 2001]));
     }
 
     #[test]
@@ -1785,11 +2580,27 @@ mod tests {
 
     #[test]
     fn test_spec_with_runtime_options() {
-        let (runtime, _temp) = create_test_runtime();
+        let (mut runtime, _temp) = create_test_runtime();
+        runtime.set_default_env(vec![
+            ("HTTP_PROXY".to_string(), "http://proxy.internal".to_string()),
+            ("LANG".to_string(), "C".to_string()),
+        ]);
+        runtime.set_default_capabilities(vec![
+            "NET_BIND_SERVICE".to_string(),
+            "CHOWN".to_string(),
+        ]);
+        runtime.set_default_sysctls(HashMap::from([(
+            "kernel.shm_rmid_forced".to_string(),
+            "1".to_string(),
+        )]));
         let mut config = create_test_config();
         config.tty = true;
         config.readonly_rootfs = true;
         config.cgroup_parent = Some("kubepods.slice/pod123".to_string());
+        config.env = vec![
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("FOO".to_string(), "bar".to_string()),
+        ];
         config
             .sysctls
             .insert("net.ipv4.ip_forward".to_string(), "1".to_string());
@@ -1814,7 +2625,42 @@ mod tests {
 
         assert_eq!(process.terminal, Some(true));
         assert_eq!(root.readonly, Some(true));
+        assert!(process
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == "HTTP_PROXY=http://proxy.internal"));
+        assert!(process
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == "LANG=C.UTF-8"));
+        assert!(process
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == "FOO=bar"));
+        assert_eq!(
+            process
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.bounding.as_ref())
+                .cloned()
+                .unwrap_or_default(),
+            vec!["CAP_NET_BIND_SERVICE".to_string(), "CAP_CHOWN".to_string()]
+        );
         assert_eq!(linux.cgroups_path.as_deref(), Some("kubepods.slice/pod123"));
+        assert_eq!(
+            linux
+                .sysctl
+                .as_ref()
+                .and_then(|sysctls| sysctls.get("kernel.shm_rmid_forced"))
+                .map(String::as_str),
+            Some("1")
+        );
         assert_eq!(
             linux
                 .sysctl
@@ -1847,6 +2693,289 @@ mod tests {
                 .and_then(|memory| memory.limit),
             Some(536870912)
         );
+    }
+
+    #[test]
+    fn test_spec_omits_cgroup_configuration_when_disabled() {
+        let (mut runtime, _temp) = create_test_runtime();
+        runtime.set_disable_cgroup(true);
+        let mut config = create_test_config();
+        config.cgroup_parent = Some("kubepods.slice/pod123".to_string());
+        config.pids_limit = Some(256);
+        config.linux_resources = Some(LinuxContainerResources {
+            cpu_shares: 2048,
+            memory_limit_in_bytes: 536870912,
+            ..Default::default()
+        });
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let linux = spec.linux.unwrap();
+
+        assert!(linux.cgroups_path.is_none());
+        assert!(linux.resources.is_none());
+    }
+
+    #[test]
+    fn test_create_spec_sets_process_oom_score_adj_from_linux_resources() {
+        let (runtime, _temp) = create_test_runtime();
+        let mut config = create_test_config();
+        config.linux_resources = Some(LinuxContainerResources {
+            oom_score_adj: 321,
+            ..Default::default()
+        });
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+
+        assert_eq!(
+            spec.process
+                .as_ref()
+                .and_then(|process| process.oom_score_adj),
+            Some(321)
+        );
+    }
+
+    #[test]
+    fn test_create_spec_restricts_oom_score_adj_to_daemon_floor() {
+        let current = RuncRuntime::daemon_oom_score_adj().unwrap();
+        let (runtime, _temp) = create_test_runtime_with_restrict(true);
+        let mut config = create_test_config();
+        config.linux_resources = Some(LinuxContainerResources {
+            oom_score_adj: current - 1,
+            ..Default::default()
+        });
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+
+        assert_eq!(
+            spec.process
+                .as_ref()
+                .and_then(|process| process.oom_score_adj),
+            Some(current as i32)
+        );
+    }
+
+    #[test]
+    fn test_enforce_oom_score_adj_policy_clamps_existing_spec_after_adjustment() {
+        let current = RuncRuntime::daemon_oom_score_adj().unwrap();
+        let (runtime, _temp) = create_test_runtime_with_restrict(true);
+        let mut spec = Spec::new("1.0.2");
+        spec.process = Some(Process {
+            terminal: Some(false),
+            user: None,
+            args: vec!["sleep".to_string(), "1".to_string()],
+            env: None,
+            cwd: "/".to_string(),
+            capabilities: None,
+            rlimits: None,
+            oom_score_adj: Some((current - 1) as i32),
+            scheduler: None,
+            no_new_privileges: None,
+            apparmor_profile: None,
+            selinux_label: None,
+            io_priority: None,
+        });
+
+        runtime.enforce_oom_score_adj_policy(&mut spec).unwrap();
+
+        assert_eq!(
+            spec.process
+                .as_ref()
+                .and_then(|process| process.oom_score_adj),
+            Some(current as i32)
+        );
+    }
+
+    #[test]
+    fn test_readonly_rootfs_keeps_default_tmpfs_and_custom_rw_mounts() {
+        let (runtime, _temp) = create_test_runtime();
+        let mut config = create_test_config();
+        config.readonly_rootfs = true;
+        config.mounts = vec![MountConfig {
+            source: PathBuf::from("/host/rw"),
+            destination: PathBuf::from("/var/lib/app"),
+            read_only: false,
+        }];
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let root = spec.root.unwrap();
+        let mounts = spec.mounts.unwrap();
+
+        assert_eq!(root.readonly, Some(true));
+        assert!(mounts.iter().any(|mount| {
+            mount.destination == "/proc" && mount.mount_type.as_deref() == Some("proc")
+        }));
+        assert!(mounts.iter().any(|mount| {
+            mount.destination == "/dev"
+                && mount.mount_type.as_deref() == Some("tmpfs")
+                && mount
+                    .options
+                    .as_ref()
+                    .map(|options| options.iter().any(|option| option == "mode=755"))
+                    .unwrap_or(false)
+        }));
+        assert!(mounts.iter().any(|mount| {
+            mount.destination == "/dev/shm"
+                && mount.mount_type.as_deref() == Some("tmpfs")
+                && mount
+                    .options
+                    .as_ref()
+                    .map(|options| options.iter().any(|option| option == "mode=1777"))
+                    .unwrap_or(false)
+        }));
+        assert!(mounts.iter().any(|mount| {
+            mount.destination == "/var/lib/app"
+                && mount.mount_type.as_deref() == Some("bind")
+                && mount
+                    .options
+                    .as_ref()
+                    .map(|options| options.iter().any(|option| option == "rw"))
+                    .unwrap_or(false)
+        }));
+    }
+
+    #[test]
+    fn test_spec_uses_host_pid_namespace_when_requested() {
+        let (runtime, _temp) = create_test_runtime();
+        let mut config = create_test_config();
+        config.namespace_options = Some(NamespaceOption {
+            network: NamespaceMode::Pod as i32,
+            pid: NamespaceMode::Node as i32,
+            ipc: NamespaceMode::Pod as i32,
+            target_id: String::new(),
+            userns_options: None,
+        });
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let linux = spec.linux.unwrap();
+        let pid_namespace = linux
+            .namespaces
+            .unwrap()
+            .into_iter()
+            .find(|namespace| namespace.ns_type == "pid")
+            .unwrap();
+
+        assert_eq!(pid_namespace.path.as_deref(), Some("/proc/1/ns/pid"));
+    }
+
+    #[test]
+    fn test_spec_uses_host_ipc_namespace_and_host_ipc_mounts_when_requested() {
+        let (runtime, _temp) = create_test_runtime();
+        let mut config = create_test_config();
+        config.namespace_options = Some(NamespaceOption {
+            network: NamespaceMode::Pod as i32,
+            pid: NamespaceMode::Pod as i32,
+            ipc: NamespaceMode::Node as i32,
+            target_id: String::new(),
+            userns_options: None,
+        });
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let linux = spec.linux.clone().unwrap();
+        let ipc_namespace = linux
+            .namespaces
+            .unwrap()
+            .into_iter()
+            .find(|namespace| namespace.ns_type == "ipc")
+            .unwrap();
+        let mounts = spec.mounts.unwrap();
+
+        assert_eq!(ipc_namespace.path.as_deref(), Some("/proc/1/ns/ipc"));
+        assert!(mounts.iter().any(|mount| {
+            mount.destination == "/dev/shm"
+                && mount.source.as_deref() == Some("/dev/shm")
+                && mount.mount_type.as_deref() == Some("bind")
+        }));
+        assert!(mounts.iter().any(|mount| {
+            mount.destination == "/dev/mqueue"
+                && mount.source.as_deref() == Some("/dev/mqueue")
+                && mount.mount_type.as_deref() == Some("bind")
+        }));
+    }
+
+    #[test]
+    fn test_spec_applies_bind_mount_prefix_to_host_ipc_mounts() {
+        let (mut runtime, _temp) = create_test_runtime();
+        runtime.set_bind_mount_prefix(PathBuf::from("/host"));
+        let mut config = create_test_config();
+        config.namespace_options = Some(NamespaceOption {
+            network: NamespaceMode::Pod as i32,
+            pid: NamespaceMode::Pod as i32,
+            ipc: NamespaceMode::Node as i32,
+            target_id: String::new(),
+            userns_options: None,
+        });
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let mounts = spec.mounts.unwrap();
+
+        assert!(mounts.iter().any(|mount| {
+            mount.destination == "/dev/shm" && mount.source.as_deref() == Some("/host/dev/shm")
+        }));
+        assert!(mounts.iter().any(|mount| {
+            mount.destination == "/dev/mqueue"
+                && mount.source.as_deref() == Some("/host/dev/mqueue")
+        }));
+    }
+
+    #[test]
+    fn test_spec_adds_user_namespace_and_mappings_when_userns_pod_mode_requested() {
+        let (runtime, _temp) = create_test_runtime();
+        let mut config = create_test_config();
+        config.namespace_options = Some(NamespaceOption {
+            network: NamespaceMode::Pod as i32,
+            pid: NamespaceMode::Pod as i32,
+            ipc: NamespaceMode::Pod as i32,
+            target_id: String::new(),
+            userns_options: Some(crate::proto::runtime::v1::UserNamespace {
+                mode: NamespaceMode::Pod as i32,
+                uids: vec![crate::proto::runtime::v1::IdMapping {
+                    host_id: 100000,
+                    container_id: 0,
+                    length: 65536,
+                }],
+                gids: vec![crate::proto::runtime::v1::IdMapping {
+                    host_id: 200000,
+                    container_id: 0,
+                    length: 65536,
+                }],
+            }),
+        });
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let linux = spec.linux.unwrap();
+
+        assert!(linux
+            .namespaces
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|namespace| namespace.ns_type == "user"));
+        assert_eq!(linux.uid_mappings.as_ref().unwrap()[0].host_id, 100000);
+        assert_eq!(linux.gid_mappings.as_ref().unwrap()[0].host_id, 200000);
+    }
+
+    #[test]
+    fn test_spec_rejects_userns_node_mode_with_mappings() {
+        let (runtime, _temp) = create_test_runtime();
+        let mut config = create_test_config();
+        config.namespace_options = Some(NamespaceOption {
+            network: NamespaceMode::Pod as i32,
+            pid: NamespaceMode::Pod as i32,
+            ipc: NamespaceMode::Pod as i32,
+            target_id: String::new(),
+            userns_options: Some(crate::proto::runtime::v1::UserNamespace {
+                mode: NamespaceMode::Node as i32,
+                uids: vec![crate::proto::runtime::v1::IdMapping {
+                    host_id: 100000,
+                    container_id: 0,
+                    length: 65536,
+                }],
+                gids: vec![],
+            }),
+        });
+
+        let err = runtime.create_spec(&config, "test-id").unwrap_err();
+        assert!(err.to_string().contains("mode NODE"));
     }
 
     #[test]
@@ -1908,6 +3037,24 @@ mod tests {
             Some("system_u:system_r:container_t:s0")
         );
         assert!(linux.seccomp.is_some());
+    }
+
+    #[test]
+    fn test_spec_with_runtime_default_seccomp_uses_builtin_profile() {
+        let (runtime, _) = create_test_runtime();
+        let mut config = create_test_config();
+        config.seccomp_profile = Some(SeccompProfile::RuntimeDefault);
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let linux = spec.linux.unwrap();
+        let seccomp = linux.seccomp.expect("runtime/default should produce seccomp");
+
+        assert_eq!(seccomp.default_action, "SCMP_ACT_ALLOW");
+        assert!(seccomp
+            .syscalls
+            .unwrap_or_default()
+            .iter()
+            .any(|syscall| syscall.names.iter().any(|name| name == "unshare")));
     }
 
     #[test]
@@ -1973,6 +3120,313 @@ mod tests {
     }
 
     #[test]
+    fn test_create_spec_applies_container_pids_limit() {
+        let (runtime, _temp) = create_test_runtime();
+        let mut config = create_test_config();
+        config.pids_limit = Some(256);
+
+        let spec = runtime.create_spec(&config, "test-id").unwrap();
+        let linux = spec.linux.unwrap();
+        let resources = linux.resources.unwrap();
+
+        assert_eq!(resources.pids.as_ref().map(|pids| pids.limit), Some(256));
+    }
+
+    #[test]
+    fn test_checkpoint_container_passes_configured_criu_path() {
+        let temp_dir = tempdir().unwrap();
+        let checkpoint_args_path = temp_dir.path().join("checkpoint.args");
+        let restore_args_path = temp_dir.path().join("restore.args");
+        let runtime_path = write_checkpoint_restore_arg_capture_runtime_script(
+            temp_dir.path(),
+            &checkpoint_args_path,
+            &restore_args_path,
+        );
+        let root = temp_dir.path().join("containers");
+        let mut runtime = RuncRuntime::new(runtime_path, root);
+        runtime.set_criu_path(PathBuf::from("/usr/sbin/criu"));
+
+        let image_path = temp_dir.path().join("checkpoint");
+        let work_path = temp_dir.path().join("checkpoint-work");
+        runtime
+            .checkpoint_container("container-1", &image_path, &work_path)
+            .unwrap();
+
+        let args = fs::read_to_string(&checkpoint_args_path).unwrap();
+        assert!(args.lines().any(|line| line == "--image-path"));
+        assert!(args
+            .lines()
+            .any(|line| line == image_path.to_string_lossy()));
+        assert!(args.lines().any(|line| line == "--work-path"));
+        assert!(args.lines().any(|line| line == work_path.to_string_lossy()));
+        assert!(args.lines().any(|line| line == "--criu"));
+        assert!(args.lines().any(|line| line == "/usr/sbin/criu"));
+    }
+
+    #[test]
+    fn test_stop_container_resumes_paused_container_before_term() {
+        let temp_dir = tempdir().unwrap();
+        let command_log_path = temp_dir.path().join("stop.log");
+        let runtime_path = write_stop_runtime_script(temp_dir.path(), &command_log_path, "paused");
+        let runtime = RuncRuntime::new(runtime_path, temp_dir.path().join("containers"));
+
+        runtime.stop_container("container-1", Some(1)).unwrap();
+
+        let log = fs::read_to_string(&command_log_path).unwrap();
+        let lines = log.lines().collect::<Vec<_>>();
+        assert_eq!(lines, vec!["resume", "kill:TERM", "kill:KILL"]);
+    }
+
+    #[test]
+    fn test_stop_container_retries_with_sigkill_after_graceful_timeout() {
+        let temp_dir = tempdir().unwrap();
+        let command_log_path = temp_dir.path().join("stop.log");
+        let runtime_path = write_stop_runtime_script(temp_dir.path(), &command_log_path, "running");
+        let runtime = RuncRuntime::new(runtime_path, temp_dir.path().join("containers"));
+
+        runtime.stop_container("container-1", Some(1)).unwrap();
+
+        let log = fs::read_to_string(&command_log_path).unwrap();
+        let lines = log.lines().collect::<Vec<_>>();
+        assert_eq!(lines.first().copied(), Some("kill:TERM"));
+        assert!(lines.iter().any(|line| *line == "kill:KILL"));
+        let final_state = fs::read_to_string(
+            temp_dir
+                .path()
+                .join("runtime-state")
+                .join("container-1.state"),
+        )
+        .unwrap();
+        assert_eq!(final_state.trim(), "stopped");
+    }
+
+    #[test]
+    fn test_exec_in_container_uses_first_cpu_affinity_when_configured() {
+        let temp_dir = tempdir().unwrap();
+        let runtime_path = temp_dir.path().join("fake-runtime.sh");
+        let affinity_path = temp_dir.path().join("affinity.txt");
+        fs::write(
+            &runtime_path,
+            format!(
+                r#"#!/bin/sh
+set -eu
+cmd="${{1:-}}"
+shift || true
+case "$cmd" in
+  exec)
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -t|-i)
+          shift
+          ;;
+        *)
+          break
+          ;;
+      esac
+    done
+    shift || true
+    awk '/Cpus_allowed_list/ {{print $2}}' /proc/self/status > "{}"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+                affinity_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let root = temp_dir.path().join("containers");
+        let mut runtime = RuncRuntime::new(runtime_path, root.clone());
+        runtime.set_exec_cpu_affinity("first".to_string());
+        let bundle = root.join("container-1");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(
+            bundle.join("config.json"),
+            serde_json::json!({
+                "ociVersion": "1.0.2",
+                "linux": {
+                    "resources": {
+                        "cpu": {
+                            "cpus": "0-3"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let exit_code = runtime
+            .exec_in_container("container-1", &["true".to_string()], false)
+            .unwrap();
+        assert_eq!(exit_code, 0);
+        assert_eq!(fs::read_to_string(&affinity_path).unwrap().trim(), "0");
+    }
+
+    #[test]
+    fn test_start_container_direct_run_uses_configured_no_pivot_policy() {
+        let temp_dir = tempdir().unwrap();
+        let args_path = temp_dir.path().join("run.args");
+        let runtime_path = write_arg_capture_runtime_script(temp_dir.path(), &args_path);
+        let root = temp_dir.path().join("containers");
+        let mut runtime = RuncRuntime::new(runtime_path, root.clone());
+        runtime.set_no_pivot(true);
+        fs::create_dir_all(root.join("container-1")).unwrap();
+
+        runtime.start_container("container-1").unwrap();
+
+        let args = fs::read_to_string(&args_path).unwrap();
+        assert!(args.lines().any(|line| line == "--no-pivot"));
+    }
+
+    #[test]
+    fn test_start_container_direct_run_omits_no_pivot_by_default() {
+        let temp_dir = tempdir().unwrap();
+        let args_path = temp_dir.path().join("run.args");
+        let runtime_path = write_arg_capture_runtime_script(temp_dir.path(), &args_path);
+        let root = temp_dir.path().join("containers");
+        let runtime = RuncRuntime::new(runtime_path, root.clone());
+        fs::create_dir_all(root.join("container-1")).unwrap();
+
+        runtime.start_container("container-1").unwrap();
+
+        let args = fs::read_to_string(&args_path).unwrap();
+        assert!(!args.lines().any(|line| line == "--no-pivot"));
+    }
+
+    #[test]
+    fn test_restore_container_uses_configured_no_pivot_policy() {
+        let temp_dir = tempdir().unwrap();
+        let checkpoint_args_path = temp_dir.path().join("checkpoint.args");
+        let args_path = temp_dir.path().join("restore.args");
+        let runtime_path = write_checkpoint_restore_arg_capture_runtime_script(
+            temp_dir.path(),
+            &checkpoint_args_path,
+            &args_path,
+        );
+        let root = temp_dir.path().join("containers");
+        let mut runtime = RuncRuntime::new(runtime_path, root.clone());
+        runtime.set_no_pivot(true);
+        runtime.set_criu_path(PathBuf::from("/usr/sbin/criu"));
+        fs::create_dir_all(root.join("container-1")).unwrap();
+        let image_path = temp_dir.path().join("checkpoint");
+        let work_path = temp_dir.path().join("checkpoint-work");
+        fs::create_dir_all(&image_path).unwrap();
+
+        runtime
+            .restore_container_from_checkpoint("container-1", &image_path, &work_path)
+            .unwrap();
+
+        let args = fs::read_to_string(&args_path).unwrap();
+        assert!(args.lines().any(|line| line == "--image-path"));
+        assert!(args
+            .lines()
+            .any(|line| line == image_path.to_string_lossy()));
+        assert!(args.lines().any(|line| line == "--work-path"));
+        assert!(args.lines().any(|line| line == work_path.to_string_lossy()));
+        assert!(args.lines().any(|line| line == "--no-pivot"));
+        assert!(args.lines().any(|line| line == "--criu"));
+        assert!(args.lines().any(|line| line == "/usr/sbin/criu"));
+    }
+
+    #[test]
+    fn test_restore_container_replaces_rootfs_from_snapshot() {
+        let temp_dir = tempdir().unwrap();
+        let checkpoint_args_path = temp_dir.path().join("checkpoint.args");
+        let restore_args_path = temp_dir.path().join("restore.args");
+        let runtime_path = write_checkpoint_restore_arg_capture_runtime_script(
+            temp_dir.path(),
+            &checkpoint_args_path,
+            &restore_args_path,
+        );
+        let root = temp_dir.path().join("containers");
+        let runtime = RuncRuntime::new(runtime_path, root.clone());
+        let bundle = root.join("container-1");
+        let rootfs = temp_dir.path().join("rootfs-live");
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::write(rootfs.join("stale.txt"), "stale").unwrap();
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(
+            bundle.join("config.json"),
+            serde_json::json!({
+                "ociVersion": "1.0.2",
+                "root": { "path": rootfs.display().to_string() }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let snapshot_src = temp_dir.path().join("rootfs-snapshot");
+        fs::create_dir_all(&snapshot_src).unwrap();
+        fs::write(snapshot_src.join("restored.txt"), "restored").unwrap();
+        let image_path = temp_dir.path().join("checkpoint");
+        let work_path = temp_dir.path().join("checkpoint-work");
+        fs::create_dir_all(&image_path).unwrap();
+        let tar_status = Command::new("tar")
+            .args([
+                "-cf",
+                image_path.join("rootfs.tar").to_str().unwrap(),
+                "-C",
+                snapshot_src.to_str().unwrap(),
+                ".",
+            ])
+            .status()
+            .unwrap();
+        assert!(tar_status.success());
+
+        runtime
+            .restore_container_from_checkpoint("container-1", &image_path, &work_path)
+            .unwrap();
+
+        assert!(!rootfs.join("stale.txt").exists());
+        assert_eq!(
+            fs::read_to_string(rootfs.join("restored.txt")).unwrap(),
+            "restored"
+        );
+    }
+
+    #[test]
+    fn test_restore_container_keeps_existing_rootfs_when_snapshot_absent() {
+        let temp_dir = tempdir().unwrap();
+        let checkpoint_args_path = temp_dir.path().join("checkpoint.args");
+        let restore_args_path = temp_dir.path().join("restore.args");
+        let runtime_path = write_checkpoint_restore_arg_capture_runtime_script(
+            temp_dir.path(),
+            &checkpoint_args_path,
+            &restore_args_path,
+        );
+        let root = temp_dir.path().join("containers");
+        let runtime = RuncRuntime::new(runtime_path, root.clone());
+        let bundle = root.join("container-1");
+        let rootfs = temp_dir.path().join("rootfs-live");
+        fs::create_dir_all(&rootfs).unwrap();
+        fs::write(rootfs.join("keep.txt"), "keep").unwrap();
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(
+            bundle.join("config.json"),
+            serde_json::json!({
+                "ociVersion": "1.0.2",
+                "root": { "path": rootfs.display().to_string() }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let image_path = temp_dir.path().join("checkpoint");
+        let work_path = temp_dir.path().join("checkpoint-work");
+        fs::create_dir_all(&image_path).unwrap();
+
+        runtime
+            .restore_container_from_checkpoint("container-1", &image_path, &work_path)
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(rootfs.join("keep.txt")).unwrap(), "keep");
+    }
+
+    #[test]
     fn test_reopen_container_log_reports_missing_socket() {
         let temp_dir = tempdir().unwrap();
         let shim_dir = temp_dir.path().join("shims");
@@ -1985,12 +3439,17 @@ mod tests {
             temp_dir.path().join("containers"),
             ShimConfig {
                 work_dir: shim_dir,
+                attach_socket_dir: temp_dir.path().join("attach"),
+                container_exits_dir: temp_dir.path().join("exits"),
                 ..Default::default()
             },
         );
 
         let err = runtime.reopen_container_log(container_id).unwrap_err();
-        assert!(err.to_string().contains("reopen log socket"));
+        assert!(matches!(
+            err.downcast_ref::<LogReopenError>(),
+            Some(LogReopenError::MissingSocket { .. })
+        ));
     }
 
     #[test]
@@ -2016,6 +3475,8 @@ mod tests {
             temp_dir.path().join("containers"),
             ShimConfig {
                 work_dir: shim_dir,
+                attach_socket_dir: temp_dir.path().join("attach"),
+                container_exits_dir: temp_dir.path().join("exits"),
                 ..Default::default()
             },
         );
@@ -2048,6 +3509,8 @@ mod tests {
             temp_dir.path().join("containers"),
             ShimConfig {
                 work_dir: shim_dir,
+                attach_socket_dir: temp_dir.path().join("attach"),
+                container_exits_dir: temp_dir.path().join("exits"),
                 ..Default::default()
             },
         );

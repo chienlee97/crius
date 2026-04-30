@@ -26,7 +26,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use super::io::{IoConfig, IoManager};
+use super::io::{IoConfig, IoManager, JournalConfig, DEFAULT_JOURNALD_SOCKET_PATH};
 
 const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";
 
@@ -44,6 +44,7 @@ struct ShimBundleConfig {
 #[derive(Debug, Deserialize, Default)]
 struct ShimStoredContainerState {
     log_path: Option<String>,
+    metadata_name: Option<String>,
     tty: bool,
     stdin: bool,
     stdin_once: bool,
@@ -59,6 +60,20 @@ pub struct Daemon {
     runtime: PathBuf,
     /// 退出码文件路径
     exit_code_file: Option<PathBuf>,
+    /// attach/resize socket 根目录
+    attach_socket_dir: Option<PathBuf>,
+    /// shim 创建的宿主 IO 工件默认 UID。
+    io_uid: u32,
+    /// shim 创建的宿主 IO 工件默认 GID。
+    io_gid: u32,
+    /// CRI 单条日志记录切分阈值（字节）。
+    max_container_log_line_size: usize,
+    /// 是否额外写 journald。
+    log_to_journald: bool,
+    /// 是否在日志轮转和容器退出时跳过 sync。
+    no_sync_log: bool,
+    /// 是否禁用 pivot_root，改用 MS_MOVE。
+    no_pivot: bool,
     /// IO管理器
     io_manager: IoManager,
     /// 是否正在运行
@@ -72,12 +87,26 @@ impl Daemon {
         bundle: PathBuf,
         runtime: PathBuf,
         exit_code_file: Option<PathBuf>,
+        attach_socket_dir: Option<PathBuf>,
+        io_uid: u32,
+        io_gid: u32,
+        max_container_log_line_size: usize,
+        log_to_journald: bool,
+        no_sync_log: bool,
+        no_pivot: bool,
     ) -> Self {
         Self {
             container_id,
             bundle,
             runtime,
             exit_code_file,
+            attach_socket_dir,
+            io_uid,
+            io_gid,
+            max_container_log_line_size,
+            log_to_journald,
+            no_sync_log,
+            no_pivot,
             io_manager: IoManager::new(),
             running: Arc::new(AtomicBool::new(true)),
         }
@@ -95,13 +124,17 @@ impl Daemon {
         self.setup_io()?;
 
         // 4. 创建并运行容器
-        let exit_code = if self.is_terminal()? {
+        let result = if self.is_terminal()? {
             let container_pid = self.create_terminal_container()?;
             info!("Container created with PID: {}", container_pid);
-            self.monitor_container(container_pid)?
+            self.monitor_container(container_pid)
         } else {
-            self.run_non_terminal_container()?
+            self.run_non_terminal_container()
         };
+        if let Err(err) = self.io_manager.shutdown() {
+            warn!("Failed to shutdown IO manager cleanly: {}", err);
+        }
+        let exit_code = result?;
 
         // 6. 记录退出码
         self.record_exit_code(exit_code)?;
@@ -150,6 +183,29 @@ impl Daemon {
             .as_ref()
             .and_then(|path| path.parent().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("/var/run/crius/shims").join(&self.container_id))
+    }
+
+    fn attach_socket_container_dir(&self) -> PathBuf {
+        match self.attach_socket_dir.as_ref() {
+            Some(root) => root.join(&self.container_id),
+            None => self.shim_dir(),
+        }
+    }
+
+    fn cleanup_attach_socket_directory(&self) {
+        let Some(_root) = self.attach_socket_dir.as_ref() else {
+            return;
+        };
+        let path = self.attach_socket_container_dir();
+        if let Err(err) = fs::remove_dir_all(&path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "Failed to remove attach socket directory {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
     }
 
     fn load_bundle_config(&self) -> Result<ShimBundleConfig> {
@@ -221,17 +277,27 @@ impl Daemon {
                 .as_ref()
                 .and_then(|process| process.terminal)
                 .unwrap_or(container_state.tty),
-            attach_socket: Some(self.shim_dir().join("attach.sock")),
+            attach_socket: Some(self.attach_socket_container_dir().join("attach.sock")),
             resize_socket: bundle_config
                 .process
                 .as_ref()
                 .and_then(|process| process.terminal)
                 .unwrap_or(container_state.tty)
-                .then(|| self.shim_dir().join("resize.sock")),
+                .then(|| self.attach_socket_container_dir().join("resize.sock")),
             reopen_socket: container_state
                 .log_path
                 .as_ref()
                 .map(|_| self.shim_dir().join("reopen.sock")),
+            journald: self.log_to_journald.then(|| JournalConfig {
+                socket_path: PathBuf::from(DEFAULT_JOURNALD_SOCKET_PATH),
+                container_id: self.container_id.clone(),
+                container_name: container_state.metadata_name.clone(),
+                syslog_identifier: "crius-shim".to_string(),
+            }),
+            no_sync_log: self.no_sync_log,
+            io_uid: self.io_uid,
+            io_gid: self.io_gid,
+            max_log_line_size: self.max_container_log_line_size,
         };
         self.io_manager.configure(io_config)?;
         self.io_manager.start_attach_server()?;
@@ -272,6 +338,9 @@ impl Daemon {
         };
 
         let mut create_args = vec!["create", "--bundle", self.bundle.to_str().unwrap()];
+        if self.no_pivot {
+            create_args.push("--no-pivot");
+        }
         if tty {
             create_args.push("--console-socket");
             create_args.push(console_socket_path.to_str().unwrap());
@@ -335,14 +404,12 @@ impl Daemon {
             .unwrap_or_default();
 
         let mut cmd = Command::new(&self.runtime);
-        cmd.args([
-            "run",
-            "--bundle",
-            self.bundle.to_str().unwrap(),
-            "--no-pivot",
-            &self.container_id,
-        ])
-        .env("XDG_RUNTIME_DIR", "/run/user/0");
+        let mut run_args = vec!["run", "--bundle", self.bundle.to_str().unwrap()];
+        if self.no_pivot {
+            run_args.push("--no-pivot");
+        }
+        run_args.push(&self.container_id);
+        cmd.args(&run_args).env("XDG_RUNTIME_DIR", "/run/user/0");
 
         if container_state.stdin {
             cmd.stdin(std::process::Stdio::piped());
@@ -453,6 +520,8 @@ impl Daemon {
         }
 
         self.cleanup_container()?;
+        self.io_manager.shutdown()?;
+        self.cleanup_attach_socket_directory();
         Ok(exit_code)
     }
 
@@ -488,6 +557,8 @@ impl Daemon {
 
         // 清理容器状态
         self.cleanup_container()?;
+        self.io_manager.shutdown()?;
+        self.cleanup_attach_socket_directory();
 
         Ok(exit_code)
     }
@@ -533,6 +604,21 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use tempfile::tempdir;
+
+    fn parse_cri_log_lines(contents: &str) -> Vec<(String, String, String, String)> {
+        contents
+            .lines()
+            .map(|line| {
+                let mut parts = line.splitn(4, ' ');
+                (
+                    parts.next().unwrap_or_default().to_string(),
+                    parts.next().unwrap_or_default().to_string(),
+                    parts.next().unwrap_or_default().to_string(),
+                    parts.next().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn test_non_terminal_container_stdio_capture() {
@@ -594,6 +680,13 @@ esac
             bundle_dir,
             runtime_path,
             Some(exit_code_file),
+            None,
+            0,
+            0,
+            4096,
+            false,
+            false,
+            false,
         );
 
         daemon
@@ -609,8 +702,106 @@ esac
         assert_eq!(exit_code, 0);
 
         let log_content = fs::read_to_string(&log_path).unwrap();
-        assert!(log_content.contains("stdout:hello"));
-        assert!(log_content.contains("stderr:world"));
+        let records = parse_cri_log_lines(&log_content);
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            assert!(chrono::DateTime::parse_from_rfc3339(&record.0).is_ok());
+            assert_eq!(record.2, "F");
+        }
+        assert!(records
+            .iter()
+            .any(|record| record.1 == "stdout" && record.3 == "stdout:hello"));
+        assert!(records
+            .iter()
+            .any(|record| record.1 == "stderr" && record.3 == "stderr:world"));
+    }
+
+    #[test]
+    fn test_non_terminal_container_passes_no_pivot_when_enabled() {
+        let temp_dir = tempdir().unwrap();
+        let bundle_dir = temp_dir.path().join("bundle");
+        fs::create_dir_all(&bundle_dir).unwrap();
+
+        let log_path = temp_dir.path().join("logs").join("container.log");
+        let args_path = temp_dir.path().join("runtime.args");
+        let internal_state = json!({
+            "log_path": log_path.to_string_lossy(),
+            "tty": false,
+            "stdin": false,
+            "stdin_once": false,
+        });
+        let config = json!({
+            "process": {
+                "terminal": false
+            },
+            "annotations": {
+                INTERNAL_CONTAINER_STATE_KEY: internal_state.to_string()
+            }
+        });
+        fs::write(
+            bundle_dir.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+
+        let runtime_path = temp_dir.path().join("fake-runtime.sh");
+        fs::write(
+            &runtime_path,
+            format!(
+                r#"#!/bin/sh
+set -eu
+
+cmd="$1"
+shift || true
+
+case "$cmd" in
+  run)
+    printf '%s\n' "$@" > "{}"
+    exit 0
+    ;;
+  delete)
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+                args_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let exit_code_file = temp_dir.path().join("shim").join("exit_code");
+        fs::create_dir_all(exit_code_file.parent().unwrap()).unwrap();
+        let mut daemon = Daemon::new(
+            "test-container".to_string(),
+            bundle_dir,
+            runtime_path,
+            Some(exit_code_file),
+            None,
+            0,
+            0,
+            4096,
+            false,
+            false,
+            true,
+        );
+
+        daemon
+            .io_manager
+            .configure(IoConfig {
+                stdout: Some(log_path),
+                terminal: false,
+                ..Default::default()
+            })
+            .unwrap();
+
+        daemon.run_non_terminal_container().unwrap();
+
+        let args = fs::read_to_string(&args_path).unwrap();
+        assert!(args.lines().any(|line| line == "--no-pivot"));
     }
 
     #[test]
@@ -669,13 +860,23 @@ esac
         fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755)).unwrap();
 
         let exit_code_file = temp_dir.path().join("shim").join("exit_code");
-        let attach_socket_path = exit_code_file.parent().unwrap().join("attach.sock");
+        let attach_socket_root = temp_dir.path().join("attach-root");
+        let attach_socket_path = attach_socket_root
+            .join("test-container")
+            .join("attach.sock");
         fs::create_dir_all(exit_code_file.parent().unwrap()).unwrap();
         let mut daemon = Daemon::new(
             "test-container".to_string(),
             bundle_dir,
             runtime_path,
             Some(exit_code_file),
+            Some(attach_socket_root.clone()),
+            0,
+            0,
+            4096,
+            false,
+            false,
+            false,
         );
 
         daemon.setup_io().unwrap();
@@ -696,6 +897,14 @@ esac
 
         let exit_code = handle.join().unwrap();
         assert_eq!(exit_code, 0);
+        assert!(
+            !attach_socket_path.exists(),
+            "attach socket should be removed once the container exits"
+        );
+        assert!(
+            !attach_socket_root.join("test-container").exists(),
+            "attach socket directory should be removed once the container exits"
+        );
 
         let log_content = fs::read_to_string(&log_path).unwrap();
         assert!(log_content.contains("stdin:hello-from-attach"));

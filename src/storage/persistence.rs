@@ -56,7 +56,7 @@ pub fn record_to_container_status(record: &ContainerRecord) -> ContainerStatus {
     match record.state.as_str() {
         "created" => ContainerStatus::Created,
         "running" => ContainerStatus::Running,
-        "stopped" => ContainerStatus::Stopped(record.exit_code.unwrap_or(0)),
+        "stopped" => ContainerStatus::Stopped(record.exit_code.unwrap_or(-1)),
         _ => ContainerStatus::Unknown,
     }
 }
@@ -137,6 +137,14 @@ impl PersistenceManager {
     /// 获取存储管理器的引用
     pub fn storage(&self) -> &StorageManager {
         &self.storage
+    }
+
+    pub fn check_integrity(&self) -> Result<bool> {
+        self.storage.integrity_check()
+    }
+
+    pub fn attempt_repair(&mut self) -> Result<bool> {
+        self.storage.attempt_repair()
     }
 
     /// 保存容器状态

@@ -46,6 +46,8 @@ pub struct ImageServiceImpl {
     // 存储镜像信息的线程安全HashMap
     images: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Image>>>,
     storage_path: PathBuf,
+    storage_driver: String,
+    global_auth_file: Option<PathBuf>,
     oci_client: Arc<Mutex<oci_distribution::Client>>,
     in_progress_pulls: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
 }
@@ -74,6 +76,22 @@ struct PulledImageMetadata {
     config_user: Option<String>,
     annotations: HashMap<String, String>,
     manifest_media_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerConfigFile {
+    #[serde(default)]
+    auths: HashMap<String, DockerAuthEntry>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DockerAuthEntry {
+    #[serde(default)]
+    auth: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
 }
 
 impl ImageServiceImpl {
@@ -334,6 +352,83 @@ impl ImageServiceImpl {
         Ok(RegistryAuth::Anonymous)
     }
 
+    fn normalize_registry_key(value: &str) -> String {
+        value
+            .trim()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches("/v1/")
+            .trim_end_matches("/v2")
+            .trim_end_matches("/v2/")
+            .trim_end_matches("/v1/_catalog")
+            .trim_end_matches("/v2/_catalog")
+            .to_ascii_lowercase()
+    }
+
+    fn registry_auth_aliases(registry: &str) -> Vec<String> {
+        let normalized = Self::normalize_registry_key(registry);
+        match normalized.as_str() {
+            "docker.io" | "registry-1.docker.io" | "index.docker.io" => vec![
+                "docker.io".to_string(),
+                "registry-1.docker.io".to_string(),
+                "index.docker.io".to_string(),
+                "index.docker.io/v1".to_string(),
+                "index.docker.io/v1/".to_string(),
+                "https://index.docker.io/v1/".to_string(),
+            ],
+            _ => vec![normalized],
+        }
+    }
+
+    fn registry_auth_from_docker_entry(entry: &DockerAuthEntry) -> Option<RegistryAuth> {
+        if !entry.username.trim().is_empty() || !entry.password.trim().is_empty() {
+            return Some(RegistryAuth::Basic(
+                entry.username.clone(),
+                entry.password.clone(),
+            ));
+        }
+
+        Self::decode_auth_field(&entry.auth)
+            .map(|(username, password)| RegistryAuth::Basic(username, password))
+    }
+
+    fn registry_auth_from_global_auth_file(
+        &self,
+        reference: &Reference,
+    ) -> Result<Option<RegistryAuth>, Status> {
+        let Some(path) = self.global_auth_file.as_ref() else {
+            return Ok(None);
+        };
+
+        let raw = std::fs::read(path).map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to read image.global_auth_file {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
+        let config: DockerConfigFile = serde_json::from_slice(&raw).map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to parse image.global_auth_file {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
+
+        let aliases = Self::registry_auth_aliases(reference.resolve_registry());
+        for alias in aliases {
+            for (registry, entry) in &config.auths {
+                if Self::normalize_registry_key(registry) == alias {
+                    return Ok(Self::registry_auth_from_docker_entry(entry));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     fn provided_registry_bearer_token(auth: &AuthConfig) -> Option<String> {
         for candidate in [&auth.registry_token, &auth.identity_token] {
             let token = candidate.trim();
@@ -380,6 +475,7 @@ impl ImageServiceImpl {
     fn build_image_verbose_info(
         image: &Image,
         storage_path: &Path,
+        storage_driver: &str,
     ) -> Result<HashMap<String, String>, Status> {
         let image_dir = storage_path.join("images").join(&image.id);
         let meta: Option<ImageMeta> = std::fs::read(image_dir.join("metadata.json"))
@@ -420,6 +516,7 @@ impl ImageServiceImpl {
                 .as_ref()
                 .and_then(|meta| meta.manifest_media_type.clone()),
             "storagePath": image_dir.display().to_string(),
+            "storageDriver": storage_driver,
             "layers": layer_files,
         });
 
@@ -512,8 +609,20 @@ impl ImageServiceImpl {
         Ok(())
     }
 
-    pub fn new(storage_path: impl AsRef<Path>) -> Result<Self, Error> {
+    pub fn new(
+        storage_path: impl AsRef<Path>,
+        storage_driver: impl AsRef<str>,
+        global_auth_file: Option<impl AsRef<Path>>,
+    ) -> Result<Self, Error> {
         let storage_path = storage_path.as_ref().to_path_buf();
+        let storage_driver = storage_driver.as_ref().trim().to_string();
+
+        if storage_driver != "overlay" {
+            return Err(Error::Config(format!(
+                "image.driver must be \"overlay\", got {}",
+                storage_driver
+            )));
+        }
 
         if !storage_path.exists() {
             std::fs::create_dir_all(&storage_path).context("Failed to create storage directory")?;
@@ -529,6 +638,8 @@ impl ImageServiceImpl {
         Ok(Self {
             images,
             storage_path,
+            storage_driver,
+            global_auth_file: global_auth_file.map(|path| path.as_ref().to_path_buf()),
             oci_client: Arc::new(Mutex::new(oci_client)),
             in_progress_pulls: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -1144,7 +1255,11 @@ impl ImageService for ImageServiceImpl {
                 return Ok(Response::new(ImageStatusResponse {
                     image: Some(image.clone()),
                     info: if req.verbose {
-                        Self::build_image_verbose_info(&image, &self.storage_path)?
+                        Self::build_image_verbose_info(
+                            &image,
+                            &self.storage_path,
+                            &self.storage_driver,
+                        )?
                     } else {
                         HashMap::new()
                     },
@@ -1169,6 +1284,11 @@ impl ImageService for ImageServiceImpl {
             .ok_or_else(|| Status::invalid_argument("Image spec not specified"))?;
         let requested_ref = image_spec.image.clone();
         let canonical_ref = Self::canonicalize_image_reference(&requested_ref);
+
+        // 解析镜像引用
+        let reference: Reference = canonical_ref
+            .parse()
+            .map_err(|e| Status::invalid_argument(format!("Invalid image reference: {}", e)))?;
         let supplied_bearer_token = req
             .auth
             .as_ref()
@@ -1176,13 +1296,10 @@ impl ImageService for ImageServiceImpl {
 
         let auth = match req.auth.clone() {
             Some(auth) => Self::registry_auth_from_auth_config(auth)?,
-            None => RegistryAuth::Anonymous,
+            None => self
+                .registry_auth_from_global_auth_file(&reference)?
+                .unwrap_or(RegistryAuth::Anonymous),
         };
-
-        // 解析镜像引用
-        let reference: Reference = canonical_ref
-            .parse()
-            .map_err(|e| Status::invalid_argument(format!("Invalid image reference: {}", e)))?;
         let pull_key = canonical_ref.clone();
 
         loop {
@@ -1543,13 +1660,55 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().to_path_buf();
         std::mem::forget(dir);
-        ImageServiceImpl::new(path).unwrap()
+        ImageServiceImpl::new(path, "overlay", Option::<&Path>::None).unwrap()
     }
 
     fn test_image_service_in_tempdir() -> (TempDir, ImageServiceImpl) {
         let dir = tempdir().unwrap();
-        let service = ImageServiceImpl::new(dir.path()).unwrap();
+        let service = ImageServiceImpl::new(dir.path(), "overlay", Option::<&Path>::None).unwrap();
         (dir, service)
+    }
+
+    #[test]
+    fn image_service_rejects_unsupported_storage_driver() {
+        let dir = tempdir().unwrap();
+        let err = match ImageServiceImpl::new(dir.path(), "btrfs", Option::<&Path>::None) {
+            Ok(_) => panic!("unsupported image driver must fail initialization"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("image.driver must be \"overlay\""));
+    }
+
+    #[test]
+    fn image_service_uses_global_auth_file_for_matching_registry() {
+        let dir = tempdir().unwrap();
+        let auth_file = dir.path().join("config.json");
+        std::fs::write(
+            &auth_file,
+            r#"{
+                "auths": {
+                    "https://index.docker.io/v1/": {
+                        "auth": "dXNlcjpwYXNz"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let service = ImageServiceImpl::new(dir.path(), "overlay", Some(&auth_file)).unwrap();
+        let reference: Reference = "docker.io/library/busybox:latest".parse().unwrap();
+
+        let auth = service
+            .registry_auth_from_global_auth_file(&reference)
+            .unwrap()
+            .expect("matching auth should be loaded");
+
+        match auth {
+            RegistryAuth::Basic(username, password) => {
+                assert_eq!(username, "user");
+                assert_eq!(password, "pass");
+            }
+            RegistryAuth::Anonymous => panic!("expected basic auth from auth file"),
+        }
     }
 
     async fn insert_image(service: &ImageServiceImpl, image: Image) {

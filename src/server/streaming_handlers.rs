@@ -1,6 +1,61 @@
 use super::*;
 
 impl RuntimeServiceImpl {
+    async fn await_exec_sync_reader(
+        &self,
+        mut task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+        stream_name: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<u8>, Status> {
+        let join_result = if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, &mut task).await {
+                Ok(result) => result,
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    return Err(Status::deadline_exceeded(format!(
+                        "Exec sync {} drain timed out after {}ms",
+                        stream_name,
+                        self.config.exec_sync_io_drain_timeout.as_millis()
+                    )));
+                }
+            }
+        } else {
+            task.await
+        };
+
+        join_result
+            .map_err(|e| Status::internal(format!("Failed to join {} task: {}", stream_name, e)))?
+            .map_err(|e| Status::internal(format!("Failed to read {}: {}", stream_name, e)))
+    }
+
+    async fn drain_exec_sync_io(
+        &self,
+        stdout_task: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
+        stderr_task: Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
+    ) -> Result<(Vec<u8>, Vec<u8>), Status> {
+        let deadline = (!self.config.exec_sync_io_drain_timeout.is_zero())
+            .then(|| tokio::time::Instant::now() + self.config.exec_sync_io_drain_timeout);
+
+        let stdout = match stdout_task {
+            Some(task) => {
+                self.await_exec_sync_reader(task, "stdout", deadline)
+                    .await?
+            }
+            None => Vec::new(),
+        };
+        let stderr = match stderr_task {
+            Some(task) => {
+                self.await_exec_sync_reader(task, "stderr", deadline)
+                    .await?
+            }
+            None => Vec::new(),
+        };
+
+        Ok((stdout, stderr))
+    }
+
     pub(super) async fn get_streaming_server(&self) -> Result<StreamingServer, Status> {
         let streaming = self.streaming.lock().await;
         streaming
@@ -30,7 +85,9 @@ impl RuntimeServiceImpl {
     }
 
     pub(super) fn attach_socket_path(&self, container_id: &str) -> PathBuf {
-        self.shim_work_dir.join(container_id).join("attach.sock")
+        self.attach_socket_dir
+            .join(container_id)
+            .join("attach.sock")
     }
 
     pub(super) async fn exec(
@@ -41,8 +98,16 @@ impl RuntimeServiceImpl {
         req.container_id = self.resolve_container_id(&req.container_id).await?;
         self.ensure_container_is_streamable(&req.container_id, "exec")
             .await?;
+        let runtime_path = self
+            .runtime_for_container_request(&req.container_id)
+            .await?
+            .runtime_path()
+            .to_path_buf();
+        let exec_cpu_affinity = self.effective_exec_cpu_affinity(&req.container_id).await;
         let streaming = self.get_streaming_server().await?;
-        let response = streaming.get_exec(&req).await?;
+        let response = streaming
+            .get_exec(&req, runtime_path, exec_cpu_affinity)
+            .await?;
         Ok(Response::new(response))
     }
 
@@ -64,12 +129,22 @@ impl RuntimeServiceImpl {
         self.ensure_container_is_streamable(&container_id, "exec_sync")
             .await?;
 
-        let mut command = TokioCommand::new(&self.config.runtime_path);
+        let runtime_path = self
+            .runtime_for_container_request(&container_id)
+            .await?
+            .runtime_path()
+            .to_path_buf();
+        let exec_cpu_affinity = self.effective_exec_cpu_affinity(&container_id).await;
+        let mut command = TokioCommand::new(&runtime_path);
         command.arg("exec");
         command.arg(&container_id);
         for arg in &cmd {
             command.arg(arg);
         }
+        crate::runtime::RuncRuntime::apply_exec_cpu_affinity_to_tokio_command(
+            &mut command,
+            exec_cpu_affinity,
+        );
         command.stdin(Stdio::null());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -101,6 +176,7 @@ impl RuntimeServiceImpl {
                 Err(_) => {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
+                    let _ = self.drain_exec_sync_io(stdout_task, stderr_task).await;
                     return Err(Status::deadline_exceeded(format!(
                         "Exec sync timed out after {}s",
                         timeout.as_secs()
@@ -114,20 +190,7 @@ impl RuntimeServiceImpl {
                 .map_err(|e| Status::internal(format!("Exec failed: {}", e)))?
         };
 
-        let stdout = match stdout_task {
-            Some(task) => task
-                .await
-                .map_err(|e| Status::internal(format!("Failed to join stdout task: {}", e)))?
-                .map_err(|e| Status::internal(format!("Failed to read stdout: {}", e)))?,
-            None => Vec::new(),
-        };
-        let stderr = match stderr_task {
-            Some(task) => task
-                .await
-                .map_err(|e| Status::internal(format!("Failed to join stderr task: {}", e)))?
-                .map_err(|e| Status::internal(format!("Failed to read stderr: {}", e)))?,
-            None => Vec::new(),
-        };
+        let (stdout, stderr) = self.drain_exec_sync_io(stdout_task, stderr_task).await?;
 
         Ok(Response::new(ExecSyncResponse {
             stdout,
@@ -161,9 +224,14 @@ impl RuntimeServiceImpl {
             )));
         }
 
-        let netns_path =
-            Self::read_internal_state::<StoredPodState>(&pod.annotations, INTERNAL_POD_STATE_KEY)
-                .and_then(|state| state.netns_path)
+        let pod_state =
+            Self::read_internal_state::<StoredPodState>(&pod.annotations, INTERNAL_POD_STATE_KEY);
+        let netns_path = if !Self::pod_requires_managed_netns(pod_state.as_ref()) {
+            "/proc/thread-self/ns/net".to_string()
+        } else {
+            let netns_path = pod_state
+                .as_ref()
+                .and_then(|state| state.netns_path.clone())
                 .or_else(|| {
                     self.pod_manager
                         .try_lock()
@@ -178,12 +246,14 @@ impl RuntimeServiceImpl {
                     ))
                 })?;
 
-        if !std::path::Path::new(&netns_path).exists() {
-            return Err(Status::failed_precondition(format!(
-                "pod sandbox {} network namespace does not exist: {}",
-                pod_id, netns_path
-            )));
-        }
+            if !std::path::Path::new(&netns_path).exists() {
+                return Err(Status::failed_precondition(format!(
+                    "pod sandbox {} network namespace does not exist: {}",
+                    pod_id, netns_path
+                )));
+            }
+            netns_path
+        };
 
         let streaming = self.get_streaming_server().await?;
         let response = streaming
@@ -212,7 +282,7 @@ impl RuntimeServiceImpl {
                             INTERNAL_CONTAINER_STATE_KEY,
                         )
                     })
-                    .map(|state| state.tty)
+                    .map(|state| state.tty && req.stdin)
                     .unwrap_or(false)
             };
 

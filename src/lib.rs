@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! # crius Rust Implementation
 //!
 //! A Rust implementation of the Kubernetes Container Runtime Interface (CRI).

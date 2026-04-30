@@ -1,6 +1,179 @@
 use super::*;
 
 impl RuntimeServiceImpl {
+    pub(super) fn stats_cache_is_fresh(
+        collected_at: std::time::Instant,
+        period_secs: u64,
+        now: std::time::Instant,
+    ) -> bool {
+        period_secs != 0
+            && now.duration_since(collected_at) < std::time::Duration::from_secs(period_secs)
+    }
+
+    fn pod_metric_enabled(&self, category: &str) -> bool {
+        self.config
+            .included_pod_metrics
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("all") || value.eq_ignore_ascii_case(category))
+    }
+
+    async fn cached_container_stats(
+        &self,
+        container_id: &str,
+        container: &Container,
+    ) -> Option<crate::proto::runtime::v1::ContainerStats> {
+        let period_secs = self.config.stats_collection_period;
+        let now = std::time::Instant::now();
+        if period_secs != 0 {
+            if let Some(entry) = self
+                .container_stats_cache
+                .lock()
+                .await
+                .get(container_id)
+                .cloned()
+            {
+                if Self::stats_cache_is_fresh(entry.collected_at, period_secs, now) {
+                    return Some(entry.value);
+                }
+            }
+        }
+
+        let cgroup_parent = self.container_cgroup_hint(container_id, container).await;
+        let stats = match MetricsCollector::new() {
+            Ok(collector) => {
+                match collector.collect_container_stats(container_id, &cgroup_parent) {
+                    Ok(stats) => {
+                        let mut proto_stats = self.convert_to_proto_container_stats(stats);
+                        Self::populate_container_stats_attributes(&mut proto_stats, container);
+                        proto_stats
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to collect stats for container {}: {}",
+                            container_id,
+                            e
+                        );
+                        return None;
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to create MetricsCollector: {}", e);
+                return None;
+            }
+        };
+
+        if period_secs != 0 {
+            self.container_stats_cache.lock().await.insert(
+                container_id.to_string(),
+                crate::server::service::CachedStatsEntry {
+                    collected_at: now,
+                    value: stats.clone(),
+                },
+            );
+        }
+
+        Some(stats)
+    }
+
+    pub(super) fn build_pod_metrics(
+        &self,
+        pod_id: &str,
+        timestamp: i64,
+        total_cpu_usage: u64,
+        total_memory_usage: u64,
+        total_memory_limit: u64,
+        total_pids: u64,
+        total_filesystem_usage: u64,
+        total_rx_bytes: u64,
+        total_tx_bytes: u64,
+    ) -> Vec<crate::proto::runtime::v1::Metric> {
+        use crate::proto::runtime::v1::{Metric, MetricType, UInt64Value};
+
+        let mut metrics = Vec::new();
+        if self.pod_metric_enabled("cpu") {
+            metrics.push(Metric {
+                name: "container_cpu_usage_seconds_total".to_string(),
+                timestamp,
+                metric_type: MetricType::Counter as i32,
+                label_values: vec![pod_id.to_string()],
+                value: Some(UInt64Value {
+                    value: total_cpu_usage,
+                }),
+            });
+        }
+        if self.pod_metric_enabled("memory") {
+            metrics.push(Metric {
+                name: "container_memory_working_set_bytes".to_string(),
+                timestamp,
+                metric_type: MetricType::Gauge as i32,
+                label_values: vec![pod_id.to_string()],
+                value: Some(UInt64Value {
+                    value: total_memory_usage,
+                }),
+            });
+            metrics.push(Metric {
+                name: "container_memory_usage_bytes".to_string(),
+                timestamp,
+                metric_type: MetricType::Gauge as i32,
+                label_values: vec![pod_id.to_string()],
+                value: Some(UInt64Value {
+                    value: total_memory_usage,
+                }),
+            });
+            metrics.push(Metric {
+                name: "container_spec_memory_limit_bytes".to_string(),
+                timestamp,
+                metric_type: MetricType::Gauge as i32,
+                label_values: vec![pod_id.to_string()],
+                value: Some(UInt64Value {
+                    value: total_memory_limit,
+                }),
+            });
+        }
+        if self.pod_metric_enabled("process") {
+            metrics.push(Metric {
+                name: "container_pids_current".to_string(),
+                timestamp,
+                metric_type: MetricType::Gauge as i32,
+                label_values: vec![pod_id.to_string()],
+                value: Some(UInt64Value { value: total_pids }),
+            });
+        }
+        if self.pod_metric_enabled("disk") {
+            metrics.push(Metric {
+                name: "container_filesystem_usage_bytes".to_string(),
+                timestamp,
+                metric_type: MetricType::Gauge as i32,
+                label_values: vec![pod_id.to_string()],
+                value: Some(UInt64Value {
+                    value: total_filesystem_usage,
+                }),
+            });
+        }
+        if self.pod_metric_enabled("network") {
+            metrics.push(Metric {
+                name: "pod_network_receive_bytes_total".to_string(),
+                timestamp,
+                metric_type: MetricType::Counter as i32,
+                label_values: vec![pod_id.to_string()],
+                value: Some(UInt64Value {
+                    value: total_rx_bytes,
+                }),
+            });
+            metrics.push(Metric {
+                name: "pod_network_transmit_bytes_total".to_string(),
+                timestamp,
+                metric_type: MetricType::Counter as i32,
+                label_values: vec![pod_id.to_string()],
+                value: Some(UInt64Value {
+                    value: total_tx_bytes,
+                }),
+            });
+        }
+        metrics
+    }
+
     pub(super) fn convert_to_proto_container_stats(
         &self,
         stats: crate::metrics::ContainerStats,
@@ -215,6 +388,214 @@ impl RuntimeServiceImpl {
         })
     }
 
+    async fn cached_pod_stats(
+        &self,
+        pod_id: &str,
+        pod: &crate::proto::runtime::v1::PodSandbox,
+    ) -> Option<crate::proto::runtime::v1::PodSandboxStats> {
+        let period_secs = self.config.stats_collection_period;
+        let now = std::time::Instant::now();
+        if period_secs != 0 {
+            if let Some(entry) = self.pod_stats_cache.lock().await.get(pod_id).cloned() {
+                if Self::stats_cache_is_fresh(entry.collected_at, period_secs, now) {
+                    return Some(entry.value);
+                }
+            }
+        }
+
+        let stats = self.collect_pod_stats(pod_id, pod).await?;
+        if period_secs != 0 {
+            self.pod_stats_cache.lock().await.insert(
+                pod_id.to_string(),
+                crate::server::service::CachedStatsEntry {
+                    collected_at: now,
+                    value: stats.clone(),
+                },
+            );
+        }
+        Some(stats)
+    }
+
+    async fn collect_pod_sandbox_metrics_for_pod(
+        &self,
+        pod_id: &str,
+        pod: &crate::proto::runtime::v1::PodSandbox,
+    ) -> Option<crate::proto::runtime::v1::PodSandboxMetrics> {
+        use crate::proto::runtime::v1::{
+            ContainerMetrics, Metric, MetricType, PodSandboxMetrics, UInt64Value,
+        };
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let containers = self.containers.lock().await;
+        let mut container_metrics_list = Vec::new();
+        let pod_uid = pod.metadata.as_ref().map(|m| m.uid.clone());
+
+        let mut total_cpu_usage = 0u64;
+        let mut total_memory_usage = 0u64;
+        let mut total_memory_limit = 0u64;
+        let mut total_pids = 0u64;
+        let mut total_filesystem_usage = 0u64;
+        let mut total_rx_bytes = 0u64;
+        let mut total_tx_bytes = 0u64;
+
+        for (container_id, container) in containers.iter() {
+            let belongs_to_pod = container.pod_sandbox_id == pod_id
+                || pod_uid
+                    .as_ref()
+                    .and_then(|uid| {
+                        container
+                            .annotations
+                            .get("io.kubernetes.pod.uid")
+                            .map(|container_uid| container_uid == uid)
+                    })
+                    .unwrap_or(false);
+
+            if belongs_to_pod {
+                let container_state = Self::read_internal_state::<StoredContainerState>(
+                    &container.annotations,
+                    INTERNAL_CONTAINER_STATE_KEY,
+                );
+
+                let cgroup_parent = container_state
+                    .as_ref()
+                    .and_then(|s| s.cgroup_parent.as_ref())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"));
+
+                if let Ok(collector) = MetricsCollector::new() {
+                    if let Ok(stats) =
+                        collector.collect_container_stats(container_id, &cgroup_parent)
+                    {
+                        let container_cpu = stats.cpu.as_ref().map(|c| c.usage_total).unwrap_or(0);
+                        let container_mem = stats.memory.as_ref().map(|m| m.usage).unwrap_or(0);
+                        let container_mem_limit =
+                            stats.memory.as_ref().map(|m| m.limit).unwrap_or(0);
+                        let container_pids = stats.pids.as_ref().map(|p| p.current).unwrap_or(0);
+                        let container_fs_usage = self
+                            .container_writable_layer_usage(container_id)
+                            .and_then(|usage| usage.used_bytes.map(|bytes| bytes.value))
+                            .unwrap_or(0);
+                        let container_network = self.container_network_stats(container_id).await;
+
+                        total_cpu_usage += container_cpu;
+                        total_memory_usage += container_mem;
+                        total_memory_limit += container_mem_limit;
+                        total_pids += container_pids;
+                        total_filesystem_usage += container_fs_usage;
+                        if let Some(network) = container_network {
+                            total_rx_bytes += network.rx_bytes;
+                            total_tx_bytes += network.tx_bytes;
+                        }
+
+                        let timestamp = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as i64;
+                        let container_metric_list = vec![
+                            Metric {
+                                name: "container_cpu_usage_seconds_total".to_string(),
+                                timestamp,
+                                metric_type: MetricType::Counter as i32,
+                                label_values: vec![container_id.clone(), pod_id.to_string()],
+                                value: Some(UInt64Value {
+                                    value: container_cpu,
+                                }),
+                            },
+                            Metric {
+                                name: "container_memory_working_set_bytes".to_string(),
+                                timestamp,
+                                metric_type: MetricType::Gauge as i32,
+                                label_values: vec![container_id.clone(), pod_id.to_string()],
+                                value: Some(UInt64Value {
+                                    value: container_mem,
+                                }),
+                            },
+                            Metric {
+                                name: "container_pids_current".to_string(),
+                                timestamp,
+                                metric_type: MetricType::Gauge as i32,
+                                label_values: vec![container_id.clone(), pod_id.to_string()],
+                                value: Some(UInt64Value {
+                                    value: container_pids,
+                                }),
+                            },
+                            Metric {
+                                name: "container_filesystem_usage_bytes".to_string(),
+                                timestamp,
+                                metric_type: MetricType::Gauge as i32,
+                                label_values: vec![container_id.clone(), pod_id.to_string()],
+                                value: Some(UInt64Value {
+                                    value: container_fs_usage,
+                                }),
+                            },
+                        ];
+
+                        container_metrics_list.push(ContainerMetrics {
+                            container_id: container_id.clone(),
+                            metrics: container_metric_list,
+                        });
+                    }
+                }
+            }
+        }
+
+        if container_metrics_list.is_empty() {
+            return None;
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
+        let metrics = self.build_pod_metrics(
+            pod_id,
+            timestamp,
+            total_cpu_usage,
+            total_memory_usage,
+            total_memory_limit,
+            total_pids,
+            total_filesystem_usage,
+            total_rx_bytes,
+            total_tx_bytes,
+        );
+
+        Some(PodSandboxMetrics {
+            pod_sandbox_id: pod_id.to_string(),
+            metrics,
+            container_metrics: container_metrics_list,
+        })
+    }
+
+    async fn cached_pod_sandbox_metrics(
+        &self,
+        pod_id: &str,
+        pod: &crate::proto::runtime::v1::PodSandbox,
+    ) -> Option<crate::proto::runtime::v1::PodSandboxMetrics> {
+        let period_secs = self.config.pod_sandbox_metrics_collection_period;
+        let now = std::time::Instant::now();
+        if period_secs != 0 {
+            if let Some(entry) = self.pod_metrics_cache.lock().await.get(pod_id).cloned() {
+                if Self::stats_cache_is_fresh(entry.collected_at, period_secs, now) {
+                    return Some(entry.value);
+                }
+            }
+        }
+
+        let metrics = self
+            .collect_pod_sandbox_metrics_for_pod(pod_id, pod)
+            .await?;
+        if period_secs != 0 {
+            self.pod_metrics_cache.lock().await.insert(
+                pod_id.to_string(),
+                crate::server::service::CachedStatsEntry {
+                    collected_at: now,
+                    value: metrics.clone(),
+                },
+            );
+        }
+        Some(metrics)
+    }
+
     pub(super) async fn container_stats(
         &self,
         request: Request<ContainerStatsRequest>,
@@ -227,30 +608,7 @@ impl RuntimeServiceImpl {
         let container = containers
             .get(&container_id)
             .ok_or_else(|| Status::not_found("Container not found"))?;
-        let cgroup_parent = self.container_cgroup_hint(&container_id, container).await;
-
-        let stats = match MetricsCollector::new() {
-            Ok(collector) => match collector.collect_container_stats(&container_id, &cgroup_parent)
-            {
-                Ok(stats) => {
-                    let mut proto_stats = self.convert_to_proto_container_stats(stats);
-                    Self::populate_container_stats_attributes(&mut proto_stats, container);
-                    Some(proto_stats)
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Failed to collect stats for container {}: {}",
-                        container_id,
-                        e
-                    );
-                    None
-                }
-            },
-            Err(e) => {
-                log::warn!("Failed to create MetricsCollector: {}", e);
-                None
-            }
-        };
+        let stats = self.cached_container_stats(&container_id, container).await;
 
         Ok(Response::new(ContainerStatsResponse { stats }))
     }
@@ -289,16 +647,6 @@ impl RuntimeServiceImpl {
 
         let containers = self.containers.lock().await;
         let mut all_stats = Vec::new();
-        let collector = match MetricsCollector::new() {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("Failed to create MetricsCollector: {}", e);
-                return Ok(Response::new(ListContainerStatsResponse {
-                    stats: Vec::new(),
-                }));
-            }
-        };
-
         for (container_id, container) in containers.iter() {
             if matches!(
                 container.state,
@@ -313,11 +661,8 @@ impl RuntimeServiceImpl {
                 }
             }
 
-            let cgroup_parent = self.container_cgroup_hint(container_id, container).await;
-            if let Ok(stats) = collector.collect_container_stats(container_id, &cgroup_parent) {
-                let mut proto_stats = self.convert_to_proto_container_stats(stats);
-                Self::populate_container_stats_attributes(&mut proto_stats, container);
-                all_stats.push(proto_stats);
+            if let Some(stats) = self.cached_container_stats(container_id, container).await {
+                all_stats.push(stats);
             }
         }
 
@@ -338,7 +683,7 @@ impl RuntimeServiceImpl {
         let pod = pods
             .get(&pod_id)
             .ok_or_else(|| Status::not_found("Pod sandbox not found"))?;
-        let stats = self.collect_pod_stats(&pod_id, pod).await;
+        let stats = self.cached_pod_stats(&pod_id, pod).await;
 
         Ok(Response::new(PodSandboxStatsResponse { stats }))
     }
@@ -378,7 +723,7 @@ impl RuntimeServiceImpl {
                     continue;
                 }
             }
-            if let Some(stats) = self.collect_pod_stats(&pod_id, &pod).await {
+            if let Some(stats) = self.cached_pod_stats(&pod_id, &pod).await {
                 all_stats.push(stats);
             }
         }
@@ -444,210 +789,12 @@ impl RuntimeServiceImpl {
         &self,
         _request: Request<ListPodSandboxMetricsRequest>,
     ) -> Result<Response<ListPodSandboxMetricsResponse>, Status> {
-        use crate::proto::runtime::v1::{
-            ContainerMetrics, Metric, MetricType, PodSandboxMetrics, UInt64Value,
-        };
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         let pods = self.pod_sandboxes.lock().await;
-        let containers = self.containers.lock().await;
         let mut pod_metrics_list = Vec::new();
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as i64;
-
         for (pod_id, pod) in pods.iter() {
-            let mut metrics = Vec::new();
-            let mut container_metrics_list = Vec::new();
-            let pod_uid = pod.metadata.as_ref().map(|m| m.uid.clone());
-
-            let mut total_cpu_usage = 0u64;
-            let mut total_memory_usage = 0u64;
-            let mut total_memory_limit = 0u64;
-            let mut total_pids = 0u64;
-            let mut total_filesystem_usage = 0u64;
-            let mut total_rx_bytes = 0u64;
-            let mut total_tx_bytes = 0u64;
-
-            for (container_id, container) in containers.iter() {
-                let belongs_to_pod = container.pod_sandbox_id == *pod_id
-                    || pod_uid
-                        .as_ref()
-                        .and_then(|uid| {
-                            container
-                                .annotations
-                                .get("io.kubernetes.pod.uid")
-                                .map(|container_uid| container_uid == uid)
-                        })
-                        .unwrap_or(false);
-
-                if belongs_to_pod {
-                    let container_state = Self::read_internal_state::<StoredContainerState>(
-                        &container.annotations,
-                        INTERNAL_CONTAINER_STATE_KEY,
-                    );
-
-                    let cgroup_parent = container_state
-                        .as_ref()
-                        .and_then(|s| s.cgroup_parent.as_ref())
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup"));
-
-                    if let Ok(collector) = MetricsCollector::new() {
-                        if let Ok(stats) =
-                            collector.collect_container_stats(container_id, &cgroup_parent)
-                        {
-                            let container_cpu =
-                                stats.cpu.as_ref().map(|c| c.usage_total).unwrap_or(0);
-                            let container_mem = stats.memory.as_ref().map(|m| m.usage).unwrap_or(0);
-                            let container_mem_limit =
-                                stats.memory.as_ref().map(|m| m.limit).unwrap_or(0);
-                            let container_pids =
-                                stats.pids.as_ref().map(|p| p.current).unwrap_or(0);
-                            let container_fs_usage = self
-                                .container_writable_layer_usage(container_id)
-                                .and_then(|usage| usage.used_bytes.map(|bytes| bytes.value))
-                                .unwrap_or(0);
-                            let container_network =
-                                self.container_network_stats(container_id).await;
-
-                            total_cpu_usage += container_cpu;
-                            total_memory_usage += container_mem;
-                            total_memory_limit += container_mem_limit;
-                            total_pids += container_pids;
-                            total_filesystem_usage += container_fs_usage;
-                            if let Some(network) = container_network {
-                                total_rx_bytes += network.rx_bytes;
-                                total_tx_bytes += network.tx_bytes;
-                            }
-
-                            let container_metric_list = vec![
-                                Metric {
-                                    name: "container_cpu_usage_seconds_total".to_string(),
-                                    timestamp,
-                                    metric_type: MetricType::Counter as i32,
-                                    label_values: vec![container_id.clone(), pod_id.clone()],
-                                    value: Some(UInt64Value {
-                                        value: container_cpu,
-                                    }),
-                                },
-                                Metric {
-                                    name: "container_memory_working_set_bytes".to_string(),
-                                    timestamp,
-                                    metric_type: MetricType::Gauge as i32,
-                                    label_values: vec![container_id.clone(), pod_id.clone()],
-                                    value: Some(UInt64Value {
-                                        value: container_mem,
-                                    }),
-                                },
-                                Metric {
-                                    name: "container_pids_current".to_string(),
-                                    timestamp,
-                                    metric_type: MetricType::Gauge as i32,
-                                    label_values: vec![container_id.clone(), pod_id.clone()],
-                                    value: Some(UInt64Value {
-                                        value: container_pids,
-                                    }),
-                                },
-                                Metric {
-                                    name: "container_filesystem_usage_bytes".to_string(),
-                                    timestamp,
-                                    metric_type: MetricType::Gauge as i32,
-                                    label_values: vec![container_id.clone(), pod_id.clone()],
-                                    value: Some(UInt64Value {
-                                        value: container_fs_usage,
-                                    }),
-                                },
-                            ];
-
-                            container_metrics_list.push(ContainerMetrics {
-                                container_id: container_id.clone(),
-                                metrics: container_metric_list,
-                            });
-                        }
-                    }
-                }
-            }
-
-            if !container_metrics_list.is_empty() {
-                metrics.push(Metric {
-                    name: "container_cpu_usage_seconds_total".to_string(),
-                    timestamp,
-                    metric_type: MetricType::Counter as i32,
-                    label_values: vec![pod_id.clone()],
-                    value: Some(UInt64Value {
-                        value: total_cpu_usage,
-                    }),
-                });
-                metrics.push(Metric {
-                    name: "container_memory_working_set_bytes".to_string(),
-                    timestamp,
-                    metric_type: MetricType::Gauge as i32,
-                    label_values: vec![pod_id.clone()],
-                    value: Some(UInt64Value {
-                        value: total_memory_usage,
-                    }),
-                });
-                metrics.push(Metric {
-                    name: "container_memory_usage_bytes".to_string(),
-                    timestamp,
-                    metric_type: MetricType::Gauge as i32,
-                    label_values: vec![pod_id.clone()],
-                    value: Some(UInt64Value {
-                        value: total_memory_usage,
-                    }),
-                });
-                metrics.push(Metric {
-                    name: "container_spec_memory_limit_bytes".to_string(),
-                    timestamp,
-                    metric_type: MetricType::Gauge as i32,
-                    label_values: vec![pod_id.clone()],
-                    value: Some(UInt64Value {
-                        value: total_memory_limit,
-                    }),
-                });
-                metrics.push(Metric {
-                    name: "container_pids_current".to_string(),
-                    timestamp,
-                    metric_type: MetricType::Gauge as i32,
-                    label_values: vec![pod_id.clone()],
-                    value: Some(UInt64Value { value: total_pids }),
-                });
-                metrics.push(Metric {
-                    name: "container_filesystem_usage_bytes".to_string(),
-                    timestamp,
-                    metric_type: MetricType::Gauge as i32,
-                    label_values: vec![pod_id.clone()],
-                    value: Some(UInt64Value {
-                        value: total_filesystem_usage,
-                    }),
-                });
-                metrics.push(Metric {
-                    name: "pod_network_receive_bytes_total".to_string(),
-                    timestamp,
-                    metric_type: MetricType::Counter as i32,
-                    label_values: vec![pod_id.clone()],
-                    value: Some(UInt64Value {
-                        value: total_rx_bytes,
-                    }),
-                });
-                metrics.push(Metric {
-                    name: "pod_network_transmit_bytes_total".to_string(),
-                    timestamp,
-                    metric_type: MetricType::Counter as i32,
-                    label_values: vec![pod_id.clone()],
-                    value: Some(UInt64Value {
-                        value: total_tx_bytes,
-                    }),
-                });
-
-                pod_metrics_list.push(PodSandboxMetrics {
-                    pod_sandbox_id: pod_id.clone(),
-                    metrics,
-                    container_metrics: container_metrics_list,
-                });
+            if let Some(metrics) = self.cached_pod_sandbox_metrics(pod_id, pod).await {
+                pod_metrics_list.push(metrics);
             }
         }
 
