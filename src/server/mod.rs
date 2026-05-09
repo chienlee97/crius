@@ -3939,13 +3939,10 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<VersionRequest>,
     ) -> Result<Response<VersionResponse>, Status> {
-        let runtime_version = self
-            .runtime_binary_version()
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
         Ok(Response::new(VersionResponse {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            runtime_name: self.config.runtime.clone(),
-            runtime_version,
+            version: self.cri_runtime_version().to_string(),
+            runtime_name: self.cri_runtime_name().to_string(),
+            runtime_version: self.cri_runtime_version().to_string(),
             runtime_api_version: "v1".to_string(),
         }))
     }

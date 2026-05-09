@@ -7450,6 +7450,8 @@ async fn status_verbose_returns_structured_config() {
     let config: serde_json::Value =
         serde_json::from_str(response.info.get("config").unwrap()).unwrap();
     assert_eq!(config["runtimeName"], "crius");
+    assert_eq!(config["runtimeVersion"], env!("CARGO_PKG_VERSION"));
+    assert!(config["ociRuntimeVersion"].is_null());
     assert_eq!(config["defaultRuntimeHandler"], "runc");
     assert!(!config["runtimeHandlers"].as_array().unwrap().is_empty());
     assert_eq!(config["imageRoot"], "/tmp/crius-test-images");
@@ -7815,7 +7817,7 @@ async fn status_verbose_reports_cgroup_disable_runtime_feature_state() {
 }
 
 #[tokio::test]
-async fn version_reports_runtime_binary_version_when_available() {
+async fn version_reports_cri_runtime_identity_when_oci_runtime_version_is_available() {
     let dir = tempdir().unwrap();
     let runtime_path = dir.path().join("fake-runtime-version.sh");
     fs::write(
@@ -7864,8 +7866,61 @@ exit 0
     .await
     .unwrap()
     .into_inner();
-    assert_eq!(response.runtime_name, "runc");
-    assert_eq!(response.runtime_version, "runc version 1.2.3");
+    assert_eq!(response.runtime_name, "crius");
+    assert_eq!(response.runtime_version, env!("CARGO_PKG_VERSION"));
+}
+
+#[tokio::test]
+async fn status_verbose_reports_oci_runtime_version_separately() {
+    let dir = tempdir().unwrap();
+    let runtime_path = dir.path().join("fake-runtime-version.sh");
+    fs::write(
+        &runtime_path,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "runc version 1.2.3"
+  exit 0
+fi
+exit 0
+"#,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&runtime_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&runtime_path, perms).unwrap();
+
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime_path = runtime_path.clone();
+    config.runtime_configs.insert(
+        "runc".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            runtime_path: runtime_path.display().to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: config.runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/definitely/missing/crius-shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 240,
+            snapshotter: "internal-overlay-untar".to_string(),
+        },
+    );
+    let service = RuntimeServiceImpl::new(config);
+    let response = RuntimeService::status(&service, Request::new(StatusRequest { verbose: true }))
+        .await
+        .unwrap()
+        .into_inner();
+    let payload: serde_json::Value =
+        serde_json::from_str(response.info.get("config").unwrap()).unwrap();
+
+    assert_eq!(payload["runtimeName"], "crius");
+    assert_eq!(payload["runtimeVersion"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(payload["ociRuntimeVersion"], "runc version 1.2.3");
 }
 
 #[test]

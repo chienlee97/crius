@@ -391,6 +391,14 @@ impl RuntimeServiceImpl {
             .map(|line| line.trim().to_string())
     }
 
+    pub(super) fn cri_runtime_name(&self) -> &'static str {
+        env!("CARGO_PKG_NAME")
+    }
+
+    pub(super) fn cri_runtime_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
     pub(super) fn runtime_readiness(&self) -> (bool, String, String) {
         let path = &self.config.runtime_path;
         let metadata = match std::fs::metadata(path) {
@@ -779,15 +787,14 @@ impl RuntimeServiceImpl {
         let info = if req.verbose {
             let runtime_network_config = self.runtime_network_config.lock().await.clone();
             let payload = json!({
-                "runtimeName": "crius",
-                "runtimeVersion": self
-                    .runtime_binary_version()
-                    .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+                "runtimeName": self.cri_runtime_name(),
+                "runtimeVersion": self.cri_runtime_version(),
                 "runtimeApiVersion": "v1",
                 "rootDir": self.config.root_dir.display().to_string(),
                 "runtime": self.config.runtime.clone(),
                 "defaultRuntimeHandler": self.config.runtime.clone(),
                 "runtimePath": self.config.runtime_path.display().to_string(),
+                "ociRuntimeVersion": self.runtime_binary_version(),
                 "runtimeRoot": self.config.runtime_root.display().to_string(),
                 "attachSocketDir": self.config.attach_socket_dir.display().to_string(),
                 "containerExitsDir": self.config.container_exits_dir.display().to_string(),
