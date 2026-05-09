@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! # crius Rust Implementation
 //!
 //! A Rust implementation of the Kubernetes Container Runtime Interface (CRI).
@@ -19,6 +21,7 @@ pub mod security;
 pub mod server;
 pub mod storage;
 pub mod streaming;
+pub mod trace_export;
 pub mod utils;
 pub use crate::proto::nri as nri_proto;
 

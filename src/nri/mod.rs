@@ -11,10 +11,11 @@ pub mod transport;
 
 pub use adjust::{
     apply_annotation_adjustments, apply_container_adjustment,
-    apply_container_adjustment_with_blockio_config, disallowed_annotation_adjustment_keys,
-    filter_annotation_adjustments_by_allowlist, resolve_blockio_class, resolve_rdt_class,
-    sanitize_linux_resources_for_capabilities, validate_adjustment_resources_with_min_memory,
-    validate_container_adjustment, validate_container_update, validate_update_linux_resources,
+    apply_container_adjustment_with_blockio_config, apply_container_adjustment_with_options,
+    disallowed_annotation_adjustment_keys, filter_annotation_adjustments_by_allowlist,
+    resolve_blockio_class, resolve_rdt_class, sanitize_linux_resources_for_capabilities,
+    validate_adjustment_resources_with_min_memory, validate_container_adjustment,
+    validate_container_update, validate_update_linux_resources, AdjustmentOptions,
 };
 pub use api::{
     NopNri, NopNriPluginSyncBlock, NriApi, NriContainerEvent, NriCreateContainerResult, NriDomain,

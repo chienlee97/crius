@@ -1,6 +1,260 @@
 use super::*;
 
 impl RuntimeServiceImpl {
+    async fn prune_recovered_logical_duplicates(&self) -> Result<(), Status> {
+        let pod_snapshots: Vec<crate::proto::runtime::v1::PodSandbox> = {
+            let pods = self.pod_sandboxes.lock().await;
+            pods.values().cloned().collect()
+        };
+        let mut best_pods = HashMap::new();
+        let mut pod_losers = Vec::new();
+        for mut pod in pod_snapshots {
+            pod.state = self.live_pod_sandbox_state(&pod).await;
+            let Some(key) = Self::sandbox_identity_key(&pod) else {
+                continue;
+            };
+            match best_pods.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if Self::sandbox_rank(&pod) > Self::sandbox_rank(entry.get()) {
+                        pod_losers.push(entry.insert(pod).id.clone());
+                    } else {
+                        pod_losers.push(pod.id.clone());
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(pod);
+                }
+            }
+        }
+        if !pod_losers.is_empty() {
+            for pod_id in &pod_losers {
+                self.cleanup_stale_logical_pod_sandbox(pod_id).await?;
+            }
+        }
+
+        let container_snapshots: Vec<Container> = {
+            let containers = self.containers.lock().await;
+            containers.values().cloned().collect()
+        };
+        let mut best_containers = HashMap::new();
+        let mut container_losers = Vec::new();
+        for mut container in container_snapshots {
+            container.state = Self::map_runtime_container_state(
+                self.runtime_container_status_checked(&container.id).await,
+            );
+            let Some(key) = Self::container_identity_key(&container) else {
+                continue;
+            };
+            match best_containers.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if Self::container_rank(&container) > Self::container_rank(entry.get()) {
+                        container_losers.push(entry.insert(container).id.clone());
+                    } else {
+                        container_losers.push(container.id.clone());
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(container);
+                }
+            }
+        }
+        if !container_losers.is_empty() {
+            for container_id in &container_losers {
+                self.cleanup_stale_logical_container(container_id).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn pause_process_root_matches_runtime_pod_root(
+        root_link: &Path,
+        pod_root: &Path,
+    ) -> bool {
+        root_link.starts_with(pod_root)
+    }
+
+    async fn cleanup_orphaned_pause_processes(&self) {
+        let pod_root = self.config.root_dir.join("pods");
+        let known_pause_pids: std::collections::HashSet<u32> = {
+            let pause_ids: Vec<String> = self
+                .pod_sandboxes
+                .lock()
+                .await
+                .values()
+                .filter_map(|pod| {
+                    Self::read_internal_state::<StoredPodState>(
+                        &pod.annotations,
+                        INTERNAL_POD_STATE_KEY,
+                    )
+                    .and_then(|state| state.pause_container_id)
+                })
+                .collect();
+            let mut pids = std::collections::HashSet::new();
+            for pause_id in pause_ids {
+                if let Some(pid) = self.runtime_container_pid_checked(&pause_id).await {
+                    pids.insert(pid as u32);
+                }
+            }
+            pids
+        };
+
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let Ok(file_name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Ok(pid) = file_name.parse::<u32>() else {
+                continue;
+            };
+            if known_pause_pids.contains(&pid) {
+                continue;
+            }
+
+            let proc_path = entry.path();
+            let Ok(comm) = std::fs::read_to_string(proc_path.join("comm")) else {
+                continue;
+            };
+            if comm.trim() != "pause" {
+                continue;
+            }
+
+            let Ok(root_link) = std::fs::read_link(proc_path.join("root")) else {
+                continue;
+            };
+            if !Self::pause_process_root_matches_runtime_pod_root(&root_link, &pod_root) {
+                continue;
+            }
+
+            #[cfg(unix)]
+            {
+                use nix::sys::signal::{self, Signal};
+                use nix::unistd::Pid;
+
+                match signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL) {
+                    Ok(()) => {
+                        log::warn!(
+                            "Killed orphaned pause process {} rooted at {}",
+                            pid,
+                            root_link.display()
+                        );
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "Failed to kill orphaned pause process {} rooted at {}: {}",
+                            pid,
+                            root_link.display(),
+                            err
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    async fn known_runtime_artifact_ids(&self) -> std::collections::HashSet<String> {
+        let mut known_ids: std::collections::HashSet<String> =
+            self.containers.lock().await.keys().cloned().collect();
+        let known_pause_ids: std::collections::HashSet<String> = self
+            .pod_sandboxes
+            .lock()
+            .await
+            .values()
+            .filter_map(|pod| {
+                Self::read_internal_state::<StoredPodState>(
+                    &pod.annotations,
+                    INTERNAL_POD_STATE_KEY,
+                )
+                .and_then(|state| state.pause_container_id)
+            })
+            .collect();
+        known_ids.extend(known_pause_ids);
+        known_ids
+    }
+
+    async fn cleanup_orphaned_runtime_bundles(&self) {
+        let known_ids = self.known_runtime_artifact_ids().await;
+        let mut scanned_roots = std::collections::HashSet::new();
+
+        for runtime in self.runtime.all_runtimes() {
+            let runtime_root = runtime.runtime_root().to_path_buf();
+            if !scanned_roots.insert(runtime_root.clone()) {
+                continue;
+            }
+
+            let Ok(entries) = std::fs::read_dir(&runtime_root) else {
+                continue;
+            };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+
+                let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+
+                if known_ids.contains(id) {
+                    continue;
+                }
+
+                if self.runtime.container_has_active_runtime_state(id) {
+                    log::warn!(
+                        "Keeping orphaned runtime bundle {} because container {} still appears active in runtime state",
+                        path.display(),
+                        id
+                    );
+                    continue;
+                }
+
+                if let Err(err) = std::fs::remove_dir_all(&path) {
+                    log::warn!(
+                        "Failed to remove orphaned runtime bundle {}: {}",
+                        path.display(),
+                        err
+                    );
+                }
+            }
+        }
+    }
+
+    async fn cleanup_orphaned_pod_workspaces(&self) {
+        let known_pod_ids: std::collections::HashSet<String> =
+            self.pod_sandboxes.lock().await.keys().cloned().collect();
+        let pod_root = self.config.root_dir.join("pods");
+        let Ok(entries) = std::fs::read_dir(&pod_root) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+
+            if known_pod_ids.contains(id) {
+                continue;
+            }
+
+            if let Err(err) = std::fs::remove_dir_all(&path) {
+                log::warn!(
+                    "Failed to remove orphaned pod workspace {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+    }
+
     pub(super) async fn reconcile_recovered_state(&self) -> Result<(), Status> {
         let container_ids: Vec<String> = {
             let containers = self.containers.lock().await;
@@ -84,6 +338,13 @@ impl RuntimeServiceImpl {
             let pause_status = self
                 .runtime_container_status_checked(&pause_container_id)
                 .await;
+            let pause_has_active_runtime_state = self
+                .runtime
+                .container_has_active_runtime_state(&pause_container_id)
+                || self
+                    .runtime_container_pid_checked(&pause_container_id)
+                    .await
+                    .is_some();
             let pod_has_required_netns = {
                 let pod_sandboxes = self.pod_sandboxes.lock().await;
                 pod_sandboxes
@@ -97,10 +358,18 @@ impl RuntimeServiceImpl {
                     pod_id
                 );
             }
+            let current_state = {
+                let pod_sandboxes = self.pod_sandboxes.lock().await;
+                pod_sandboxes
+                    .get(&pod_id)
+                    .map(|pod| pod.state)
+                    .unwrap_or(PodSandboxState::SandboxNotready as i32)
+            };
             let next_state = match pause_status {
                 ContainerStatus::Running if pod_has_required_netns => {
                     PodSandboxState::SandboxReady as i32
                 }
+                ContainerStatus::Unknown if pause_has_active_runtime_state => current_state,
                 _ => PodSandboxState::SandboxNotready as i32,
             };
 
@@ -279,35 +548,99 @@ impl RuntimeServiceImpl {
                     };
                     log::info!("Recovered pod: {} with state {}", record.id, record.state);
                     memory_pods.insert(record.id.clone(), pod);
+                    if let Err(err) = self
+                        .pod_names
+                        .lock()
+                        .map_err(|_| "pod name registry lock poisoned".to_string())
+                        .and_then(|mut registry| {
+                            registry.reserve(
+                                &Self::pod_name_key(&PodSandboxMetadata {
+                                    name: record.name.clone(),
+                                    uid: record.uid.clone(),
+                                    namespace: record.namespace.clone(),
+                                    attempt: 1,
+                                }),
+                                &record.id,
+                            )
+                        })
+                    {
+                        log::warn!(
+                            "Failed to reserve recovered pod name for {}: {}",
+                            record.id,
+                            err
+                        );
+                    }
 
-                    let mut additional_ip_values: Vec<IpAddr> = pod_state
-                        .additional_ips
-                        .iter()
-                        .filter_map(|ip| ip.parse::<IpAddr>().ok())
-                        .collect();
+                    let ordered_ip_values: Vec<IpAddr> = pod_state
+                        .raw_cni_result
+                        .as_ref()
+                        .map(crate::network::CniManager::ordered_result_ips)
+                        .unwrap_or_else(|| {
+                            pod_state
+                                .additional_ips
+                                .iter()
+                                .filter_map(|ip| ip.parse::<IpAddr>().ok())
+                                .collect()
+                        });
+                    let (selected_primary_ip, _) = crate::network::CniManager::select_pod_ips(
+                        ordered_ip_values.clone(),
+                        self.config.cni_config.ip_pref(),
+                    );
                     let primary_ip = pod_state
                         .ip
                         .as_ref()
                         .and_then(|ip| ip.parse::<IpAddr>().ok())
-                        .or_else(|| additional_ip_values.first().copied());
+                        .or(selected_primary_ip);
                     let network_status = primary_ip.map(|parsed_ip| {
-                        additional_ip_values.retain(|ip| ip != &parsed_ip);
-                        crate::network::NetworkStatus {
-                            name: "default".to_string(),
-                            ip: Some(parsed_ip),
-                            mac: None,
-                            interfaces: additional_ip_values
-                                .iter()
-                                .enumerate()
-                                .map(|(idx, ip)| crate::network::NetworkInterface {
-                                    name: format!("additional{}", idx),
-                                    ip: Some(*ip),
-                                    mac: None,
-                                    netmask: None,
-                                    gateway: None,
-                                })
-                                .collect(),
+                        let mut additional_ip_values = Vec::new();
+                        let mut seen = std::collections::HashSet::new();
+                        for ip in &ordered_ip_values {
+                            if ip == &parsed_ip {
+                                continue;
+                            }
+                            if seen.insert(*ip) {
+                                additional_ip_values.push(*ip);
+                            }
                         }
+                        let mut status = pod_state
+                            .raw_cni_result
+                            .as_ref()
+                            .and_then(|raw| {
+                                crate::network::CniManager::network_status_from_cni_result_with_preference(
+                                    Some(raw),
+                                    self.config.cni_config.ip_pref(),
+                                ).ok()
+                            })
+                            .unwrap_or(crate::network::NetworkStatus {
+                                name: "default".to_string(),
+                                ip: Some(parsed_ip),
+                                mac: None,
+                                interfaces: additional_ip_values
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, ip)| crate::network::NetworkInterface {
+                                        name: format!("additional{}", idx),
+                                        ip: Some(*ip),
+                                        mac: None,
+                                        netmask: None,
+                                        gateway: None,
+                                    })
+                                    .collect(),
+                                raw_result: None,
+                            });
+                        status.ip = Some(parsed_ip);
+                        status.interfaces = additional_ip_values
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, ip)| crate::network::NetworkInterface {
+                                name: format!("additional{}", idx),
+                                ip: Some(*ip),
+                                mac: None,
+                                netmask: None,
+                                gateway: None,
+                            })
+                            .collect();
+                        status
                     });
 
                     pod_manager.restore_pod_sandbox(crate::pod::PodSandbox {
@@ -316,16 +649,28 @@ impl RuntimeServiceImpl {
                             name: record.name.clone(),
                             namespace: record.namespace.clone(),
                             uid: record.uid.clone(),
-                            hostname: record.name.clone(),
+                            hostname: pod_state
+                                .hostname
+                                .clone()
+                                .unwrap_or_else(|| record.name.clone()),
                             log_directory: pod_state.log_directory.as_ref().map(PathBuf::from),
                             runtime_handler: recovered_runtime_handler.clone(),
                             labels: labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                            annotations: Self::external_annotations(&annotations)
+                            annotations: Self::external_container_annotations(&annotations)
                                 .iter()
                                 .map(|(k, v)| (k.clone(), v.clone()))
                                 .collect(),
                             dns_config: None,
-                            port_mappings: vec![],
+                            port_mappings: pod_state
+                                .port_mappings
+                                .iter()
+                                .map(|mapping| crate::pod::PortMapping {
+                                    protocol: mapping.protocol.clone(),
+                                    container_port: mapping.container_port,
+                                    host_port: mapping.host_port,
+                                    host_ip: mapping.host_ip.clone(),
+                                })
+                                .collect(),
                             network_config: None,
                             cgroup_parent: pod_state.cgroup_parent.clone(),
                             sysctls: pod_state.sysctls.clone(),
@@ -338,6 +683,16 @@ impl RuntimeServiceImpl {
                             run_as_group: pod_state.run_as_group,
                             supplemental_groups: pod_state.supplemental_groups.clone(),
                             readonly_rootfs: pod_state.readonly_rootfs,
+                            pids_limit: pod_state
+                                .linux_resources
+                                .as_ref()
+                                .and_then(|resources| resources.pids_limit)
+                                .or_else(|| {
+                                    pod_state
+                                        .overhead_linux_resources
+                                        .as_ref()
+                                        .and_then(|resources| resources.pids_limit)
+                                }),
                             no_new_privileges: pod_state.no_new_privileges,
                             apparmor_profile: pod_state.apparmor_profile.clone(),
                             selinux_label: pod_state.selinux_label.clone(),
@@ -382,6 +737,7 @@ impl RuntimeServiceImpl {
                         network_status,
                     });
                 }
+                pod_manager.rebuild_port_mappings();
                 log::info!(
                     "Recovered {} pod sandboxes from database",
                     memory_pods.len()
@@ -392,9 +748,81 @@ impl RuntimeServiceImpl {
             }
         }
 
+        let recovered_container_name_keys = {
+            let containers = self.containers.lock().await;
+            let pods = self.pod_sandboxes.lock().await;
+            containers
+                .values()
+                .filter_map(|container| {
+                    let metadata = container.metadata.clone()?;
+                    let pod_metadata = pods.get(&container.pod_sandbox_id)?.metadata.clone()?;
+                    Some((
+                        container.id.clone(),
+                        Self::container_name_key(&metadata, &pod_metadata),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (container_id, container_name_key) in recovered_container_name_keys {
+            if let Err(err) = self
+                .container_names
+                .lock()
+                .map_err(|_| "container name registry lock poisoned".to_string())
+                .and_then(|mut registry| registry.reserve(&container_name_key, &container_id))
+            {
+                log::warn!(
+                    "Failed to reserve recovered container name for {}: {}",
+                    container_id,
+                    err
+                );
+            }
+        }
+
+        self.prune_recovered_logical_duplicates().await?;
+
+        let recovered_seccomp_notifiers = {
+            let containers = self.containers.lock().await;
+            containers
+                .values()
+                .filter_map(|container| {
+                    let state = Self::read_internal_state::<StoredContainerState>(
+                        &container.annotations,
+                        INTERNAL_CONTAINER_STATE_KEY,
+                    )?;
+                    let mode = match state.seccomp_notifier_action.as_deref() {
+                        Some("stop") => Some(crate::runtime::SeccompNotifierMode::Stop),
+                        Some("log") | Some("") => Some(crate::runtime::SeccompNotifierMode::Log),
+                        _ => None,
+                    }?;
+                    Some((container.id.clone(), mode))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (container_id, mode) in recovered_seccomp_notifiers {
+            if let Err(err) = self.ensure_seccomp_notifier(&container_id, mode) {
+                log::warn!(
+                    "Failed to restore seccomp notifier for recovered container {}: {}",
+                    container_id,
+                    err
+                );
+            }
+        }
+
         self.reconcile_recovered_state().await?;
         self.ensure_exit_monitors_for_active_containers().await;
-        self.cleanup_orphaned_shim_artifacts().await;
+        if self.last_startup_clean_shutdown().unwrap_or(false)
+            && !self.last_startup_detected_reboot().unwrap_or(false)
+            && !self.last_startup_detected_upgrade().unwrap_or(false)
+        {
+            log::info!("Skipping orphan runtime sweeps because previous shutdown was clean");
+        } else if !self.config.internal_wipe {
+            log::info!("Skipping orphan runtime sweeps because runtime.internal_wipe is disabled");
+        } else {
+            self.cleanup_orphaned_runtime_bundles().await;
+            self.cleanup_orphaned_pod_workspaces().await;
+            self.cleanup_orphaned_shim_artifacts().await;
+            self.cleanup_orphaned_pause_processes().await;
+        }
         Ok(())
     }
 }

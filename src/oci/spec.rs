@@ -166,6 +166,7 @@ pub struct Hook {
 
 /// Linux配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Linux {
     /// 命名空间配置
     pub namespaces: Option<Vec<Namespace>>,
@@ -189,6 +190,10 @@ pub struct Linux {
     pub sysctl: Option<HashMap<String, String>>,
     /// 挂载标签
     pub mount_label: Option<String>,
+    /// 需要在容器内屏蔽的路径。
+    pub masked_paths: Option<Vec<String>>,
+    /// 需要在容器内设为只读的路径。
+    pub readonly_paths: Option<Vec<String>>,
     /// Intel RDT资源控制
     pub intel_rdt: Option<LinuxIntelRdt>,
 }
@@ -423,6 +428,7 @@ pub struct LinuxIntelRdt {
 
 /// Seccomp配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Seccomp {
     /// Seccomp模式
     pub default_action: String,
@@ -442,6 +448,7 @@ pub struct Seccomp {
 
 /// Seccomp系统调用
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SeccompSyscall {
     /// 动作
     pub action: String,
@@ -615,9 +622,39 @@ impl Spec {
         ]
     }
 
-    /// 默认设备
-    pub fn default_devices() -> Vec<Device> {
+    /// 默认的受保护 `/proc` / `/sys` 路径。
+    pub fn default_masked_paths() -> Vec<String> {
         vec![
+            "/proc/acpi".to_string(),
+            "/proc/kcore".to_string(),
+            "/proc/keys".to_string(),
+            "/proc/latency_stats".to_string(),
+            "/proc/sched_debug".to_string(),
+            "/proc/scsi".to_string(),
+            "/proc/timer_list".to_string(),
+            "/proc/timer_stats".to_string(),
+            "/proc/interrupts".to_string(),
+            "/sys/devices/virtual/powercap".to_string(),
+            "/sys/firmware".to_string(),
+            "/sys/fs/selinux".to_string(),
+        ]
+    }
+
+    /// 默认的只读 `/proc` 路径。
+    pub fn default_readonly_paths() -> Vec<String> {
+        vec![
+            "/proc/asound".to_string(),
+            "/proc/bus".to_string(),
+            "/proc/fs".to_string(),
+            "/proc/irq".to_string(),
+            "/proc/sys".to_string(),
+            "/proc/sysrq-trigger".to_string(),
+        ]
+    }
+
+    /// 默认设备
+    pub fn default_devices(include_tty: bool) -> Vec<Device> {
+        let mut devices = vec![
             Device {
                 device_type: "c".to_string(),
                 path: "/dev/null".to_string(),
@@ -654,7 +691,9 @@ impl Spec {
                 uid: None,
                 gid: None,
             },
-            Device {
+        ];
+        if include_tty {
+            devices.push(Device {
                 device_type: "c".to_string(),
                 path: "/dev/tty".to_string(),
                 major: Some(5),
@@ -662,8 +701,9 @@ impl Spec {
                 file_mode: Some(0o666),
                 uid: None,
                 gid: None,
-            },
-        ]
+            });
+        }
+        devices
     }
 
     /// 序列化为JSON字符串
@@ -718,6 +758,15 @@ mod tests {
         let mounts = Spec::default_mounts();
         assert!(!mounts.is_empty());
         assert!(mounts.iter().any(|m| m.destination == "/proc"));
+    }
+
+    #[test]
+    fn test_default_devices_only_adds_tty_for_terminal_containers() {
+        let without_tty = Spec::default_devices(false);
+        assert!(!without_tty.iter().any(|device| device.path == "/dev/tty"));
+
+        let with_tty = Spec::default_devices(true);
+        assert!(with_tty.iter().any(|device| device.path == "/dev/tty"));
     }
 
     #[test]
@@ -837,6 +886,8 @@ mod tests {
             }),
             sysctl: None,
             mount_label: None,
+            masked_paths: None,
+            readonly_paths: None,
             intel_rdt: None,
             net_devices: None,
         });
@@ -889,5 +940,19 @@ mod tests {
             .and_then(|list| list.first())
             .expect("seccomp syscall should exist");
         assert_eq!(syscall.errno_ret, Some(0));
+
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json value");
+        let seccomp_json = value
+            .get("linux")
+            .and_then(|linux| linux.get("seccomp"))
+            .expect("serialized seccomp should exist");
+        assert!(seccomp_json.get("defaultAction").is_some());
+        assert!(seccomp_json.get("defaultErrnoRet").is_some());
+        let syscall_json = seccomp_json
+            .get("syscalls")
+            .and_then(|syscalls| syscalls.as_array())
+            .and_then(|syscalls| syscalls.first())
+            .expect("serialized seccomp syscall should exist");
+        assert!(syscall_json.get("errnoRet").is_some());
     }
 }

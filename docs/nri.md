@@ -1,118 +1,81 @@
 # NRI 说明
 
-## 文档目的
+本文档说明 `crius` 当前的 NRI 能力、配置模型、生命周期接线与运维边界，面向需要启用或排查 NRI 的用户和开发者。
 
-本文档说明 `crius` 当前 NRI 能力、配置模型、运行方式和已知边界。它面向需要启用、验证或维护 NRI 的使用者和开发者。
+## NRI 在 `crius` 中的位置
 
-## NRI 在项目中的位置
-
-`crius` 的 NRI 实现位于 CRI 服务与运行时实现之间，负责把 Pod / Container 生命周期映射为 NRI 调用，并把插件调整结果落到本地 OCI spec 与运行时状态中。
+`crius` 的 NRI 实现位于 CRI 服务与底层 runtime 之间。它的职责不是直接运行容器，而是在关键生命周期阶段接收插件调整，并把调整结果落到 OCI spec、运行时状态和后续资源更新中。
 
 逻辑关系如下：
 
 ```text
-CRI handlers (src/server)
+CRI handlers (`src/server`)
     ->
-NRI API / Manager / Domain (src/nri)
+NRI manager / domain / adjust (`src/nri`)
     ->
-Runtime abstraction (src/runtime)
+Runtime abstraction (`src/runtime`)
     ->
 runc / shim / bundle
 ```
 
-主要模块职责如下：
+## 当前能力
+
+当前仓库已经接入以下 NRI 主路径能力：
+
+- ttRPC server/client
+- 插件注册、排序与请求超时控制
+- Pod / Container 生命周期分发
+- 多插件 adjustment merge 与冲突检测
+- `ValidateContainerAdjustment`
+- unsolicited update
+- eviction
+- 守护进程重启后的 `Synchronize`
+
+## 主要模块
 
 | 模块 | 职责 |
 | --- | --- |
-| `src/server/` | 将 CRI 生命周期映射为 NRI 调用顺序 |
-| `src/nri/api.rs` | 定义 `NriApi`、`NriDomain` 和 `NopNri` |
-| `src/nri/manager.rs` | 插件注册表、排序、超时、同步和 dispatch |
+| `src/nri/api.rs` | NRI 抽象接口与 `NopNri` |
+| `src/nri/manager.rs` | 插件发现、注册、排序、超时与调度 |
 | `src/nri/transport.rs` | ttRPC 传输层 |
-| `src/nri/convert.rs` | Pod / Container 与 NRI 对象之间的转换 |
-| `src/nri/domain.rs` | 快照、unsolicited update、evict 的运行时落地 |
-| `src/nri/merge.rs` | 多插件 adjustment / update 合并与冲突检测 |
-| `src/nri/adjust.rs` | 把 adjustment 应回本地 OCI spec |
+| `src/nri/convert.rs` | CRI / runtime 对象与 NRI 对象之间的转换 |
+| `src/nri/merge.rs` | 多插件 adjustment 合并与冲突检测 |
+| `src/nri/adjust.rs` | 把 adjustment 落回本地 OCI spec |
+| `src/nri/domain.rs` | unsolicited update 与 eviction 的运行时落地 |
 
-## 当前能力
-
-当前仓库已实现以下 NRI 主路径能力：
-
-- ttRPC server/client
-- 插件注册、排序、超时控制和 sync gate
-- Pod / Container 生命周期接线
-- adjustment merge、冲突检测和 `ValidateContainerAdjustment`
-- unsolicited update / eviction 落地
-- 重启恢复后的 `Synchronize`
-
-首版未纳入的扩展能力：
-
-- 通用 builtin plugin 框架
-- wasm plugin 支持
-- OpenTelemetry ttRPC tracing 注入
-
-## 配置模型
-
-NRI 配置位于 `src/config/mod.rs::NriConfig`。
-
-| 字段 | 说明 | 默认值 |
-| --- | --- | --- |
-| `enable` | 是否启用 NRI | `false` |
-| `runtime_name` | 上报给插件的 runtime 名称 | `crius` |
-| `runtime_version` | 上报给插件的 runtime 版本 | crate 版本 |
-| `socket_path` | 运行时侧 NRI socket | `/run/crius/nri.sock` |
-| `plugin_path` | 预装插件扫描目录 | `/opt/nri/plugins` |
-| `plugin_config_path` | 插件配置目录 | `/etc/nri/conf.d` |
-| `blockio_config_path` | `blockio_class` 映射文件 | 空 |
-| `allowed_annotation_prefixes` | 全局 annotation allowlist | `[]` |
-| `runtime_allowed_annotation_prefixes` | 按 runtime handler 扩展 allowlist | `{}` |
-| `workload_allowed_annotation_prefixes` | 按 workload 激活的 allowlist | `[]` |
-| `registration_timeout_ms` | 插件注册超时 | `5000` |
-| `request_timeout_ms` | 插件请求超时 | `2000` |
-| `enable_external_connections` | 允许外部插件主动连入 | `false` |
-| `default_validator` | 默认 validator 配置 | 全部关闭 |
-
-示例配置：
+## 最小配置
 
 ```toml
 [nri]
 enable = true
+enable_cdi = true
 runtime_name = "crius"
-runtime_version = "0.1.0"
 socket_path = "/run/crius/nri.sock"
 plugin_path = "/opt/nri/plugins"
 plugin_config_path = "/etc/nri/conf.d"
-blockio_config_path = "/etc/nri/blockio.json"
+blockio_config_path = ""
+cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
+allowed_annotation_prefixes = []
 registration_timeout_ms = 5000
 request_timeout_ms = 2000
 enable_external_connections = false
-allowed_annotation_prefixes = ["io.kubernetes."]
-
-[nri.default_validator]
-enable = true
-reject_namespace_adjustment = true
 ```
 
-`blockio_config_path` 当前使用本项目的映射格式，例如：
+说明：
 
-```json
-{
-  "classes": {
-    "gold": {
-      "weight": 500
-    }
-  }
-}
-```
+- 如果不需要 NRI，请保持 `enable = false`。
+- `runtime_version` 建议使用运行时实际版本，而不是手工写入固定示例值。
+- `plugin_path` 用于预装插件模式。
+- `enable_external_connections` 控制是否允许外部插件主动连接到 runtime socket。
+- `enable_cdi` 只影响 CDI 设备调整链路，不等价于整个 NRI 开关。
 
 ## 生命周期接入点
 
-当前已接入的生命周期包括：
+当前已接入的关键生命周期包括：
 
 - `RunPodSandbox`
 - `StopPodSandbox`
 - `RemovePodSandbox`
-- `UpdatePodSandbox`
-- `PostUpdatePodSandbox`
 - `CreateContainer`
 - `PostCreateContainer`
 - `StartContainer`
@@ -121,57 +84,67 @@ reject_namespace_adjustment = true
 - `PostUpdateContainer`
 - `StopContainer`
 - `RemoveContainer`
-- 容器异步退出后的状态通知
+- 容器异步退出后的状态同步
 
-实现上，`crius` 会先生成 pristine OCI spec，再应用 NRI adjustment，最后写入 bundle 并交由 runtime 执行。
+实现上，`crius` 会先准备基础 OCI spec，再应用 NRI adjustment，最后把结果写入 bundle 并交给 runtime 执行。
 
-## 支持的 adjustment / update 能力
+## 支持的调整能力
 
-当前已支持的调整项包括：
+当前已接入的调整范围包括：
 
 - annotations、env、args、mounts、hooks
 - devices、CDI devices、rlimits、OOM score
-- Linux namespaces、seccomp、sysctl、cgroups path
-- CPU：`shares`、`quota`、`period`、`cpus`、`mems`、`realtimeRuntime`、`realtimePeriod`
-- Memory：`limit`、`reservation`、`swap`、`kernel`、`kernelTCP`、`swappiness`、`disableOOMKiller`、`useHierarchy`
-- `hugepage_limits`、`unified`、`pids`
+- namespaces、seccomp、sysctl、cgroups path
+- CPU、memory、hugepage、pids 等 Linux 资源
 - `blockio_class`
 - `rdt_class`
 - unsolicited `UpdateContainers`
 - eviction
 
-## 启用方式
+这意味着 NRI 可以参与“创建前调整”和“运行中资源调整”两类主路径。
 
-启用 NRI 的典型流程如下：
+## 启用流程
 
-1. 在配置文件中设置 `[nri].enable = true`
+建议按以下顺序启用：
+
+1. 在配置文件中打开 `[nri].enable = true`
 2. 准备插件目录和插件配置目录
 3. 启动 `crius`
-4. 确认运行时创建了 `socket_path`
-5. 启动或放置 NRI 插件
-6. 观察插件注册、`Configure` 和 `Synchronize` 是否成功
+4. 确认 `socket_path` 已创建
+5. 启动插件或放置预装插件
+6. 检查插件是否完成注册、`Configure` 和 `Synchronize`
 
-如果使用预装插件模式，运行时会按 `plugin_path` 扫描并拉起插件；如果启用了外部连接，则插件也可以通过 socket 主动接入。
+## 运维建议
 
-## 排障建议
+- 把 NRI 视为运行时扩展层，而不是核心容器启动必需层
+- 先在单节点验证插件行为，再推广到更多节点
+- 对会修改资源、devices、annotations 的插件，务必建立回归测试
+- 对 `blockio_class`、`rdt_class` 这类依赖宿主能力的功能，先验证宿主内核和文件系统前提
 
-排查 NRI 问题时，建议按以下顺序检查：
+## 排障顺序
 
-1. 确认 `[nri].enable` 已开启，且 `socket_path` 可创建
-2. 检查 `plugin_path`、`plugin_config_path` 是否存在且权限正确
-3. 检查插件是否完成注册、是否通过 `Configure` 和 `Synchronize`
-4. 确认插件请求未被 `ValidateContainerAdjustment` 或 annotation allowlist 拒绝
-5. 检查资源更新是否触发运行时能力裁剪，例如 cgroup 或 block I/O 限制
+出现 NRI 相关问题时，建议按以下顺序排查：
 
-如果问题集中在 `blockio_class`，应同时核对：
+1. 确认 `[nri].enable` 已开启
+2. 检查 `socket_path`、`plugin_path`、`plugin_config_path` 是否存在且权限正确
+3. 确认插件已成功注册，并通过 `Configure` 与 `Synchronize`
+4. 检查 adjustment 是否被 annotation allowlist 或 validator 拒绝
+5. 检查插件下发的资源是否超出宿主或 OCI runtime 能力边界
 
-- `blockio_config_path` 是否可读
-- 类名是否存在于映射文件
-- 插件下发的 class 是否与本地配置一致
+如果问题集中在 `blockio_class`：
+
+- 确认 `blockio_config_path` 可读
+- 确认类名存在于映射文件中
+- 确认宿主环境真的支持对应 block I/O 调整
 
 ## 已知边界
 
-- `blockio_class` 当前使用 `crius` 自有映射格式，不直接复用上游 Go blockio loader
-- 文档只覆盖运行时侧 NRI，不包含上游 builtin / wasm 插件生态能力
-- annotation allowlist 已接入全局、runtime handler 和 workload 三层，但当前配置模型仍以本项目自身规则为准
-- 关闭 NRI 时会走 `NopNri` 路径，目标是保持原有 CRI 行为不变
+- 文档只覆盖 `crius` 的运行时侧 NRI 能力，不覆盖完整上游插件生态
+- `blockio_class` 依赖本项目的本地映射配置，而不是自动复用外部 Go 实现
+- 关闭 NRI 时会退回 `NopNri` 路径，目标是保持原有 CRI 行为尽可能不变
+- 当前仓库尚未提供覆盖不同 Kubernetes 版本、插件实现和宿主发行版组合的正式验证矩阵
+
+## 相关文档
+
+- [架构设计](architecture.md)
+- [配置参考](config-matrix.md)

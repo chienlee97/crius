@@ -15,6 +15,14 @@ impl RuntimeServiceImpl {
                 propagation: mount.propagation,
                 uid_mappings: Vec::new(),
                 gid_mappings: Vec::new(),
+                recursive_read_only: false,
+                image: (!mount.image.is_empty()).then(|| crate::proto::runtime::v1::ImageSpec {
+                    image: mount.image.clone(),
+                    user_specified_image: mount.image.clone(),
+                    runtime_handler: String::new(),
+                    annotations: HashMap::new(),
+                }),
+                image_sub_path: mount.image_sub_path.clone(),
             })
             .collect()
     }
@@ -27,18 +35,32 @@ impl RuntimeServiceImpl {
             &container.annotations,
             INTERNAL_CONTAINER_STATE_KEY,
         );
-        let started_at = container_state
-            .as_ref()
-            .and_then(|state| state.started_at)
-            .unwrap_or_default();
-        let finished_at = container_state
-            .as_ref()
-            .and_then(|state| state.finished_at)
-            .unwrap_or_default();
-        let exit_code = container_state
-            .as_ref()
-            .and_then(|state| state.exit_code)
-            .unwrap_or_default();
+        let (started_at, finished_at, exit_code) = match runtime_state {
+            x if x == ContainerState::ContainerCreated as i32 => (0, 0, 0),
+            x if x == ContainerState::ContainerRunning as i32 => (
+                container_state
+                    .as_ref()
+                    .and_then(|state| state.started_at)
+                    .unwrap_or_default(),
+                0,
+                0,
+            ),
+            x if x == ContainerState::ContainerExited as i32 => (
+                container_state
+                    .as_ref()
+                    .and_then(|state| state.started_at)
+                    .unwrap_or_default(),
+                container_state
+                    .as_ref()
+                    .and_then(|state| state.finished_at)
+                    .unwrap_or_default(),
+                container_state
+                    .as_ref()
+                    .and_then(|state| state.exit_code)
+                    .unwrap_or(-1),
+            ),
+            _ => (0, 0, 0),
+        };
         let (reason, message) = Self::container_reason_message(runtime_state, exit_code);
         let mounts = Self::stored_mounts_to_proto(
             container_state
@@ -66,7 +88,7 @@ impl RuntimeServiceImpl {
             reason,
             message,
             labels: container.labels.clone(),
-            annotations: Self::external_annotations(&container.annotations),
+            annotations: Self::external_container_annotations(&container.annotations),
             mounts,
             log_path: container_state
                 .as_ref()
@@ -142,6 +164,14 @@ impl RuntimeServiceImpl {
             "apparmorProfile": container_state
                 .as_ref()
                 .and_then(|state| state.apparmor_profile.clone()),
+            "seccompNotifierAction": container_state
+                .as_ref()
+                .and_then(|state| state.seccomp_notifier_action.clone()),
+            "seccompNotifier": self.seccomp_notifier_snapshot(&container.id).map(|snapshot| json!({
+                "socketPath": snapshot.socket_path,
+                "stopMode": snapshot.stop_mode,
+                "syscalls": snapshot.syscalls,
+            })),
             "noNewPrivileges": container_state
                 .as_ref()
                 .and_then(|state| state.no_new_privileges),
@@ -171,6 +201,7 @@ impl RuntimeServiceImpl {
             &pod_sandbox.annotations,
             INTERNAL_POD_STATE_KEY,
         );
+        let network_status = Self::pod_network_status_from_state(pod_state.as_ref());
         let pause_container_id = pod_state
             .as_ref()
             .and_then(|state| state.pause_container_id.clone());
@@ -190,23 +221,61 @@ impl RuntimeServiceImpl {
             .unwrap_or_else(|| self.config.pause_image.clone());
         let payload = json!({
             "id": pod_sandbox.id.clone(),
+            "hostname": pod_state
+                .as_ref()
+                .and_then(|state| state.hostname.clone())
+                .or_else(|| {
+                    pod_sandbox
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.name.clone())
+                        .filter(|hostname| !hostname.is_empty())
+                }),
             "image": pause_image,
             "pid": pause_pid,
             "runtimeSpec": runtime_spec,
             "runtimeHandler": pod_sandbox.runtime_handler.clone(),
             "runtimePodCIDR": pod_state.as_ref().and_then(|state| state.runtime_pod_cidr.clone()),
+            "rawCniResult": pod_state.as_ref().and_then(|state| state.raw_cni_result.clone()),
             "netnsPath": pod_state.as_ref().and_then(|state| state.netns_path.clone()),
             "logDirectory": pod_state.as_ref().and_then(|state| state.log_directory.clone()),
             "pauseContainerId": pause_container_id,
-            "ip": pod_state.as_ref().and_then(|state| state.ip.clone()),
-            "additionalIPs": pod_state
+            "ip": network_status.as_ref().map(|status| status.ip.clone()),
+            "portMappings": pod_state
                 .as_ref()
-                .map(|state| state.additional_ips.clone())
+                .map(|state| {
+                    state
+                        .port_mappings
+                        .iter()
+                        .map(|mapping| {
+                            json!({
+                                "protocol": mapping.protocol,
+                                "containerPort": mapping.container_port,
+                                "hostPort": mapping.host_port,
+                                "hostIp": mapping.host_ip,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            "additionalIPs": network_status
+                .as_ref()
+                .map(|status| {
+                    status
+                        .additional_ips
+                        .iter()
+                        .map(|ip| ip.ip.clone())
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default(),
             "cgroupParent": pod_state.as_ref().and_then(|state| state.cgroup_parent.clone()),
             "sysctls": pod_state
                 .as_ref()
                 .map(|state| state.sysctls.clone())
+                .unwrap_or_default(),
+            "supplementalGroups": pod_state
+                .as_ref()
+                .map(|state| state.supplemental_groups.clone())
                 .unwrap_or_default(),
             "privileged": pod_state.as_ref().map(|state| state.privileged).unwrap_or(false),
             "readonlyRootfs": pod_state
@@ -248,7 +317,7 @@ impl RuntimeServiceImpl {
             network: Self::pod_network_status_from_state(pod_state.as_ref()),
             linux: Self::pod_linux_status_from_state(pod_state.as_ref()),
             labels: pod_sandbox.labels.clone(),
-            annotations: Self::external_annotations(&pod_sandbox.annotations),
+            annotations: Self::external_pod_annotations(&pod_sandbox.annotations),
             runtime_handler: if pod_sandbox.runtime_handler.is_empty() {
                 let restored = pod_state
                     .as_ref()

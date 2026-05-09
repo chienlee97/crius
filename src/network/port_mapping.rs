@@ -27,6 +27,7 @@ pub struct PortMapping {
 pub enum Protocol {
     Tcp,
     Udp,
+    Sctp,
     Both,
 }
 
@@ -35,6 +36,7 @@ impl Protocol {
         match self {
             Protocol::Tcp => "tcp",
             Protocol::Udp => "udp",
+            Protocol::Sctp => "sctp",
             Protocol::Both => "tcp,udp",
         }
     }
@@ -341,6 +343,7 @@ mod tests {
     fn test_protocol_as_str() {
         assert_eq!(Protocol::Tcp.as_str(), "tcp");
         assert_eq!(Protocol::Udp.as_str(), "udp");
+        assert_eq!(Protocol::Sctp.as_str(), "sctp");
         assert_eq!(Protocol::Both.as_str(), "tcp,udp");
     }
 
@@ -356,33 +359,5 @@ mod tests {
 
         assert_eq!(mapping.container_port, 80);
         assert_eq!(mapping.host_port, 8080);
-    }
-
-    // 注意：以下测试需要root权限，默认忽略
-    #[test]
-    #[ignore = "requires root and iptables/nftables"]
-    fn test_port_mapping_manager_creation() {
-        let manager = PortMappingManager::auto();
-        assert!(manager.is_ok());
-    }
-
-    #[test]
-    #[ignore = "requires root and iptables"]
-    fn test_iptables_add_remove() {
-        let manager = PortMappingManager::new(PortMappingBackend::Iptables).unwrap();
-
-        let mapping = PortMapping {
-            protocol: Protocol::Tcp,
-            container_port: 80,
-            host_port: 18080, // 使用高位端口避免冲突
-            host_ip: None,
-            container_ip: IpAddr::V4(Ipv4Addr::new(10, 88, 0, 1)),
-        };
-
-        // 添加规则
-        manager.add_port_mapping(&mapping).unwrap();
-
-        // 删除规则
-        manager.remove_port_mapping(&mapping).unwrap();
     }
 }

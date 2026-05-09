@@ -7,5 +7,5 @@ pub mod io;
 pub mod process;
 pub mod subreaper;
 
-pub use daemon::Daemon;
+pub use daemon::{Daemon, DaemonOptions};
 pub use io::{IoConfig, IoManager};

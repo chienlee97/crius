@@ -647,6 +647,8 @@ mod tests {
                 seccomp: None,
                 sysctl: None,
                 mount_label: None,
+                masked_paths: None,
+                readonly_paths: None,
                 intel_rdt: Some(LinuxIntelRdt {
                     clos_id: Some("gold".to_string()),
                     l3_cache_schema: Some("0=ff".to_string()),

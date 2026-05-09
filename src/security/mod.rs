@@ -326,6 +326,8 @@ impl SecurityManager {
             seccomp: None,
             sysctl: None,
             mount_label: None,
+            masked_paths: None,
+            readonly_paths: None,
             intel_rdt: None,
         };
 

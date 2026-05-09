@@ -111,22 +111,44 @@ struct CdiNetDevice {
     name: String,
 }
 
-fn cdi_spec_dirs() -> Vec<PathBuf> {
-    std::env::var("CDI_SPEC_DIRS")
-        .ok()
-        .map(|dirs| {
-            dirs.split(':')
-                .filter(|entry| !entry.is_empty())
-                .map(PathBuf::from)
-                .collect::<Vec<_>>()
-        })
+#[derive(Debug, Clone)]
+pub struct AdjustmentOptions<'a> {
+    pub blockio_config_path: Option<&'a str>,
+    pub cdi_enabled: bool,
+    pub cdi_spec_dirs: Option<&'a [String]>,
+}
+
+impl Default for AdjustmentOptions<'_> {
+    fn default() -> Self {
+        Self {
+            blockio_config_path: None,
+            cdi_enabled: true,
+            cdi_spec_dirs: None,
+        }
+    }
+}
+
+fn cdi_spec_dirs(configured_dirs: Option<&[String]>) -> Vec<PathBuf> {
+    configured_dirs
         .filter(|dirs| !dirs.is_empty())
+        .map(|dirs| dirs.iter().map(PathBuf::from).collect())
+        .or_else(|| {
+            std::env::var("CDI_SPEC_DIRS")
+                .ok()
+                .map(|dirs| {
+                    dirs.split(':')
+                        .filter(|entry| !entry.is_empty())
+                        .map(PathBuf::from)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|dirs| !dirs.is_empty())
+        })
         .unwrap_or_else(|| DEFAULT_CDI_SPEC_DIRS.iter().map(PathBuf::from).collect())
 }
 
-fn load_cdi_specs() -> Result<Vec<CdiSpec>> {
+fn load_cdi_specs(configured_dirs: Option<&[String]>) -> Result<Vec<CdiSpec>> {
     let mut specs = Vec::new();
-    for dir in cdi_spec_dirs() {
+    for dir in cdi_spec_dirs(configured_dirs) {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -182,14 +204,17 @@ fn merge_cdi_edits(base: &mut CdiContainerEdits, extra: &CdiContainerEdits) {
     }
 }
 
-fn resolve_cdi_edits(device_ref: &str) -> Result<CdiContainerEdits> {
+fn resolve_cdi_edits(
+    device_ref: &str,
+    configured_dirs: Option<&[String]>,
+) -> Result<CdiContainerEdits> {
     let Some((kind, name)) = device_ref.split_once('=') else {
         return Err(NriError::Plugin(format!(
             "invalid CDI device reference {device_ref:?}, expected <vendor>/<class>=<device>"
         )));
     };
 
-    for spec in load_cdi_specs()? {
+    for spec in load_cdi_specs(configured_dirs)? {
         if spec.kind != kind {
             continue;
         }
@@ -642,6 +667,8 @@ fn ensure_linux(spec: &mut Spec) -> &mut Linux {
         seccomp: None,
         sysctl: None,
         mount_label: None,
+        masked_paths: None,
+        readonly_paths: None,
         intel_rdt: None,
     })
 }
@@ -1484,9 +1511,19 @@ fn apply_cdi_edits(spec: &mut Spec, edits: &CdiContainerEdits) -> Result<()> {
     Ok(())
 }
 
-fn apply_cdi_device_adjustments(spec: &mut Spec, devices: &[nri_api::CDIDevice]) -> Result<()> {
+fn apply_cdi_device_adjustments(
+    spec: &mut Spec,
+    devices: &[nri_api::CDIDevice],
+    enabled: bool,
+    configured_dirs: Option<&[String]>,
+) -> Result<()> {
+    if !enabled && !devices.is_empty() {
+        return Err(NriError::Plugin(
+            "CDI device adjustments are disabled by configuration".to_string(),
+        ));
+    }
     for device in devices {
-        let edits = resolve_cdi_edits(&device.name)?;
+        let edits = resolve_cdi_edits(&device.name, configured_dirs)?;
         apply_cdi_edits(spec, &edits)?;
     }
     Ok(())
@@ -1512,7 +1549,7 @@ pub fn apply_container_adjustment(
     spec: &mut Spec,
     adjustment: &nri_api::ContainerAdjustment,
 ) -> Result<()> {
-    apply_container_adjustment_with_blockio_config(spec, adjustment, None)
+    apply_container_adjustment_with_options(spec, adjustment, AdjustmentOptions::default())
 }
 
 pub fn apply_container_adjustment_with_blockio_config(
@@ -1520,12 +1557,33 @@ pub fn apply_container_adjustment_with_blockio_config(
     adjustment: &nri_api::ContainerAdjustment,
     blockio_config_path: Option<&str>,
 ) -> Result<()> {
+    apply_container_adjustment_with_options(
+        spec,
+        adjustment,
+        AdjustmentOptions {
+            blockio_config_path,
+            cdi_enabled: true,
+            cdi_spec_dirs: None,
+        },
+    )
+}
+
+pub fn apply_container_adjustment_with_options(
+    spec: &mut Spec,
+    adjustment: &nri_api::ContainerAdjustment,
+    options: AdjustmentOptions<'_>,
+) -> Result<()> {
     apply_annotation_adjustments(spec, &adjustment.annotations);
     apply_mount_adjustments(spec, adjustment.mounts.as_slice());
     apply_env_adjustments(spec, adjustment.env.as_slice());
     apply_hook_adjustments(spec, adjustment.hooks.as_ref());
-    apply_cdi_device_adjustments(spec, &adjustment.CDI_devices)?;
-    apply_linux_adjustments(spec, adjustment.linux.as_ref(), blockio_config_path)?;
+    apply_cdi_device_adjustments(
+        spec,
+        &adjustment.CDI_devices,
+        options.cdi_enabled,
+        options.cdi_spec_dirs,
+    )?;
+    apply_linux_adjustments(spec, adjustment.linux.as_ref(), options.blockio_config_path)?;
     apply_rlimit_adjustments(spec, adjustment.rlimits.as_slice());
 
     if !adjustment.args.is_empty() {
@@ -1550,10 +1608,11 @@ mod tests {
 
     use super::{
         apply_container_adjustment, apply_container_adjustment_with_blockio_config,
-        disallowed_annotation_adjustment_keys, filter_annotation_adjustments_by_allowlist,
-        resolve_rdt_class, sanitize_linux_resources_for_capabilities,
-        validate_adjustment_resources_with_min_memory, validate_container_adjustment,
-        validate_container_update, validate_update_linux_resources, REMOVAL_PREFIX,
+        apply_container_adjustment_with_options, disallowed_annotation_adjustment_keys,
+        filter_annotation_adjustments_by_allowlist, resolve_rdt_class,
+        sanitize_linux_resources_for_capabilities, validate_adjustment_resources_with_min_memory,
+        validate_container_adjustment, validate_container_update, validate_update_linux_resources,
+        AdjustmentOptions, REMOVAL_PREFIX,
     };
     use crate::nri_proto::api as nri_api;
     use crate::oci::spec::{
@@ -1702,6 +1761,8 @@ mod tests {
                     "0".to_string(),
                 )])),
                 mount_label: None,
+                masked_paths: None,
+                readonly_paths: None,
                 intel_rdt: None,
             }),
             annotations: Some(HashMap::from([
@@ -2266,6 +2327,49 @@ mod tests {
     }
 
     #[test]
+    fn applies_cdi_device_edits_from_configured_spec_dirs_without_env() {
+        let dir = tempdir().unwrap();
+        let spec_path = dir.path().join("vendor.json");
+        fs::write(
+            &spec_path,
+            serde_json::json!({
+                "cdiVersion": "0.7.0",
+                "kind": "vendor.com/device",
+                "devices": [{
+                    "name": "gpu0",
+                    "containerEdits": {
+                        "env": ["FROM_CONFIGURED_DIR=1"]
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut spec = spec_with_process();
+        let mut adjustment = nri_api::ContainerAdjustment::new();
+        adjustment.CDI_devices.push(nri_api::CDIDevice {
+            name: "vendor.com/device=gpu0".to_string(),
+            ..Default::default()
+        });
+        let configured_dirs = vec![dir.path().display().to_string()];
+
+        apply_container_adjustment_with_options(
+            &mut spec,
+            &adjustment,
+            AdjustmentOptions {
+                blockio_config_path: None,
+                cdi_enabled: true,
+                cdi_spec_dirs: Some(&configured_dirs),
+            },
+        )
+        .unwrap();
+
+        let env = spec.process.as_ref().unwrap().env.as_ref().unwrap();
+        assert!(env.iter().any(|entry| entry == "FROM_CONFIGURED_DIR=1"));
+    }
+
+    #[test]
     fn rejects_invalid_cdi_reference() {
         let mut adjustment = nri_api::ContainerAdjustment::new();
         adjustment.CDI_devices.push(nri_api::CDIDevice {
@@ -2276,6 +2380,28 @@ mod tests {
         let mut spec = spec_with_process();
         let err = apply_container_adjustment(&mut spec, &adjustment).unwrap_err();
         assert!(format!("{err}").contains("expected <vendor>/<class>=<device>"));
+    }
+
+    #[test]
+    fn rejects_cdi_adjustments_when_disabled() {
+        let mut adjustment = nri_api::ContainerAdjustment::new();
+        adjustment.CDI_devices.push(nri_api::CDIDevice {
+            name: "vendor.com/device=gpu0".to_string(),
+            ..Default::default()
+        });
+
+        let mut spec = spec_with_process();
+        let err = apply_container_adjustment_with_options(
+            &mut spec,
+            &adjustment,
+            AdjustmentOptions {
+                blockio_config_path: None,
+                cdi_enabled: false,
+                cdi_spec_dirs: Some(&["/etc/cdi".to_string()]),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("CDI device adjustments are disabled"));
     }
 
     #[test]

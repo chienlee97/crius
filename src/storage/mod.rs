@@ -150,6 +150,21 @@ impl StorageManager {
         Ok(())
     }
 
+    pub fn integrity_check(&self) -> Result<bool> {
+        let status: String = self
+            .conn
+            .query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))
+            .context("Failed to run SQLite integrity_check")?;
+        Ok(status.trim().eq_ignore_ascii_case("ok"))
+    }
+
+    pub fn attempt_repair(&mut self) -> Result<bool> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); REINDEX; VACUUM;")
+            .context("Failed to run SQLite repair commands")?;
+        self.integrity_check()
+    }
+
     /// 保存容器记录
     pub fn save_container(&mut self, record: &ContainerRecord) -> Result<()> {
         self.conn.execute(

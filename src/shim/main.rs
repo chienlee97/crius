@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crius::shim::Daemon;
+use crius::shim::{Daemon, DaemonOptions};
 use log::{debug, info};
 use std::fs;
 use std::path::PathBuf;
@@ -30,9 +30,37 @@ struct Args {
     #[clap(short, long, default_value = "runc")]
     runtime: PathBuf,
 
+    /// Optional runtime-specific configuration file path
+    #[clap(long)]
+    runtime_config_path: Option<PathBuf>,
+
+    /// Target cgroup for the shim/monitor process
+    #[clap(long)]
+    monitor_cgroup: Option<String>,
+
     /// Debug mode
     #[clap(short, long)]
     debug: bool,
+
+    /// Duplicate container output to journald in addition to CRI log file
+    #[clap(long)]
+    log_to_journald: bool,
+
+    /// Skip syncing CRI log files on reopen and container exit
+    #[clap(long)]
+    no_sync_log: bool,
+
+    /// Disable pivot_root and use MS_MOVE instead
+    #[clap(long)]
+    no_pivot: bool,
+
+    /// Do not create a new session keyring for the container
+    #[clap(long)]
+    no_new_keyring: bool,
+
+    /// Start the runtime with systemd cgroup support
+    #[clap(long)]
+    systemd_cgroup: bool,
 
     /// Log file path
     #[clap(short, long)]
@@ -41,6 +69,22 @@ struct Args {
     /// Exit code file path
     #[clap(long)]
     exit_code_file: Option<PathBuf>,
+
+    /// Attach/resize socket root directory
+    #[clap(long)]
+    attach_socket_dir: Option<PathBuf>,
+
+    /// Owner UID for shim-created host IO artifacts
+    #[clap(long, default_value_t = 0)]
+    io_uid: u32,
+
+    /// Owner GID for shim-created host IO artifacts
+    #[clap(long, default_value_t = 0)]
+    io_gid: u32,
+
+    /// Maximum CRI container log line size in bytes
+    #[clap(long, default_value_t = 4096)]
+    max_container_log_line_size: usize,
 }
 
 fn main() -> Result<()> {
@@ -73,7 +117,25 @@ fn main() -> Result<()> {
     // rootfs 不再要求位于 bundle/rootfs，实际路径以 OCI config.json 的 root.path 为准。
 
     // 创建并运行shim守护进程
-    let daemon = Daemon::new(args.id, args.bundle, args.runtime, args.exit_code_file);
+    let daemon = Daemon::new(
+        args.id,
+        args.bundle,
+        args.runtime,
+        DaemonOptions {
+            runtime_config_path: args.runtime_config_path.unwrap_or_default(),
+            monitor_cgroup: args.monitor_cgroup.unwrap_or_default(),
+            exit_code_file: args.exit_code_file,
+            attach_socket_dir: args.attach_socket_dir,
+            io_uid: args.io_uid,
+            io_gid: args.io_gid,
+            max_container_log_line_size: args.max_container_log_line_size,
+            log_to_journald: args.log_to_journald,
+            no_sync_log: args.no_sync_log,
+            no_pivot: args.no_pivot,
+            no_new_keyring: args.no_new_keyring,
+            systemd_cgroup: args.systemd_cgroup,
+        },
+    );
 
     daemon.run()
 }

@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) enum AnnotationScope {
+    Pod,
+    Container,
+}
+
 pub(super) struct ContainerAnnotationContext<'a> {
     pub(super) annotations: &'a mut HashMap<String, String>,
     pub(super) container_id: &'a str,
@@ -13,6 +19,228 @@ pub(super) struct ContainerAnnotationContext<'a> {
 }
 
 impl RuntimeServiceImpl {
+    fn is_reserved_annotation_namespace(key: &str) -> bool {
+        key.starts_with("io.kubernetes.cri-o.")
+            || key.starts_with("io.kubernetes.cri.")
+            || key.starts_with("io.containerd.cri.")
+            || key.starts_with("io.kubernetes.container.")
+    }
+
+    fn scope_allows_reserved_annotation(scope: AnnotationScope, key: &str) -> bool {
+        match scope {
+            AnnotationScope::Pod => matches!(
+                key,
+                CRIO_SANDBOX_ID_ANNOTATION
+                    | CRIO_SANDBOX_NAME_ANNOTATION
+                    | CRIO_POD_NAME_ANNOTATION
+                    | CRIO_POD_NAMESPACE_ANNOTATION
+                    | CRIO_SECCOMP_NOTIFIER_ACTION_ANNOTATION
+                    | CRIO_RUNTIME_HANDLER_ANNOTATION
+                    | CONTAINERD_SANDBOX_ID_ANNOTATION
+                    | CONTAINERD_SANDBOX_NAME_ANNOTATION
+                    | CONTAINERD_SANDBOX_NAMESPACE_ANNOTATION
+                    | CONTAINERD_SANDBOX_UID_ANNOTATION
+                    | CONTAINERD_RUNTIME_HANDLER_ANNOTATION
+            ),
+            AnnotationScope::Container if key.starts_with("io.kubernetes.container.") => true,
+            AnnotationScope::Container => matches!(
+                key,
+                CRIO_CONTAINER_ID_ANNOTATION
+                    | CRIO_CONTAINER_NAME_ANNOTATION
+                    | CRIO_CONTAINER_TYPE_ANNOTATION
+                    | CRIO_USER_REQUESTED_IMAGE_ANNOTATION
+                    | CRIO_IMAGE_NAME_ANNOTATION
+                    | CRIO_LOG_PATH_ANNOTATION
+                    | CRIO_SECCOMP_NOTIFIER_ACTION_ANNOTATION
+                    | CRIO_RUNTIME_HANDLER_ANNOTATION
+                    | CRIO_SANDBOX_ID_ANNOTATION
+                    | CONTAINERD_CONTAINER_TYPE_ANNOTATION
+                    | CONTAINERD_IMAGE_NAME_ANNOTATION
+                    | CONTAINERD_SANDBOX_ID_ANNOTATION
+                    | CONTAINERD_CONTAINER_NAME_ANNOTATION
+                    | CONTAINERD_RUNTIME_HANDLER_ANNOTATION
+                    | KUBERNETES_CONTAINER_NAME_ANNOTATION
+            ),
+        }
+    }
+
+    fn external_annotations_for_scope(
+        annotations: &HashMap<String, String>,
+        scope: AnnotationScope,
+    ) -> HashMap<String, String> {
+        annotations
+            .iter()
+            .filter(|(key, _)| !Self::is_internal_annotation_key(key))
+            .filter(|(key, _)| {
+                !Self::is_reserved_annotation_namespace(key)
+                    || Self::scope_allows_reserved_annotation(scope, key)
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    fn resolved_runtime_handler_name<'a>(&'a self, runtime_handler: &'a str) -> &'a str {
+        let runtime_handler = runtime_handler.trim();
+        if runtime_handler.is_empty() {
+            self.config.runtime.as_str()
+        } else {
+            runtime_handler
+        }
+    }
+
+    fn runtime_handler_allowed_annotations(&self, runtime_handler: &str) -> Vec<String> {
+        self.config
+            .runtime_configs
+            .get(self.resolved_runtime_handler_name(runtime_handler))
+            .map(|config| config.allowed_annotations.clone())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn apply_runtime_handler_default_annotations(
+        &self,
+        annotations: &mut HashMap<String, String>,
+        runtime_handler: &str,
+    ) {
+        let Some(config) = self
+            .config
+            .runtime_configs
+            .get(self.resolved_runtime_handler_name(runtime_handler))
+        else {
+            return;
+        };
+
+        for (key, value) in &config.default_annotations {
+            annotations
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+
+    fn workload_profile_selected_name(
+        &self,
+        activation_annotations: &HashMap<String, String>,
+    ) -> Result<Option<String>, Status> {
+        let mut selected: Vec<String> = self
+            .config
+            .workloads
+            .iter()
+            .filter(|(_, workload)| {
+                !workload.activation_annotation.trim().is_empty()
+                    && activation_annotations.contains_key(workload.activation_annotation.trim())
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        selected.sort();
+        selected.dedup();
+
+        if selected.len() > 1 {
+            return Err(Status::invalid_argument(format!(
+                "multiple workload profiles are activated simultaneously: {}",
+                selected.join(", ")
+            )));
+        }
+
+        Ok(selected.into_iter().next())
+    }
+
+    pub(super) fn selected_workload_profile(
+        &self,
+        activation_annotations: &HashMap<String, String>,
+    ) -> Result<Option<&crate::config::RuntimeWorkloadConfig>, Status> {
+        let Some(name) = self.workload_profile_selected_name(activation_annotations)? else {
+            return Ok(None);
+        };
+        Ok(self.config.workloads.get(&name))
+    }
+
+    fn workload_profile_allowed_annotations(
+        &self,
+        activation_annotations: &HashMap<String, String>,
+    ) -> Result<Vec<String>, Status> {
+        Ok(self
+            .selected_workload_profile(activation_annotations)?
+            .map(|workload| workload.allowed_annotations.clone())
+            .unwrap_or_default())
+    }
+
+    fn milli_cpu_to_quota(milli_cpu: i64, period: i64) -> i64 {
+        if milli_cpu == 0 {
+            return 0;
+        }
+        let period = if period == 0 { 100_000 } else { period };
+        ((milli_cpu * period) / 1000).max(1_000)
+    }
+
+    pub(super) fn workload_resources_from_annotation(
+        &self,
+        activation_annotations: &HashMap<String, String>,
+        container_name: &str,
+    ) -> Result<Option<crate::config::RuntimeWorkloadResources>, Status> {
+        let Some(workload) = self.selected_workload_profile(activation_annotations)? else {
+            return Ok(None);
+        };
+        let mut resources = workload.resources.clone();
+        let annotation_key = format!("{}/{}", workload.annotation_prefix.trim(), container_name);
+        let Some(raw) = activation_annotations.get(&annotation_key) else {
+            return Ok(Some(resources));
+        };
+        let override_resources: crate::config::RuntimeWorkloadResources = serde_json::from_str(raw)
+            .map_err(|err| {
+                Status::invalid_argument(format!(
+                    "failed to parse workload annotation {annotation_key}: {err}"
+                ))
+            })?;
+        override_resources
+            .validate()
+            .map_err(Status::invalid_argument)?;
+
+        if override_resources.cpu_shares != 0 {
+            resources.cpu_shares = override_resources.cpu_shares;
+        }
+        if override_resources.cpu_quota != 0 {
+            resources.cpu_quota = override_resources.cpu_quota;
+        }
+        if override_resources.cpu_period != 0 {
+            resources.cpu_period = override_resources.cpu_period;
+        }
+        if !override_resources.cpuset_cpus.trim().is_empty() {
+            resources.cpuset_cpus = override_resources.cpuset_cpus;
+        }
+        if override_resources.cpu_limit != 0 {
+            resources.cpu_limit = override_resources.cpu_limit;
+        }
+        Ok(Some(resources))
+    }
+
+    pub(super) fn apply_workload_resources(
+        resources: &mut StoredLinuxResources,
+        workload: &crate::config::RuntimeWorkloadResources,
+    ) {
+        if workload.cpu_shares > 0 {
+            resources.cpu_shares = workload.cpu_shares;
+        }
+        if workload.cpu_period > 0 {
+            resources.cpu_period = workload.cpu_period;
+        }
+        if workload.cpu_quota > 0 {
+            resources.cpu_quota = workload.cpu_quota;
+        }
+        if !workload.cpuset_cpus.trim().is_empty() {
+            resources.cpuset_cpus = workload.cpuset_cpus.trim().to_string();
+        }
+        if workload.cpu_limit > 0 {
+            let period = if resources.cpu_period > 0 {
+                resources.cpu_period
+            } else if workload.cpu_period > 0 {
+                workload.cpu_period
+            } else {
+                100_000
+            };
+            resources.cpu_period = period;
+            resources.cpu_quota = Self::milli_cpu_to_quota(workload.cpu_limit, period);
+        }
+    }
+
     pub(super) fn default_allowed_annotation_prefixes() -> Vec<String> {
         vec![
             "io.kubernetes.cri-o.".to_string(),
@@ -26,7 +254,14 @@ impl RuntimeServiceImpl {
             "irq-load-balancing.crio.io".to_string(),
             "cpu-c-states.crio.io".to_string(),
             "cpu-freq-governor.crio.io".to_string(),
+            "seccomp-notifier-action.crio.io".to_string(),
         ]
+    }
+
+    pub(super) fn annotation_key_allowed(key: &str, allowed_prefixes: &[String]) -> bool {
+        allowed_prefixes
+            .iter()
+            .any(|prefix| !prefix.trim().is_empty() && key.starts_with(prefix))
     }
 
     pub(super) fn workload_annotation_prefixes(
@@ -54,7 +289,7 @@ impl RuntimeServiceImpl {
         activation_annotations: &HashMap<String, String>,
         existing_annotations: &HashMap<String, String>,
         runtime_handler: &str,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, Status> {
         let mut allowed = Self::default_allowed_annotation_prefixes();
         allowed.extend(self.nri_config.allowed_annotation_prefixes.iter().cloned());
         allowed.extend(
@@ -70,7 +305,7 @@ impl RuntimeServiceImpl {
                 }),
         );
         allowed.extend(
-            Self::external_annotations(existing_annotations)
+            Self::external_container_annotations(existing_annotations)
                 .into_keys()
                 .collect::<Vec<_>>(),
         );
@@ -93,13 +328,15 @@ impl RuntimeServiceImpl {
                 allowed.extend(runtime_allowed.iter().cloned());
             }
         }
+        allowed.extend(self.runtime_handler_allowed_annotations(runtime_handler));
+        allowed.extend(self.workload_profile_allowed_annotations(activation_annotations)?);
         allowed.extend(Self::workload_annotation_prefixes(
             activation_annotations,
             &self.nri_config.workload_allowed_annotation_prefixes,
         ));
         allowed.sort();
         allowed.dedup();
-        allowed
+        Ok(allowed)
     }
 
     pub(super) fn filter_nri_annotation_adjustments(
@@ -108,12 +345,12 @@ impl RuntimeServiceImpl {
         adjustments: &HashMap<String, String>,
         existing_annotations: &HashMap<String, String>,
         runtime_handler: &str,
-    ) -> HashMap<String, String> {
+    ) -> Result<HashMap<String, String>, Status> {
         let allowed = self.nri_allowed_annotation_prefixes(
             activation_annotations,
             existing_annotations,
             runtime_handler,
-        );
+        )?;
         let disallowed = disallowed_annotation_adjustment_keys(adjustments, &allowed);
         if !disallowed.is_empty() {
             log::warn!(
@@ -121,30 +358,48 @@ impl RuntimeServiceImpl {
                 disallowed.join(", ")
             );
         }
-        filter_annotation_adjustments_by_allowlist(adjustments, &allowed)
+        Ok(filter_annotation_adjustments_by_allowlist(
+            adjustments,
+            &allowed,
+        ))
     }
 
     pub(super) fn is_internal_annotation_key(key: &str) -> bool {
         key.starts_with(INTERNAL_ANNOTATION_PREFIX)
     }
 
-    pub(super) fn external_annotations(
+    pub(super) fn external_pod_annotations(
         annotations: &HashMap<String, String>,
     ) -> HashMap<String, String> {
-        annotations
-            .iter()
-            .filter(|(key, _)| !Self::is_internal_annotation_key(key))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect()
+        Self::external_annotations_for_scope(annotations, AnnotationScope::Pod)
     }
 
-    pub(super) fn merge_external_annotations(
+    pub(super) fn external_container_annotations(
+        annotations: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        Self::external_annotations_for_scope(annotations, AnnotationScope::Container)
+    }
+
+    pub(super) fn merge_external_pod_annotations(
         base: &HashMap<String, String>,
         spec_annotations: Option<&HashMap<String, String>>,
     ) -> HashMap<String, String> {
-        let mut merged = Self::external_annotations(base);
+        let mut merged = Self::external_pod_annotations(base);
         if let Some(spec_annotations) = spec_annotations {
-            for (key, value) in Self::external_annotations(spec_annotations) {
+            for (key, value) in Self::external_pod_annotations(spec_annotations) {
+                merged.insert(key, value);
+            }
+        }
+        merged
+    }
+
+    pub(super) fn merge_external_container_annotations(
+        base: &HashMap<String, String>,
+        spec_annotations: Option<&HashMap<String, String>>,
+    ) -> HashMap<String, String> {
+        let mut merged = Self::external_container_annotations(base);
+        if let Some(spec_annotations) = spec_annotations {
+            for (key, value) in Self::external_container_annotations(spec_annotations) {
                 merged.insert(key, value);
             }
         }

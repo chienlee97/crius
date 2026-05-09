@@ -3,7 +3,7 @@ pub mod spdy;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream as StdTcpStream, ToSocketAddrs};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -23,11 +23,17 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Method, Request, Response, Server, StatusCode};
 use nix::pty::openpty;
 use nix::sched::CloneFlags;
-use serde::Deserialize;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
+use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+use serde::de::Deserializer;
+use serde::{Deserialize, Serialize, Serializer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::{TcpListener as TokioTcpListener, TcpStream, UnixStream};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::Mutex;
+use tokio_rustls::TlsAcceptor;
 
 use crate::attach::{AttachOutputDecoder, ATTACH_PIPE_STDERR, ATTACH_PIPE_STDOUT};
 use crate::proto::runtime::v1::{
@@ -44,14 +50,346 @@ const WS_CHANNEL_STDOUT: u8 = 1;
 const WS_CHANNEL_STDERR: u8 = 2;
 const WS_CHANNEL_ERROR: u8 = 3;
 const WS_CHANNEL_RESIZE: u8 = 4;
-const STREAMING_REQUEST_TTL: Duration = Duration::from_secs(30);
-const PORT_FORWARD_STREAM_CREATION_TIMEOUT: Duration = Duration::from_secs(30);
-const PORT_FORWARD_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
+const DEFAULT_STREAMING_ADDRESS: &str = "127.0.0.1";
+const DEFAULT_STREAMING_PORT: u16 = 0;
+const DEFAULT_STREAMING_REQUEST_TTL: Duration = Duration::from_secs(30);
+const DEFAULT_PORT_FORWARD_STREAM_CREATION_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_PORT_FORWARD_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
+const DEFAULT_TLS_MIN_VERSION: &str = "VersionTLS12";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StreamingConfig {
+    pub address: String,
+    pub port: u16,
+    pub enable_tls: bool,
+    pub tls_cert_file: String,
+    pub tls_key_file: String,
+    pub tls_ca_file: String,
+    pub tls_min_version: String,
+    pub tls_cipher_suites: Vec<String>,
+    #[serde(
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub request_token_ttl: Duration,
+    #[serde(
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub port_forward_stream_creation_timeout: Duration,
+    #[serde(
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
+    )]
+    pub port_forward_idle_timeout: Duration,
+}
+
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self {
+            address: DEFAULT_STREAMING_ADDRESS.to_string(),
+            port: DEFAULT_STREAMING_PORT,
+            enable_tls: false,
+            tls_cert_file: String::new(),
+            tls_key_file: String::new(),
+            tls_ca_file: String::new(),
+            tls_min_version: DEFAULT_TLS_MIN_VERSION.to_string(),
+            tls_cipher_suites: Vec::new(),
+            request_token_ttl: DEFAULT_STREAMING_REQUEST_TTL,
+            port_forward_stream_creation_timeout: DEFAULT_PORT_FORWARD_STREAM_CREATION_TIMEOUT,
+            port_forward_idle_timeout: DEFAULT_PORT_FORWARD_STREAM_IDLE_TIMEOUT,
+        }
+    }
+}
+
+impl StreamingConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.address.trim().is_empty() {
+            anyhow::bail!("api.streaming.address must not be empty");
+        }
+        if self.enable_tls {
+            if self.tls_cert_file.trim().is_empty() {
+                anyhow::bail!("api.streaming.tls_cert_file must not be empty when TLS is enabled");
+            }
+            if self.tls_key_file.trim().is_empty() {
+                anyhow::bail!("api.streaming.tls_key_file must not be empty when TLS is enabled");
+            }
+            if !Path::new(self.tls_cert_file.trim()).is_absolute() {
+                anyhow::bail!("api.streaming.tls_cert_file must be an absolute path");
+            }
+            if !Path::new(self.tls_key_file.trim()).is_absolute() {
+                anyhow::bail!("api.streaming.tls_key_file must be an absolute path");
+            }
+        }
+        if !self.tls_ca_file.trim().is_empty() && !Path::new(self.tls_ca_file.trim()).is_absolute()
+        {
+            anyhow::bail!("api.streaming.tls_ca_file must be an absolute path");
+        }
+        if !matches!(self.tls_min_version.trim(), "VersionTLS12" | "VersionTLS13") {
+            anyhow::bail!("api.streaming.tls_min_version must be VersionTLS12 or VersionTLS13");
+        }
+        resolve_tls_cipher_suites(&self.tls_cipher_suites)?;
+        if self.request_token_ttl.is_zero() {
+            anyhow::bail!("api.streaming.request_token_ttl must be greater than zero");
+        }
+        if self.port_forward_stream_creation_timeout.is_zero() {
+            anyhow::bail!(
+                "api.streaming.port_forward_stream_creation_timeout must be greater than zero"
+            );
+        }
+        Ok(())
+    }
+
+    fn bind_target(&self) -> (&str, u16) {
+        (self.address.as_str(), self.port)
+    }
+
+    fn base_url(&self, local_addr: std::net::SocketAddr) -> String {
+        format!(
+            "{}://{}:{}",
+            if self.enable_tls { "https" } else { "http" },
+            format_http_host(&self.address),
+            local_addr.port()
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DurationValue {
+    String(String),
+    Seconds(u64),
+}
+
+pub(crate) fn deserialize_duration<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = DurationValue::deserialize(deserializer)?;
+    parse_duration_value(value).map_err(serde::de::Error::custom)
+}
+
+pub(crate) fn serialize_duration<S>(
+    duration: &Duration,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&format_duration(*duration))
+}
+
+fn parse_duration_value(value: DurationValue) -> anyhow::Result<Duration> {
+    match value {
+        DurationValue::Seconds(seconds) => Ok(Duration::from_secs(seconds)),
+        DurationValue::String(raw) => parse_duration(&raw),
+    }
+}
+
+pub(crate) fn parse_duration(raw: &str) -> anyhow::Result<Duration> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("duration must not be empty");
+    }
+    if let Ok(seconds) = trimmed.parse::<u64>() {
+        return Ok(Duration::from_secs(seconds));
+    }
+
+    let (value, unit) = trimmed
+        .char_indices()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map(|(idx, _)| trimmed.split_at(idx))
+        .ok_or_else(|| anyhow::anyhow!("duration is missing a unit"))?;
+    let amount = value
+        .parse::<u64>()
+        .map_err(|err| anyhow::anyhow!("invalid duration value {trimmed}: {err}"))?;
+
+    match unit {
+        "ms" => Ok(Duration::from_millis(amount)),
+        "s" => Ok(Duration::from_secs(amount)),
+        "m" => Ok(Duration::from_secs(amount.saturating_mul(60))),
+        "h" => Ok(Duration::from_secs(amount.saturating_mul(60 * 60))),
+        _ => anyhow::bail!("unsupported duration unit {unit}; use ms, s, m or h"),
+    }
+}
+
+pub(crate) fn format_duration(duration: Duration) -> String {
+    if duration.is_zero() {
+        return "0s".to_string();
+    }
+    let millis = duration.as_millis();
+    if millis % (60 * 60 * 1000) as u128 == 0 {
+        format!("{}h", millis / (60 * 60 * 1000) as u128)
+    } else if millis % (60 * 1000) as u128 == 0 {
+        format!("{}m", millis / (60 * 1000) as u128)
+    } else if millis % 1000 == 0 {
+        format!("{}s", millis / 1000)
+    } else {
+        format!("{}ms", millis)
+    }
+}
+
+fn format_http_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') && !host.ends_with(']') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    }
+}
+
+fn resolve_tls_cipher_suites(
+    configured: &[String],
+) -> anyhow::Result<Vec<rustls::SupportedCipherSuite>> {
+    use rustls::crypto::ring::cipher_suite;
+
+    configured
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let suite = match entry {
+                "TLS13_AES_256_GCM_SHA384" => cipher_suite::TLS13_AES_256_GCM_SHA384,
+                "TLS13_AES_128_GCM_SHA256" => cipher_suite::TLS13_AES_128_GCM_SHA256,
+                "TLS13_CHACHA20_POLY1305_SHA256" => cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => {
+                    cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+                }
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => {
+                    cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+                }
+                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => {
+                    cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+                }
+                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => {
+                    cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+                }
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => {
+                    cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+                }
+                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => {
+                    cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+                }
+                other => {
+                    anyhow::bail!(
+                        "unsupported streaming TLS cipher suite {}; expected a rustls ring cipher suite name",
+                        other
+                    );
+                }
+            };
+            Ok(suite)
+        })
+        .collect()
+}
+
+fn load_streaming_tls_config(config: &StreamingConfig) -> anyhow::Result<RustlsServerConfig> {
+    let certs = load_certificates(Path::new(&config.tls_cert_file))?;
+    let key = load_private_key(Path::new(&config.tls_key_file))?;
+    let versions = tls_versions_from_config(config)?;
+    let mut provider = rustls::crypto::ring::default_provider();
+    let cipher_suites = resolve_tls_cipher_suites(&config.tls_cipher_suites)?;
+    if !cipher_suites.is_empty() {
+        provider.cipher_suites = cipher_suites;
+    }
+    let provider = Arc::new(provider);
+    let builder = RustlsServerConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&versions)
+        .map_err(|err| anyhow::anyhow!("failed to configure streaming TLS versions: {}", err))?;
+    let builder = if config.tls_ca_file.trim().is_empty() {
+        builder.with_no_client_auth()
+    } else {
+        let mut roots = RootCertStore::empty();
+        for cert in load_certificates(Path::new(&config.tls_ca_file))? {
+            roots
+                .add(cert)
+                .map_err(|err| anyhow::anyhow!("failed to add client CA certificate: {}", err))?;
+        }
+        let verifier =
+            WebPkiClientVerifier::builder_with_provider(roots.into(), provider).build()?;
+        builder.with_client_cert_verifier(verifier)
+    };
+
+    Ok(builder.with_single_cert(certs, key)?)
+}
+
+fn tls_versions_from_config(
+    config: &StreamingConfig,
+) -> anyhow::Result<Vec<&'static rustls::SupportedProtocolVersion>> {
+    match config.tls_min_version.trim() {
+        "VersionTLS12" => Ok(vec![&rustls::version::TLS13, &rustls::version::TLS12]),
+        "VersionTLS13" => Ok(vec![&rustls::version::TLS13]),
+        other => Err(anyhow::anyhow!(
+            "unsupported TLS minimum version {}; expected VersionTLS12 or VersionTLS13",
+            other
+        )),
+    }
+}
+
+fn load_certificates(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    let file = File::open(path).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to open certificate file {}: {}",
+            path.display(),
+            err
+        )
+    })?;
+    let mut reader = BufReader::new(file);
+    let certs: Vec<CertificateDer<'static>> =
+        certs(&mut reader).collect::<std::result::Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        anyhow::bail!(
+            "certificate file {} did not contain any certificates",
+            path.display()
+        );
+    }
+    Ok(certs)
+}
+
+fn load_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
+    let file = File::open(path).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to open private key file {}: {}",
+            path.display(),
+            err
+        )
+    })?;
+    let mut reader = BufReader::new(file);
+    if let Some(key) = pkcs8_private_keys(&mut reader)
+        .next()
+        .transpose()?
+        .map(PrivateKeyDer::Pkcs8)
+    {
+        return Ok(key);
+    }
+
+    let file = File::open(path).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to reopen private key file {}: {}",
+            path.display(),
+            err
+        )
+    })?;
+    let mut reader = BufReader::new(file);
+    if let Some(key) = rsa_private_keys(&mut reader)
+        .next()
+        .transpose()?
+        .map(PrivateKeyDer::Pkcs1)
+    {
+        return Ok(key);
+    }
+
+    anyhow::bail!(
+        "private key file {} did not contain a PKCS#8 or RSA private key",
+        path.display()
+    )
+}
 
 #[derive(Debug, Clone)]
 enum StreamingRequest {
-    Exec(ExecRequest),
-    Attach(AttachRequest),
+    Exec(ExecRequestContext),
+    Attach(AttachRequestContext),
     AttachLog(AttachLogRequestContext),
     PortForward(PortForwardRequestContext),
 }
@@ -66,59 +404,168 @@ struct CachedStreamingRequest {
 struct PortForwardRequestContext {
     req: PortForwardRequest,
     netns_path: PathBuf,
+    websocket_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AttachRequestContext {
+    req: AttachRequest,
+    websocket_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
 struct AttachLogRequestContext {
     req: AttachRequest,
     log_path: PathBuf,
+    websocket_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ExecRequestContext {
+    req: ExecRequest,
+    runtime_path: PathBuf,
+    runtime_config_path: PathBuf,
+    exec_cpu_affinity: Option<usize>,
+    websocket_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct StreamingServer {
     cache: Arc<Mutex<HashMap<String, CachedStreamingRequest>>>,
     base_url: String,
+    config: StreamingConfig,
 }
 
 impl StreamingServer {
     #[cfg(test)]
     pub(crate) fn for_test(base_url: impl Into<String>) -> Self {
+        Self::for_test_with_config(base_url, StreamingConfig::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_config(
+        base_url: impl Into<String>,
+        config: StreamingConfig,
+    ) -> Self {
         Self {
             cache: Arc::new(Mutex::new(HashMap::new())),
             base_url: base_url.into(),
+            config,
         }
     }
 
+    #[cfg(test)]
+    async fn handle_request_for_test(
+        &self,
+        runtime_path: PathBuf,
+        req: Request<Body>,
+    ) -> Response<Body> {
+        handle_request(self.cache.clone(), self.config.clone(), runtime_path, req).await
+    }
+
     pub async fn start(bind_addr: &str, runtime_path: PathBuf) -> anyhow::Result<Self> {
-        let listener = TcpListener::bind(bind_addr)?;
+        let mut config = StreamingConfig::default();
+        let mut addrs = bind_addr.to_socket_addrs()?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("streaming bind address resolved to no addresses"))?;
+        config.address = addr.ip().to_string();
+        config.port = addr.port();
+        Self::start_with_config(config, runtime_path).await
+    }
+
+    pub async fn start_with_config(
+        config: StreamingConfig,
+        runtime_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        config.validate()?;
+        let listener = TcpListener::bind(config.bind_target())?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
         let cache = Arc::new(Mutex::new(HashMap::new()));
-        let service_cache = cache.clone();
-        let service_runtime_path = runtime_path.clone();
+        if config.enable_tls {
+            let tls_config = Arc::new(load_streaming_tls_config(&config)?);
+            let tls_listener = TokioTcpListener::from_std(listener)?;
+            let acceptor = TlsAcceptor::from(tls_config);
+            let service_cache = cache.clone();
+            let service_runtime_path = runtime_path.clone();
+            let service_config = config.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = match tls_listener.accept().await {
+                        Ok(accepted) => accepted,
+                        Err(err) => {
+                            log::error!("Streaming TLS listener accept failed: {}", err);
+                            continue;
+                        }
+                    };
+                    let acceptor = acceptor.clone();
+                    let cache = service_cache.clone();
+                    let runtime_path = service_runtime_path.clone();
+                    let config = service_config.clone();
+                    tokio::spawn(async move {
+                        let tls_stream = match acceptor.accept(stream).await {
+                            Ok(stream) => stream,
+                            Err(err) => {
+                                log::error!("Streaming TLS handshake failed: {}", err);
+                                return;
+                            }
+                        };
+                        let service = service_fn(move |req| {
+                            let cache = cache.clone();
+                            let runtime_path = runtime_path.clone();
+                            let config = config.clone();
+                            async move {
+                                Ok::<_, Infallible>(
+                                    handle_request(cache, config, runtime_path, req).await,
+                                )
+                            }
+                        });
+                        if let Err(err) = hyper::server::conn::Http::new()
+                            .serve_connection(tls_stream, service)
+                            .with_upgrades()
+                            .await
+                        {
+                            log::error!("Streaming TLS connection exited: {}", err);
+                        }
+                    });
+                }
+            });
+        } else {
+            let service_cache = cache.clone();
+            let service_runtime_path = runtime_path.clone();
+            let service_config = config.clone();
 
-        let make_service = make_service_fn(move |_| {
-            let cache = service_cache.clone();
-            let runtime_path = service_runtime_path.clone();
-            async move {
-                Ok::<_, Infallible>(service_fn(move |req| {
-                    let cache = cache.clone();
-                    let runtime_path = runtime_path.clone();
-                    async move { Ok::<_, Infallible>(handle_request(cache, runtime_path, req).await) }
-                }))
-            }
-        });
+            let make_service = make_service_fn(move |_| {
+                let cache = service_cache.clone();
+                let runtime_path = service_runtime_path.clone();
+                let config = service_config.clone();
+                async move {
+                    Ok::<_, Infallible>(service_fn(move |req| {
+                        let cache = cache.clone();
+                        let runtime_path = runtime_path.clone();
+                        let config = config.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                handle_request(cache, config, runtime_path, req).await,
+                            )
+                        }
+                    }))
+                }
+            });
 
-        let server = Server::from_tcp(listener)?.serve(make_service);
-        tokio::spawn(async move {
-            if let Err(e) = server.await {
-                log::error!("Streaming server exited: {}", e);
-            }
-        });
+            let server = Server::from_tcp(listener)?.serve(make_service);
+            tokio::spawn(async move {
+                if let Err(e) = server.await {
+                    log::error!("Streaming server exited: {}", e);
+                }
+            });
+        }
 
         Ok(Self {
             cache,
-            base_url: format!("http://{}", local_addr),
+            base_url: config.base_url(local_addr),
+            config,
         })
     }
 
@@ -126,20 +573,40 @@ impl StreamingServer {
         &self.base_url
     }
 
-    pub async fn get_exec(&self, req: &ExecRequest) -> Result<ExecResponse, tonic::Status> {
+    pub async fn get_exec(
+        &self,
+        req: &ExecRequest,
+        runtime_path: PathBuf,
+        runtime_config_path: PathBuf,
+        exec_cpu_affinity: Option<usize>,
+        websocket_enabled: bool,
+    ) -> Result<ExecResponse, tonic::Status> {
         Self::validate_exec_request(req)?;
         let token = self
-            .insert_request(StreamingRequest::Exec(req.clone()))
+            .insert_request(StreamingRequest::Exec(ExecRequestContext {
+                req: req.clone(),
+                runtime_path,
+                runtime_config_path,
+                exec_cpu_affinity,
+                websocket_enabled,
+            }))
             .await;
         Ok(ExecResponse {
             url: format!("{}/exec/{}", self.base_url, token),
         })
     }
 
-    pub async fn get_attach(&self, req: &AttachRequest) -> Result<AttachResponse, tonic::Status> {
+    pub async fn get_attach(
+        &self,
+        req: &AttachRequest,
+        websocket_enabled: bool,
+    ) -> Result<AttachResponse, tonic::Status> {
         Self::validate_attach_request(req)?;
         let token = self
-            .insert_request(StreamingRequest::Attach(req.clone()))
+            .insert_request(StreamingRequest::Attach(AttachRequestContext {
+                req: req.clone(),
+                websocket_enabled,
+            }))
             .await;
         Ok(AttachResponse {
             url: format!("{}/attach/{}", self.base_url, token),
@@ -150,12 +617,14 @@ impl StreamingServer {
         &self,
         req: &AttachRequest,
         log_path: PathBuf,
+        websocket_enabled: bool,
     ) -> Result<AttachResponse, tonic::Status> {
         Self::validate_attach_request(req)?;
         let token = self
             .insert_request(StreamingRequest::AttachLog(AttachLogRequestContext {
                 req: req.clone(),
                 log_path,
+                websocket_enabled,
             }))
             .await;
         Ok(AttachResponse {
@@ -167,12 +636,14 @@ impl StreamingServer {
         &self,
         req: &PortForwardRequest,
         netns_path: PathBuf,
+        websocket_enabled: bool,
     ) -> Result<PortForwardResponse, tonic::Status> {
         Self::validate_port_forward_request(req)?;
         let token = self
             .insert_request(StreamingRequest::PortForward(PortForwardRequestContext {
                 req: req.clone(),
                 netns_path,
+                websocket_enabled,
             }))
             .await;
         Ok(PortForwardResponse {
@@ -183,7 +654,7 @@ impl StreamingServer {
     async fn insert_request(&self, request: StreamingRequest) -> String {
         let token = uuid::Uuid::new_v4().to_string();
         let mut cache = self.cache.lock().await;
-        Self::prune_expired_requests_locked(&mut cache);
+        Self::prune_expired_requests_locked(&mut cache, self.config.request_token_ttl);
         cache.insert(
             token.clone(),
             CachedStreamingRequest {
@@ -194,9 +665,12 @@ impl StreamingServer {
         token
     }
 
-    fn prune_expired_requests_locked(cache: &mut HashMap<String, CachedStreamingRequest>) {
+    fn prune_expired_requests_locked(
+        cache: &mut HashMap<String, CachedStreamingRequest>,
+        request_token_ttl: Duration,
+    ) {
         let now = Instant::now();
-        cache.retain(|_, entry| now.duration_since(entry.created_at) <= STREAMING_REQUEST_TTL);
+        cache.retain(|_, entry| now.duration_since(entry.created_at) <= request_token_ttl);
     }
 
     #[cfg(test)]
@@ -278,7 +752,8 @@ impl StreamingServer {
 
 async fn handle_request(
     cache: Arc<Mutex<HashMap<String, CachedStreamingRequest>>>,
-    runtime_path: PathBuf,
+    config: StreamingConfig,
+    _runtime_path: PathBuf,
     req: Request<Body>,
 ) -> Response<Body> {
     if req.method() != Method::GET && req.method() != Method::POST {
@@ -298,13 +773,26 @@ async fn handle_request(
 
     let request = {
         let mut cache = cache.lock().await;
-        StreamingServer::prune_expired_requests_locked(&mut cache);
+        StreamingServer::prune_expired_requests_locked(&mut cache, config.request_token_ttl);
         cache.remove(token)
     };
 
     match (action, request.map(|entry| entry.request)) {
-        ("exec", Some(StreamingRequest::Exec(exec_req))) => {
+        ("exec", Some(StreamingRequest::Exec(exec_ctx))) => {
+            let ExecRequestContext {
+                req: exec_req,
+                runtime_path,
+                runtime_config_path,
+                exec_cpu_affinity,
+                websocket_enabled,
+            } = exec_ctx;
             if is_websocket_upgrade_request(&req) {
+                if !websocket_enabled {
+                    return response(
+                        StatusCode::BAD_REQUEST,
+                        "websocket streaming is disabled for this runtime handler",
+                    );
+                }
                 let Some(protocol) = negotiate_remotecommand_websocket_protocol(&req) else {
                     return response(
                         StatusCode::FORBIDDEN,
@@ -315,8 +803,15 @@ async fn handle_request(
                 let response = websocket_switching_response(&req, protocol);
                 let on_upgrade = hyper::upgrade::on(req);
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        serve_exec_websocket(on_upgrade, exec_req, runtime_path, protocol).await
+                    if let Err(e) = serve_exec_websocket(
+                        on_upgrade,
+                        exec_req,
+                        runtime_path,
+                        runtime_config_path,
+                        exec_cpu_affinity,
+                        protocol,
+                    )
+                    .await
                     {
                         log::error!("Exec websocket session failed: {}", e);
                     }
@@ -340,7 +835,15 @@ async fn handle_request(
 
             let on_upgrade = hyper::upgrade::on(req);
             tokio::spawn(async move {
-                if let Err(e) = serve_exec_spdy(on_upgrade, exec_req, runtime_path, protocol).await
+                if let Err(e) = serve_exec_spdy(
+                    on_upgrade,
+                    exec_req,
+                    runtime_path,
+                    runtime_config_path,
+                    exec_cpu_affinity,
+                    protocol,
+                )
+                .await
                 {
                     log::error!("Exec SPDY session failed: {}", e);
                 }
@@ -354,8 +857,18 @@ async fn handle_request(
                 .body(Body::empty())
                 .unwrap_or_else(|_| Response::new(Body::empty()))
         }
-        ("attach", Some(StreamingRequest::Attach(attach_req))) => {
+        ("attach", Some(StreamingRequest::Attach(attach_ctx))) => {
+            let AttachRequestContext {
+                req: attach_req,
+                websocket_enabled,
+            } = attach_ctx;
             if is_websocket_upgrade_request(&req) {
+                if !websocket_enabled {
+                    return response(
+                        StatusCode::BAD_REQUEST,
+                        "websocket streaming is disabled for this runtime handler",
+                    );
+                }
                 let Some(protocol) = negotiate_remotecommand_websocket_protocol(&req) else {
                     return response(
                         StatusCode::FORBIDDEN,
@@ -403,7 +916,14 @@ async fn handle_request(
                 .unwrap_or_else(|_| Response::new(Body::empty()))
         }
         ("attach", Some(StreamingRequest::AttachLog(attach_log_ctx))) => {
+            let websocket_enabled = attach_log_ctx.websocket_enabled;
             if is_websocket_upgrade_request(&req) {
+                if !websocket_enabled {
+                    return response(
+                        StatusCode::BAD_REQUEST,
+                        "websocket streaming is disabled for this runtime handler",
+                    );
+                }
                 let Some(protocol) = negotiate_remotecommand_websocket_protocol(&req) else {
                     return response(
                         StatusCode::FORBIDDEN,
@@ -453,7 +973,14 @@ async fn handle_request(
                 .unwrap_or_else(|_| Response::new(Body::empty()))
         }
         ("portforward", Some(StreamingRequest::PortForward(port_forward_ctx))) => {
+            let websocket_enabled = port_forward_ctx.websocket_enabled;
             if is_websocket_upgrade_request(&req) {
+                if !websocket_enabled {
+                    return response(
+                        StatusCode::BAD_REQUEST,
+                        "websocket streaming is disabled for this runtime handler",
+                    );
+                }
                 let Some(protocol) = negotiate_portforward_websocket_protocol(&req) else {
                     return response(
                         StatusCode::FORBIDDEN,
@@ -463,9 +990,11 @@ async fn handle_request(
 
                 let response = websocket_switching_response(&req, protocol);
                 let on_upgrade = hyper::upgrade::on(req);
+                let config = config.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        serve_portforward_websocket(on_upgrade, port_forward_ctx, protocol).await
+                        serve_portforward_websocket(on_upgrade, port_forward_ctx, protocol, config)
+                            .await
                     {
                         log::error!("Port-forward websocket session failed: {}", e);
                     }
@@ -488,8 +1017,9 @@ async fn handle_request(
             };
 
             let on_upgrade = hyper::upgrade::on(req);
+            let config = config.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_portforward_spdy(on_upgrade, port_forward_ctx).await {
+                if let Err(e) = serve_portforward_spdy(on_upgrade, port_forward_ctx, config).await {
                     log::error!("Port-forward SPDY session failed: {}", e);
                 }
             });
@@ -754,12 +1284,14 @@ fn expected_exec_roles(req: &ExecRequest) -> Vec<ExecStreamRole> {
     roles
 }
 
-fn shim_work_dir() -> PathBuf {
-    crate::runtime::default_shim_work_dir()
+fn attach_socket_dir() -> PathBuf {
+    std::env::var("CRIUS_ATTACH_SOCKET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| crate::runtime::default_shim_work_dir())
 }
 
 fn shim_socket_path(container_id: &str, socket_name: &str) -> PathBuf {
-    shim_work_dir().join(container_id).join(socket_name)
+    attach_socket_dir().join(container_id).join(socket_name)
 }
 
 fn parse_terminal_size(payload: &[u8]) -> anyhow::Result<(u16, u16)> {
@@ -1158,6 +1690,10 @@ fn portforward_websocket_protocol(protocol: &str) -> PortForwardWebsocketProtoco
     }
 }
 
+fn exec_exit_error_message(exit_code: i32) -> String {
+    format!("command terminated with non-zero exit code: {}", exit_code)
+}
+
 fn portforward_request_id(
     stream_id: spdy::StreamId,
     stream_type: &str,
@@ -1331,24 +1867,22 @@ fn register_portforward_stream(
 fn next_portforward_pair_timeout(
     pending_pairs: &HashMap<String, PortForwardPair>,
     now: Instant,
+    creation_timeout: Duration,
 ) -> Option<Duration> {
     pending_pairs
         .values()
-        .map(|pair| {
-            (pair.created_at + PORT_FORWARD_STREAM_CREATION_TIMEOUT).saturating_duration_since(now)
-        })
+        .map(|pair| (pair.created_at + creation_timeout).saturating_duration_since(now))
         .min()
 }
 
 fn take_expired_portforward_pairs(
     pending_pairs: &mut HashMap<String, PortForwardPair>,
     now: Instant,
+    creation_timeout: Duration,
 ) -> Vec<PortForwardPair> {
     let expired_request_ids: Vec<String> = pending_pairs
         .iter()
-        .filter(|(_, pair)| {
-            now.duration_since(pair.created_at) >= PORT_FORWARD_STREAM_CREATION_TIMEOUT
-        })
+        .filter(|(_, pair)| now.duration_since(pair.created_at) >= creation_timeout)
         .map(|(request_id, _)| request_id.clone())
         .collect();
     expired_request_ids
@@ -1402,9 +1936,10 @@ fn next_portforward_wait_timeout(
     activity: &StreamActivity,
     now: Instant,
     idle_timeout: Duration,
+    creation_timeout: Duration,
 ) -> Duration {
     let idle_timeout_remaining = next_stream_idle_timeout(activity, now, idle_timeout);
-    match next_portforward_pair_timeout(pending_pairs, now) {
+    match next_portforward_pair_timeout(pending_pairs, now, creation_timeout) {
         Some(pair_timeout) => idle_timeout_remaining.min(pair_timeout),
         None => idle_timeout_remaining,
     }
@@ -1646,6 +2181,8 @@ async fn serve_exec_spdy(
     on_upgrade: hyper::upgrade::OnUpgrade,
     req: ExecRequest,
     runtime_path: PathBuf,
+    runtime_config_path: PathBuf,
+    exec_cpu_affinity: Option<usize>,
     _protocol: &'static str,
 ) -> anyhow::Result<()> {
     let upgraded = on_upgrade.await?;
@@ -1730,6 +2267,9 @@ async fn serve_exec_spdy(
     }
 
     let mut command = TokioCommand::new(&runtime_path);
+    if !runtime_config_path.as_os_str().is_empty() {
+        command.arg("--config").arg(&runtime_config_path);
+    }
     command.arg("exec");
     if req.tty {
         command.arg("-t");
@@ -1738,6 +2278,10 @@ async fn serve_exec_spdy(
     for arg in &req.cmd {
         command.arg(arg);
     }
+    crate::runtime::RuncRuntime::apply_exec_cpu_affinity_to_tokio_command(
+        &mut command,
+        exec_cpu_affinity,
+    );
 
     let mut tty_master = None;
     let mut tty_resize = None;
@@ -2099,7 +2643,7 @@ async fn serve_exec_spdy(
             writer
                 .write_data(
                     stream_id,
-                    format!("command terminated with non-zero exit code: {}", exit_code).as_bytes(),
+                    exec_exit_error_message(exit_code).as_bytes(),
                     false,
                 )
                 .await?;
@@ -2117,6 +2661,8 @@ async fn serve_exec_websocket(
     on_upgrade: hyper::upgrade::OnUpgrade,
     req: ExecRequest,
     runtime_path: PathBuf,
+    runtime_config_path: PathBuf,
+    exec_cpu_affinity: Option<usize>,
     _protocol: &'static str,
 ) -> anyhow::Result<()> {
     let upgraded = on_upgrade.await?;
@@ -2124,6 +2670,9 @@ async fn serve_exec_websocket(
     let writer = Arc::new(Mutex::new(writer));
 
     let mut command = TokioCommand::new(&runtime_path);
+    if !runtime_config_path.as_os_str().is_empty() {
+        command.arg("--config").arg(&runtime_config_path);
+    }
     command.arg("exec");
     if req.tty {
         command.arg("-t");
@@ -2132,6 +2681,10 @@ async fn serve_exec_websocket(
     for arg in &req.cmd {
         command.arg(arg);
     }
+    crate::runtime::RuncRuntime::apply_exec_cpu_affinity_to_tokio_command(
+        &mut command,
+        exec_cpu_affinity,
+    );
 
     let mut tty_master = None;
     let mut tty_resize = None;
@@ -2388,7 +2941,7 @@ async fn serve_exec_websocket(
         write_websocket_channel_frame(
             &writer,
             WS_CHANNEL_ERROR,
-            format!("command terminated with non-zero exit code: {}", exit_code).as_bytes(),
+            exec_exit_error_message(exit_code).as_bytes(),
         )
         .await?;
     }
@@ -2399,6 +2952,7 @@ async fn serve_exec_websocket(
 async fn serve_portforward_spdy(
     on_upgrade: hyper::upgrade::OnUpgrade,
     ctx: PortForwardRequestContext,
+    config: StreamingConfig,
 ) -> anyhow::Result<()> {
     let upgraded = on_upgrade.await?;
     let (read_half, write_half) = tokio::io::split(upgraded);
@@ -2417,12 +2971,16 @@ async fn serve_portforward_spdy(
     let mut active_streams = 0usize;
 
     loop {
-        if stream_is_idle(&activity, Instant::now(), PORT_FORWARD_STREAM_IDLE_TIMEOUT) {
+        if stream_is_idle(&activity, Instant::now(), config.port_forward_idle_timeout) {
             let _ = writer.lock().await.write_goaway(0).await;
             break;
         }
 
-        for pair in take_expired_portforward_pairs(&mut pending_pairs, Instant::now()) {
+        for pair in take_expired_portforward_pairs(
+            &mut pending_pairs,
+            Instant::now(),
+            config.port_forward_stream_creation_timeout,
+        ) {
             let message = format!(
                 "timed out waiting for matching port-forward stream for request {}",
                 pair.request_id
@@ -2435,7 +2993,8 @@ async fn serve_portforward_spdy(
                 &pending_pairs,
                 &activity,
                 Instant::now(),
-                PORT_FORWARD_STREAM_IDLE_TIMEOUT,
+                config.port_forward_idle_timeout,
+                config.port_forward_stream_creation_timeout,
             ),
             spdy::read_frame_async(&mut reader),
         )
@@ -2926,6 +3485,7 @@ async fn serve_portforward_websocket(
     on_upgrade: hyper::upgrade::OnUpgrade,
     ctx: PortForwardRequestContext,
     protocol: &'static str,
+    config: StreamingConfig,
 ) -> anyhow::Result<()> {
     let upgraded = on_upgrade.await?;
     let (mut reader, writer) = tokio::io::split(upgraded);
@@ -2938,13 +3498,13 @@ async fn serve_portforward_websocket(
     let mut data_channels: HashMap<u8, tokio::sync::mpsc::Sender<Option<Vec<u8>>>> = HashMap::new();
 
     loop {
-        if stream_is_idle(&activity, Instant::now(), PORT_FORWARD_STREAM_IDLE_TIMEOUT) {
+        if stream_is_idle(&activity, Instant::now(), config.port_forward_idle_timeout) {
             write_websocket_frame(&mut *writer.lock().await, 0x8, &[]).await?;
             break;
         }
 
         let frame = match tokio::time::timeout(
-            next_stream_idle_timeout(&activity, Instant::now(), PORT_FORWARD_STREAM_IDLE_TIMEOUT),
+            next_stream_idle_timeout(&activity, Instant::now(), config.port_forward_idle_timeout),
             read_websocket_frame(&mut reader),
         )
         .await
@@ -3500,38 +4060,60 @@ fn response(status: StatusCode, body: &str) -> Response<Body> {
 mod tests {
     use super::*;
     use hyper::body::to_bytes;
-    use std::fs;
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixListener as StdUnixListener;
-    use std::sync::mpsc;
-    use std::thread;
     use tempfile::tempdir;
 
-    fn parse_http_url(url: &str) -> (String, u16, String) {
-        let remainder = url
-            .strip_prefix("http://")
-            .expect("streaming test URLs must be http");
-        let (authority, path) = remainder.split_once('/').expect("missing URL path");
-        let (host, port) = authority.rsplit_once(':').expect("missing URL port");
-        (
-            host.to_string(),
-            port.parse().expect("invalid URL port"),
-            format!("/{}", path),
-        )
-    }
+    const TEST_TLS_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDCTCCAfGgAwIBAgIUVaFPJmszsQZiWnM3obSar9/CN9owDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJMTI3LjAuMC4xMB4XDTI2MDQzMDA3MDI0NVoXDTI2MDUw
+MTA3MDI0NVowFDESMBAGA1UEAwwJMTI3LjAuMC4xMIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAwUchidUdWHWopktZaqbHy7KFnYgSZFcXlt7Tj9GTw7Sw
+dPMDsUiyayHCZfE8U8IPzs/7975OiM/HHippkSX+vHEkwQ8h6EJ1XQuGhFfZp11U
+ShrHq6WgMFFkvorqZRy4R6CiqtFefPEKfSTqsdRHA4lW+NWpFvPiYj5Sk9hdpJPd
+wLucp4LFscvEeghqbn1mSPDehJolNVX5y4iDRvAaPF5++sgEb1tQbr7VyDgdSsT0
+/XuCrfNDPBvOGOvp86aH4A5SaJkoewJnWwkxB2Z6YKt+BCjGOsVBw8yHyEUvTCXk
+3cUhjHBtwdRf47cLEN9o4VFQY3nc33S+ofsua9GREwIDAQABo1MwUTAdBgNVHQ4E
+FgQUv8RtHGhrSGx6VYTVmT9va1bLSqQwHwYDVR0jBBgwFoAUv8RtHGhrSGx6VYTV
+mT9va1bLSqQwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAqHk1
+BEeux5284FHhG98JopveEQrA3f9w2Ywvzx9cyxgsEDpTj7DWR5EFBVsxrJJdplM1
+aWgaly13BsGgG6U2imZuydYKO5y8ekX+qC5jh/aBfgnUa/rQ8NdzXeIik7+gEkUe
+CPFzGNGvitrcgnqnAH4S5vy6OCj2Ay33pKW8UQgnxcCryxfJ+GxaOnOcYf0jwfyc
+6vjiIuddYbxEP/sVFIKj1rNdLtvtiB15ep/A0KMlSRfpllOvG2f24YufXVhB8qMQ
+ZC/YtnhyWUay1bIcQbrPIPVLsjgjM+Fu91VOKbVB5fb1BuDhdDsuWVaTcZenrxpP
+H7nbZnmhvkgzl+bBog==
+-----END CERTIFICATE-----
+"#;
 
-    fn read_http_response_head(stream: &mut StdTcpStream) -> String {
-        let mut response = Vec::new();
-        let mut byte = [0u8; 1];
-        while response.len() < 8192 {
-            stream.read_exact(&mut byte).unwrap();
-            response.push(byte[0]);
-            if response.ends_with(b"\r\n\r\n") {
-                break;
-            }
-        }
-        String::from_utf8(response).unwrap()
-    }
+    const TEST_TLS_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDBRyGJ1R1Ydaim
+S1lqpsfLsoWdiBJkVxeW3tOP0ZPDtLB08wOxSLJrIcJl8TxTwg/Oz/v3vk6Iz8ce
+KmmRJf68cSTBDyHoQnVdC4aEV9mnXVRKGserpaAwUWS+iuplHLhHoKKq0V588Qp9
+JOqx1EcDiVb41akW8+JiPlKT2F2kk93Au5yngsWxy8R6CGpufWZI8N6EmiU1VfnL
+iING8Bo8Xn76yARvW1BuvtXIOB1KxPT9e4Kt80M8G84Y6+nzpofgDlJomSh7Amdb
+CTEHZnpgq34EKMY6xUHDzIfIRS9MJeTdxSGMcG3B1F/jtwsQ32jhUVBjedzfdL6h
++y5r0ZETAgMBAAECggEAVD7C+acw8VvntQRm5zvnHnykDPRAwAfOOm7J3IhHViiu
+OWurklzTmCrQ50ptNz0BUu4JMAV9idi3PAjUlvXuwQi4MoZ8CxbcvT/G1GzObEsb
+8GkX21OILUdtGDjIzmXkVSRJgxdbji4qmj27JuQWSA5XIINQ/rYzWQs9R0AqIQ+n
+/fLcOA7tyQRN+ndYJ61k0WjjjXMWrhnmKQMEOXYK0B6cSPoU8CYR/jj0ewrg5XJU
+6iZauHf/SnvjlUORw0r2tWgM9Svuafujv8HqY1E9PzQh1pa+LCGne/Aj6MYnZtGZ
+b5R5lhy1HB+/0r/LUFKobHZKadxC5LKqSODXzGGs4QKBgQDz5vZtmy6PTVA3ZSo4
+6IPH3BwnhrR3NAHUBD12ZzKoSikoM2ICXrIP3KRfHVuxo9xz69c1JTch2uX6rsXb
+4/AGpkZt+HpD9Sfbfw6kdXUWGTvm6c2ENuQbnAI4zWYwrBY7kKMa/ZNghNWpbhdF
+AULfvSHpTeOvsp+SMCWfrWSx+wKBgQDK3VjoME8R4g2eMQOFt+VTOq8RKVHh1Dps
+1i1N5VRpV2i4xRVDjh2ucEX+Qgz5vu64aX2wJC2bChwfgdCtMhDI86zzP+qq5l7p
+v1uoJKY725ipToIlFDWSXNjPVtXjUbWBG0C8YsBYa2QWhkKtzz+vjyCymCJ5YHlX
+2/dtQIAJyQKBgCY+PL2K644ErWNCNZCexKr91FxOPtXCDddUot6B5+uDVVi8Vc3R
+U1IxYoSXcd00uEhk3mWy5CYm0JCx/swvvV8Ni1WK9IDbW9iK35zh3e4NHttiJZtp
+j/LUT3Tgn/lZwlKspyaARC+KJIZggL2NKRMz8LFIST8vXt3pNr0GzxcpAoGAA+Z1
+iyFCo+lgsaXnl26Nrif2rbHJrTnTVbxYaqL6GHxhuwuu+PmGgJAQCG9kqHiPRmRg
+0j4f0ldDayenx2yq/fIRZSvZaye6s2vGa1kpCQWTzc2Amw3kacf3MyVMP26WusC3
+YefUIt8NsZErPwQ5CTsLOePK5eKA8rt76lHPJGECgYBpWfniRtq9peKu4CHN4S3W
+e/URtTFvdJsCvolY9WnMS7qtOhuTmKWuBPzkbEra2uYWMmB5FQq7NXvFNLfK6Oh2
+VvfZab2Q10gdVv02GoNc1NiveAzxhCCQgLud9A6Sss0/9ZJdTh6RMPs+BPWTfMax
+dB0HtnAja5pmq6N9Ck79+g==
+-----END PRIVATE KEY-----
+"#;
+    use std::fs;
+    use std::io::Write;
 
     async fn response_body_string(response: Response<Body>) -> String {
         let bytes = to_bytes(response.into_body()).await.unwrap();
@@ -3550,7 +4132,16 @@ mod tests {
             tty: true,
         };
 
-        let response = server.get_exec(&req).await.unwrap();
+        let response = server
+            .get_exec(
+                &req,
+                PathBuf::from("/bin/false"),
+                PathBuf::new(),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
         assert!(response.url.contains("/exec/"));
         assert!(response.url.starts_with("http://127.0.0.1:12345"));
     }
@@ -3602,7 +4193,7 @@ mod tests {
             tty: false,
         };
 
-        let response = server.get_attach(&req).await.unwrap();
+        let response = server.get_attach(&req, true).await.unwrap();
         assert!(response.url.contains("/attach/"));
     }
 
@@ -3610,13 +4201,19 @@ mod tests {
     async fn test_exec_transport_explicitly_rejects_non_spdy_requests() {
         let server = StreamingServer::for_test("http://127.0.0.1:12345");
         let token = server
-            .insert_request(StreamingRequest::Exec(ExecRequest {
-                container_id: "abc".to_string(),
-                cmd: vec!["sh".to_string()],
-                stdin: true,
-                stdout: true,
-                stderr: false,
-                tty: true,
+            .insert_request(StreamingRequest::Exec(ExecRequestContext {
+                req: ExecRequest {
+                    container_id: "abc".to_string(),
+                    cmd: vec!["sh".to_string()],
+                    stdin: true,
+                    stdout: true,
+                    stderr: false,
+                    tty: true,
+                },
+                runtime_path: PathBuf::from("/bin/false"),
+                runtime_config_path: PathBuf::new(),
+                exec_cpu_affinity: None,
+                websocket_enabled: true,
             }))
             .await;
         let request = Request::builder()
@@ -3625,8 +4222,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let response =
-            handle_request(server.cache.clone(), PathBuf::from("/bin/false"), request).await;
+        let response = server
+            .handle_request_for_test(PathBuf::from("/bin/false"), request)
+            .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(response_body_string(response)
             .await
@@ -3637,13 +4235,19 @@ mod tests {
     async fn test_exec_transport_accepts_websocket_upgrade_requests() {
         let server = StreamingServer::for_test("http://127.0.0.1:12345");
         let token = server
-            .insert_request(StreamingRequest::Exec(ExecRequest {
-                container_id: "abc".to_string(),
-                cmd: vec!["sh".to_string()],
-                stdin: true,
-                stdout: true,
-                stderr: false,
-                tty: true,
+            .insert_request(StreamingRequest::Exec(ExecRequestContext {
+                req: ExecRequest {
+                    container_id: "abc".to_string(),
+                    cmd: vec!["sh".to_string()],
+                    stdin: true,
+                    stdout: true,
+                    stderr: false,
+                    tty: true,
+                },
+                runtime_path: PathBuf::from("/bin/false"),
+                runtime_config_path: PathBuf::new(),
+                exec_cpu_affinity: None,
+                websocket_enabled: true,
             }))
             .await;
         let request = Request::builder()
@@ -3657,8 +4261,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let response =
-            handle_request(server.cache.clone(), PathBuf::from("/bin/false"), request).await;
+        let response = server
+            .handle_request_for_test(PathBuf::from("/bin/false"), request)
+            .await;
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
         assert_eq!(
             response
@@ -3667,18 +4272,91 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("websocket")
         );
+        assert_eq!(
+            response
+                .headers()
+                .get(SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|value| value.to_str().ok()),
+            Some("v4.channel.k8s.io")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_transport_rejects_websocket_when_disabled_for_token() {
+        let server = StreamingServer::for_test("http://127.0.0.1:12345");
+        let token = server
+            .insert_request(StreamingRequest::Exec(ExecRequestContext {
+                req: ExecRequest {
+                    container_id: "abc".to_string(),
+                    cmd: vec!["sh".to_string()],
+                    stdin: true,
+                    stdout: true,
+                    stderr: false,
+                    tty: true,
+                },
+                runtime_path: PathBuf::from("/bin/false"),
+                runtime_config_path: PathBuf::new(),
+                exec_cpu_affinity: None,
+                websocket_enabled: false,
+            }))
+            .await;
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/exec/{}", token))
+            .header(CONNECTION, "Upgrade")
+            .header(UPGRADE, "websocket")
+            .header(SEC_WEBSOCKET_VERSION, "13")
+            .header(SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+            .header(SEC_WEBSOCKET_PROTOCOL, "v4.channel.k8s.io")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = server
+            .handle_request_for_test(PathBuf::from("/bin/false"), request)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response_body_string(response)
+            .await
+            .contains("websocket streaming is disabled"));
+    }
+
+    #[test]
+    fn test_negotiate_remotecommand_websocket_protocol_prefers_highest_supported_version() {
+        let request = Request::builder()
+            .header(
+                SEC_WEBSOCKET_PROTOCOL,
+                "channel.k8s.io, v3.channel.k8s.io, v5.channel.k8s.io",
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            negotiate_remotecommand_websocket_protocol(&request),
+            Some("v5.channel.k8s.io")
+        );
+
+        let request = Request::builder()
+            .header(SEC_WEBSOCKET_PROTOCOL, "v2.channel.k8s.io, channel.k8s.io")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            negotiate_remotecommand_websocket_protocol(&request),
+            Some("v2.channel.k8s.io")
+        );
     }
 
     #[tokio::test]
     async fn test_attach_transport_explicitly_rejects_non_spdy_requests() {
         let server = StreamingServer::for_test("http://127.0.0.1:12345");
         let token = server
-            .insert_request(StreamingRequest::Attach(AttachRequest {
-                container_id: "abc".to_string(),
-                stdin: false,
-                stdout: true,
-                stderr: true,
-                tty: false,
+            .insert_request(StreamingRequest::Attach(AttachRequestContext {
+                req: AttachRequest {
+                    container_id: "abc".to_string(),
+                    stdin: false,
+                    stdout: true,
+                    stderr: true,
+                    tty: false,
+                },
+                websocket_enabled: true,
             }))
             .await;
         let request = Request::builder()
@@ -3687,8 +4365,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let response =
-            handle_request(server.cache.clone(), PathBuf::from("/bin/false"), request).await;
+        let response = server
+            .handle_request_for_test(PathBuf::from("/bin/false"), request)
+            .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(response_body_string(response)
             .await
@@ -3707,7 +4386,7 @@ mod tests {
         };
 
         let response = server
-            .get_attach_log(&req, PathBuf::from("/var/log/pods/abc.log"))
+            .get_attach_log(&req, PathBuf::from("/var/log/pods/abc.log"), true)
             .await
             .unwrap();
         assert!(response.url.contains("/attach/"));
@@ -3718,12 +4397,15 @@ mod tests {
     async fn test_attach_transport_accepts_websocket_upgrade_requests() {
         let server = StreamingServer::for_test("http://127.0.0.1:12345");
         let token = server
-            .insert_request(StreamingRequest::Attach(AttachRequest {
-                container_id: "abc".to_string(),
-                stdin: false,
-                stdout: true,
-                stderr: true,
-                tty: false,
+            .insert_request(StreamingRequest::Attach(AttachRequestContext {
+                req: AttachRequest {
+                    container_id: "abc".to_string(),
+                    stdin: false,
+                    stdout: true,
+                    stderr: true,
+                    tty: false,
+                },
+                websocket_enabled: true,
             }))
             .await;
         let request = Request::builder()
@@ -3737,8 +4419,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let response =
-            handle_request(server.cache.clone(), PathBuf::from("/bin/false"), request).await;
+        let response = server
+            .handle_request_for_test(PathBuf::from("/bin/false"), request)
+            .await;
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
         assert_eq!(
             response
@@ -3747,6 +4430,48 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("websocket")
         );
+        assert_eq!(
+            response
+                .headers()
+                .get(SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|value| value.to_str().ok()),
+            Some("v4.channel.k8s.io")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attach_transport_rejects_websocket_when_disabled_for_token() {
+        let server = StreamingServer::for_test("http://127.0.0.1:12345");
+        let token = server
+            .insert_request(StreamingRequest::Attach(AttachRequestContext {
+                req: AttachRequest {
+                    container_id: "abc".to_string(),
+                    stdin: false,
+                    stdout: true,
+                    stderr: true,
+                    tty: false,
+                },
+                websocket_enabled: false,
+            }))
+            .await;
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/attach/{}", token))
+            .header(CONNECTION, "Upgrade")
+            .header(UPGRADE, "websocket")
+            .header(SEC_WEBSOCKET_VERSION, "13")
+            .header(SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+            .header(SEC_WEBSOCKET_PROTOCOL, "v4.channel.k8s.io")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = server
+            .handle_request_for_test(PathBuf::from("/bin/false"), request)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response_body_string(response)
+            .await
+            .contains("websocket streaming is disabled"));
     }
 
     #[tokio::test]
@@ -3762,6 +4487,7 @@ mod tests {
                     tty: false,
                 },
                 log_path: PathBuf::from("/var/log/pods/abc.log"),
+                websocket_enabled: true,
             }))
             .await;
         let request = Request::builder()
@@ -3775,8 +4501,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let response =
-            handle_request(server.cache.clone(), PathBuf::from("/bin/false"), request).await;
+        let response = server
+            .handle_request_for_test(PathBuf::from("/bin/false"), request)
+            .await;
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
         assert_eq!(
             response
@@ -3784,6 +4511,13 @@ mod tests {
                 .get(UPGRADE)
                 .and_then(|value| value.to_str().ok()),
             Some("websocket")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|value| value.to_str().ok()),
+            Some("v4.channel.k8s.io")
         );
     }
 
@@ -3796,7 +4530,7 @@ mod tests {
         };
 
         let response = server
-            .get_port_forward(&req, PathBuf::from("/proc/self/ns/net"))
+            .get_port_forward(&req, PathBuf::from("/proc/self/ns/net"), true)
             .await
             .unwrap();
         assert!(response.url.contains("/portforward/"));
@@ -3813,6 +4547,7 @@ mod tests {
                     port: vec![8080],
                 },
                 netns_path: PathBuf::from("/proc/thread-self/ns/net"),
+                websocket_enabled: true,
             }))
             .await;
         let request = Request::builder()
@@ -3821,8 +4556,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let response =
-            handle_request(server.cache.clone(), PathBuf::from("/bin/false"), request).await;
+        let response = server
+            .handle_request_for_test(PathBuf::from("/bin/false"), request)
+            .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(response_body_string(response)
             .await
@@ -3839,6 +4575,7 @@ mod tests {
                     port: vec![8080],
                 },
                 netns_path: PathBuf::from("/proc/thread-self/ns/net"),
+                websocket_enabled: true,
             }))
             .await;
         let request = Request::builder()
@@ -3852,8 +4589,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let response =
-            handle_request(server.cache.clone(), PathBuf::from("/bin/false"), request).await;
+        let response = server
+            .handle_request_for_test(PathBuf::from("/bin/false"), request)
+            .await;
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
         assert_eq!(
             response
@@ -3872,6 +4610,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_portforward_transport_rejects_websocket_when_disabled_for_token() {
+        let server = StreamingServer::for_test("http://127.0.0.1:12345");
+        let token = server
+            .insert_request(StreamingRequest::PortForward(PortForwardRequestContext {
+                req: PortForwardRequest {
+                    pod_sandbox_id: "pod-1".to_string(),
+                    port: vec![8080],
+                },
+                netns_path: PathBuf::from("/proc/thread-self/ns/net"),
+                websocket_enabled: false,
+            }))
+            .await;
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/portforward/{}", token))
+            .header(CONNECTION, "Upgrade")
+            .header(UPGRADE, "websocket")
+            .header(SEC_WEBSOCKET_VERSION, "13")
+            .header(SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+            .header(SEC_WEBSOCKET_PROTOCOL, PORT_FORWARD_WS_PROTOCOL_V4_BINARY)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = server
+            .handle_request_for_test(PathBuf::from("/bin/false"), request)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response_body_string(response)
+            .await
+            .contains("websocket streaming is disabled"));
+    }
+
+    #[tokio::test]
     async fn test_portforward_transport_requires_supported_protocol_version() {
         let server = StreamingServer::for_test("http://127.0.0.1:12345");
         let token = server
@@ -3881,6 +4652,7 @@ mod tests {
                     port: vec![8080],
                 },
                 netns_path: PathBuf::from("/proc/thread-self/ns/net"),
+                websocket_enabled: true,
             }))
             .await;
         let request = Request::builder()
@@ -3891,8 +4663,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let response =
-            handle_request(server.cache.clone(), PathBuf::from("/bin/false"), request).await;
+        let response = server
+            .handle_request_for_test(PathBuf::from("/bin/false"), request)
+            .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(response_body_string(response)
             .await
@@ -3903,13 +4676,19 @@ mod tests {
     async fn test_portforward_route_rejects_token_kind_mismatch() {
         let server = StreamingServer::for_test("http://127.0.0.1:12345");
         let token = server
-            .insert_request(StreamingRequest::Exec(ExecRequest {
-                container_id: "abc".to_string(),
-                cmd: vec!["sh".to_string()],
-                stdin: true,
-                stdout: true,
-                stderr: false,
-                tty: true,
+            .insert_request(StreamingRequest::Exec(ExecRequestContext {
+                req: ExecRequest {
+                    container_id: "abc".to_string(),
+                    cmd: vec!["sh".to_string()],
+                    stdin: true,
+                    stdout: true,
+                    stderr: false,
+                    tty: true,
+                },
+                runtime_path: PathBuf::from("/bin/false"),
+                runtime_config_path: PathBuf::new(),
+                exec_cpu_affinity: None,
+                websocket_enabled: true,
             }))
             .await;
         let request = Request::builder()
@@ -3918,8 +4697,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let response =
-            handle_request(server.cache.clone(), PathBuf::from("/bin/false"), request).await;
+        let response = server
+            .handle_request_for_test(PathBuf::from("/bin/false"), request)
+            .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(response_body_string(response)
             .await
@@ -3928,18 +4708,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_expired_streaming_token_is_rejected() {
-        let server = StreamingServer::for_test("http://127.0.0.1:12345");
+        let server = StreamingServer::for_test_with_config(
+            "http://127.0.0.1:12345",
+            StreamingConfig {
+                request_token_ttl: Duration::from_secs(5),
+                ..StreamingConfig::default()
+            },
+        );
         let token = server
             .insert_request_for_test(
-                StreamingRequest::Exec(ExecRequest {
-                    container_id: "abc".to_string(),
-                    cmd: vec!["sh".to_string()],
-                    stdin: false,
-                    stdout: true,
-                    stderr: true,
-                    tty: false,
+                StreamingRequest::Exec(ExecRequestContext {
+                    req: ExecRequest {
+                        container_id: "abc".to_string(),
+                        cmd: vec!["sh".to_string()],
+                        stdin: false,
+                        stdout: true,
+                        stderr: true,
+                        tty: false,
+                    },
+                    runtime_path: PathBuf::from("/bin/false"),
+                    runtime_config_path: PathBuf::new(),
+                    exec_cpu_affinity: None,
+                    websocket_enabled: true,
                 }),
-                STREAMING_REQUEST_TTL + Duration::from_secs(1),
+                Duration::from_secs(6),
             )
             .await;
         let request = Request::builder()
@@ -3948,8 +4740,9 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let response =
-            handle_request(server.cache.clone(), PathBuf::from("/bin/false"), request).await;
+        let response = server
+            .handle_request_for_test(PathBuf::from("/bin/false"), request)
+            .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(response_body_string(response)
             .await
@@ -4099,6 +4892,7 @@ mod tests {
     #[test]
     fn test_take_expired_portforward_pairs_returns_only_timed_out_pairs() {
         let now = Instant::now();
+        let creation_timeout = Duration::from_secs(15);
         let mut pending_pairs = HashMap::from([
             (
                 "expired".to_string(),
@@ -4107,7 +4901,7 @@ mod tests {
                     port: 8080,
                     data_stream: Some(1),
                     error_stream: None,
-                    created_at: now - PORT_FORWARD_STREAM_CREATION_TIMEOUT - Duration::from_secs(1),
+                    created_at: now - creation_timeout - Duration::from_secs(1),
                 },
             ),
             (
@@ -4122,7 +4916,7 @@ mod tests {
             ),
         ]);
 
-        let expired = take_expired_portforward_pairs(&mut pending_pairs, now);
+        let expired = take_expired_portforward_pairs(&mut pending_pairs, now, creation_timeout);
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].request_id, "expired");
         assert!(pending_pairs.contains_key("fresh"));
@@ -4132,6 +4926,7 @@ mod tests {
     #[test]
     fn test_next_portforward_pair_timeout_uses_earliest_pending_deadline() {
         let now = Instant::now();
+        let creation_timeout = Duration::from_secs(20);
         let pending_pairs = HashMap::from([
             (
                 "first".to_string(),
@@ -4155,11 +4950,128 @@ mod tests {
             ),
         ]);
 
-        let timeout = next_portforward_pair_timeout(&pending_pairs, now).unwrap();
-        assert_eq!(
-            timeout,
-            PORT_FORWARD_STREAM_CREATION_TIMEOUT - Duration::from_secs(10)
-        );
+        let timeout = next_portforward_pair_timeout(&pending_pairs, now, creation_timeout).unwrap();
+        assert_eq!(timeout, creation_timeout - Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn test_start_with_config_uses_configured_base_url_and_port() {
+        let server = StreamingServer::start_with_config(
+            StreamingConfig {
+                address: "127.0.0.1".to_string(),
+                port: 0,
+                ..StreamingConfig::default()
+            },
+            PathBuf::from("/bin/false"),
+        )
+        .await
+        .unwrap();
+
+        assert!(server.base_url().starts_with("http://127.0.0.1:"));
+    }
+
+    #[tokio::test]
+    async fn test_start_with_config_serves_https_when_tls_is_enabled() {
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("tls.crt");
+        let key_path = dir.path().join("tls.key");
+        std::fs::write(&cert_path, TEST_TLS_CERT_PEM).unwrap();
+        std::fs::write(&key_path, TEST_TLS_KEY_PEM).unwrap();
+
+        let server = StreamingServer::start_with_config(
+            StreamingConfig {
+                address: "127.0.0.1".to_string(),
+                port: 0,
+                enable_tls: true,
+                tls_cert_file: cert_path.display().to_string(),
+                tls_key_file: key_path.display().to_string(),
+                ..StreamingConfig::default()
+            },
+            PathBuf::from("/bin/false"),
+        )
+        .await
+        .unwrap();
+
+        assert!(server.base_url().starts_with("https://127.0.0.1:"));
+
+        let response = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap()
+            .get(format!("{}/missing", server.base_url()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_load_streaming_tls_config_accepts_explicit_cipher_suites() {
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("tls.crt");
+        let key_path = dir.path().join("tls.key");
+        std::fs::write(&cert_path, TEST_TLS_CERT_PEM).unwrap();
+        std::fs::write(&key_path, TEST_TLS_KEY_PEM).unwrap();
+
+        let config = StreamingConfig {
+            enable_tls: true,
+            tls_cert_file: cert_path.display().to_string(),
+            tls_key_file: key_path.display().to_string(),
+            tls_cipher_suites: vec![
+                "TLS13_AES_256_GCM_SHA384".to_string(),
+                "TLS13_AES_128_GCM_SHA256".to_string(),
+            ],
+            ..StreamingConfig::default()
+        };
+
+        load_streaming_tls_config(&config).expect("cipher suite list should be accepted");
+    }
+
+    #[test]
+    fn test_load_streaming_tls_config_rejects_unknown_cipher_suite() {
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("tls.crt");
+        let key_path = dir.path().join("tls.key");
+        std::fs::write(&cert_path, TEST_TLS_CERT_PEM).unwrap();
+        std::fs::write(&key_path, TEST_TLS_KEY_PEM).unwrap();
+
+        let config = StreamingConfig {
+            enable_tls: true,
+            tls_cert_file: cert_path.display().to_string(),
+            tls_key_file: key_path.display().to_string(),
+            tls_cipher_suites: vec!["TLS_FAKE_SUITE".to_string()],
+            ..StreamingConfig::default()
+        };
+
+        let err = load_streaming_tls_config(&config)
+            .expect_err("unknown cipher suites should be rejected");
+        assert!(err
+            .to_string()
+            .contains("unsupported streaming TLS cipher suite"));
+    }
+
+    #[test]
+    fn test_load_streaming_tls_config_rejects_tls12_suites_when_tls13_only() {
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("tls.crt");
+        let key_path = dir.path().join("tls.key");
+        std::fs::write(&cert_path, TEST_TLS_CERT_PEM).unwrap();
+        std::fs::write(&key_path, TEST_TLS_KEY_PEM).unwrap();
+
+        let config = StreamingConfig {
+            enable_tls: true,
+            tls_cert_file: cert_path.display().to_string(),
+            tls_key_file: key_path.display().to_string(),
+            tls_min_version: "VersionTLS13".to_string(),
+            tls_cipher_suites: vec!["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256".to_string()],
+            ..StreamingConfig::default()
+        };
+
+        let err = load_streaming_tls_config(&config)
+            .expect_err("TLS1.2-only cipher suites should be rejected when TLS1.3 is required");
+        assert!(err
+            .to_string()
+            .contains("no usable cipher suites configured"));
     }
 
     #[test]
@@ -4200,7 +5112,13 @@ mod tests {
         )]);
 
         assert_eq!(
-            next_portforward_wait_timeout(&pending_pairs, &activity, now, Duration::from_secs(60)),
+            next_portforward_wait_timeout(
+                &pending_pairs,
+                &activity,
+                now,
+                Duration::from_secs(60),
+                Duration::from_secs(30),
+            ),
             Duration::from_secs(1)
         );
     }
@@ -4309,6 +5227,14 @@ mod tests {
         assert_eq!(
             negotiate_portforward_websocket_protocol(&request),
             Some(PORT_FORWARD_WS_PROTOCOL_V4_BASE64)
+        );
+    }
+
+    #[test]
+    fn test_exec_exit_error_message_is_stable() {
+        assert_eq!(
+            exec_exit_error_message(17),
+            "command terminated with non-zero exit code: 17"
         );
     }
 
@@ -4435,600 +5361,13 @@ mod tests {
 
     #[test]
     fn test_shim_socket_path_honors_env_override() {
-        std::env::set_var("CRIUS_SHIM_DIR", "/tmp/crius-shims");
+        std::env::set_var("CRIUS_ATTACH_SOCKET_DIR", "/tmp/crius-attach");
         let socket_path = shim_socket_path("abc123", "attach.sock");
         assert_eq!(
             socket_path,
-            PathBuf::from("/tmp/crius-shims/abc123/attach.sock")
+            PathBuf::from("/tmp/crius-attach/abc123/attach.sock")
         );
-        std::env::remove_var("CRIUS_SHIM_DIR");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires local TCP bind permissions in the current test environment"]
-    async fn test_portforward_spdy_roundtrip_single_port() {
-        let backend = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let target_port = backend.local_addr().unwrap().port();
-        let backend_thread = thread::spawn(move || {
-            let (mut stream, _) = backend.accept().unwrap();
-            let mut buffer = Vec::new();
-            stream.read_to_end(&mut buffer).unwrap();
-            stream.write_all(&buffer).unwrap();
-        });
-
-        let server = StreamingServer::start("127.0.0.1:0", PathBuf::from("/bin/false"))
-            .await
-            .unwrap();
-        let response = server
-            .get_port_forward(
-                &PortForwardRequest {
-                    pod_sandbox_id: "pod-1".to_string(),
-                    port: vec![target_port as i32],
-                },
-                PathBuf::from("/proc/thread-self/ns/net"),
-            )
-            .await
-            .unwrap();
-        let (host, port, path) = parse_http_url(&response.url);
-
-        let mut stream = StdTcpStream::connect((host.as_str(), port)).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        write!(
-            stream,
-            "POST {} HTTP/1.1\r\nHost: {}:{}\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\nX-Stream-Protocol-Version: {}\r\n\r\n",
-            path, host, port, PORT_FORWARD_PROTOCOL_V1
-        )
-        .unwrap();
-        stream.flush().unwrap();
-
-        let response_head = read_http_response_head(&mut stream);
-        assert!(
-            response_head.starts_with("HTTP/1.1 101"),
-            "unexpected upgrade response: {}",
-            response_head
-        );
-
-        let writer_stream = stream.try_clone().unwrap();
-        let mut writer = spdy::SpdyWriter::new(writer_stream);
-        let data_headers = vec![
-            ("streamtype".to_string(), "data".to_string()),
-            ("port".to_string(), target_port.to_string()),
-            ("requestid".to_string(), "1".to_string()),
-        ];
-        let error_headers = vec![
-            ("streamtype".to_string(), "error".to_string()),
-            ("port".to_string(), target_port.to_string()),
-            ("requestid".to_string(), "1".to_string()),
-        ];
-        writer.write_syn_stream(1, 0, &data_headers, false).unwrap();
-        writer
-            .write_syn_stream(3, 0, &error_headers, false)
-            .unwrap();
-        writer.write_data(1, b"hello port-forward", true).unwrap();
-
-        let mut syn_reply_count = 0usize;
-        let mut data_payload = Vec::new();
-        let mut error_payload = Vec::new();
-        let mut saw_data_fin = false;
-        let mut saw_error_fin = false;
-        while !(syn_reply_count >= 2 && saw_data_fin && saw_error_fin) {
-            match spdy::read_frame(&mut stream).unwrap() {
-                spdy::Frame::SynReply(_) => {
-                    syn_reply_count += 1;
-                }
-                spdy::Frame::Data(frame) if frame.stream_id == 1 => {
-                    data_payload.extend_from_slice(&frame.data);
-                    if frame.flags & 0x01 != 0 {
-                        saw_data_fin = true;
-                    }
-                }
-                spdy::Frame::Data(frame) if frame.stream_id == 3 => {
-                    error_payload.extend_from_slice(&frame.data);
-                    if frame.flags & 0x01 != 0 {
-                        saw_error_fin = true;
-                    }
-                }
-                spdy::Frame::GoAway(_) => break,
-                other => panic!("unexpected SPDY frame: {:?}", other),
-            }
-        }
-
-        assert_eq!(data_payload, b"hello port-forward");
-        assert!(
-            error_payload.is_empty(),
-            "unexpected port-forward error payload: {}",
-            String::from_utf8_lossy(&error_payload)
-        );
-        backend_thread.join().unwrap();
-    }
-
-    #[tokio::test]
-    #[ignore = "requires local TCP bind permissions in the current test environment"]
-    async fn test_portforward_spdy_roundtrip_multiple_ports() {
-        let backend_a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let target_port_a = backend_a.local_addr().unwrap().port();
-        let backend_a_thread = thread::spawn(move || {
-            let (mut stream, _) = backend_a.accept().unwrap();
-            let mut buffer = Vec::new();
-            stream.read_to_end(&mut buffer).unwrap();
-            let mut reply = b"reply-a:".to_vec();
-            reply.extend_from_slice(&buffer);
-            stream.write_all(&reply).unwrap();
-        });
-
-        let backend_b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let target_port_b = backend_b.local_addr().unwrap().port();
-        let backend_b_thread = thread::spawn(move || {
-            let (mut stream, _) = backend_b.accept().unwrap();
-            let mut buffer = Vec::new();
-            stream.read_to_end(&mut buffer).unwrap();
-            let mut reply = b"reply-b:".to_vec();
-            reply.extend_from_slice(&buffer);
-            stream.write_all(&reply).unwrap();
-        });
-
-        let server = StreamingServer::start("127.0.0.1:0", PathBuf::from("/bin/false"))
-            .await
-            .unwrap();
-        let response = server
-            .get_port_forward(
-                &PortForwardRequest {
-                    pod_sandbox_id: "pod-1".to_string(),
-                    port: vec![target_port_a as i32, target_port_b as i32],
-                },
-                PathBuf::from("/proc/thread-self/ns/net"),
-            )
-            .await
-            .unwrap();
-        let (host, port, path) = parse_http_url(&response.url);
-
-        let mut stream = StdTcpStream::connect((host.as_str(), port)).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        write!(
-            stream,
-            "POST {} HTTP/1.1\r\nHost: {}:{}\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\nX-Stream-Protocol-Version: {}\r\n\r\n",
-            path, host, port, PORT_FORWARD_PROTOCOL_V1
-        )
-        .unwrap();
-        stream.flush().unwrap();
-
-        let response_head = read_http_response_head(&mut stream);
-        assert!(
-            response_head.starts_with("HTTP/1.1 101"),
-            "unexpected upgrade response: {}",
-            response_head
-        );
-
-        let writer_stream = stream.try_clone().unwrap();
-        let mut writer = spdy::SpdyWriter::new(writer_stream);
-        let data_headers_a = vec![
-            ("streamtype".to_string(), "data".to_string()),
-            ("port".to_string(), target_port_a.to_string()),
-            ("requestid".to_string(), "1".to_string()),
-        ];
-        let error_headers_a = vec![
-            ("streamtype".to_string(), "error".to_string()),
-            ("port".to_string(), target_port_a.to_string()),
-            ("requestid".to_string(), "1".to_string()),
-        ];
-        let data_headers_b = vec![
-            ("streamtype".to_string(), "data".to_string()),
-            ("port".to_string(), target_port_b.to_string()),
-            ("requestid".to_string(), "2".to_string()),
-        ];
-        let error_headers_b = vec![
-            ("streamtype".to_string(), "error".to_string()),
-            ("port".to_string(), target_port_b.to_string()),
-            ("requestid".to_string(), "2".to_string()),
-        ];
-        writer
-            .write_syn_stream(1, 0, &data_headers_a, false)
-            .unwrap();
-        writer
-            .write_syn_stream(3, 0, &error_headers_a, false)
-            .unwrap();
-        writer
-            .write_syn_stream(5, 0, &data_headers_b, false)
-            .unwrap();
-        writer
-            .write_syn_stream(7, 0, &error_headers_b, false)
-            .unwrap();
-        writer.write_data(1, b"hello-a", true).unwrap();
-        writer.write_data(5, b"hello-b", true).unwrap();
-
-        let mut syn_reply_count = 0usize;
-        let mut data_payload_a = Vec::new();
-        let mut data_payload_b = Vec::new();
-        let mut error_payload_a = Vec::new();
-        let mut error_payload_b = Vec::new();
-        let mut saw_data_fin_a = false;
-        let mut saw_data_fin_b = false;
-        let mut saw_error_fin_a = false;
-        let mut saw_error_fin_b = false;
-        while !(syn_reply_count >= 4
-            && saw_data_fin_a
-            && saw_data_fin_b
-            && saw_error_fin_a
-            && saw_error_fin_b)
-        {
-            match spdy::read_frame(&mut stream).unwrap() {
-                spdy::Frame::SynReply(_) => {
-                    syn_reply_count += 1;
-                }
-                spdy::Frame::Data(frame) if frame.stream_id == 1 => {
-                    data_payload_a.extend_from_slice(&frame.data);
-                    if frame.flags & 0x01 != 0 {
-                        saw_data_fin_a = true;
-                    }
-                }
-                spdy::Frame::Data(frame) if frame.stream_id == 3 => {
-                    error_payload_a.extend_from_slice(&frame.data);
-                    if frame.flags & 0x01 != 0 {
-                        saw_error_fin_a = true;
-                    }
-                }
-                spdy::Frame::Data(frame) if frame.stream_id == 5 => {
-                    data_payload_b.extend_from_slice(&frame.data);
-                    if frame.flags & 0x01 != 0 {
-                        saw_data_fin_b = true;
-                    }
-                }
-                spdy::Frame::Data(frame) if frame.stream_id == 7 => {
-                    error_payload_b.extend_from_slice(&frame.data);
-                    if frame.flags & 0x01 != 0 {
-                        saw_error_fin_b = true;
-                    }
-                }
-                spdy::Frame::GoAway(_) => break,
-                other => panic!("unexpected SPDY frame: {:?}", other),
-            }
-        }
-
-        assert_eq!(data_payload_a, b"reply-a:hello-a");
-        assert_eq!(data_payload_b, b"reply-b:hello-b");
-        assert!(
-            error_payload_a.is_empty(),
-            "unexpected port-forward error payload A: {}",
-            String::from_utf8_lossy(&error_payload_a)
-        );
-        assert!(
-            error_payload_b.is_empty(),
-            "unexpected port-forward error payload B: {}",
-            String::from_utf8_lossy(&error_payload_b)
-        );
-
-        backend_a_thread.join().unwrap();
-        backend_b_thread.join().unwrap();
-    }
-
-    #[tokio::test]
-    #[ignore = "requires local TCP bind permissions in the current test environment"]
-    async fn test_exec_spdy_interactive_tty_resize_roundtrip() {
-        let temp_dir = tempdir().unwrap();
-        let runtime_path = temp_dir.path().join("fake-runc.sh");
-        fs::write(
-            &runtime_path,
-            r#"#!/bin/bash
-set -eu
-cmd="${1:-}"
-if [ "$cmd" = "exec" ]; then
-  shift
-  if [ "${1:-}" = "-t" ]; then
-    shift
-  fi
-  shift
-  exec "$@"
-fi
-echo "unsupported command" >&2
-exit 1
-"#,
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&runtime_path).unwrap().permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
-        }
-        fs::set_permissions(&runtime_path, perms).unwrap();
-
-        let server = StreamingServer::start("127.0.0.1:0", runtime_path)
-            .await
-            .unwrap();
-        let response = server
-            .get_exec(&ExecRequest {
-                container_id: "container-1".to_string(),
-                cmd: vec![
-                    "sh".to_string(),
-                    "-lc".to_string(),
-                    "stty -echo; stty size; cat".to_string(),
-                ],
-                stdin: true,
-                stdout: true,
-                stderr: false,
-                tty: true,
-            })
-            .await
-            .unwrap();
-        let (host, port, path) = parse_http_url(&response.url);
-
-        let mut stream = StdTcpStream::connect((host.as_str(), port)).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        write!(
-            stream,
-            "POST {} HTTP/1.1\r\nHost: {}:{}\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\nX-Stream-Protocol-Version: v4.channel.k8s.io\r\n\r\n",
-            path, host, port
-        )
-        .unwrap();
-        stream.flush().unwrap();
-
-        let response_head = read_http_response_head(&mut stream);
-        assert!(
-            response_head.starts_with("HTTP/1.1 101"),
-            "unexpected upgrade response: {}",
-            response_head
-        );
-
-        let writer_stream = stream.try_clone().unwrap();
-        let mut writer = spdy::SpdyWriter::new(writer_stream);
-        writer
-            .write_syn_stream(
-                1,
-                0,
-                &[("streamtype".to_string(), "error".to_string())],
-                false,
-            )
-            .unwrap();
-        writer
-            .write_syn_stream(
-                3,
-                0,
-                &[("streamtype".to_string(), "stdin".to_string())],
-                false,
-            )
-            .unwrap();
-        writer
-            .write_syn_stream(
-                5,
-                0,
-                &[("streamtype".to_string(), "stdout".to_string())],
-                false,
-            )
-            .unwrap();
-        writer
-            .write_syn_stream(
-                7,
-                0,
-                &[("streamtype".to_string(), "resize".to_string())],
-                false,
-            )
-            .unwrap();
-        writer
-            .write_data(7, br#"{"Width":101,"Height":37}"#, false)
-            .unwrap();
-        writer.write_data(3, b"hello-exec\n", true).unwrap();
-
-        let mut stdout_payload = Vec::new();
-        let mut error_payload = Vec::new();
-        let mut saw_stdout_fin = false;
-        let mut saw_error_fin = false;
-        while !(saw_stdout_fin && saw_error_fin) {
-            match spdy::read_frame(&mut stream).unwrap() {
-                spdy::Frame::Data(frame) if frame.stream_id == 5 => {
-                    stdout_payload.extend_from_slice(&frame.data);
-                    if frame.flags & 0x01 != 0 {
-                        saw_stdout_fin = true;
-                    }
-                }
-                spdy::Frame::Data(frame) if frame.stream_id == 1 => {
-                    error_payload.extend_from_slice(&frame.data);
-                    if frame.flags & 0x01 != 0 {
-                        saw_error_fin = true;
-                    }
-                }
-                spdy::Frame::GoAway(_) => break,
-                _ => {}
-            }
-        }
-
-        let stdout_text = String::from_utf8_lossy(&stdout_payload);
-        assert!(
-            stdout_text.contains("37 101"),
-            "stdout was: {}",
-            stdout_text
-        );
-        assert!(
-            stdout_text.contains("hello-exec"),
-            "stdout was: {}",
-            stdout_text
-        );
-        assert!(
-            error_payload.is_empty(),
-            "unexpected exec error payload: {}",
-            String::from_utf8_lossy(&error_payload)
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "requires local TCP bind permissions in the current test environment"]
-    async fn test_attach_spdy_interactive_tty_resize_roundtrip() {
-        let temp_dir = tempdir().unwrap();
-        let shim_root = temp_dir.path().join("shims");
-        let container_dir = shim_root.join("container-1");
-        fs::create_dir_all(&container_dir).unwrap();
-        let attach_socket_path = container_dir.join("attach.sock");
-        let resize_socket_path = container_dir.join("resize.sock");
-        let _ = fs::remove_file(&attach_socket_path);
-        let _ = fs::remove_file(&resize_socket_path);
-        std::env::set_var("CRIUS_SHIM_DIR", &shim_root);
-
-        let resize_listener = StdUnixListener::bind(&resize_socket_path).unwrap();
-        let (resize_tx, resize_rx) = mpsc::channel();
-        let resize_thread = thread::spawn(move || {
-            let (stream, _) = resize_listener.accept().unwrap();
-            let mut reader = std::io::BufReader::new(stream);
-            let mut payload = String::new();
-            use std::io::BufRead;
-            reader.read_line(&mut payload).unwrap();
-            resize_tx.send(payload).unwrap();
-        });
-
-        let attach_listener = StdUnixListener::bind(&attach_socket_path).unwrap();
-        let attach_thread = thread::spawn(move || {
-            let (mut stream, _) = attach_listener.accept().unwrap();
-            let mut input = Vec::new();
-            stream.read_to_end(&mut input).unwrap();
-            let mut output =
-                crate::attach::encode_attach_output_frame(ATTACH_PIPE_STDOUT, b"attach-ready\n");
-            output.extend_from_slice(&crate::attach::encode_attach_output_frame(
-                ATTACH_PIPE_STDOUT,
-                &input,
-            ));
-            stream.write_all(&output).unwrap();
-        });
-
-        let server = StreamingServer::start("127.0.0.1:0", PathBuf::from("/bin/false"))
-            .await
-            .unwrap();
-        let response = server
-            .get_attach(&AttachRequest {
-                container_id: "container-1".to_string(),
-                stdin: true,
-                stdout: true,
-                stderr: false,
-                tty: true,
-            })
-            .await
-            .unwrap();
-        let (host, port, path) = parse_http_url(&response.url);
-
-        let mut stream = StdTcpStream::connect((host.as_str(), port)).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        write!(
-            stream,
-            "POST {} HTTP/1.1\r\nHost: {}:{}\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\nX-Stream-Protocol-Version: v4.channel.k8s.io\r\n\r\n",
-            path, host, port
-        )
-        .unwrap();
-        stream.flush().unwrap();
-
-        let response_head = read_http_response_head(&mut stream);
-        assert!(
-            response_head.starts_with("HTTP/1.1 101"),
-            "unexpected upgrade response: {}",
-            response_head
-        );
-
-        let writer_stream = stream.try_clone().unwrap();
-        let mut writer = spdy::SpdyWriter::new(writer_stream);
-        writer
-            .write_syn_stream(
-                1,
-                0,
-                &[("streamtype".to_string(), "error".to_string())],
-                false,
-            )
-            .unwrap();
-        writer
-            .write_syn_stream(
-                3,
-                0,
-                &[("streamtype".to_string(), "stdin".to_string())],
-                false,
-            )
-            .unwrap();
-        writer
-            .write_syn_stream(
-                5,
-                0,
-                &[("streamtype".to_string(), "stdout".to_string())],
-                false,
-            )
-            .unwrap();
-        writer
-            .write_syn_stream(
-                7,
-                0,
-                &[("streamtype".to_string(), "resize".to_string())],
-                false,
-            )
-            .unwrap();
-        writer
-            .write_data(7, br#"{"Width":101,"Height":37}"#, false)
-            .unwrap();
-        writer.write_data(3, b"hello-attach\n", true).unwrap();
-
-        let mut stdout_payload = Vec::new();
-        let mut error_payload = Vec::new();
-        let mut saw_stdout_fin = false;
-        let mut saw_error_fin = false;
-        while !(saw_stdout_fin && saw_error_fin) {
-            match spdy::read_frame(&mut stream).unwrap() {
-                spdy::Frame::Data(frame) if frame.stream_id == 5 => {
-                    stdout_payload.extend_from_slice(&frame.data);
-                    if frame.flags & 0x01 != 0 {
-                        saw_stdout_fin = true;
-                    }
-                }
-                spdy::Frame::Data(frame) if frame.stream_id == 1 => {
-                    error_payload.extend_from_slice(&frame.data);
-                    if frame.flags & 0x01 != 0 {
-                        saw_error_fin = true;
-                    }
-                }
-                spdy::Frame::GoAway(_) => break,
-                _ => {}
-            }
-        }
-
-        let stdout_text = String::from_utf8_lossy(&stdout_payload);
-        assert!(
-            stdout_text.contains("attach-ready"),
-            "stdout was: {}",
-            stdout_text
-        );
-        assert!(
-            stdout_text.contains("hello-attach"),
-            "stdout was: {}",
-            stdout_text
-        );
-        assert!(
-            error_payload.is_empty(),
-            "unexpected attach error payload: {}",
-            String::from_utf8_lossy(&error_payload)
-        );
-
-        let resize_payload = resize_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(
-            resize_payload.contains("\"Width\":101") || resize_payload.contains("\"width\":101")
-        );
-        assert!(
-            resize_payload.contains("\"Height\":37") || resize_payload.contains("\"height\":37")
-        );
-
-        attach_thread.join().unwrap();
-        resize_thread.join().unwrap();
-        std::env::remove_var("CRIUS_SHIM_DIR");
+        std::env::remove_var("CRIUS_ATTACH_SOCKET_DIR");
     }
 
     #[test]

@@ -1,5 +1,26 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::net::IpAddr;
+
+/// Pod 主 IP 选择策略。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MainIpPreference {
+    Ipv4,
+    Ipv6,
+    #[default]
+    Cni,
+}
+
+impl MainIpPreference {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+            Self::Cni => "cni",
+        }
+    }
+}
 
 /// 网络状态
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -15,6 +36,9 @@ pub struct NetworkStatus {
 
     /// 网络接口列表
     pub interfaces: Vec<NetworkInterface>,
+
+    /// 原始 CNI 结果，用于恢复 additional IP 顺序和调试
+    pub raw_result: Option<Value>,
 }
 
 /// 网络接口信息
