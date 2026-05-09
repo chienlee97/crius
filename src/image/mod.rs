@@ -2953,12 +2953,6 @@ impl ImageService for ImageServiceImpl {
                 };
 
                 if let Some((mut image, sibling_tags)) = exact_tag_candidate {
-                    if image.pinned {
-                        return Err(Status::failed_precondition(format!(
-                            "image {} is pinned and excluded from garbage collection",
-                            requested_ref
-                        )));
-                    }
                     let requested_is_id_or_digest =
                         Self::image_id_matches(&image.id, &requested_ref)
                             || image
@@ -2999,16 +2993,6 @@ impl ImageService for ImageServiceImpl {
 
                 let (candidate_ids, candidate_refs): (HashSet<String>, HashSet<String>) = {
                     let images = self.images.lock().await;
-                    if images.values().any(|image| {
-                        image.pinned
-                            && (Self::image_matches_ref(image, &requested_ref)
-                                || image.repo_tags.iter().any(|tag| tag == &requested_ref))
-                    }) {
-                        return Err(Status::failed_precondition(format!(
-                            "image {} is pinned and excluded from garbage collection",
-                            requested_ref
-                        )));
-                    }
                     if let Some(image) = images.get(&requested_ref) {
                         let mut ids = HashSet::new();
                         ids.insert(image.id.clone());
@@ -4433,7 +4417,69 @@ server = "https://docker.io"
     }
 
     #[tokio::test]
-    async fn remove_image_rejects_pinned_images() {
+    async fn remove_image_by_id_deletes_all_tags_for_same_image() {
+        let dir = tempdir().unwrap();
+        let service = test_image_service_with_options(
+            dir.path(),
+            "overlay",
+            Option::<&Path>::None,
+            Option::<&Path>::None,
+            Option::<&Path>::None,
+            Vec::new(),
+        );
+        insert_image(
+            &service,
+            Image {
+                id: "sha256:multi-tag-id".to_string(),
+                repo_tags: vec![
+                    "docker.io/library/busybox:latest".to_string(),
+                    "docker.io/library/busybox:debug".to_string(),
+                ],
+                repo_digests: vec!["docker.io/library/busybox@sha256:multi-tag-id".to_string()],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        ImageService::remove_image(
+            &service,
+            Request::new(RemoveImageRequest {
+                image: Some(ImageSpec {
+                    image: "sha256:multi-tag-id".to_string(),
+                    ..Default::default()
+                }),
+            }),
+        )
+        .await
+        .expect("image id removal should delete the whole image");
+
+        for reference in [
+            "sha256:multi-tag-id",
+            "docker.io/library/busybox:latest",
+            "docker.io/library/busybox:debug",
+        ] {
+            let removed = ImageService::image_status(
+                &service,
+                Request::new(ImageStatusRequest {
+                    image: Some(ImageSpec {
+                        image: reference.to_string(),
+                        ..Default::default()
+                    }),
+                    verbose: false,
+                }),
+            )
+            .await
+            .expect("image status lookup should succeed")
+            .into_inner();
+            assert!(
+                removed.image.is_none(),
+                "reference {reference} should be removed with image id deletion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_image_allows_pinned_images() {
         let dir = tempdir().unwrap();
         let service = test_image_service_with_options(
             dir.path(),
@@ -4454,7 +4500,7 @@ server = "https://docker.io"
         )
         .await;
 
-        let err = ImageService::remove_image(
+        let response = ImageService::remove_image(
             &service,
             Request::new(RemoveImageRequest {
                 image: Some(ImageSpec {
@@ -4464,9 +4510,23 @@ server = "https://docker.io"
             }),
         )
         .await
-        .expect_err("pinned image removal must be rejected");
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err.message().contains("pinned"));
+        .expect("pinned image removal should succeed");
+        let _ = response.into_inner();
+
+        let removed = ImageService::image_status(
+            &service,
+            Request::new(ImageStatusRequest {
+                image: Some(ImageSpec {
+                    image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }),
+                verbose: false,
+            }),
+        )
+        .await
+        .expect("image status lookup should succeed")
+        .into_inner();
+        assert!(removed.image.is_none());
     }
 
     #[tokio::test]
