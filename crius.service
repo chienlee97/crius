@@ -10,7 +10,6 @@ Restart=always
 RestartSec=5
 Delegate=yes
 KillMode=process
-RuntimeDirectory=crius
 StateDirectory=crius
 LogsDirectory=crius
 
