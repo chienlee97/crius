@@ -1,4 +1,5 @@
 use super::*;
+use crate::image::{ImageServiceImpl, ImageServiceOptions};
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
 use std::time::Instant;
 
@@ -28,7 +29,6 @@ impl NameRegistry {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn get_id(&self, name: &str) -> Option<String> {
         self.ids_by_name.get(name).cloned()
     }
@@ -78,11 +78,14 @@ pub struct RuntimeServiceImpl {
     pub(super) pod_sandboxes: Arc<Mutex<HashMap<String, crate::proto::runtime::v1::PodSandbox>>>,
     pub(super) container_names: StdArc<StdMutex<NameRegistry>>,
     pub(super) pod_names: StdArc<StdMutex<NameRegistry>>,
+    pub(super) removed_container_ids: StdArc<StdMutex<HashSet<String>>>,
+    pub(super) removed_pod_sandbox_ids: StdArc<StdMutex<HashSet<String>>>,
     pub(super) config: RuntimeConfig,
     pub(super) nri_config: NriConfig,
     pub(super) nri: Arc<dyn NriApi>,
     pub(super) runtime: RuntimeRegistry,
     pub(super) pod_manager: tokio::sync::Mutex<PodSandboxManager<RuntimeRegistry>>,
+    pub(super) image_service: ImageServiceImpl,
     pub(super) persistence: Arc<Mutex<PersistenceManager>>,
     pub(super) streaming: Arc<Mutex<Option<StreamingServer>>>,
     pub(super) events: tokio::sync::broadcast::Sender<ContainerEventResponse>,
@@ -97,6 +100,14 @@ pub struct RuntimeServiceImpl {
     pub(super) last_startup_detected_upgrade: StdArc<StdMutex<Option<bool>>>,
     pub(super) last_startup_attempted_repair: StdArc<StdMutex<Option<bool>>>,
     pub(super) last_startup_repair_succeeded: StdArc<StdMutex<Option<bool>>>,
+    pub(super) last_irqbalance_restore_status: StdArc<StdMutex<Option<IrqBalanceRestoreStatus>>>,
+    pub(super) seccomp_notifier_dir: PathBuf,
+    pub(super) seccomp_notifiers:
+        StdArc<StdMutex<HashMap<String, seccomp_notifier::SeccompNotifier>>>,
+    pub(super) seccomp_notifier_snapshots:
+        StdArc<StdMutex<HashMap<String, seccomp_notifier::SeccompNotifierSnapshot>>>,
+    pub(super) seccomp_notification_tx:
+        tokio::sync::mpsc::UnboundedSender<seccomp_notifier::SeccompNotificationEvent>,
     pub(super) runtime_network_config: Arc<Mutex<Option<crate::proto::runtime::v1::NetworkConfig>>>,
     pub(super) exit_monitors: Arc<Mutex<HashSet<String>>>,
     pub(super) container_stats_cache:
@@ -104,6 +115,20 @@ pub struct RuntimeServiceImpl {
     pub(super) pod_stats_cache:
         Arc<Mutex<HashMap<String, CachedStatsEntry<crate::proto::runtime::v1::PodSandboxStats>>>>,
     pub(super) pod_metrics_cache:
+        Arc<Mutex<HashMap<String, CachedStatsEntry<crate::proto::runtime::v1::PodSandboxMetrics>>>>,
+}
+
+#[derive(Clone)]
+pub struct RuntimeMetricsProvider {
+    containers: Arc<Mutex<HashMap<String, Container>>>,
+    pod_sandboxes: Arc<Mutex<HashMap<String, crate::proto::runtime::v1::PodSandbox>>>,
+    config: RuntimeConfig,
+    events: tokio::sync::broadcast::Sender<ContainerEventResponse>,
+    container_stats_cache:
+        Arc<Mutex<HashMap<String, CachedStatsEntry<crate::proto::runtime::v1::ContainerStats>>>>,
+    pod_stats_cache:
+        Arc<Mutex<HashMap<String, CachedStatsEntry<crate::proto::runtime::v1::PodSandboxStats>>>>,
+    pod_metrics_cache:
         Arc<Mutex<HashMap<String, CachedStatsEntry<crate::proto::runtime::v1::PodSandboxMetrics>>>>,
 }
 
@@ -119,6 +144,13 @@ pub(super) struct ContainerCreateDeadline {
     pub(super) deadline: Instant,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct IrqBalanceRestoreStatus {
+    pub attempted: bool,
+    pub restored: bool,
+    pub message: String,
+}
+
 /// 运行时配置
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -129,8 +161,28 @@ pub struct RuntimeConfig {
     pub runtime_root: PathBuf,
     pub log_dir: PathBuf,
     pub runtime_path: PathBuf,
+    pub runtime_config_path: PathBuf,
     pub image_root: PathBuf,
     pub image_driver: String,
+    pub image_global_auth_file: PathBuf,
+    pub image_namespaced_auth_dir: PathBuf,
+    pub image_default_transport: String,
+    pub image_short_name_mode: String,
+    pub image_pull_progress_timeout: std::time::Duration,
+    pub image_max_concurrent_downloads: usize,
+    pub image_pull_retry_count: u32,
+    pub image_registry_config_dir: PathBuf,
+    pub image_decryption_keys_path: PathBuf,
+    pub image_decryption_decoder_path: String,
+    pub image_decryption_keyprovider_config: PathBuf,
+    pub image_additional_artifact_stores: Vec<PathBuf>,
+    pub image_signature_policy: PathBuf,
+    pub image_signature_policy_dir: PathBuf,
+    pub image_storage_options: Vec<String>,
+    pub image_volumes: String,
+    pub image_pinned_images: Vec<String>,
+    pub image_big_files_temporary_dir: PathBuf,
+    pub image_oci_artifact_mount_support: bool,
     pub workloads: HashMap<String, crate::config::RuntimeWorkloadConfig>,
     pub enable_pod_events: bool,
     pub included_pod_metrics: Vec<String>,
@@ -138,10 +190,36 @@ pub struct RuntimeConfig {
     pub pod_sandbox_metrics_collection_period: u64,
     pub grpc_max_send_msg_size: u32,
     pub grpc_max_recv_msg_size: u32,
+    pub metrics_enable: bool,
+    pub metrics_host: String,
+    pub metrics_port: u16,
+    pub metrics_socket_path: PathBuf,
+    pub metrics_enable_tls: bool,
+    pub metrics_tls_cert_file: PathBuf,
+    pub metrics_tls_key_file: PathBuf,
+    pub metrics_tls_ca_file: PathBuf,
+    pub metrics_tls_min_version: String,
+    pub metrics_tls_cipher_suites: Vec<String>,
+    pub metrics_collectors: Vec<String>,
+    pub tracing_enable: bool,
+    pub tracing_endpoint: String,
+    pub tracing_sampling_rate_per_million: u32,
     pub monitor_env: Vec<String>,
+    pub monitor_cgroup: String,
     pub default_env: Vec<(String, String)>,
     pub default_capabilities: Vec<String>,
     pub default_sysctls: HashMap<String, String>,
+    pub default_ulimits: Vec<crate::oci::spec::Rlimit>,
+    pub allowed_devices: Vec<PathBuf>,
+    pub additional_devices: Vec<crate::runtime::DeviceMapping>,
+    pub device_ownership_from_security_context: bool,
+    pub add_inheritable_capabilities: bool,
+    pub base_runtime_spec: Option<crate::oci::spec::Spec>,
+    pub default_mounts_file: PathBuf,
+    pub hooks_dir: Vec<PathBuf>,
+    pub absent_mount_sources_to_reject: Vec<PathBuf>,
+    pub disable_proc_mount: bool,
+    pub timezone: String,
     pub attach_socket_dir: PathBuf,
     pub container_exits_dir: PathBuf,
     pub clean_shutdown_file: PathBuf,
@@ -159,7 +237,13 @@ pub struct RuntimeConfig {
     pub tolerate_missing_hugetlb_controller: bool,
     pub separate_pull_cgroup: String,
     pub seccomp_profile: PathBuf,
+    pub privileged_seccomp_profile: String,
     pub unset_seccomp_profile: String,
+    pub apparmor_default_profile: String,
+    pub disable_apparmor: bool,
+    pub enable_selinux: bool,
+    pub selinux_category_range: u32,
+    pub hostnetwork_disable_selinux: bool,
     pub uid_mappings: Option<Vec<crate::proto::runtime::v1::IdMapping>>,
     pub gid_mappings: Option<Vec<crate::proto::runtime::v1::IdMapping>>,
     pub minimum_mappable_uid: i64,
@@ -167,11 +251,17 @@ pub struct RuntimeConfig {
     pub io_uid: u32,
     pub io_gid: u32,
     pub pids_limit: i64,
+    pub infra_ctr_cpuset: String,
+    pub shared_cpuset: String,
     pub exec_cpu_affinity: String,
+    pub irqbalance_config_file: PathBuf,
+    pub irqbalance_config_restore_file: String,
     pub read_only: bool,
     pub no_pivot: bool,
+    pub no_new_keyring: bool,
     pub pause_image: String,
     pub pause_command: String,
+    pub drop_infra_ctr: bool,
     pub cni_config: CniConfig,
     pub cgroup_driver: Option<CgroupDriver>,
     pub exec_sync_io_drain_timeout: std::time::Duration,
@@ -217,6 +307,19 @@ impl RuntimeRegistry {
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
         })
+    }
+
+    pub(super) fn runtime_handler_name_for_annotations_map(
+        &self,
+        annotations: &HashMap<String, String>,
+    ) -> String {
+        annotations
+            .get(CRIO_RUNTIME_HANDLER_ANNOTATION)
+            .or_else(|| annotations.get(CONTAINERD_RUNTIME_HANDLER_ANNOTATION))
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(self.default_handler.as_str())
+            .to_string()
     }
 
     fn remember_container_handler(&self, container_id: &str, handler: &str) {
@@ -283,6 +386,26 @@ impl RuntimeRegistry {
         }
 
         self.runtime_for_handler(&self.default_handler)
+    }
+
+    pub(super) fn runtime_handler_name_for_container(
+        &self,
+        container_id: &str,
+    ) -> anyhow::Result<String> {
+        if let Ok(handlers) = self.container_handlers.lock() {
+            if let Some(handler) = handlers.get(container_id) {
+                return Ok(handler.clone());
+            }
+        }
+
+        for (handler, runtime) in self.runtimes.iter() {
+            if runtime.bundle_path_for(container_id).exists() {
+                self.remember_container_handler(container_id, handler);
+                return Ok(handler.clone());
+            }
+        }
+
+        Ok(self.default_handler.clone())
     }
 
     pub(super) fn bundle_path_for_container(&self, container_id: &str) -> anyhow::Result<PathBuf> {
@@ -490,18 +613,121 @@ impl RuntimeServiceImpl {
                 deadline.timeout_secs
             )));
         }
-        tokio::time::timeout(remaining, future)
-            .await
-            .map_err(|_| {
-                Status::deadline_exceeded(format!(
-                    "container create phase {phase} exceeded runtime handler create timeout of {}s",
-                    deadline.timeout_secs
-                ))
-            })?
+        tokio::time::timeout(remaining, future).await.map_err(|_| {
+            Status::deadline_exceeded(format!(
+                "container create phase {phase} exceeded runtime handler create timeout of {}s",
+                deadline.timeout_secs
+            ))
+        })?
+    }
+
+    pub fn metrics_provider(&self) -> RuntimeMetricsProvider {
+        RuntimeMetricsProvider {
+            containers: self.containers.clone(),
+            pod_sandboxes: self.pod_sandboxes.clone(),
+            config: self.config.clone(),
+            events: self.events.clone(),
+            container_stats_cache: self.container_stats_cache.clone(),
+            pod_stats_cache: self.pod_stats_cache.clone(),
+            pod_metrics_cache: self.pod_metrics_cache.clone(),
+        }
+    }
+
+    pub fn image_service(&self) -> ImageServiceImpl {
+        self.image_service.clone()
+    }
+}
+
+impl RuntimeMetricsProvider {
+    pub async fn snapshot(&self) -> crate::metrics::RuntimeMetricsSnapshot {
+        let runtime_ready = RuntimeServiceImpl::runtime_binary_ready(&self.config.runtime_path);
+        let network_ready = match crate::network::CniManager::new(
+            self.config
+                .cni_config
+                .plugin_dirs()
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect(),
+            self.config
+                .cni_config
+                .config_dirs()
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect(),
+            self.config.cni_config.cache_dir().display().to_string(),
+        ) {
+            Ok(mut cni) => {
+                cni.set_max_conf_num(self.config.cni_config.max_conf_num());
+                cni.set_default_network_name(
+                    self.config
+                        .cni_config
+                        .default_network_name()
+                        .map(ToOwned::to_owned),
+                );
+                cni.load_network_configs()
+                    .await
+                    .map(|status| status.ready)
+                    .unwrap_or(false)
+            }
+            Err(_) => false,
+        };
+
+        crate::metrics::RuntimeMetricsSnapshot {
+            runtime_ready,
+            network_ready,
+            container_count: self.containers.lock().await.len(),
+            pod_sandbox_count: self.pod_sandboxes.lock().await.len(),
+            event_subscriber_count: self.events.receiver_count(),
+            container_stats_cache_entries: self.container_stats_cache.lock().await.len(),
+            pod_stats_cache_entries: self.pod_stats_cache.lock().await.len(),
+            pod_metrics_cache_entries: self.pod_metrics_cache.lock().await.len(),
+        }
     }
 }
 
 impl RuntimeServiceImpl {
+    pub(super) fn runtime_binary_ready(path: &Path) -> bool {
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => return false,
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
+    fn shared_cpuset_annotation_enabled(
+        annotations: &HashMap<String, String>,
+        container_name: Option<&str>,
+    ) -> bool {
+        let Some(container_name) = container_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            return false;
+        };
+        let key = format!("cpu-shared.crio.io/{container_name}");
+        annotations
+            .get(&key)
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "enable" | "enabled"
+                )
+            })
+            .unwrap_or(false)
+    }
+
     pub(super) fn effective_container_stop_timeout(&self, requested_timeout_secs: u32) -> u32 {
         if requested_timeout_secs == 0 {
             self.config.container_stop_timeout
@@ -546,11 +772,33 @@ impl RuntimeServiceImpl {
         if self.config.exec_cpu_affinity != "first" {
             return None;
         }
+        let container = {
+            let containers = self.containers.lock().await;
+            containers.get(container_id).cloned()
+        };
+        let shared_enabled = container.as_ref().is_some_and(|container| {
+            Self::shared_cpuset_annotation_enabled(
+                &container.annotations,
+                container
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.name.as_str()),
+            )
+        });
+        if shared_enabled && !self.config.shared_cpuset.trim().is_empty() {
+            if let Some(cpu) =
+                crate::runtime::RuncRuntime::first_cpu_from_cpuset(&self.config.shared_cpuset)
+            {
+                return Some(cpu);
+            }
+        }
+
         self.container_internal_state(container_id)
             .await
-            .and_then(|state| state.linux_resources)
-            .and_then(|resources| {
-                crate::runtime::RuncRuntime::first_cpu_from_cpuset(&resources.cpuset_cpus)
+            .and_then(|state| {
+                state.linux_resources.and_then(|resources| {
+                    crate::runtime::RuncRuntime::first_cpu_from_cpuset(&resources.cpuset_cpus)
+                })
             })
     }
 
@@ -595,6 +843,50 @@ impl RuntimeServiceImpl {
                 gids: gid_mappings.clone(),
             }),
         })
+    }
+
+    pub(super) fn effective_container_namespace_options(
+        &self,
+        requested: Option<&NamespaceOption>,
+        sandbox: Option<&StoredNamespaceOptions>,
+    ) -> Option<NamespaceOption> {
+        let mut effective = self.effective_userns_options(requested);
+        let Some(sandbox) = sandbox else {
+            return effective;
+        };
+
+        let sandbox = sandbox.to_proto();
+        let requested_missing = requested.is_none();
+        let effective = effective.get_or_insert_with(|| sandbox.clone());
+
+        // Match CRI-O's behavior: the sandbox decides whether workload
+        // containers must run in host namespaces, even if the container
+        // request omitted namespace options or left them at proto defaults.
+        if sandbox.network == NamespaceMode::Node as i32 {
+            effective.network = sandbox.network;
+        } else if requested_missing {
+            effective.network = sandbox.network;
+        }
+
+        if sandbox.pid == NamespaceMode::Node as i32 {
+            effective.pid = sandbox.pid;
+            effective.target_id.clear();
+        } else if requested_missing {
+            effective.pid = sandbox.pid;
+            effective.target_id = sandbox.target_id.clone();
+        }
+
+        if sandbox.ipc == NamespaceMode::Node as i32 {
+            effective.ipc = sandbox.ipc;
+        } else if requested_missing {
+            effective.ipc = sandbox.ipc;
+        }
+
+        if effective.userns_options.is_none() {
+            effective.userns_options = sandbox.userns_options;
+        }
+
+        Some(effective.clone())
     }
 
     fn run_as_user_is_non_root(run_as_user: Option<&str>) -> bool {
@@ -678,6 +970,82 @@ impl RuntimeServiceImpl {
         &self.version_file_persist
     }
 
+    pub fn irqbalance_config_file(&self) -> &Path {
+        &self.config.irqbalance_config_file
+    }
+
+    pub fn irqbalance_config_restore_file(&self) -> &str {
+        &self.config.irqbalance_config_restore_file
+    }
+
+    pub fn seccomp_notifier_dir(&self) -> &Path {
+        &self.seccomp_notifier_dir
+    }
+
+    pub(super) fn seccomp_notifier_snapshot(
+        &self,
+        container_id: &str,
+    ) -> Option<seccomp_notifier::SeccompNotifierSnapshot> {
+        self.seccomp_notifier_snapshots
+            .lock()
+            .ok()
+            .and_then(|snapshots| snapshots.get(container_id).cloned())
+    }
+
+    pub fn seccomp_notifier_active_containers(&self) -> Vec<String> {
+        self.seccomp_notifier_snapshots
+            .lock()
+            .map(|snapshots| snapshots.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn seccomp_notifier_socket_path(&self, container_id: &str) -> PathBuf {
+        self.seccomp_notifier_dir.join(container_id)
+    }
+
+    pub(super) fn ensure_seccomp_notifier(
+        &self,
+        container_id: &str,
+        mode: crate::runtime::SeccompNotifierMode,
+    ) -> Result<PathBuf, Status> {
+        let socket_path = self.seccomp_notifier_socket_path(container_id);
+        let mut notifiers = self
+            .seccomp_notifiers
+            .lock()
+            .map_err(|_| Status::internal("seccomp notifier mutex poisoned"))?;
+        if !notifiers.contains_key(container_id) {
+            let notifier = seccomp_notifier::SeccompNotifier::bind(
+                socket_path.clone(),
+                container_id.to_string(),
+                mode,
+                self.seccomp_notification_tx.clone(),
+            )
+            .map_err(|err| {
+                Status::internal(format!(
+                    "failed to bind seccomp notifier socket {}: {}",
+                    socket_path.display(),
+                    err
+                ))
+            })?;
+            if let Ok(mut snapshots) = self.seccomp_notifier_snapshots.lock() {
+                snapshots.insert(container_id.to_string(), notifier.snapshot());
+            }
+            notifiers.insert(container_id.to_string(), notifier);
+        }
+        Ok(socket_path)
+    }
+
+    pub(super) fn remove_seccomp_notifier(&self, container_id: &str) {
+        if let Ok(mut notifiers) = self.seccomp_notifiers.lock() {
+            if let Some(mut notifier) = notifiers.remove(container_id) {
+                notifier.close();
+            }
+        }
+        if let Ok(mut snapshots) = self.seccomp_notifier_snapshots.lock() {
+            snapshots.remove(container_id);
+        }
+    }
+
     pub fn record_startup_clean_shutdown(&self, clean: bool) {
         if let Ok(mut state) = self.last_startup_clean_shutdown.lock() {
             *state = Some(clean);
@@ -731,6 +1099,19 @@ impl RuntimeServiceImpl {
             .lock()
             .ok()
             .and_then(|state| *state)
+    }
+
+    pub fn record_irqbalance_restore_status(&self, status: IrqBalanceRestoreStatus) {
+        if let Ok(mut state) = self.last_irqbalance_restore_status.lock() {
+            *state = Some(status);
+        }
+    }
+
+    pub fn last_irqbalance_restore_status(&self) -> Option<IrqBalanceRestoreStatus> {
+        self.last_irqbalance_restore_status
+            .lock()
+            .ok()
+            .and_then(|state| state.clone())
     }
 
     pub fn last_startup_repair_succeeded(&self) -> Option<bool> {
@@ -893,7 +1274,6 @@ impl RuntimeServiceImpl {
             .and_then(|registry| registry.get_id(name))
     }
 
-    #[cfg(test)]
     pub(super) fn container_id_for_reserved_name(&self, name: &str) -> Option<String> {
         self.container_names
             .lock()
@@ -906,7 +1286,8 @@ impl RuntimeServiceImpl {
     }
 
     pub fn new_with_nri_config(config: RuntimeConfig, nri_config: NriConfig) -> Self {
-        Self::new_with_shim_work_dir(config, nri_config, default_shim_work_dir())
+        let shim_work_dir = config.shim.work_dir.clone();
+        Self::new_with_shim_work_dir(config, nri_config, shim_work_dir)
     }
 
     pub fn new_with_nri_api(
@@ -914,7 +1295,8 @@ impl RuntimeServiceImpl {
         nri_config: NriConfig,
         nri: Arc<dyn NriApi>,
     ) -> Self {
-        Self::new_with_shim_work_dir_and_nri(config, nri_config, default_shim_work_dir(), Some(nri))
+        let shim_work_dir = config.shim.work_dir.clone();
+        Self::new_with_shim_work_dir_and_nri(config, nri_config, shim_work_dir, Some(nri))
     }
 
     pub(super) fn new_with_shim_work_dir(
@@ -954,12 +1336,19 @@ impl RuntimeServiceImpl {
             config.runtime.clone(),
             crate::config::ResolvedRuntimeHandlerConfig {
                 runtime_path: config.runtime_path.display().to_string(),
+                runtime_config_path: config.runtime_config_path.display().to_string(),
                 runtime_root: config.runtime_root.display().to_string(),
+                platform_runtime_paths: HashMap::new(),
                 monitor_path: config.shim.shim_path.display().to_string(),
+                monitor_cgroup: config.monitor_cgroup.clone(),
                 monitor_env: config.monitor_env.clone(),
+                stream_websockets: false,
                 allowed_annotations: Vec::new(),
                 default_annotations: HashMap::new(),
+                privileged_without_host_devices: false,
+                privileged_without_host_devices_all_devices_allowed: false,
                 container_create_timeout: 240,
+                snapshotter: "internal-overlay-untar".to_string(),
             },
         );
         config.runtime_configs = runtime_configs;
@@ -984,21 +1373,56 @@ impl RuntimeServiceImpl {
                 shim_config.attach_socket_dir = config.attach_socket_dir.clone();
                 shim_config.container_exits_dir = config.container_exits_dir.clone();
                 shim_config.shim_path = PathBuf::from(&runtime_config.monitor_path);
+                shim_config.runtime_config_path =
+                    PathBuf::from(runtime_config.runtime_config_path.as_str());
+                shim_config.monitor_cgroup = runtime_config.monitor_cgroup.clone();
                 shim_config.io_uid = config.io_uid;
                 shim_config.io_gid = config.io_gid;
                 shim_config.runtime_path = PathBuf::from(&runtime_config.runtime_path);
                 shim_config.monitor_env = runtime_config.monitor_env.clone();
                 shim_config.no_sync_log = config.no_sync_log;
+                shim_config.no_new_keyring = config.no_new_keyring;
+                shim_config.systemd_cgroup = config.cgroup_driver == Some(CgroupDriver::Systemd);
                 (handler.clone(), {
                     let mut runtime = RuncRuntime::with_shim_and_image_storage(
                         PathBuf::from(&runtime_config.runtime_path),
                         PathBuf::from(&runtime_config.runtime_root),
-                        config.root_dir.join("storage"),
+                        config.image_root.clone(),
                         shim_config,
                     );
                     runtime.set_default_env(config.default_env.clone());
                     runtime.set_default_capabilities(config.default_capabilities.clone());
                     runtime.set_default_sysctls(config.default_sysctls.clone());
+                    runtime.set_default_ulimits(config.default_ulimits.clone());
+                    runtime.set_allowed_devices(config.allowed_devices.clone());
+                    runtime.set_additional_devices(config.additional_devices.clone());
+                    runtime.set_device_ownership_from_security_context(
+                        config.device_ownership_from_security_context,
+                    );
+                    runtime.set_privileged_without_host_devices(
+                        runtime_config.privileged_without_host_devices,
+                    );
+                    runtime.set_privileged_without_host_devices_all_devices_allowed(
+                        runtime_config.privileged_without_host_devices_all_devices_allowed,
+                    );
+                    runtime.set_add_inheritable_capabilities(config.add_inheritable_capabilities);
+                    runtime.set_base_runtime_spec(config.base_runtime_spec.clone());
+                    runtime.set_default_mounts_file(config.default_mounts_file.clone());
+                    runtime.set_hooks_dirs(config.hooks_dir.clone());
+                    runtime.set_absent_mount_sources_to_reject(
+                        config.absent_mount_sources_to_reject.clone(),
+                    );
+                    runtime.set_image_volumes_mode(crate::runtime::ImageVolumesMode::from_config(
+                        &config.image_volumes,
+                    ));
+                    runtime.set_rootfs_snapshotter(crate::runtime::RootfsSnapshotter::from_config(
+                        runtime_config.snapshotter.as_str(),
+                    ));
+                    runtime.set_disable_proc_mount(config.disable_proc_mount);
+                    runtime.set_timezone(config.timezone.clone());
+                    runtime.set_runtime_config_path(PathBuf::from(
+                        runtime_config.runtime_config_path.as_str(),
+                    ));
                     runtime
                         .set_container_create_timeout_secs(runtime_config.container_create_timeout);
                     runtime.set_container_stop_timeout_secs(config.container_stop_timeout);
@@ -1009,21 +1433,56 @@ impl RuntimeServiceImpl {
                     runtime.set_default_seccomp_profile_path(config.seccomp_profile.clone());
                     runtime.set_exec_cpu_affinity(config.exec_cpu_affinity.clone());
                     runtime.set_no_pivot(config.no_pivot);
+                    runtime.set_no_new_keyring(config.no_new_keyring);
+                    runtime.set_cgroup_driver(match config.cgroup_driver {
+                        Some(CgroupDriver::Systemd) => crate::config::CgroupDriverConfig::Systemd,
+                        _ => crate::config::CgroupDriverConfig::Cgroupfs,
+                    });
                     runtime
                 })
             })
             .collect();
-        let runtime = RuntimeRegistry::new(
-            config.runtime.clone(),
-            runtimes,
-            container_create_timeouts,
-        );
+        let runtime =
+            RuntimeRegistry::new(config.runtime.clone(), runtimes, container_create_timeouts);
+        let image_service = ImageServiceImpl::new_with_options(ImageServiceOptions {
+            storage_path: config.image_root.clone(),
+            storage_driver: config.image_driver.clone(),
+            global_auth_file: (!config.image_global_auth_file.as_os_str().is_empty())
+                .then(|| config.image_global_auth_file.clone()),
+            namespaced_auth_dir: (!config.image_namespaced_auth_dir.as_os_str().is_empty())
+                .then(|| config.image_namespaced_auth_dir.clone()),
+            default_transport: config.image_default_transport.clone(),
+            short_name_mode: config.image_short_name_mode.clone(),
+            pull_progress_timeout: config.image_pull_progress_timeout,
+            max_concurrent_downloads: config.image_max_concurrent_downloads,
+            pull_retry_count: config.image_pull_retry_count,
+            registry_config_dir: (!config.image_registry_config_dir.as_os_str().is_empty())
+                .then(|| config.image_registry_config_dir.clone()),
+            decryption_keys_path: (!config.image_decryption_keys_path.as_os_str().is_empty())
+                .then(|| config.image_decryption_keys_path.clone()),
+            decryption_decoder_path: config.image_decryption_decoder_path.clone(),
+            decryption_keyprovider_config: (!config
+                .image_decryption_keyprovider_config
+                .as_os_str()
+                .is_empty())
+            .then(|| config.image_decryption_keyprovider_config.clone()),
+            additional_artifact_stores: config.image_additional_artifact_stores.clone(),
+            pinned_image_patterns: config.image_pinned_images.clone(),
+            signature_policy: (!config.image_signature_policy.as_os_str().is_empty())
+                .then(|| config.image_signature_policy.clone()),
+            signature_policy_dir: (!config.image_signature_policy_dir.as_os_str().is_empty())
+                .then(|| config.image_signature_policy_dir.clone()),
+            big_files_temporary_dir: (!config.image_big_files_temporary_dir.as_os_str().is_empty())
+                .then(|| config.image_big_files_temporary_dir.clone()),
+        })
+        .expect("Failed to initialize image service");
 
         let pod_manager = PodSandboxManager::new(
             runtime.clone(),
             config.root_dir.join("pods"),
             config.pause_image.clone(),
             config.pause_command.clone(),
+            config.infra_ctr_cpuset.clone(),
             config.cni_config.clone(),
         );
         let persistence_config = PersistenceConfig {
@@ -1062,17 +1521,71 @@ impl RuntimeServiceImpl {
                 );
                 None
             });
+        let seccomp_notifier_dir = config.runtime_root.join("seccomp-notifier");
+        let seccomp_notifiers = StdArc::new(StdMutex::new(HashMap::new()));
+        let seccomp_notifier_snapshots = StdArc::new(StdMutex::new(HashMap::<
+            String,
+            seccomp_notifier::SeccompNotifierSnapshot,
+        >::new()));
+        let (seccomp_notification_tx, mut seccomp_notification_rx) =
+            tokio::sync::mpsc::unbounded_channel::<seccomp_notifier::SeccompNotificationEvent>();
+        let runtime_for_seccomp = runtime.clone();
+        let seccomp_snapshots_for_task = seccomp_notifier_snapshots.clone();
+        let seccomp_event_worker = async move {
+            let mut stop_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+            while let Some(event) = seccomp_notification_rx.recv().await {
+                log::info!(
+                    "Got seccomp notifier message for container ID: {} (syscall = {})",
+                    event.container_id,
+                    event.syscall
+                );
+                if event.stop_mode {
+                    if let Some(existing) = stop_tasks.remove(&event.container_id) {
+                        existing.abort();
+                    }
+                    let runtime = runtime_for_seccomp.clone();
+                    let container_id = event.container_id.clone();
+                    stop_tasks.insert(
+                        event.container_id.clone(),
+                        tokio::spawn(async move {
+                            tokio::time::sleep(seccomp_notifier::seccomp_stop_delay()).await;
+                            let _ = tokio::task::spawn_blocking(move || {
+                                runtime.stop_container(&container_id, Some(0))
+                            })
+                            .await;
+                        }),
+                    );
+                }
+                let _ = seccomp_snapshots_for_task.lock().map(|mut snapshots| {
+                    if let Some(snapshot) = snapshots.get_mut(&event.container_id) {
+                        *snapshot.syscalls.entry(event.syscall.clone()).or_insert(0) += 1;
+                    }
+                });
+            }
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(seccomp_event_worker);
+        } else {
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Runtime::new()
+                    .expect("failed to create background runtime for seccomp notifier worker");
+                runtime.block_on(seccomp_event_worker);
+            });
+        }
 
         Self {
             containers,
             pod_sandboxes,
             container_names,
             pod_names,
+            removed_container_ids: StdArc::new(StdMutex::new(HashSet::new())),
+            removed_pod_sandbox_ids: StdArc::new(StdMutex::new(HashSet::new())),
             config,
             nri_config,
             nri,
             runtime,
             pod_manager: tokio::sync::Mutex::new(pod_manager),
+            image_service,
             persistence,
             streaming: Arc::new(Mutex::new(None)),
             events,
@@ -1087,6 +1600,11 @@ impl RuntimeServiceImpl {
             last_startup_detected_upgrade: StdArc::new(StdMutex::new(None)),
             last_startup_attempted_repair: StdArc::new(StdMutex::new(None)),
             last_startup_repair_succeeded: StdArc::new(StdMutex::new(None)),
+            last_irqbalance_restore_status: StdArc::new(StdMutex::new(None)),
+            seccomp_notifier_dir,
+            seccomp_notifiers,
+            seccomp_notifier_snapshots,
+            seccomp_notification_tx,
             runtime_network_config: Arc::new(Mutex::new(runtime_network_config)),
             exit_monitors: Arc::new(Mutex::new(HashSet::new())),
             container_stats_cache: Arc::new(Mutex::new(HashMap::new())),

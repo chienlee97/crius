@@ -143,6 +143,19 @@ impl RuntimeServiceImpl {
         Status::internal(format!("Failed to create pod sandbox: {}", err))
     }
 
+    fn requested_pause_image(
+        &self,
+        pod_config: &crate::proto::runtime::v1::PodSandboxConfig,
+    ) -> String {
+        pod_config
+            .annotations
+            .get("io.kubernetes.cri.sandbox-image")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| self.config.pause_image.clone())
+    }
+
     fn pod_fallback_netns_name(
         pod: &crate::proto::runtime::v1::PodSandbox,
         pod_state: Option<&StoredPodState>,
@@ -163,7 +176,7 @@ impl RuntimeServiceImpl {
             })
     }
 
-    async fn fallback_cleanup_pod_sandbox_resources(
+    pub(super) async fn fallback_cleanup_pod_sandbox_resources(
         &self,
         pod_id: &str,
         pod: &crate::proto::runtime::v1::PodSandbox,
@@ -262,6 +275,11 @@ impl RuntimeServiceImpl {
                     .as_ref()
                     .map(|m| m.name.clone())
                     .unwrap_or_default();
+                let uid = pod
+                    .metadata
+                    .as_ref()
+                    .map(|m| m.uid.clone())
+                    .unwrap_or_default();
                 let runtime_handler = pod_state
                     .and_then(|state| {
                         (!state.runtime_handler.is_empty())
@@ -270,7 +288,14 @@ impl RuntimeServiceImpl {
                     .filter(|handler| !handler.is_empty())
                     .unwrap_or(pod.runtime_handler.as_str());
                 if let Err(err) = network_manager
-                    .teardown_pod_network(pod_id, netns_path, &namespace, &name, runtime_handler)
+                    .teardown_pod_network(
+                        pod_id,
+                        netns_path,
+                        &namespace,
+                        &name,
+                        &uid,
+                        runtime_handler,
+                    )
                     .await
                 {
                     log::debug!("Fallback CNI teardown failed for pod {}: {}", pod_id, err);
@@ -456,21 +481,46 @@ impl RuntimeServiceImpl {
             );
         }
         let effective_pids_limit = self.effective_pids_limit(None)?;
+        let pod_privileged = sandbox_security
+            .map(|security| security.privileged)
+            .unwrap_or(false);
         let managed_netns = sandbox_security
-            .and_then(|_| effective_namespace_options.as_ref())
+            .and(effective_namespace_options.as_ref())
             .map(|options| options.network != NamespaceMode::Node as i32)
             .unwrap_or(true);
-        let pod_selinux_label = Self::selinux_label_from_proto(
+        let pod_metadata = pod_config.metadata.as_ref();
+        let pod_selinux_seed = format!(
+            "{}:{}:{}",
+            pod_metadata
+                .map(|metadata| metadata.namespace.as_str())
+                .unwrap_or("default"),
+            pod_metadata
+                .map(|metadata| metadata.name.as_str())
+                .unwrap_or("pod"),
+            pod_metadata
+                .map(|metadata| metadata.uid.as_str())
+                .unwrap_or("uid"),
+        );
+        let pod_selinux_label = self.effective_selinux_label_from_proto(
             sandbox_security.and_then(|security| security.selinux_options.as_ref()),
+            !managed_netns,
+            Some(&pod_selinux_seed),
         );
         let pod_seccomp_profile = self.effective_seccomp_profile_from_proto(
             sandbox_security.and_then(|security| security.seccomp.as_ref()),
             Self::legacy_linux_sandbox_seccomp_profile_path(sandbox_security),
+            pod_privileged,
         );
         let stored_seccomp_profile = self.effective_stored_seccomp_profile_from_proto(
             sandbox_security.and_then(|security| security.seccomp.as_ref()),
             Self::legacy_linux_sandbox_seccomp_profile_path(sandbox_security),
+            pod_privileged,
         );
+        let pod_apparmor_profile = self.effective_apparmor_profile_from_proto(
+            sandbox_security.and_then(|security| security.apparmor.as_ref()),
+            "",
+            pod_privileged,
+        )?;
         let effective_sysctls = self.effective_pod_sysctls(
             linux_config.as_ref().map(|linux| &linux.sysctls),
             effective_namespace_options.as_ref(),
@@ -585,11 +635,14 @@ impl RuntimeServiceImpl {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            dns_config: pod_config.dns_config.map(|d| crate::pod::DNSConfig {
-                servers: d.servers,
-                searches: d.searches,
-                options: d.options,
-            }),
+            dns_config: pod_config
+                .dns_config
+                .clone()
+                .map(|d| crate::pod::DNSConfig {
+                    servers: d.servers,
+                    searches: d.searches,
+                    options: d.options,
+                }),
             port_mappings: pod_config
                 .port_mappings
                 .iter()
@@ -635,19 +688,14 @@ impl RuntimeServiceImpl {
                 .or_else(|| Some("crius".to_string())),
             sysctls: effective_sysctls.clone(),
             namespace_options: effective_namespace_options.clone(),
-            privileged: sandbox_security
-                .map(|security| security.privileged)
-                .unwrap_or(false),
+            privileged: pod_privileged,
             run_as_user: run_as_user.clone(),
             run_as_group,
             supplemental_groups: supplemental_groups.clone(),
             readonly_rootfs,
             pids_limit: effective_pids_limit,
             no_new_privileges: None,
-            apparmor_profile: Self::security_profile_name(
-                sandbox_security.and_then(|security| security.apparmor.as_ref()),
-                "",
-            ),
+            apparmor_profile: pod_apparmor_profile.clone(),
             selinux_label: pod_selinux_label.clone(),
             seccomp_profile: pod_seccomp_profile.clone(),
             linux_resources: effective_pod_linux_resources.clone(),
@@ -662,6 +710,20 @@ impl RuntimeServiceImpl {
                 host_ip: mapping.host_ip.clone(),
             })
             .collect();
+        let pause_image = self.requested_pause_image(&pod_config);
+        self.image_service
+            .ensure_image_exists_for_sandbox(&pause_image, &pod_config)
+            .await
+            .map_err(|status| {
+                Status::new(
+                    status.code(),
+                    format!(
+                        "failed to ensure pause image {} for pod sandbox: {}",
+                        pause_image,
+                        status.message()
+                    ),
+                )
+            })?;
 
         let mut pod_manager = self.pod_manager.lock().await;
         let pod_id = pod_manager
@@ -728,18 +790,13 @@ impl RuntimeServiceImpl {
                 namespace_options: effective_namespace_options
                     .as_ref()
                     .map(StoredNamespaceOptions::from),
-                privileged: sandbox_security
-                    .map(|security| security.privileged)
-                    .unwrap_or(false),
+                privileged: pod_privileged,
                 run_as_user: run_as_user.clone(),
                 run_as_group,
                 supplemental_groups: supplemental_groups.clone(),
                 readonly_rootfs,
                 no_new_privileges: None,
-                apparmor_profile: Self::security_profile_name(
-                    sandbox_security.and_then(|security| security.apparmor.as_ref()),
-                    "",
-                ),
+                apparmor_profile: pod_apparmor_profile.clone(),
                 selinux_label: pod_selinux_label.clone(),
                 seccomp_profile: stored_seccomp_profile.clone(),
                 overhead_linux_resources: pod_overhead.as_ref().map(StoredLinuxResources::from),
@@ -764,24 +821,24 @@ impl RuntimeServiceImpl {
                 namespace_options: effective_namespace_options
                     .as_ref()
                     .map(StoredNamespaceOptions::from),
-                privileged: sandbox_security
-                    .map(|security| security.privileged)
-                    .unwrap_or(false),
+                privileged: pod_privileged,
                 run_as_user,
                 run_as_group,
                 supplemental_groups,
                 readonly_rootfs,
                 no_new_privileges: None,
-                apparmor_profile: Self::security_profile_name(
-                    sandbox_security.and_then(|security| security.apparmor.as_ref()),
-                    "",
-                ),
+                apparmor_profile: pod_apparmor_profile,
                 selinux_label: pod_selinux_label.clone(),
                 seccomp_profile: stored_seccomp_profile.clone(),
                 overhead_linux_resources: pod_overhead.as_ref().map(StoredLinuxResources::from),
                 linux_resources: stored_effective_pod_linux_resources,
                 ..Default::default()
             });
+        log::info!(
+            "RunPodSandbox resolved cgroup_parent for pod {}: {:?}",
+            pod_id,
+            pod_state.cgroup_parent
+        );
         let mut stored_annotations = sandbox_annotations;
         Self::insert_internal_state(&mut stored_annotations, INTERNAL_POD_STATE_KEY, &pod_state)?;
 
@@ -831,35 +888,66 @@ impl RuntimeServiceImpl {
         } else {
             String::new()
         };
-        let mut persistence = self.persistence.lock().await;
-        if let Err(e) = persistence.save_pod_sandbox(
-            &pod_id,
-            "ready",
-            &pod_config
-                .metadata
-                .as_ref()
-                .map(|m| m.name.clone())
-                .unwrap_or_default(),
-            &pod_config
-                .metadata
-                .as_ref()
-                .map(|m| m.namespace.clone())
-                .unwrap_or_else(|| "default".to_string()),
-            &pod_config
-                .metadata
-                .as_ref()
-                .map(|m| m.uid.clone())
-                .unwrap_or_default(),
-            &netns_path,
-            &pod_config.labels,
-            &stored_annotations,
-            pod_state.pause_container_id.as_deref(),
-            pod_state.ip.as_deref(),
-        ) {
-            log::error!("Failed to persist pod sandbox {}: {}", pod_id, e);
-        } else {
-            log::info!("Pod sandbox {} persisted to database", pod_id);
-        }
+        let persistence = self.persistence.clone();
+        let pod_sandboxes = self.pod_sandboxes.clone();
+        let removed_pod_sandbox_ids = self.removed_pod_sandbox_ids.clone();
+        let pod_id_for_persist = pod_id.clone();
+        tokio::spawn(async move {
+            if removed_pod_sandbox_ids
+                .lock()
+                .ok()
+                .map(|removed| removed.contains(&pod_id_for_persist))
+                .unwrap_or(false)
+            {
+                return;
+            }
+
+            let Some(current_pod) = ({
+                let pod_sandboxes = pod_sandboxes.lock().await;
+                pod_sandboxes.get(&pod_id_for_persist).cloned()
+            }) else {
+                return;
+            };
+
+            let pod_state = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
+                &current_pod.annotations,
+                INTERNAL_POD_STATE_KEY,
+            )
+            .unwrap_or_default();
+            let state = if current_pod.state == PodSandboxState::SandboxReady as i32 {
+                "ready"
+            } else {
+                "notready"
+            };
+            let netns_path = if RuntimeServiceImpl::pod_requires_managed_netns(Some(&pod_state)) {
+                pod_state.netns_path.unwrap_or(netns_path)
+            } else {
+                String::new()
+            };
+            let metadata = current_pod.metadata.clone().unwrap_or_default();
+
+            let mut persistence = persistence.lock().await;
+            if let Err(err) = persistence.save_pod_sandbox(
+                &pod_id_for_persist,
+                state,
+                &metadata.name,
+                &metadata.namespace,
+                &metadata.uid,
+                &netns_path,
+                &current_pod.labels,
+                &current_pod.annotations,
+                pod_state.pause_container_id.as_deref(),
+                pod_state.ip.as_deref(),
+            ) {
+                log::error!(
+                    "Failed to persist pod sandbox {}: {}",
+                    pod_id_for_persist,
+                    err
+                );
+            } else {
+                log::info!("Pod sandbox {} persisted to database", pod_id_for_persist);
+            }
+        });
         if let Err(err) = self
             .nri
             .run_pod_sandbox(self.nri_pod_event(&pod_id).await)
@@ -1152,49 +1240,52 @@ impl RuntimeServiceImpl {
         }
 
         if let Some(updated_pod) = updated_pod {
-            let netns_path = Self::read_internal_state::<StoredPodState>(
-                &updated_pod.annotations,
-                INTERNAL_POD_STATE_KEY,
-            )
-            .and_then(|state| state.netns_path)
-            .unwrap_or_default();
-            let mut persistence = self.persistence.lock().await;
-            if let Err(err) = persistence.save_pod_sandbox(
-                &updated_pod.id,
-                "notready",
-                &updated_pod
-                    .metadata
-                    .as_ref()
-                    .map(|metadata| metadata.name.clone())
-                    .unwrap_or_default(),
-                &updated_pod
-                    .metadata
-                    .as_ref()
-                    .map(|metadata| metadata.namespace.clone())
-                    .unwrap_or_default(),
-                &updated_pod
-                    .metadata
-                    .as_ref()
-                    .map(|metadata| metadata.uid.clone())
-                    .unwrap_or_default(),
-                &netns_path,
-                &updated_pod.labels,
-                &updated_pod.annotations,
-                Self::read_internal_state::<StoredPodState>(
+            let persistence = self.persistence.clone();
+            tokio::spawn(async move {
+                let netns_path = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
                     &updated_pod.annotations,
                     INTERNAL_POD_STATE_KEY,
                 )
-                .and_then(|state| state.pause_container_id)
-                .as_deref(),
-                Self::read_internal_state::<StoredPodState>(
+                .and_then(|state| state.netns_path)
+                .unwrap_or_default();
+                let pause_container_id = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
                     &updated_pod.annotations,
                     INTERNAL_POD_STATE_KEY,
                 )
-                .and_then(|state| state.ip)
-                .as_deref(),
-            ) {
-                log::error!("Failed to persist stopped pod {}: {}", pod_id, err);
-            }
+                .and_then(|state| state.pause_container_id);
+                let ip = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
+                    &updated_pod.annotations,
+                    INTERNAL_POD_STATE_KEY,
+                )
+                .and_then(|state| state.ip);
+                let mut persistence = persistence.lock().await;
+                if let Err(err) = persistence.save_pod_sandbox(
+                    &updated_pod.id,
+                    "notready",
+                    &updated_pod
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.name.clone())
+                        .unwrap_or_default(),
+                    &updated_pod
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.namespace.clone())
+                        .unwrap_or_default(),
+                    &updated_pod
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.uid.clone())
+                        .unwrap_or_default(),
+                    &netns_path,
+                    &updated_pod.labels,
+                    &updated_pod.annotations,
+                    pause_container_id.as_deref(),
+                    ip.as_deref(),
+                ) {
+                    log::error!("Failed to persist stopped pod {}: {}", updated_pod.id, err);
+                }
+            });
         }
 
         log::info!("Pod sandbox {} stopped", pod_id);
@@ -1286,14 +1377,25 @@ impl RuntimeServiceImpl {
         let mut pod_sandboxes = self.pod_sandboxes.lock().await;
         pod_sandboxes.remove(&pod_id);
         drop(pod_sandboxes);
+        if let Ok(mut removed) = self.removed_pod_sandbox_ids.lock() {
+            removed.insert(pod_id.clone());
+        }
         self.release_pod_name(&pod_id);
 
-        let mut persistence = self.persistence.lock().await;
-        if let Err(e) = persistence.delete_pod_sandbox(&pod_id) {
-            log::error!("Failed to delete pod {} from database: {}", pod_id, e);
-        } else {
-            log::info!("Pod sandbox {} removed from database", pod_id);
-        }
+        let persistence = self.persistence.clone();
+        let pod_id_for_delete = pod_id.clone();
+        tokio::spawn(async move {
+            let mut persistence = persistence.lock().await;
+            if let Err(e) = persistence.delete_pod_sandbox(&pod_id_for_delete) {
+                log::error!(
+                    "Failed to delete pod {} from database: {}",
+                    pod_id_for_delete,
+                    e
+                );
+            } else {
+                log::info!("Pod sandbox {} removed from database", pod_id_for_delete);
+            }
+        });
 
         if let Err(err) = self.nri.remove_pod_sandbox(pod_remove_event).await {
             log::warn!("NRI RemovePodSandbox failed for {}: {}", pod_id, err);

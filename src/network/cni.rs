@@ -6,7 +6,10 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::Command;
+
+const DEFAULT_CNI_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// CNI网络配置
 #[derive(Debug, Clone)]
@@ -35,18 +38,30 @@ pub struct CniLoadStatus {
     pub default_network_name: Option<String>,
 }
 
+struct CniLoadStatusDetails {
+    discovered_files: Vec<String>,
+    invalid_files: Vec<String>,
+    loaded_networks: Vec<String>,
+    declared_plugins: Vec<String>,
+    missing_plugin_binaries: Vec<String>,
+    default_network_name: Option<String>,
+}
+
 impl CniLoadStatus {
     fn new(
         ready: bool,
         reason: impl Into<String>,
         message: impl Into<String>,
-        discovered_files: Vec<String>,
-        invalid_files: Vec<String>,
-        loaded_networks: Vec<String>,
-        declared_plugins: Vec<String>,
-        missing_plugin_binaries: Vec<String>,
-        default_network_name: Option<String>,
+        details: CniLoadStatusDetails,
     ) -> Self {
+        let CniLoadStatusDetails {
+            discovered_files,
+            invalid_files,
+            loaded_networks,
+            declared_plugins,
+            missing_plugin_binaries,
+            default_network_name,
+        } = details;
         Self {
             checked_at_unix_millis: chrono::Utc::now().timestamp_millis(),
             ready,
@@ -83,6 +98,8 @@ pub struct CniManager {
     max_conf_num: usize,
     /// Pod 主 IP 选择策略。
     ip_pref: MainIpPreference,
+    /// Pod 网络 teardown 的固定超时，参考 CRI-O 的 networkStop 语义。
+    teardown_timeout: Duration,
     /// 默认使用的网络配置名称
     default_network_name: Option<String>,
     /// 最近一次加载结果
@@ -251,6 +268,7 @@ impl CniManager {
             configured_default_network_name: None,
             max_conf_num: 0,
             ip_pref: MainIpPreference::Cni,
+            teardown_timeout: DEFAULT_CNI_TEARDOWN_TIMEOUT,
             default_network_name: None,
             last_load_status: None,
         })
@@ -270,6 +288,10 @@ impl CniManager {
 
     pub fn set_ip_pref(&mut self, ip_pref: MainIpPreference) {
         self.ip_pref = ip_pref;
+    }
+
+    pub fn set_teardown_timeout(&mut self, teardown_timeout: Duration) {
+        self.teardown_timeout = teardown_timeout;
     }
 
     pub fn last_load_status(&self) -> Option<&CniLoadStatus> {
@@ -344,12 +366,14 @@ impl CniManager {
                             config_dir.display(),
                             err
                         ),
-                        discovered_files,
-                        invalid_files,
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        None,
+                        CniLoadStatusDetails {
+                            discovered_files,
+                            invalid_files,
+                            loaded_networks: Vec::new(),
+                            declared_plugins: Vec::new(),
+                            missing_plugin_binaries: Vec::new(),
+                            default_network_name: None,
+                        },
                     );
                     self.last_load_status = Some(status.clone());
                     return Err(err).context("Failed to read CNI config directory");
@@ -442,12 +466,14 @@ impl CniManager {
                     "configured default CNI network {} was not found in configured CNI config directories",
                     configured_name
                 ),
-                discovered_files,
-                invalid_files,
-                loaded_networks,
-                declared_plugins,
-                missing_plugin_binaries,
-                self.default_network_name.clone(),
+                CniLoadStatusDetails {
+                    discovered_files,
+                    invalid_files,
+                    loaded_networks,
+                    declared_plugins,
+                    missing_plugin_binaries,
+                    default_network_name: self.default_network_name.clone(),
+                },
             );
         }
 
@@ -456,12 +482,14 @@ impl CniManager {
                 false,
                 "CNIConfigMissing",
                 "no CNI config file found in configured CNI config directories",
-                discovered_files,
-                invalid_files,
-                loaded_networks,
-                declared_plugins,
-                missing_plugin_binaries,
-                self.default_network_name.clone(),
+                CniLoadStatusDetails {
+                    discovered_files,
+                    invalid_files,
+                    loaded_networks,
+                    declared_plugins,
+                    missing_plugin_binaries,
+                    default_network_name: self.default_network_name.clone(),
+                },
             )
         } else if !invalid_files.is_empty() && loaded_networks.is_empty() {
             CniLoadStatus::new(
@@ -472,12 +500,14 @@ impl CniManager {
                     invalid_files.len(),
                     invalid_files.join(", ")
                 ),
-                discovered_files,
-                invalid_files,
-                loaded_networks,
-                declared_plugins,
-                missing_plugin_binaries,
-                self.default_network_name.clone(),
+                CniLoadStatusDetails {
+                    discovered_files,
+                    invalid_files,
+                    loaded_networks,
+                    declared_plugins,
+                    missing_plugin_binaries,
+                    default_network_name: self.default_network_name.clone(),
+                },
             )
         } else if !missing_plugin_binaries.is_empty() {
             CniLoadStatus::new(
@@ -487,12 +517,14 @@ impl CniManager {
                     "missing or non-executable CNI plugin binary/binaries: {}",
                     missing_plugin_binaries.join(", ")
                 ),
-                discovered_files,
-                invalid_files,
-                loaded_networks,
-                declared_plugins,
-                missing_plugin_binaries,
-                self.default_network_name.clone(),
+                CniLoadStatusDetails {
+                    discovered_files,
+                    invalid_files,
+                    loaded_networks,
+                    declared_plugins,
+                    missing_plugin_binaries,
+                    default_network_name: self.default_network_name.clone(),
+                },
             )
         } else if !loaded_networks.is_empty() {
             CniLoadStatus::new(
@@ -503,24 +535,28 @@ impl CniManager {
                     loaded_networks.len(),
                     declared_plugins.len()
                 ),
-                discovered_files,
-                invalid_files,
-                loaded_networks,
-                declared_plugins,
-                missing_plugin_binaries,
-                self.default_network_name.clone(),
+                CniLoadStatusDetails {
+                    discovered_files,
+                    invalid_files,
+                    loaded_networks,
+                    declared_plugins,
+                    missing_plugin_binaries,
+                    default_network_name: self.default_network_name.clone(),
+                },
             )
         } else {
             CniLoadStatus::new(
                 true,
                 "CNINetworkConfigReady",
                 format!("discovered {} CNI config file(s)", discovered_files.len()),
-                discovered_files,
-                invalid_files,
-                loaded_networks,
-                declared_plugins,
-                missing_plugin_binaries,
-                self.default_network_name.clone(),
+                CniLoadStatusDetails {
+                    discovered_files,
+                    invalid_files,
+                    loaded_networks,
+                    declared_plugins,
+                    missing_plugin_binaries,
+                    default_network_name: self.default_network_name.clone(),
+                },
             )
         }
     }
@@ -593,6 +629,7 @@ impl CniManager {
         netns: &str,
         pod_name: &str,
         pod_namespace: &str,
+        pod_uid: &str,
         pod_cidr: Option<&str>,
     ) -> Result<NetworkStatus> {
         let config = self.default_network_config().with_context(|| {
@@ -613,6 +650,7 @@ impl CniManager {
                 "eth0",
                 pod_name,
                 pod_namespace,
+                pod_uid,
                 pod_cidr,
             )
             .await?;
@@ -629,37 +667,88 @@ impl CniManager {
         netns: &str,
         pod_namespace: &str,
         pod_name: &str,
+        pod_uid: &str,
     ) -> Result<()> {
         if let Some(config) = self.default_network_config() {
-            match self
-                .exec_cni_chain(
-                    config,
-                    "DEL",
-                    pod_id,
-                    netns,
-                    "eth0",
-                    pod_name,
-                    pod_namespace,
-                    None,
-                )
-                .await
-            {
-                Ok(_) => info!("Pod {} network teardown completed", pod_id),
-                Err(e) => error!("Failed to teardown network for pod {}: {}", pod_id, e),
+            let teardown = self.exec_cni_chain(
+                config,
+                "DEL",
+                pod_id,
+                netns,
+                "eth0",
+                pod_name,
+                pod_namespace,
+                pod_uid,
+                None,
+            );
+            match tokio::time::timeout(self.teardown_timeout, teardown).await {
+                Ok(Ok(_)) => info!("Pod {} network teardown completed", pod_id),
+                Ok(Err(err)) => {
+                    error!("Failed to teardown network for pod {}: {}", pod_id, err);
+                    return Err(err);
+                }
+                Err(_) => {
+                    let err = anyhow::anyhow!(
+                        "CNI teardown for pod {} timed out after {:?}",
+                        pod_id,
+                        self.teardown_timeout
+                    );
+                    error!("{err}");
+                    return Err(err);
+                }
             }
         }
         Ok(())
     }
 
     /// 构建CNI参数
-    fn base_cni_args(&self, pod_id: &str, pod_name: &str, pod_namespace: &str) -> Value {
+    fn base_cni_args(
+        &self,
+        pod_id: &str,
+        pod_name: &str,
+        pod_namespace: &str,
+        pod_uid: &str,
+    ) -> Value {
         json!({
             "cni": {
                 "podId": pod_id,
                 "podName": pod_name,
-                "podNamespace": pod_namespace
+                "podNamespace": pod_namespace,
+                "podUID": pod_uid
             }
         })
+    }
+
+    fn cni_args_env(
+        &self,
+        pod_id: &str,
+        pod_name: &str,
+        pod_namespace: &str,
+        pod_uid: &str,
+    ) -> String {
+        let mut pairs = vec![
+            ("IgnoreUnknown".to_string(), "1".to_string()),
+            ("K8S_POD_NAMESPACE".to_string(), pod_namespace.to_string()),
+            ("K8S_POD_NAME".to_string(), pod_name.to_string()),
+            ("K8S_POD_INFRA_CONTAINER_ID".to_string(), pod_id.to_string()),
+        ];
+        if !pod_uid.trim().is_empty() {
+            pairs.push(("K8S_POD_UID".to_string(), pod_uid.to_string()));
+        }
+        if let Ok(existing) = std::env::var("CNI_ARGS") {
+            for kvpair in existing.split(';').filter(|entry| !entry.trim().is_empty()) {
+                if let Some((key, value)) = kvpair.split_once('=') {
+                    if !pairs.iter().any(|(existing_key, _)| existing_key == key) {
+                        pairs.push((key.to_string(), value.to_string()));
+                    }
+                }
+            }
+        }
+        pairs
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(";")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -670,6 +759,7 @@ impl CniManager {
         pod_id: &str,
         pod_name: &str,
         pod_namespace: &str,
+        pod_uid: &str,
         pod_cidr: Option<&str>,
         prev_result: Option<&Value>,
     ) -> Value {
@@ -696,7 +786,7 @@ impl CniManager {
             }
         }
 
-        config_value["args"] = self.base_cni_args(pod_id, pod_name, pod_namespace);
+        config_value["args"] = self.base_cni_args(pod_id, pod_name, pod_namespace, pod_uid);
 
         if let Some(prev_result) = prev_result {
             config_value["prevResult"] = prev_result.clone();
@@ -715,6 +805,7 @@ impl CniManager {
         if_name: &str,
         pod_name: &str,
         pod_namespace: &str,
+        pod_uid: &str,
         pod_cidr: Option<&str>,
     ) -> Result<Option<Value>> {
         let plugins = Self::plugin_chain(&config.config);
@@ -744,11 +835,20 @@ impl CniManager {
                 pod_id,
                 pod_name,
                 pod_namespace,
+                pod_uid,
                 pod_cidr,
                 prev_result.as_ref(),
             );
             let output = self
-                .exec_cni_plugin(plugin_type, command, pod_id, netns, if_name, &plugin_config)
+                .exec_cni_plugin(
+                    plugin_type,
+                    command,
+                    pod_id,
+                    netns,
+                    if_name,
+                    &self.cni_args_env(pod_id, pod_name, pod_namespace, pod_uid),
+                    &plugin_config,
+                )
                 .await?;
 
             if command == "ADD" && !output.trim().is_empty() {
@@ -778,6 +878,7 @@ impl CniManager {
         pod_id: &str,
         netns: &str,
         if_name: &str,
+        cni_env_args: &str,
         cni_args: &Value,
     ) -> Result<String> {
         let plugin_path = self
@@ -789,6 +890,7 @@ impl CniManager {
             .env("CNI_NETNS", netns)
             .env("CNI_CONTAINERID", pod_id)
             .env("CNI_IFNAME", if_name)
+            .env("CNI_ARGS", cni_env_args)
             .env(
                 "CNI_PATH",
                 self.plugin_dirs
@@ -799,7 +901,8 @@ impl CniManager {
             )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         let mut child = cmd.spawn().context("Failed to spawn CNI plugin")?;
 
@@ -854,6 +957,33 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = self.previous.as_ref() {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn load_network_configs_includes_conflist_files() {
@@ -1070,6 +1200,7 @@ mod tests {
                 "/var/run/netns/test-pod",
                 "test-pod",
                 "default",
+                "uid-1",
                 None
             )
             .await
@@ -1136,7 +1267,7 @@ mod tests {
         .unwrap();
 
         let bridge_script = format!(
-            "#!/bin/sh\ncat > \"{}/bridge.input\"\nprintf '%s\\n' '{{\"cniVersion\":\"1.0.0\",\"ips\":[{{\"address\":\"10.88.0.2/16\"}}]}}'\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$CNI_ARGS\" > \"{0}/bridge.env\"\ncat > \"{0}/bridge.input\"\nprintf '%s\\n' '{{\"cniVersion\":\"1.0.0\",\"ips\":[{{\"address\":\"10.88.0.2/16\"}}]}}'\n",
             record_dir.display()
         );
         let bridge_path = plugin_dir.join("bridge");
@@ -1173,6 +1304,7 @@ mod tests {
                 "/var/run/netns/test-pod",
                 "test-pod",
                 "default",
+                "uid-1",
                 None,
             )
             .await
@@ -1184,6 +1316,13 @@ mod tests {
             .await
             .unwrap();
         assert!(bridge_input.contains("\"type\":\"bridge\""));
+        let bridge_env = tokio::fs::read_to_string(record_dir.join("bridge.env"))
+            .await
+            .unwrap();
+        assert!(bridge_env.contains("K8S_POD_NAMESPACE=default"));
+        assert!(bridge_env.contains("K8S_POD_NAME=test-pod"));
+        assert!(bridge_env.contains("K8S_POD_INFRA_CONTAINER_ID=pod-1"));
+        assert!(bridge_env.contains("K8S_POD_UID=uid-1"));
         assert!(!bridge_input.contains("\"plugins\""));
 
         let portmap_input = tokio::fs::read_to_string(record_dir.join("portmap.input"))
@@ -1191,6 +1330,110 @@ mod tests {
             .unwrap();
         assert!(portmap_input.contains("\"type\":\"portmap\""));
         assert!(portmap_input.contains("\"prevResult\""));
+    }
+
+    #[tokio::test]
+    async fn fake_cni_plugin_fixture_can_inject_add_failure() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("bin");
+        let config_dir = dir.path().join("net.d");
+        let record_path = dir.path().join("bridge.input");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::create_dir_all(&config_dir).await.unwrap();
+        tokio::fs::write(
+            config_dir.join("10-test.conf"),
+            r#"{"cniVersion":"1.0.0","name":"test-net","type":"bridge"}"#,
+        )
+        .await
+        .unwrap();
+
+        let fixture = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cni-plugin.sh"),
+        )
+        .unwrap();
+        let plugin_path = plugin_dir.join("bridge");
+        tokio::fs::write(&plugin_path, fixture).await.unwrap();
+        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&plugin_path, perms).unwrap();
+
+        let _fail_on = EnvGuard::set("CRIUS_FAKE_CNI_PLUGIN_FAIL_ON", "ADD");
+        let _message = EnvGuard::set(
+            "CRIUS_FAKE_CNI_PLUGIN_ERROR_MESSAGE",
+            "injected add failure",
+        );
+        let _record = EnvGuard::set(
+            "CRIUS_FAKE_CNI_PLUGIN_RECORD_PATH",
+            record_path.to_str().unwrap(),
+        );
+
+        let mut manager = CniManager::new(
+            vec![plugin_dir.display().to_string()],
+            vec![config_dir.display().to_string()],
+            dir.path().join("cache").display().to_string(),
+        )
+        .unwrap();
+        let load_status = manager.load_network_configs().await.unwrap();
+        assert!(load_status.ready);
+
+        let err = manager
+            .setup_pod_network(
+                "pod-1",
+                "/var/run/netns/pod-1",
+                "pod",
+                "default",
+                "uid-1",
+                None,
+            )
+            .await
+            .expect_err("fake plugin should inject ADD failure");
+        assert!(err.to_string().contains("injected add failure"));
+        let recorded = tokio::fs::read_to_string(&record_path).await.unwrap();
+        assert!(recorded.contains("\"name\":\"test-net\""));
+    }
+
+    #[tokio::test]
+    async fn teardown_pod_network_times_out_stuck_del_plugin() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("bin");
+        let config_dir = dir.path().join("net.d");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::create_dir_all(&config_dir).await.unwrap();
+        tokio::fs::write(
+            config_dir.join("10-test.conf"),
+            r#"{"cniVersion":"1.0.0","name":"test-net","type":"bridge"}"#,
+        )
+        .await
+        .unwrap();
+
+        let plugin_path = plugin_dir.join("bridge");
+        tokio::fs::write(
+            &plugin_path,
+            "#!/bin/sh\ncat >/dev/null\nif [ \"${CNI_COMMAND:-}\" = \"DEL\" ]; then sleep 10; fi\nprintf '%s\\n' '{\"cniVersion\":\"1.0.0\",\"ips\":[{\"address\":\"10.88.0.2/16\"}]}'\n",
+        )
+        .await
+        .unwrap();
+        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&plugin_path, perms).unwrap();
+
+        let mut manager = CniManager::new(
+            vec![plugin_dir.display().to_string()],
+            vec![config_dir.display().to_string()],
+            dir.path().join("cache").display().to_string(),
+        )
+        .unwrap();
+        manager.set_teardown_timeout(Duration::from_millis(100));
+        let load_status = manager.load_network_configs().await.unwrap();
+        assert!(load_status.ready);
+
+        let start = std::time::Instant::now();
+        let err = manager
+            .teardown_pod_network("pod-1", "/var/run/netns/pod-1", "default", "pod", "uid-1")
+            .await
+            .expect_err("stuck DEL plugin should hit teardown timeout");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(err.to_string().contains("timed out"));
     }
 
     #[test]

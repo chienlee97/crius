@@ -21,6 +21,7 @@ pub mod security;
 pub mod server;
 pub mod storage;
 pub mod streaming;
+pub mod trace_export;
 pub mod utils;
 pub use crate::proto::nri as nri_proto;
 

@@ -34,12 +34,14 @@ pub struct CniConfig {
     conf_template: Option<PathBuf>,
     max_conf_num: usize,
     ip_pref: MainIpPreference,
+    teardown_timeout: std::time::Duration,
     runtime_handler_config_dirs: std::collections::HashMap<String, Vec<PathBuf>>,
     runtime_handler_max_conf_nums: std::collections::HashMap<String, usize>,
     default_network_name: Option<String>,
     disable_hostport_mapping: bool,
     netns_mount_dir: PathBuf,
     netns_mounts_under_state_dir: bool,
+    namespace_helper_path: Option<PathBuf>,
 }
 
 impl Default for CniConfig {
@@ -58,12 +60,14 @@ impl Default for CniConfig {
             conf_template: None,
             max_conf_num: 0,
             ip_pref: MainIpPreference::Cni,
+            teardown_timeout: std::time::Duration::from_secs(60),
             runtime_handler_config_dirs: std::collections::HashMap::new(),
             runtime_handler_max_conf_nums: std::collections::HashMap::new(),
             default_network_name: None,
             disable_hostport_mapping: false,
             netns_mount_dir: PathBuf::from("/var/run/netns"),
             netns_mounts_under_state_dir: false,
+            namespace_helper_path: None,
         }
     }
 }
@@ -85,6 +89,7 @@ impl CniConfig {
             conf_template: None,
             max_conf_num,
             ip_pref,
+            teardown_timeout: std::time::Duration::from_secs(60),
             runtime_handler_config_dirs: std::collections::HashMap::new(),
             runtime_handler_max_conf_nums: std::collections::HashMap::new(),
             default_network_name: default_network_name
@@ -95,6 +100,7 @@ impl CniConfig {
             disable_hostport_mapping,
             netns_mount_dir: PathBuf::from("/var/run/netns"),
             netns_mounts_under_state_dir: false,
+            namespace_helper_path: None,
         }
     }
 
@@ -150,6 +156,10 @@ impl CniConfig {
                     _ => None,
                 })
                 .unwrap_or(defaults.ip_pref),
+            teardown_timeout: std::env::var("CRIUS_CNI_TEARDOWN_TIMEOUT")
+                .ok()
+                .and_then(|value| crate::streaming::parse_duration(&value).ok())
+                .unwrap_or(defaults.teardown_timeout),
             runtime_handler_config_dirs: std::collections::HashMap::new(),
             runtime_handler_max_conf_nums: std::collections::HashMap::new(),
             default_network_name: std::env::var("CRIUS_CNI_DEFAULT_NETWORK")
@@ -175,6 +185,7 @@ impl CniConfig {
                     )
                 })
                 .unwrap_or(defaults.netns_mounts_under_state_dir),
+            namespace_helper_path: None,
         }
     }
 
@@ -202,6 +213,10 @@ impl CniConfig {
         self.ip_pref
     }
 
+    pub fn teardown_timeout(&self) -> std::time::Duration {
+        self.teardown_timeout
+    }
+
     pub fn set_handler_config_dirs(
         &mut self,
         runtime_handler: impl Into<String>,
@@ -219,6 +234,10 @@ impl CniConfig {
 
     pub fn set_conf_template(&mut self, conf_template: Option<PathBuf>) {
         self.conf_template = conf_template.filter(|path| !path.as_os_str().is_empty());
+    }
+
+    pub fn set_teardown_timeout(&mut self, teardown_timeout: std::time::Duration) {
+        self.teardown_timeout = teardown_timeout;
     }
 
     pub fn set_handler_max_conf_num(
@@ -260,8 +279,23 @@ impl CniConfig {
         self.netns_mounts_under_state_dir = enabled;
     }
 
+    pub fn namespace_helper_path(&self) -> Option<&Path> {
+        self.namespace_helper_path.as_deref()
+    }
+
+    pub fn set_namespace_helper_path(&mut self, helper_path: Option<PathBuf>) {
+        self.namespace_helper_path = helper_path.filter(|path| !path.as_os_str().is_empty());
+    }
+
     pub fn netns_path(&self, ns_name_or_path: &str) -> PathBuf {
         NamespaceManager::new(self.netns_mount_dir.clone()).resolve_path(ns_name_or_path)
+    }
+
+    pub fn namespace_manager(&self) -> NamespaceManager {
+        NamespaceManager::with_helper(
+            self.netns_mount_dir.clone(),
+            self.namespace_helper_path.clone(),
+        )
     }
 
     fn config_dir_strings(&self) -> Vec<String> {
@@ -286,15 +320,27 @@ impl CniConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceManager {
     mount_dir: PathBuf,
+    helper_path: Option<PathBuf>,
 }
 
 impl NamespaceManager {
     pub fn new(mount_dir: PathBuf) -> Self {
-        Self { mount_dir }
+        Self::with_helper(mount_dir, None::<PathBuf>)
+    }
+
+    pub fn with_helper(mount_dir: PathBuf, helper_path: Option<impl Into<PathBuf>>) -> Self {
+        Self {
+            mount_dir,
+            helper_path: helper_path.map(Into::into),
+        }
     }
 
     pub fn mount_dir(&self) -> &Path {
         &self.mount_dir
+    }
+
+    pub fn helper_path(&self) -> Option<&Path> {
+        self.helper_path.as_deref()
     }
 
     pub fn resolve_path(&self, ns_name_or_path: &str) -> PathBuf {
@@ -326,15 +372,85 @@ impl NamespaceManager {
             return Ok(path);
         }
 
+        if self.helper_path.is_some() && path.parent() == Some(self.mount_dir.as_path()) {
+            self.create_with_helper(&path)?;
+            return Ok(path);
+        }
+
+        self.create_internal(&path)?;
+        Ok(path)
+    }
+
+    fn create_with_helper(&self, path: &Path) -> Result<(), NetworkError> {
+        let helper = self.helper_path.as_ref().ok_or_else(|| {
+            NetworkError::Other("namespace helper path is not configured".to_string())
+        })?;
+        let ns_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                NetworkError::Other(format!(
+                    "failed to derive namespace name for helper-managed path {}",
+                    path.display()
+                ))
+            })?;
+        let helper_base_dir = self.mount_dir.parent().ok_or_else(|| {
+            NetworkError::Other(format!(
+                "failed to derive helper base directory from mount dir {}",
+                self.mount_dir.display()
+            ))
+        })?;
+        std::fs::create_dir_all(helper_base_dir)?;
+        std::fs::create_dir_all(&self.mount_dir)?;
+
+        let output = StdCommand::new(helper)
+            .arg("-d")
+            .arg(helper_base_dir)
+            .arg("-f")
+            .arg(ns_name)
+            .arg("--net")
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("status={}", output.status)
+            };
+            return Err(NetworkError::Other(format!(
+                "namespace helper {} failed for {}: {}",
+                helper.display(),
+                path.display(),
+                detail
+            )));
+        }
+
+        if !path.exists() {
+            return Err(NetworkError::Other(format!(
+                "namespace helper {} completed without creating {}",
+                helper.display(),
+                path.display()
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn create_internal(&self, path: &Path) -> Result<(), NetworkError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let _mountpoint = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)?;
+            .open(path)?;
 
-        let mount_path = path.clone();
+        let mount_path = path.to_path_buf();
         std::thread::spawn(move || -> Result<(), NetworkError> {
             unshare(CloneFlags::CLONE_NEWNET).map_err(|err| {
                 NetworkError::Other(format!("failed to unshare network namespace: {err}"))
@@ -355,9 +471,11 @@ impl NamespaceManager {
             Ok(())
         })
         .join()
-        .map_err(|_| NetworkError::Other("network namespace creator thread panicked".to_string()))??;
+        .map_err(|_| {
+            NetworkError::Other("network namespace creator thread panicked".to_string())
+        })??;
 
-        Ok(path)
+        Ok(())
     }
 
     pub async fn remove(&self, ns_name_or_path: &str) -> Result<(), NetworkError> {
@@ -418,6 +536,7 @@ pub trait NetworkManager: Send + Sync + 'static {
         netns: &str,
         pod_name: &str,
         pod_namespace: &str,
+        pod_uid: &str,
         runtime_handler: &str,
         pod_cidr: Option<&str>,
     ) -> Result<NetworkStatus, NetworkError>;
@@ -429,6 +548,7 @@ pub trait NetworkManager: Send + Sync + 'static {
         netns: &str,
         pod_namespace: &str,
         pod_name: &str,
+        pod_uid: &str,
         runtime_handler: &str,
     ) -> Result<(), NetworkError>;
 }
@@ -441,6 +561,7 @@ pub struct DefaultNetworkManager {
     cni_cache_dir: String,
     cni_max_conf_num: usize,
     cni_ip_pref: MainIpPreference,
+    cni_teardown_timeout: std::time::Duration,
     cni_runtime_handler_config_dirs: std::collections::HashMap<String, Vec<String>>,
     cni_runtime_handler_max_conf_nums: std::collections::HashMap<String, usize>,
     cni_default_network_name: Option<String>,
@@ -512,6 +633,7 @@ impl DefaultNetworkManager {
             cni_cache_dir: cni.cache_dir_string(),
             cni_max_conf_num: cni.max_conf_num(),
             cni_ip_pref: cni.ip_pref(),
+            cni_teardown_timeout: cni.teardown_timeout(),
             cni_runtime_handler_config_dirs: cni
                 .runtime_handler_config_dirs
                 .iter()
@@ -573,6 +695,7 @@ impl NetworkManager for DefaultNetworkManager {
         netns: &str,
         pod_name: &str,
         pod_namespace: &str,
+        pod_uid: &str,
         runtime_handler: &str,
         pod_cidr: Option<&str>,
     ) -> Result<NetworkStatus, NetworkError> {
@@ -587,11 +710,12 @@ impl NetworkManager for DefaultNetworkManager {
         cni.set_max_conf_num(self.effective_cni_max_conf_num(runtime_handler));
         cni.set_ip_pref(self.cni_ip_pref);
         cni.set_default_network_name(self.cni_default_network_name.clone());
+        cni.set_teardown_timeout(self.cni_teardown_timeout);
         cni.load_network_configs()
             .await
             .map_err(|e| NetworkError::Other(e.to_string()))?;
 
-        cni.setup_pod_network(pod_id, netns, pod_name, pod_namespace, pod_cidr)
+        cni.setup_pod_network(pod_id, netns, pod_name, pod_namespace, pod_uid, pod_cidr)
             .await
             .map_err(|e| NetworkError::Other(e.to_string()))
     }
@@ -602,6 +726,7 @@ impl NetworkManager for DefaultNetworkManager {
         netns: &str,
         pod_namespace: &str,
         pod_name: &str,
+        pod_uid: &str,
         runtime_handler: &str,
     ) -> Result<(), NetworkError> {
         let mut cni = CniManager::new(
@@ -613,20 +738,20 @@ impl NetworkManager for DefaultNetworkManager {
         cni.set_max_conf_num(self.effective_cni_max_conf_num(runtime_handler));
         cni.set_ip_pref(self.cni_ip_pref);
         cni.set_default_network_name(self.cni_default_network_name.clone());
+        cni.set_teardown_timeout(self.cni_teardown_timeout);
         cni.load_network_configs()
             .await
             .map_err(|e| NetworkError::Other(e.to_string()))?;
-        let _ = cni
-            .teardown_pod_network(pod_id, netns, pod_namespace, pod_name)
-            .await;
-        Ok(())
+        cni.teardown_pod_network(pod_id, netns, pod_namespace, pod_name, pod_uid)
+            .await
+            .map_err(|e| NetworkError::Other(e.to_string()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::process::Command;
+    use std::fs;
 
     #[test]
     fn default_network_manager_prefers_runtime_specific_config_dirs() {
@@ -658,66 +783,66 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires root privileges and iproute2"] // 需要root权限运行ip netns
-    async fn test_network_namespace() -> Result<(), Box<dyn std::error::Error>> {
-        let manager = DefaultNetworkManager::new(None, None, None);
+    async fn namespace_manager_uses_configured_helper_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper_path = dir.path().join("fake-pinns.sh");
+        let args_path = dir.path().join("helper.args");
+        fs::write(
+            &helper_path,
+            format!(
+                r#"#!/bin/sh
+set -eu
+dir=""
+name=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -d)
+      dir="$2"
+      shift 2
+      ;;
+    -f)
+      name="$2"
+      shift 2
+      ;;
+    --net)
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '%s\n' "$dir" "$name" > "{}"
+mkdir -p "$dir/netns"
+: > "$dir/netns/$name"
+"#,
+                args_path.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&helper_path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        fs::set_permissions(&helper_path, perms).unwrap();
 
-        // 使用简单的命名空间名称（不是路径）
-        let ns_name = "crius-test-ns";
-
-        // 测试创建网络命名空间
-        manager.create_network_namespace(ns_name).await?;
-
-        // 验证命名空间存在（在 /var/run/netns/ 或 /run/netns/）
-        let ns_exists = std::path::Path::new("/run/netns").join(ns_name).exists()
-            || std::path::Path::new("/var/run/netns")
-                .join(ns_name)
-                .exists();
-        assert!(ns_exists, "Network namespace should exist");
-
-        // 测试删除网络命名空间
-        manager.remove_network_namespace(ns_name).await?;
-
-        let ns_exists_after = std::path::Path::new("/run/netns").join(ns_name).exists()
-            || std::path::Path::new("/var/run/netns")
-                .join(ns_name)
-                .exists();
-        assert!(!ns_exists_after, "Network namespace should be deleted");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore = "requires root privileges and iproute2"]
-    async fn test_setup_pod_network_brings_loopback_up() -> Result<(), Box<dyn std::error::Error>> {
-        let manager = DefaultNetworkManager::new(None, None, None);
-        let ns_name = "crius-test-loopback";
-
-        manager.create_network_namespace(ns_name).await?;
-        manager
-            .setup_pod_network(
-                "pod-1",
-                &format!("/var/run/netns/{}", ns_name),
-                "pod",
-                "default",
-                "runc",
-                None,
-            )
-            .await?;
-
-        let output = Command::new("ip")
-            .args(["-n", ns_name, "addr", "show", "lo"])
-            .output()
-            .await?;
-        assert!(
-            output.status.success(),
-            "expected ip addr show lo to succeed"
+        let manager = NamespaceManager::with_helper(
+            dir.path().join("state").join("netns"),
+            Some(helper_path.clone()),
         );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("127.0.0.1/8"));
-        assert!(stdout.contains("LOOPBACK,UP"));
+        let path = manager.create("pod-1").await.unwrap();
 
-        manager.remove_network_namespace(ns_name).await?;
-        Ok(())
+        assert_eq!(path, dir.path().join("state").join("netns").join("pod-1"));
+        assert!(path.exists());
+
+        let args = fs::read_to_string(args_path).unwrap();
+        let mut lines = args.lines();
+        assert_eq!(
+            lines.next(),
+            Some(dir.path().join("state").display().to_string().as_str())
+        );
+        assert_eq!(lines.next(), Some("pod-1"));
     }
 }

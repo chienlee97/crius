@@ -1775,6 +1775,8 @@ mod tests {
         NriManager::with_domain(
             NriManagerConfig {
                 enable: true,
+                enable_cdi: true,
+                cdi_spec_dirs: vec!["/etc/cdi".to_string(), "/var/run/cdi".to_string()],
                 runtime_name: "crius".to_string(),
                 runtime_version: "test".to_string(),
                 socket_path: "unix:///tmp/crius-nri-manager-tests.sock".to_string(),
@@ -2437,6 +2439,8 @@ mod tests {
         let manager = NriManager::with_domain(
             NriManagerConfig {
                 enable: true,
+                enable_cdi: true,
+                cdi_spec_dirs: vec!["/etc/cdi".to_string(), "/var/run/cdi".to_string()],
                 runtime_name: "crius".to_string(),
                 runtime_version: "test".to_string(),
                 socket_path: "unix:///tmp/crius-nri-default-validator-tests.sock".to_string(),
@@ -2727,6 +2731,8 @@ mod tests {
         let manager = NriManager::with_domain(
             NriManagerConfig {
                 enable: true,
+                enable_cdi: true,
+                cdi_spec_dirs: vec!["/etc/cdi".to_string(), "/var/run/cdi".to_string()],
                 runtime_name: "crius".to_string(),
                 runtime_version: "test".to_string(),
                 socket_path: "unix:///tmp/crius-nri-manager-timeout-tests.sock".to_string(),
@@ -2936,6 +2942,8 @@ mod tests {
         let socket_path = dir.path().join("nri.sock");
         let manager = NriManager::new(NriManagerConfig {
             enable: true,
+            enable_cdi: true,
+            cdi_spec_dirs: vec!["/etc/cdi".to_string(), "/var/run/cdi".to_string()],
             runtime_name: "crius".to_string(),
             runtime_version: "test".to_string(),
             socket_path: format!("unix://{}", socket_path.display()),

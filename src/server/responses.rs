@@ -15,6 +15,14 @@ impl RuntimeServiceImpl {
                 propagation: mount.propagation,
                 uid_mappings: Vec::new(),
                 gid_mappings: Vec::new(),
+                recursive_read_only: false,
+                image: (!mount.image.is_empty()).then(|| crate::proto::runtime::v1::ImageSpec {
+                    image: mount.image.clone(),
+                    user_specified_image: mount.image.clone(),
+                    runtime_handler: String::new(),
+                    annotations: HashMap::new(),
+                }),
+                image_sub_path: mount.image_sub_path.clone(),
             })
             .collect()
     }
@@ -80,7 +88,7 @@ impl RuntimeServiceImpl {
             reason,
             message,
             labels: container.labels.clone(),
-            annotations: Self::external_annotations(&container.annotations),
+            annotations: Self::external_container_annotations(&container.annotations),
             mounts,
             log_path: container_state
                 .as_ref()
@@ -156,6 +164,14 @@ impl RuntimeServiceImpl {
             "apparmorProfile": container_state
                 .as_ref()
                 .and_then(|state| state.apparmor_profile.clone()),
+            "seccompNotifierAction": container_state
+                .as_ref()
+                .and_then(|state| state.seccomp_notifier_action.clone()),
+            "seccompNotifier": self.seccomp_notifier_snapshot(&container.id).map(|snapshot| json!({
+                "socketPath": snapshot.socket_path,
+                "stopMode": snapshot.stop_mode,
+                "syscalls": snapshot.syscalls,
+            })),
             "noNewPrivileges": container_state
                 .as_ref()
                 .and_then(|state| state.no_new_privileges),
@@ -301,7 +317,7 @@ impl RuntimeServiceImpl {
             network: Self::pod_network_status_from_state(pod_state.as_ref()),
             linux: Self::pod_linux_status_from_state(pod_state.as_ref()),
             labels: pod_sandbox.labels.clone(),
-            annotations: Self::external_annotations(&pod_sandbox.annotations),
+            annotations: Self::external_pod_annotations(&pod_sandbox.annotations),
             runtime_handler: if pod_sandbox.runtime_handler.is_empty() {
                 let restored = pod_state
                     .as_ref()

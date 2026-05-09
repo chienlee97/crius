@@ -98,15 +98,30 @@ impl RuntimeServiceImpl {
         req.container_id = self.resolve_container_id(&req.container_id).await?;
         self.ensure_container_is_streamable(&req.container_id, "exec")
             .await?;
-        let runtime_path = self
+        let runtime = self
             .runtime_for_container_request(&req.container_id)
-            .await?
-            .runtime_path()
-            .to_path_buf();
+            .await?;
+        let runtime_path = runtime.runtime_path().to_path_buf();
+        let runtime_config_path = runtime.runtime_config_path().to_path_buf();
+        let runtime_handler = self
+            .runtime_handler_name_for_container_request(&req.container_id)
+            .await?;
+        let websocket_enabled = self
+            .config
+            .runtime_configs
+            .get(runtime_handler.as_str())
+            .map(|config| config.stream_websockets)
+            .unwrap_or(false);
         let exec_cpu_affinity = self.effective_exec_cpu_affinity(&req.container_id).await;
         let streaming = self.get_streaming_server().await?;
         let response = streaming
-            .get_exec(&req, runtime_path, exec_cpu_affinity)
+            .get_exec(
+                &req,
+                runtime_path,
+                runtime_config_path,
+                exec_cpu_affinity,
+                websocket_enabled,
+            )
             .await?;
         Ok(Response::new(response))
     }
@@ -129,13 +144,14 @@ impl RuntimeServiceImpl {
         self.ensure_container_is_streamable(&container_id, "exec_sync")
             .await?;
 
-        let runtime_path = self
-            .runtime_for_container_request(&container_id)
-            .await?
-            .runtime_path()
-            .to_path_buf();
+        let runtime = self.runtime_for_container_request(&container_id).await?;
+        let runtime_path = runtime.runtime_path().to_path_buf();
+        let runtime_config_path = runtime.runtime_config_path().to_path_buf();
         let exec_cpu_affinity = self.effective_exec_cpu_affinity(&container_id).await;
         let mut command = TokioCommand::new(&runtime_path);
+        if !runtime_config_path.as_os_str().is_empty() {
+            command.arg("--config").arg(&runtime_config_path);
+        }
         command.arg("exec");
         command.arg(&container_id);
         for arg in &cmd {
@@ -256,8 +272,19 @@ impl RuntimeServiceImpl {
         };
 
         let streaming = self.get_streaming_server().await?;
+        let runtime_handler = pod_state
+            .as_ref()
+            .map(|state| state.runtime_handler.as_str())
+            .filter(|handler| !handler.is_empty())
+            .unwrap_or(pod.runtime_handler.as_str());
+        let websocket_enabled = self
+            .config
+            .runtime_configs
+            .get(runtime_handler)
+            .map(|config| config.stream_websockets)
+            .unwrap_or(false);
         let response = streaming
-            .get_port_forward(&req, PathBuf::from(netns_path))
+            .get_port_forward(&req, PathBuf::from(netns_path), websocket_enabled)
             .await?;
         Ok(Response::new(response))
     }
@@ -270,6 +297,15 @@ impl RuntimeServiceImpl {
         req.container_id = self.resolve_container_id(&req.container_id).await?;
         self.ensure_container_is_streamable(&req.container_id, "attach")
             .await?;
+        let runtime_handler = self
+            .runtime_handler_name_for_container_request(&req.container_id)
+            .await?;
+        let websocket_enabled = self
+            .config
+            .runtime_configs
+            .get(runtime_handler.as_str())
+            .map(|config| config.stream_websockets)
+            .unwrap_or(false);
         let attach_socket_path = self.attach_socket_path(&req.container_id);
         if !attach_socket_path.exists() {
             let should_try_restore = {
@@ -322,7 +358,7 @@ impl RuntimeServiceImpl {
             if !req.stdin && log_path.is_some() {
                 let streaming = self.get_streaming_server().await?;
                 let response = streaming
-                    .get_attach_log(&req, PathBuf::from(log_path.unwrap()))
+                    .get_attach_log(&req, PathBuf::from(log_path.unwrap()), websocket_enabled)
                     .await?;
                 return Ok(Response::new(response));
             }
@@ -334,7 +370,7 @@ impl RuntimeServiceImpl {
             )));
         }
         let streaming = self.get_streaming_server().await?;
-        let response = streaming.get_attach(&req).await?;
+        let response = streaming.get_attach(&req, websocket_enabled).await?;
         Ok(Response::new(response))
     }
 }

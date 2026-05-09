@@ -12,6 +12,21 @@ const MIN_CONTAINER_STOP_TIMEOUT_SECS: u32 = 30;
 const DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS: u32 = 240;
 const MIN_CONTAINER_CREATE_TIMEOUT_SECS: u32 = 30;
 const DEFAULT_GRPC_MAX_MESSAGE_SIZE_BYTES: u32 = 80 * 1024 * 1024;
+const DEFAULT_PERSISTENT_ROOT_DIR: &str = "/var/lib/crius";
+const DEFAULT_RUNTIME_STATE_DIR: &str = "/run/crius";
+const DEFAULT_CRI_SOCKET_URI: &str = "unix:///run/crius/crius.sock";
+const DEFAULT_RUNTIME_SHIM_DIR: &str = "/run/crius/shims";
+const DEFAULT_RUNTIME_ATTACH_SOCKET_DIR: &str = "/run/crius/shims";
+const DEFAULT_RUNTIME_CONTAINER_EXITS_DIR: &str = "/run/crius/exits";
+const DEFAULT_RUNTIME_CLEAN_SHUTDOWN_FILE: &str = "/var/lib/crius/clean.shutdown";
+const DEFAULT_RUNTIME_VERSION_FILE: &str = "/run/crius/version";
+const DEFAULT_RUNTIME_VERSION_FILE_PERSIST: &str = "/var/lib/crius/version";
+const DEFAULT_NRI_SOCKET_PATH: &str = "/run/crius/nri.sock";
+const LEGACY_RUNTIME_CLEAN_SHUTDOWN_FILE: &str = "/run/crius/clean.shutdown";
+const LEGACY_RUNTIME_SHIM_DIR: &str = "/var/run/crius/shims";
+const LEGACY_RUNTIME_ATTACH_SOCKET_DIR: &str = "/var/run/crius/shims";
+const LEGACY_RUNTIME_CONTAINER_EXITS_DIR: &str = "/var/run/crius/exits";
+const LEGACY_VAR_RUN_NRI_SOCKET_PATH: &str = "/var/run/crius/nri.sock";
 
 /// 守护进程主配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +50,15 @@ pub struct Config {
     /// 日志配置。
     pub logging: LoggingConfig,
 
+    /// 安全配置。
+    pub security: SecurityConfig,
+
+    /// 指标配置。
+    pub metrics: MetricsConfig,
+
+    /// tracing 导出配置。
+    pub tracing: TracingConfig,
+
     /// NRI 配置。
     pub nri: NriConfig,
 }
@@ -45,6 +69,9 @@ pub struct Config {
 pub struct ApiConfig {
     /// CRI gRPC 监听地址。
     pub listen: String,
+    /// 额外暴露的 Unix socket 别名；用于兼容 kubeadm 识别的标准 CRI socket 路径。
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub listen_aliases: Vec<String>,
     /// 是否允许通过 TCP 暴露 CRI gRPC 服务。
     pub allow_tcp_service: bool,
     /// gRPC 最大发送消息大小（字节）。
@@ -83,6 +110,68 @@ pub struct LoggingConfig {
     pub max_container_log_line_size: usize,
 }
 
+/// 守护进程安全配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// 显式请求 `runtime/default` 时使用的默认 seccomp profile；为空时使用内建最小默认策略。
+    pub seccomp_profile: String,
+    /// privileged 容器请求 `runtime/default` 或未显式设置 seccomp 时使用的默认策略。
+    pub privileged_seccomp_profile: String,
+    /// 当 CRI 请求未显式给出 seccomp profile 时使用的默认策略。
+    pub unset_seccomp_profile: String,
+    /// daemon 级默认 AppArmor profile 名称。
+    pub apparmor_default_profile: String,
+    /// 是否在 daemon 级关闭 AppArmor 处理。
+    pub disable_apparmor: bool,
+    /// 是否启用 SELinux 标签写入。
+    pub enable_selinux: bool,
+    /// 自动生成 SELinux MCS level 时允许使用的分类上界；`0` 视为默认 `1024`。
+    pub selinux_category_range: u32,
+    /// hostNetwork Pod 是否跳过 SELinux 标签注入。
+    pub hostnetwork_disable_selinux: bool,
+}
+
+/// 守护进程指标配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    /// 是否启用独立 metrics 服务。
+    pub enable: bool,
+    /// metrics TCP 监听 host。
+    pub host: String,
+    /// metrics TCP 监听端口。
+    pub port: u16,
+    /// metrics unix socket 路径；非空时优先于 host/port。
+    pub socket_path: String,
+    /// 是否为 metrics 服务启用 TLS。
+    pub enable_tls: bool,
+    /// TLS 证书路径。
+    pub tls_cert_file: String,
+    /// TLS 私钥路径。
+    pub tls_key_file: String,
+    /// TLS 客户端 CA 路径；为空表示不启用 mTLS。
+    pub tls_ca_file: String,
+    /// 最低 TLS 版本。
+    pub tls_min_version: String,
+    /// 允许的 TLS cipher suites。
+    pub tls_cipher_suites: Vec<String>,
+    /// 启用的 collector 集。
+    pub collectors: Vec<String>,
+}
+
+/// tracing 导出配置。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TracingConfig {
+    /// 是否启用 tracing 导出。
+    pub enable: bool,
+    /// tracing 导出 HTTP endpoint。
+    pub endpoint: String,
+    /// 采样率，按百万分比表示。
+    pub sampling_rate_per_million: u32,
+}
+
 /// 守护进程 cgroup driver 配置。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -108,8 +197,14 @@ pub struct RuntimeConfig {
     pub runtime_type: String,
     /// OCI runtime 二进制路径。
     pub runtime_path: String,
+    /// 默认 runtime 特定配置文件路径。
+    pub runtime_config_path: String,
+    /// 默认 OCI spec 模板文件；为空表示使用内建生成逻辑。
+    pub base_runtime_spec: String,
     /// 运行时状态根目录。
     pub root: String,
+    /// 默认 runtime 按平台覆盖的二进制路径映射，格式为 `os/arch -> path`。
+    pub platform_runtime_paths: HashMap<String, String>,
     /// 对外暴露的 runtime handlers。
     pub handlers: Vec<String>,
     /// 按 handler 细化的 runtime 配置，参考 CRI-O runtimes 表。
@@ -120,10 +215,16 @@ pub struct RuntimeConfig {
     pub pause_image: String,
     /// pause 镜像内的 infra 命令路径。
     pub pause_command: String,
+    /// 命名空间辅助二进制路径；为空时使用内建 netns 管理逻辑。
+    pub pinns_path: String,
+    /// 是否允许在特定场景下省略 infra/pause 容器。
+    pub drop_infra_ctr: bool,
     /// 可选的 cgroup driver 显式配置。
     pub cgroup_driver: Option<CgroupDriverConfig>,
     /// shim 二进制路径。
     pub shim_path: String,
+    /// 默认 monitor/shim 所在 cgroup；支持空字符串、`pod` 或 systemd slice。
+    pub monitor_cgroup: String,
     /// shim 工作目录。
     pub shim_dir: String,
     /// attach/resize socket 根目录。
@@ -172,12 +273,22 @@ pub struct RuntimeConfig {
     pub io_gid: u32,
     /// 守护进程默认的 pids 限制；-1 表示不设置默认限制。
     pub pids_limit: i64,
+    /// infra/pause 容器默认 cpuset。
+    pub infra_ctr_cpuset: String,
+    /// 允许 guaranteed workload 共享使用的 cpuset。
+    pub shared_cpuset: String,
     /// exec / execSync 的 CPU 亲和策略；"" 表示 runtime 默认，"first" 表示使用 cpuset 的第一个 CPU。
     pub exec_cpu_affinity: String,
+    /// irqbalance 守护进程配置文件路径。
+    pub irqbalance_config_file: String,
+    /// irqbalance banned CPU mask 启动期恢复文件；`disable` 表示禁用恢复逻辑。
+    pub irqbalance_config_restore_file: String,
     /// 是否默认将所有 Pod/容器根文件系统设为只读。
     pub read_only: bool,
     /// 是否禁用 pivot_root，改用 MS_MOVE。
     pub no_pivot: bool,
+    /// 是否禁止为容器创建新的 session keyring。
+    pub no_new_keyring: bool,
     /// 是否启用 shim debug。
     pub shim_debug: bool,
     /// 传给 monitor/shim 进程的默认环境变量列表，格式为 `KEY=value`。
@@ -188,10 +299,26 @@ pub struct RuntimeConfig {
     pub default_capabilities: Vec<String>,
     /// daemon 级默认 sysctls，格式为 `key = value` 或 `key=value`。
     pub default_sysctls: Vec<String>,
-    /// 显式请求 `runtime/default` 时使用的默认 seccomp profile；为空时使用内建最小默认策略。
-    pub seccomp_profile: String,
-    /// 当 CRI 请求未显式给出 seccomp profile 时使用的默认策略。
-    pub unset_seccomp_profile: String,
+    /// daemon 级默认 ulimits，格式为 `name=soft:hard`。
+    pub default_ulimits: Vec<String>,
+    /// 允许 CRI 请求映射进容器的宿主设备路径列表。
+    pub allowed_devices: Vec<String>,
+    /// 注入到所有容器的额外宿主设备映射，格式为 `/SRC[:/DST[:PERMS]]`。
+    pub additional_devices: Vec<String>,
+    /// 是否将设备节点的 uid/gid 跟随 security context 的 runAsUser/runAsGroup。
+    pub device_ownership_from_security_context: bool,
+    /// 是否把 capabilities 同步写入 inheritable 集合。
+    pub add_inheritable_capabilities: bool,
+    /// 默认附加挂载文件，格式为 `/SRC:/DST`，一行一个。
+    pub default_mounts_file: String,
+    /// OCI hooks 目录列表；后面的目录拥有更高同名文件优先级。
+    pub hooks_dir: Vec<String>,
+    /// 宿主关键挂载源缺失时需要直接拒绝创建的路径列表。
+    pub absent_mount_sources_to_reject: Vec<String>,
+    /// 是否禁用 Kubernetes ProcMount 支持。
+    pub disable_proc_mount: bool,
+    /// 容器时区策略；空字符串表示不注入，`Local` 表示跟随宿主机。
+    pub timezone: String,
     /// 是否在 CRI 日志文件之外额外写 journald。
     pub log_to_journald: bool,
     /// 是否在日志轮转和容器退出时跳过 sync。
@@ -210,20 +337,34 @@ pub struct RuntimeConfig {
 pub struct RuntimeHandlerConfig {
     /// 该 handler 对应的 OCI runtime 二进制路径。
     pub runtime_path: String,
+    /// 该 handler 对应的 runtime 特定配置文件路径；为空时继承默认值。
+    pub runtime_config_path: String,
     /// 该 handler 对应的 runtime 状态根目录。
     pub runtime_root: String,
+    /// 该 handler 按平台覆盖的 runtime 二进制路径映射。
+    pub platform_runtime_paths: HashMap<String, String>,
     /// 是否继承默认 handler 的 runtime_path/runtime_root。
     pub inherit_default_runtime: bool,
     /// 该 handler 专属的 monitor/shim 二进制路径；为空时继承 runtime.shim_path。
     pub monitor_path: String,
+    /// 该 handler 专属的 monitor/shim cgroup；未设置时继承 runtime.monitor_cgroup。
+    pub monitor_cgroup: Option<String>,
     /// 该 handler 专属的 monitor/shim 环境变量；未设置时继承 runtime.monitor_env。
     pub monitor_env: Option<Vec<String>>,
+    /// 是否允许该 handler 的 exec/attach/port-forward 使用 websocket 协议；未设置时继承默认值。
+    pub stream_websockets: Option<bool>,
     /// 该 handler 额外允许处理的 annotation 前缀。
     pub allowed_annotations: Vec<String>,
     /// 该 handler 默认注入到 OCI annotations 的键值对；显式请求优先。
     pub default_annotations: HashMap<String, String>,
+    /// privileged 容器是否跳过默认宿主设备注入。
+    pub privileged_without_host_devices: bool,
+    /// 在跳过宿主设备注入时，是否仍维持全设备 allowlist。
+    pub privileged_without_host_devices_all_devices_allowed: bool,
     /// 该 handler 的容器创建超时（秒）；未设置时继承内置默认值。
     pub container_create_timeout: Option<u32>,
+    /// 该 handler 的 rootfs snapshotter；为空时使用默认 `internal-overlay-untar`。
+    pub snapshotter: String,
     /// 该 handler 专属的 CNI 配置目录；为空时继承全局 network.config_dirs。
     pub cni_conf_dir: String,
     /// 该 handler 专属的 CNI 配置文件最大加载数量；未设置时继承全局 network.max_conf_num。
@@ -288,12 +429,40 @@ impl RuntimeWorkloadResources {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRuntimeHandlerConfig {
     pub runtime_path: String,
+    pub runtime_config_path: String,
     pub runtime_root: String,
+    pub platform_runtime_paths: HashMap<String, String>,
     pub monitor_path: String,
+    pub monitor_cgroup: String,
     pub monitor_env: Vec<String>,
+    pub stream_websockets: bool,
     pub allowed_annotations: Vec<String>,
     pub default_annotations: HashMap<String, String>,
+    pub privileged_without_host_devices: bool,
+    pub privileged_without_host_devices_all_devices_allowed: bool,
     pub container_create_timeout: u32,
+    pub snapshotter: String,
+}
+
+impl Default for ResolvedRuntimeHandlerConfig {
+    fn default() -> Self {
+        Self {
+            runtime_path: String::new(),
+            runtime_config_path: String::new(),
+            runtime_root: String::new(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: String::new(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS,
+            snapshotter: "internal-overlay-untar".to_string(),
+        }
+    }
 }
 
 /// 镜像配置。
@@ -306,6 +475,46 @@ pub struct ImageConfig {
     pub root: String,
     /// 守护进程级 registry 鉴权文件，兼容 docker config.json 的 auths 结构。
     pub global_auth_file: String,
+    /// 按 Pod namespace 分隔的 registry 鉴权目录。
+    pub namespaced_auth_dir: String,
+    /// 默认镜像拉取 transport。
+    pub default_transport: String,
+    /// 短名解析策略。
+    pub short_name_mode: String,
+    /// 镜像拉取无进展超时。
+    #[serde(
+        deserialize_with = "crate::streaming::deserialize_duration",
+        serialize_with = "crate::streaming::serialize_duration"
+    )]
+    pub pull_progress_timeout: std::time::Duration,
+    /// 单镜像最大并发下载层数。
+    pub max_concurrent_downloads: usize,
+    /// 拉取失败时的额外重试次数。
+    pub pull_retry_count: u32,
+    /// registry hosts.toml/certs.d 配置目录。
+    pub registry_config_dir: String,
+    /// 节点本地镜像解密私钥目录；为空表示关闭镜像解密。
+    pub decryption_keys_path: String,
+    /// OCI crypt decoder 二进制路径或命令名。
+    pub decryption_decoder_path: String,
+    /// 可选的 OCICRYPT keyprovider 配置文件路径。
+    pub decryption_keyprovider_config: String,
+    /// 额外的只读 OCI artifact store 根目录列表；每个目录下期望存在 `artifacts/` 子目录。
+    pub additional_artifact_stores: Vec<String>,
+    /// 全局镜像签名策略文件。
+    pub signature_policy: String,
+    /// 按 namespace 选择镜像签名策略文件的目录。
+    pub signature_policy_dir: String,
+    /// 镜像存储驱动额外参数。
+    pub storage_options: Vec<String>,
+    /// 镜像定义卷处理策略；支持 `mkdir`、`bind`、`ignore`。
+    pub image_volumes: String,
+    /// 不参与 kubelet 垃圾回收的保留镜像模式列表。
+    pub pinned_images: Vec<String>,
+    /// 大 layer staging 的临时目录；为空表示使用镜像目录同盘临时文件。
+    pub big_files_temporary_dir: String,
+    /// 是否允许把 OCI artifact 作为 CRI image volume mount 到容器中。
+    pub oci_artifact_mount_support: bool,
 }
 
 /// 网络配置。
@@ -333,6 +542,12 @@ pub struct NetworkConfig {
     pub max_conf_num: usize,
     /// Pod 主 IP 选择策略。
     pub ip_pref: MainIpPreference,
+    /// CNI teardown/DEL 的固定超时；默认 1 分钟，对齐 CRI-O 的 networkStop 语义。
+    #[serde(
+        deserialize_with = "crate::streaming::deserialize_duration",
+        serialize_with = "crate::streaming::serialize_duration"
+    )]
+    pub teardown_timeout: std::time::Duration,
     /// 显式指定默认使用的 CNI 网络名；为空时按文件名字典序选择第一个。
     #[serde(alias = "cni_default_network")]
     pub default_network_name: Option<String>,
@@ -348,6 +563,8 @@ pub struct NetworkConfig {
 pub struct NriConfig {
     /// 是否启用 NRI
     pub enable: bool,
+    /// 是否启用 CDI device adjustment。
+    pub enable_cdi: bool,
     /// runtime 名称（上报给插件）
     pub runtime_name: String,
     /// runtime 版本（上报给插件）
@@ -360,6 +577,9 @@ pub struct NriConfig {
     pub plugin_config_path: String,
     /// NRI blockio class 配置文件
     pub blockio_config_path: String,
+    /// CDI spec 搜索目录。
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub cdi_spec_dirs: Vec<String>,
     /// 全局允许的 NRI annotation 前缀
     pub allowed_annotation_prefixes: Vec<String>,
     /// 按 runtime handler 额外允许的 annotation 前缀
@@ -430,7 +650,8 @@ where
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
-            listen: "unix:///run/crius/crius.sock".to_string(),
+            listen: DEFAULT_CRI_SOCKET_URI.to_string(),
+            listen_aliases: Vec::new(),
             allow_tcp_service: false,
             grpc_max_send_msg_size: DEFAULT_GRPC_MAX_MESSAGE_SIZE_BYTES,
             grpc_max_recv_msg_size: DEFAULT_GRPC_MAX_MESSAGE_SIZE_BYTES,
@@ -455,26 +676,69 @@ impl Default for LoggingConfig {
     }
 }
 
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            seccomp_profile: String::new(),
+            privileged_seccomp_profile: "unconfined".to_string(),
+            unset_seccomp_profile: "runtime/default".to_string(),
+            apparmor_default_profile: "crius-default".to_string(),
+            disable_apparmor: false,
+            enable_selinux: false,
+            selinux_category_range: 1024,
+            hostnetwork_disable_selinux: true,
+        }
+    }
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            host: "127.0.0.1".to_string(),
+            port: 9090,
+            socket_path: String::new(),
+            enable_tls: false,
+            tls_cert_file: String::new(),
+            tls_key_file: String::new(),
+            tls_ca_file: String::new(),
+            tls_min_version: "VersionTLS12".to_string(),
+            tls_cipher_suites: Vec::new(),
+            collectors: vec![
+                "runtime".to_string(),
+                "resources".to_string(),
+                "images".to_string(),
+            ],
+        }
+    }
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             runtime_type: "runc".to_string(),
             runtime_path: "/usr/bin/runc".to_string(),
-            root: "/run/crius".to_string(),
+            runtime_config_path: String::new(),
+            base_runtime_spec: String::new(),
+            root: DEFAULT_RUNTIME_STATE_DIR.to_string(),
+            platform_runtime_paths: HashMap::new(),
             handlers: Vec::new(),
             runtimes: HashMap::new(),
             workloads: HashMap::new(),
             pause_image: "registry.k8s.io/pause:3.9".to_string(),
             pause_command: "/pause".to_string(),
+            pinns_path: String::new(),
+            drop_infra_ctr: false,
             cgroup_driver: None,
             shim_path: "/usr/bin/crius-shim".to_string(),
-            shim_dir: "/var/run/crius/shims".to_string(),
-            attach_socket_dir: "/var/run/crius/shims".to_string(),
-            container_exits_dir: "/var/run/crius/exits".to_string(),
-            clean_shutdown_file: "/var/lib/crius/clean.shutdown".to_string(),
+            monitor_cgroup: String::new(),
+            shim_dir: DEFAULT_RUNTIME_SHIM_DIR.to_string(),
+            attach_socket_dir: DEFAULT_RUNTIME_ATTACH_SOCKET_DIR.to_string(),
+            container_exits_dir: DEFAULT_RUNTIME_CONTAINER_EXITS_DIR.to_string(),
+            clean_shutdown_file: DEFAULT_RUNTIME_CLEAN_SHUTDOWN_FILE.to_string(),
             container_stop_timeout: MIN_CONTAINER_STOP_TIMEOUT_SECS,
-            version_file: "/run/crius/version".to_string(),
-            version_file_persist: "/var/lib/crius/version".to_string(),
+            version_file: DEFAULT_RUNTIME_VERSION_FILE.to_string(),
+            version_file_persist: DEFAULT_RUNTIME_VERSION_FILE_PERSIST.to_string(),
             criu_path: String::new(),
             criu_image_path: String::new(),
             criu_work_path: String::new(),
@@ -492,9 +756,14 @@ impl Default for RuntimeConfig {
             io_uid: 0,
             io_gid: 0,
             pids_limit: -1,
+            infra_ctr_cpuset: String::new(),
+            shared_cpuset: String::new(),
             exec_cpu_affinity: String::new(),
+            irqbalance_config_file: String::new(),
+            irqbalance_config_restore_file: "disable".to_string(),
             read_only: false,
             no_pivot: false,
+            no_new_keyring: false,
             shim_debug: false,
             monitor_env: Vec::new(),
             default_env: Vec::new(),
@@ -515,8 +784,16 @@ impl Default for RuntimeConfig {
                 "AUDIT_WRITE".to_string(),
             ],
             default_sysctls: Vec::new(),
-            seccomp_profile: String::new(),
-            unset_seccomp_profile: "runtime/default".to_string(),
+            default_ulimits: Vec::new(),
+            allowed_devices: Vec::new(),
+            additional_devices: Vec::new(),
+            device_ownership_from_security_context: false,
+            add_inheritable_capabilities: false,
+            default_mounts_file: String::new(),
+            hooks_dir: Vec::new(),
+            absent_mount_sources_to_reject: Vec::new(),
+            disable_proc_mount: false,
+            timezone: String::new(),
             log_to_journald: false,
             no_sync_log: false,
             restrict_oom_score_adj: false,
@@ -532,6 +809,24 @@ impl Default for ImageConfig {
             driver: "overlay".to_string(),
             root: "/var/lib/containers/storage".to_string(),
             global_auth_file: String::new(),
+            namespaced_auth_dir: String::new(),
+            default_transport: "docker://".to_string(),
+            short_name_mode: "disabled".to_string(),
+            pull_progress_timeout: std::time::Duration::ZERO,
+            max_concurrent_downloads: 3,
+            pull_retry_count: 0,
+            registry_config_dir: String::new(),
+            decryption_keys_path: String::new(),
+            decryption_decoder_path: "ctd-decoder".to_string(),
+            decryption_keyprovider_config: String::new(),
+            additional_artifact_stores: Vec::new(),
+            signature_policy: String::new(),
+            signature_policy_dir: String::new(),
+            storage_options: Vec::new(),
+            image_volumes: "mkdir".to_string(),
+            pinned_images: Vec::new(),
+            big_files_temporary_dir: String::new(),
+            oci_artifact_mount_support: true,
         }
     }
 }
@@ -553,6 +848,7 @@ impl Default for NetworkConfig {
             conf_template: String::new(),
             max_conf_num: 0,
             ip_pref: MainIpPreference::Cni,
+            teardown_timeout: std::time::Duration::from_secs(60),
             default_network_name: None,
             disable_hostport_mapping: false,
             netns_mounts_under_state_dir: false,
@@ -564,12 +860,14 @@ impl Default for NriConfig {
     fn default() -> Self {
         Self {
             enable: false,
+            enable_cdi: true,
             runtime_name: "crius".to_string(),
             runtime_version: env!("CARGO_PKG_VERSION").to_string(),
-            socket_path: "/run/crius/nri.sock".to_string(),
+            socket_path: DEFAULT_NRI_SOCKET_PATH.to_string(),
             plugin_path: "/opt/nri/plugins".to_string(),
             plugin_config_path: "/etc/nri/conf.d".to_string(),
             blockio_config_path: String::new(),
+            cdi_spec_dirs: vec!["/etc/cdi".to_string(), "/var/run/cdi".to_string()],
             allowed_annotation_prefixes: Vec::new(),
             runtime_allowed_annotation_prefixes: HashMap::new(),
             workload_allowed_annotation_prefixes: Vec::new(),
@@ -583,19 +881,29 @@ impl Default for NriConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            root: "/var/lib/crius".to_string(),
+        let mut config = Self {
+            root: DEFAULT_PERSISTENT_ROOT_DIR.to_string(),
             api: ApiConfig::default(),
             runtime: RuntimeConfig::default(),
             image: ImageConfig::default(),
             network: NetworkConfig::default(),
             logging: LoggingConfig::default(),
+            security: SecurityConfig::default(),
+            metrics: MetricsConfig::default(),
+            tracing: TracingConfig::default(),
             nri: NriConfig::default(),
-        }
+        };
+        config.normalize_runtime_settings();
+        config
     }
 }
 
 impl RuntimeConfig {
+    pub fn effective_cgroup_driver(&self) -> CgroupDriverConfig {
+        self.cgroup_driver
+            .unwrap_or_else(detect_system_cgroup_driver)
+    }
+
     pub fn normalized_handlers(&self) -> Vec<String> {
         let mut handlers = Vec::new();
         for handler in &self.handlers {
@@ -621,13 +929,26 @@ impl RuntimeConfig {
     pub fn resolved_runtimes(&self) -> Result<HashMap<String, ResolvedRuntimeHandlerConfig>> {
         let default_handler = self.runtime_type.trim();
         let default_runtime = ResolvedRuntimeHandlerConfig {
-            runtime_path: self.runtime_path.trim().to_string(),
+            runtime_path: resolve_platform_runtime_path(
+                self.runtime_path.trim(),
+                &self.platform_runtime_paths,
+            )?,
+            runtime_config_path: self.runtime_config_path.trim().to_string(),
             runtime_root: self.root.trim().to_string(),
+            platform_runtime_paths: self.platform_runtime_paths.clone(),
             monitor_path: self.shim_path.trim().to_string(),
+            monitor_cgroup: resolve_monitor_cgroup(
+                self.monitor_cgroup.as_str(),
+                self.effective_cgroup_driver(),
+            )?,
             monitor_env: self.monitor_env.clone(),
+            stream_websockets: false,
             allowed_annotations: Vec::new(),
             default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
             container_create_timeout: DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS,
+            snapshotter: "internal-overlay-untar".to_string(),
         };
         let mut resolved = HashMap::from([(default_handler.to_string(), default_runtime.clone())]);
 
@@ -650,17 +971,40 @@ impl RuntimeConfig {
                     )));
                 }
                 let mut inherited = default_runtime.clone();
+                if !config.runtime_config_path.trim().is_empty() {
+                    inherited.runtime_config_path = config.runtime_config_path.trim().to_string();
+                }
+                if !config.platform_runtime_paths.is_empty() {
+                    inherited.platform_runtime_paths = config.platform_runtime_paths.clone();
+                    inherited.runtime_path = resolve_platform_runtime_path(
+                        self.runtime_path.trim(),
+                        &inherited.platform_runtime_paths,
+                    )?;
+                }
                 if !config.monitor_path.trim().is_empty() {
                     inherited.monitor_path = config.monitor_path.trim().to_string();
+                }
+                if let Some(monitor_cgroup) = config.monitor_cgroup.as_deref() {
+                    inherited.monitor_cgroup =
+                        resolve_monitor_cgroup(monitor_cgroup, self.effective_cgroup_driver())?;
                 }
                 if let Some(monitor_env) = config.monitor_env.as_ref() {
                     inherited.monitor_env = monitor_env.clone();
                 }
+                if let Some(stream_websockets) = config.stream_websockets {
+                    inherited.stream_websockets = stream_websockets;
+                }
                 inherited.allowed_annotations = config.allowed_annotations.clone();
                 inherited.default_annotations = config.default_annotations.clone();
+                inherited.privileged_without_host_devices = config.privileged_without_host_devices;
+                inherited.privileged_without_host_devices_all_devices_allowed =
+                    config.privileged_without_host_devices_all_devices_allowed;
                 if let Some(timeout) = config.container_create_timeout {
                     inherited.container_create_timeout =
                         timeout.max(MIN_CONTAINER_CREATE_TIMEOUT_SECS);
+                }
+                if !config.snapshotter.trim().is_empty() {
+                    inherited.snapshotter = config.snapshotter.trim().to_string();
                 }
                 resolved.insert(handler, inherited);
                 continue;
@@ -675,27 +1019,54 @@ impl RuntimeConfig {
             resolved.insert(
                 handler,
                 ResolvedRuntimeHandlerConfig {
-                    runtime_path: config.runtime_path.trim().to_string(),
+                    runtime_path: resolve_platform_runtime_path(
+                        config.runtime_path.trim(),
+                        &config.platform_runtime_paths,
+                    )?,
+                    runtime_config_path: if config.runtime_config_path.trim().is_empty() {
+                        default_runtime.runtime_config_path.clone()
+                    } else {
+                        config.runtime_config_path.trim().to_string()
+                    },
                     runtime_root: if config.runtime_root.trim().is_empty() {
                         default_runtime.runtime_root.clone()
                     } else {
                         config.runtime_root.trim().to_string()
                     },
+                    platform_runtime_paths: config.platform_runtime_paths.clone(),
                     monitor_path: if config.monitor_path.trim().is_empty() {
                         default_runtime.monitor_path.clone()
                     } else {
                         config.monitor_path.trim().to_string()
                     },
+                    monitor_cgroup: resolve_monitor_cgroup(
+                        config
+                            .monitor_cgroup
+                            .as_deref()
+                            .unwrap_or(default_runtime.monitor_cgroup.as_str()),
+                        self.effective_cgroup_driver(),
+                    )?,
                     monitor_env: config
                         .monitor_env
                         .clone()
                         .unwrap_or_else(|| self.monitor_env.clone()),
+                    stream_websockets: config
+                        .stream_websockets
+                        .unwrap_or(default_runtime.stream_websockets),
                     allowed_annotations: config.allowed_annotations.clone(),
                     default_annotations: config.default_annotations.clone(),
+                    privileged_without_host_devices: config.privileged_without_host_devices,
+                    privileged_without_host_devices_all_devices_allowed: config
+                        .privileged_without_host_devices_all_devices_allowed,
                     container_create_timeout: config
                         .container_create_timeout
                         .unwrap_or(DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS)
                         .max(MIN_CONTAINER_CREATE_TIMEOUT_SECS),
+                    snapshotter: if config.snapshotter.trim().is_empty() {
+                        "internal-overlay-untar".to_string()
+                    } else {
+                        config.snapshotter.trim().to_string()
+                    },
                 },
             );
         }
@@ -726,6 +1097,43 @@ impl RuntimeConfig {
                 parse_sysctl_assignment(entry)
                     .map_err(|message| Error::Config(format!("runtime.default_sysctls: {message}")))
             })
+            .collect()
+    }
+
+    pub fn parsed_default_ulimits(&self) -> Result<Vec<crate::oci::spec::Rlimit>> {
+        self.default_ulimits
+            .iter()
+            .map(|entry| {
+                parse_ulimit_assignment(entry)
+                    .map_err(|message| Error::Config(format!("runtime.default_ulimits: {message}")))
+            })
+            .collect()
+    }
+
+    pub fn parsed_additional_devices(&self) -> Result<Vec<crate::runtime::DeviceMapping>> {
+        self.additional_devices
+            .iter()
+            .map(|entry| {
+                parse_additional_device(entry)
+                    .map(
+                        |(source, destination, permissions)| crate::runtime::DeviceMapping {
+                            source: PathBuf::from(source),
+                            destination: PathBuf::from(destination),
+                            permissions,
+                        },
+                    )
+                    .map_err(|message| {
+                        Error::Config(format!("runtime.additional_devices: {message}"))
+                    })
+            })
+            .collect()
+    }
+
+    pub fn parsed_allowed_devices(&self) -> Vec<PathBuf> {
+        self.allowed_devices
+            .iter()
+            .map(|entry| PathBuf::from(entry.trim()))
+            .filter(|path| !path.as_os_str().is_empty())
             .collect()
     }
 
@@ -768,6 +1176,7 @@ impl NetworkConfig {
             self.default_network_name.clone(),
             self.disable_hostport_mapping,
         );
+        cni.set_teardown_timeout(self.teardown_timeout);
         if !self.conf_template.trim().is_empty() {
             cni.set_conf_template(Some(PathBuf::from(self.conf_template.trim())));
         }
@@ -781,15 +1190,33 @@ impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path)?;
         let mut config: Self = toml::from_str(&content)?;
-        config.normalize_runtime_settings();
+        config.normalize_derived_settings();
         config.validate()?;
         Ok(config)
+    }
+
+    /// 在 file/env/CLI 覆盖后收口派生路径和默认语义。
+    pub fn normalize_derived_settings(&mut self) {
+        self.normalize_runtime_settings();
+        self.api.listen_aliases = self
+            .api
+            .listen_aliases
+            .iter()
+            .map(|alias| alias.trim())
+            .filter(|alias| !alias.is_empty())
+            .fold(Vec::new(), |mut acc, alias| {
+                if !acc.iter().any(|existing| existing == alias) {
+                    acc.push(alias.to_string());
+                }
+                acc
+            });
     }
 
     /// 应用环境变量覆盖。
     pub fn apply_env_overrides(&mut self) -> Result<()> {
         apply_string_override("CRIUS_ROOT", &mut self.root);
         apply_string_override("CRIUS_LISTEN", &mut self.api.listen);
+        apply_csv_override("CRIUS_LISTEN_ALIASES", &mut self.api.listen_aliases);
         apply_bool_override("CRIUS_ALLOW_TCP_SERVICE", &mut self.api.allow_tcp_service)?;
         apply_u32_override(
             "CRIUS_GRPC_MAX_SEND_MSG_SIZE",
@@ -826,17 +1253,15 @@ impl Config {
             "CRIUS_STREAM_TLS_CERT",
             &mut self.api.streaming.tls_cert_file,
         );
-        apply_string_override(
-            "CRIUS_STREAM_TLS_KEY",
-            &mut self.api.streaming.tls_key_file,
-        );
-        apply_string_override(
-            "CRIUS_STREAM_TLS_CA",
-            &mut self.api.streaming.tls_ca_file,
-        );
+        apply_string_override("CRIUS_STREAM_TLS_KEY", &mut self.api.streaming.tls_key_file);
+        apply_string_override("CRIUS_STREAM_TLS_CA", &mut self.api.streaming.tls_ca_file);
         apply_string_override(
             "CRIUS_TLS_MIN_VERSION",
             &mut self.api.streaming.tls_min_version,
+        );
+        apply_csv_override(
+            "CRIUS_STREAM_TLS_CIPHER_SUITES",
+            &mut self.api.streaming.tls_cipher_suites,
         );
         apply_duration_override(
             "CRIUS_STREAM_REQUEST_TOKEN_TTL",
@@ -853,11 +1278,22 @@ impl Config {
 
         apply_string_override("CRIUS_RUNTIME_TYPE", &mut self.runtime.runtime_type);
         apply_string_override("CRIUS_RUNTIME_PATH", &mut self.runtime.runtime_path);
+        apply_string_override(
+            "CRIUS_RUNTIME_CONFIG_PATH",
+            &mut self.runtime.runtime_config_path,
+        );
+        apply_string_override(
+            "CRIUS_BASE_RUNTIME_SPEC",
+            &mut self.runtime.base_runtime_spec,
+        );
         apply_string_override("CRIUS_RUNTIME_ROOT", &mut self.runtime.root);
         apply_csv_override("CRIUS_RUNTIME_HANDLERS", &mut self.runtime.handlers);
         apply_string_override("CRIUS_PAUSE_IMAGE", &mut self.runtime.pause_image);
         apply_string_override("CRIUS_PAUSE_COMMAND", &mut self.runtime.pause_command);
+        apply_string_override("CRIUS_PINNS_PATH", &mut self.runtime.pinns_path);
+        apply_bool_override("CRIUS_DROP_INFRA_CTR", &mut self.runtime.drop_infra_ctr)?;
         apply_string_override("CRIUS_SHIM_PATH", &mut self.runtime.shim_path);
+        apply_string_override("CRIUS_MONITOR_CGROUP", &mut self.runtime.monitor_cgroup);
         apply_string_override("CRIUS_SHIM_DIR", &mut self.runtime.shim_dir);
         apply_csv_override("CRIUS_MONITOR_ENV", &mut self.runtime.monitor_env);
         apply_csv_override("CRIUS_DEFAULT_ENV", &mut self.runtime.default_env);
@@ -866,14 +1302,60 @@ impl Config {
             &mut self.runtime.default_capabilities,
         );
         apply_csv_override("CRIUS_DEFAULT_SYSCTLS", &mut self.runtime.default_sysctls);
+        apply_csv_override("CRIUS_DEFAULT_ULIMITS", &mut self.runtime.default_ulimits);
+        apply_csv_override("CRIUS_ALLOWED_DEVICES", &mut self.runtime.allowed_devices);
+        apply_csv_override(
+            "CRIUS_ADDITIONAL_DEVICES",
+            &mut self.runtime.additional_devices,
+        );
+        apply_bool_override(
+            "CRIUS_DEVICE_OWNERSHIP_FROM_SECURITY_CONTEXT",
+            &mut self.runtime.device_ownership_from_security_context,
+        )?;
+        apply_bool_override(
+            "CRIUS_ADD_INHERITABLE_CAPABILITIES",
+            &mut self.runtime.add_inheritable_capabilities,
+        )?;
         apply_string_override(
-            "CRIUS_SECCOMP_PROFILE",
-            &mut self.runtime.seccomp_profile,
+            "CRIUS_DEFAULT_MOUNTS_FILE",
+            &mut self.runtime.default_mounts_file,
+        );
+        apply_colon_dirs_override("CRIUS_HOOKS_DIRS", &mut self.runtime.hooks_dir);
+        apply_csv_override(
+            "CRIUS_ABSENT_MOUNT_SOURCES_TO_REJECT",
+            &mut self.runtime.absent_mount_sources_to_reject,
+        );
+        apply_bool_override(
+            "CRIUS_DISABLE_PROC_MOUNT",
+            &mut self.runtime.disable_proc_mount,
+        )?;
+        apply_string_override("CRIUS_TIMEZONE", &mut self.runtime.timezone);
+        apply_string_override("CRIUS_SECCOMP_PROFILE", &mut self.security.seccomp_profile);
+        apply_string_override(
+            "CRIUS_PRIVILEGED_SECCOMP_PROFILE",
+            &mut self.security.privileged_seccomp_profile,
         );
         apply_string_override(
             "CRIUS_UNSET_SECCOMP_PROFILE",
-            &mut self.runtime.unset_seccomp_profile,
+            &mut self.security.unset_seccomp_profile,
         );
+        apply_string_override(
+            "CRIUS_APPARMOR_DEFAULT_PROFILE",
+            &mut self.security.apparmor_default_profile,
+        );
+        apply_bool_override(
+            "CRIUS_DISABLE_APPARMOR",
+            &mut self.security.disable_apparmor,
+        )?;
+        apply_bool_override("CRIUS_ENABLE_SELINUX", &mut self.security.enable_selinux)?;
+        apply_u32_override(
+            "CRIUS_SELINUX_CATEGORY_RANGE",
+            &mut self.security.selinux_category_range,
+        )?;
+        apply_bool_override(
+            "CRIUS_HOSTNETWORK_DISABLE_SELINUX",
+            &mut self.security.hostnetwork_disable_selinux,
+        )?;
         apply_string_override(
             "CRIUS_ATTACH_SOCKET_DIR",
             &mut self.runtime.attach_socket_dir,
@@ -926,12 +1408,23 @@ impl Config {
         apply_u32_override("CRIUS_IO_UID", &mut self.runtime.io_uid)?;
         apply_u32_override("CRIUS_IO_GID", &mut self.runtime.io_gid)?;
         apply_i64_override("CRIUS_PIDS_LIMIT", &mut self.runtime.pids_limit)?;
+        apply_string_override("CRIUS_INFRA_CTR_CPUSET", &mut self.runtime.infra_ctr_cpuset);
+        apply_string_override("CRIUS_SHARED_CPUSET", &mut self.runtime.shared_cpuset);
         apply_string_override(
             "CRIUS_EXEC_CPU_AFFINITY",
             &mut self.runtime.exec_cpu_affinity,
         );
+        apply_string_override(
+            "CRIUS_IRQBALANCE_CONFIG_FILE",
+            &mut self.runtime.irqbalance_config_file,
+        );
+        apply_string_override(
+            "CRIUS_IRQBALANCE_CONFIG_RESTORE_FILE",
+            &mut self.runtime.irqbalance_config_restore_file,
+        );
         apply_bool_override("CRIUS_READ_ONLY", &mut self.runtime.read_only)?;
         apply_bool_override("CRIUS_NO_PIVOT", &mut self.runtime.no_pivot)?;
+        apply_bool_override("CRIUS_NO_NEW_KEYRING", &mut self.runtime.no_new_keyring)?;
         apply_u32_override(
             "CRIUS_CONTAINER_STOP_TIMEOUT",
             &mut self.runtime.container_stop_timeout,
@@ -962,6 +1455,72 @@ impl Config {
             "CRIUS_IMAGE_GLOBAL_AUTH_FILE",
             &mut self.image.global_auth_file,
         );
+        apply_string_override(
+            "CRIUS_IMAGE_NAMESPACED_AUTH_DIR",
+            &mut self.image.namespaced_auth_dir,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_DEFAULT_TRANSPORT",
+            &mut self.image.default_transport,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_SHORT_NAME_MODE",
+            &mut self.image.short_name_mode,
+        );
+        apply_duration_override(
+            "CRIUS_IMAGE_PULL_PROGRESS_TIMEOUT",
+            &mut self.image.pull_progress_timeout,
+        )?;
+        apply_usize_override(
+            "CRIUS_MAX_CONCURRENT_DOWNLOADS",
+            &mut self.image.max_concurrent_downloads,
+        )?;
+        apply_u32_override(
+            "CRIUS_IMAGE_PULL_RETRY_COUNT",
+            &mut self.image.pull_retry_count,
+        )?;
+        apply_string_override(
+            "CRIUS_IMAGE_REGISTRY_CONFIG_DIR",
+            &mut self.image.registry_config_dir,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_DECRYPTION_KEYS_PATH",
+            &mut self.image.decryption_keys_path,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_DECRYPTION_DECODER_PATH",
+            &mut self.image.decryption_decoder_path,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_DECRYPTION_KEYPROVIDER_CONFIG",
+            &mut self.image.decryption_keyprovider_config,
+        );
+        apply_csv_override(
+            "CRIUS_ADDITIONAL_ARTIFACT_STORES",
+            &mut self.image.additional_artifact_stores,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_SIGNATURE_POLICY",
+            &mut self.image.signature_policy,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_SIGNATURE_POLICY_DIR",
+            &mut self.image.signature_policy_dir,
+        );
+        apply_csv_override(
+            "CRIUS_IMAGE_STORAGE_OPTIONS",
+            &mut self.image.storage_options,
+        );
+        apply_string_override("CRIUS_IMAGE_VOLUMES", &mut self.image.image_volumes);
+        apply_csv_override("CRIUS_PINNED_IMAGES", &mut self.image.pinned_images);
+        apply_string_override(
+            "CRIUS_IMAGE_BIG_FILES_TEMPORARY_DIR",
+            &mut self.image.big_files_temporary_dir,
+        );
+        apply_bool_override(
+            "CRIUS_OCI_ARTIFACT_MOUNT_SUPPORT",
+            &mut self.image.oci_artifact_mount_support,
+        )?;
 
         apply_colon_dirs_override("CRIUS_CNI_CONFIG_DIRS", &mut self.network.config_dirs);
         if std::env::var_os("CRIUS_CNI_PLUGIN_DIRS").is_some() {
@@ -976,6 +1535,10 @@ impl Config {
             self.network.ip_pref =
                 parse_main_ip_preference(&ip_pref.to_string_lossy()).map_err(Error::Config)?;
         }
+        apply_duration_override(
+            "CRIUS_CNI_TEARDOWN_TIMEOUT",
+            &mut self.network.teardown_timeout,
+        )?;
         apply_optional_string_override(
             "CRIUS_CNI_DEFAULT_NETWORK",
             &mut self.network.default_network_name,
@@ -997,11 +1560,94 @@ impl Config {
             &mut self.logging.max_container_log_line_size,
         )?;
 
-        self.normalize_runtime_settings();
+        apply_bool_override("CRIUS_ENABLE_METRICS", &mut self.metrics.enable)?;
+        apply_string_override("CRIUS_METRICS_HOST", &mut self.metrics.host);
+        apply_u16_override("CRIUS_METRICS_PORT", &mut self.metrics.port)?;
+        apply_string_override("CRIUS_METRICS_SOCKET", &mut self.metrics.socket_path);
+        apply_bool_override("CRIUS_METRICS_ENABLE_TLS", &mut self.metrics.enable_tls)?;
+        apply_string_override("CRIUS_METRICS_TLS_CERT", &mut self.metrics.tls_cert_file);
+        apply_string_override("CRIUS_METRICS_TLS_KEY", &mut self.metrics.tls_key_file);
+        apply_string_override("CRIUS_METRICS_TLS_CA", &mut self.metrics.tls_ca_file);
+        apply_string_override(
+            "CRIUS_METRICS_TLS_MIN_VERSION",
+            &mut self.metrics.tls_min_version,
+        );
+        apply_csv_override(
+            "CRIUS_METRICS_TLS_CIPHER_SUITES",
+            &mut self.metrics.tls_cipher_suites,
+        );
+        apply_csv_override("CRIUS_METRICS_COLLECTORS", &mut self.metrics.collectors);
+
+        apply_bool_override("CRIUS_ENABLE_TRACING", &mut self.tracing.enable)?;
+        apply_string_override("CRIUS_TRACING_ENDPOINT", &mut self.tracing.endpoint);
+        apply_u32_override(
+            "CRIUS_TRACING_SAMPLING_RATE_PER_MILLION",
+            &mut self.tracing.sampling_rate_per_million,
+        )?;
+
+        apply_bool_override("CRIUS_ENABLE_NRI", &mut self.nri.enable)?;
+        apply_bool_override("CRIUS_ENABLE_CDI", &mut self.nri.enable_cdi)?;
+        apply_colon_dirs_override("CRIUS_CDI_SPEC_DIRS", &mut self.nri.cdi_spec_dirs);
+
+        self.normalize_derived_settings();
         self.validate()
     }
 
     fn normalize_runtime_settings(&mut self) {
+        let runtime_state_dir = PathBuf::from(self.runtime.root.trim());
+        let persistent_root_dir = PathBuf::from(self.root.trim());
+        rewrite_default_string(
+            &mut self.api.listen,
+            &[DEFAULT_CRI_SOCKET_URI],
+            format!("unix://{}", runtime_state_dir.join("crius.sock").display()),
+        );
+        rewrite_default_string(
+            &mut self.runtime.shim_dir,
+            &[DEFAULT_RUNTIME_SHIM_DIR, LEGACY_RUNTIME_SHIM_DIR],
+            runtime_state_dir.join("shims").display().to_string(),
+        );
+        rewrite_default_string(
+            &mut self.runtime.attach_socket_dir,
+            &[
+                DEFAULT_RUNTIME_ATTACH_SOCKET_DIR,
+                LEGACY_RUNTIME_ATTACH_SOCKET_DIR,
+            ],
+            runtime_state_dir.join("shims").display().to_string(),
+        );
+        rewrite_default_string(
+            &mut self.runtime.container_exits_dir,
+            &[
+                DEFAULT_RUNTIME_CONTAINER_EXITS_DIR,
+                LEGACY_RUNTIME_CONTAINER_EXITS_DIR,
+            ],
+            runtime_state_dir.join("exits").display().to_string(),
+        );
+        rewrite_default_string(
+            &mut self.runtime.clean_shutdown_file,
+            &[
+                DEFAULT_RUNTIME_CLEAN_SHUTDOWN_FILE,
+                LEGACY_RUNTIME_CLEAN_SHUTDOWN_FILE,
+            ],
+            persistent_root_dir
+                .join("clean.shutdown")
+                .display()
+                .to_string(),
+        );
+        rewrite_default_string(
+            &mut self.runtime.version_file,
+            &[DEFAULT_RUNTIME_VERSION_FILE],
+            runtime_state_dir.join("version").display().to_string(),
+        );
+        rewrite_default_string(
+            &mut self.runtime.version_file_persist,
+            &[DEFAULT_RUNTIME_VERSION_FILE_PERSIST],
+            persistent_root_dir.join("version").display().to_string(),
+        );
+        rewrite_default_string(
+            &mut self.nri.socket_path,
+            &[DEFAULT_NRI_SOCKET_PATH, LEGACY_VAR_RUN_NRI_SOCKET_PATH],
+            runtime_state_dir.join("nri.sock").display().to_string(),
+        );
         self.runtime.container_stop_timeout = self
             .runtime
             .container_stop_timeout
@@ -1020,6 +1666,15 @@ impl Config {
         ensure_non_empty("root", &self.root)?;
         ensure_non_empty("api.listen", &self.api.listen)?;
         validate_listen_address(&self.api.listen, self.api.allow_tcp_service)?;
+        for alias in &self.api.listen_aliases {
+            validate_unix_listen_address("api.listen_aliases", alias)?;
+            if alias == &self.api.listen {
+                return Err(Error::Config(format!(
+                    "api.listen_aliases must not repeat api.listen {}",
+                    self.api.listen
+                )));
+            }
+        }
         if self.api.grpc_max_send_msg_size == 0 {
             return Err(Error::Config(
                 "api.grpc_max_send_msg_size must be greater than zero".to_string(),
@@ -1038,10 +1693,32 @@ impl Config {
 
         ensure_non_empty("runtime.runtime_type", &self.runtime.runtime_type)?;
         ensure_non_empty("runtime.runtime_path", &self.runtime.runtime_path)?;
+        validate_optional_existing_absolute_path(
+            "runtime.runtime_config_path",
+            &self.runtime.runtime_config_path,
+        )?;
+        validate_optional_existing_absolute_path(
+            "runtime.base_runtime_spec",
+            &self.runtime.base_runtime_spec,
+        )?;
         ensure_non_empty("runtime.root", &self.runtime.root)?;
+        validate_platform_runtime_paths(
+            "runtime.platform_runtime_paths",
+            &self.runtime.platform_runtime_paths,
+        )?;
         ensure_non_empty("runtime.pause_image", &self.runtime.pause_image)?;
         ensure_non_empty("runtime.pause_command", &self.runtime.pause_command)?;
+        validate_optional_existing_absolute_path("runtime.pinns_path", &self.runtime.pinns_path)?;
+        if self.runtime.drop_infra_ctr {
+            return Err(Error::Config(
+                "runtime.drop_infra_ctr=true is not supported by crius; infra/pause containers are always required for pod lifecycle, status, and recovery".to_string(),
+            ));
+        }
         ensure_non_empty("runtime.shim_path", &self.runtime.shim_path)?;
+        resolve_monitor_cgroup(
+            self.runtime.monitor_cgroup.as_str(),
+            self.runtime.effective_cgroup_driver(),
+        )?;
         ensure_non_empty("runtime.shim_dir", &self.runtime.shim_dir)?;
         validate_monitor_env_list("runtime.monitor_env", &self.runtime.monitor_env)?;
         validate_monitor_env_list("runtime.default_env", &self.runtime.default_env)?;
@@ -1050,13 +1727,37 @@ impl Config {
             &self.runtime.default_capabilities,
         )?;
         validate_sysctl_assignments("runtime.default_sysctls", &self.runtime.default_sysctls)?;
+        validate_ulimit_assignments("runtime.default_ulimits", &self.runtime.default_ulimits)?;
+        validate_allowed_devices("runtime.allowed_devices", &self.runtime.allowed_devices)?;
+        validate_additional_devices(
+            "runtime.additional_devices",
+            &self.runtime.additional_devices,
+        )?;
+        validate_optional_existing_absolute_path(
+            "runtime.default_mounts_file",
+            &self.runtime.default_mounts_file,
+        )?;
+        validate_absolute_path_list("runtime.hooks_dir", &self.runtime.hooks_dir)?;
+        validate_absolute_path_list(
+            "runtime.absent_mount_sources_to_reject",
+            &self.runtime.absent_mount_sources_to_reject,
+        )?;
+        validate_timezone("runtime.timezone", &self.runtime.timezone)?;
         validate_optional_seccomp_profile_path(
-            "runtime.seccomp_profile",
-            &self.runtime.seccomp_profile,
+            "security.seccomp_profile",
+            &self.security.seccomp_profile,
         )?;
         validate_seccomp_profile_selector(
-            "runtime.unset_seccomp_profile",
-            &self.runtime.unset_seccomp_profile,
+            "security.privileged_seccomp_profile",
+            &self.security.privileged_seccomp_profile,
+        )?;
+        validate_seccomp_profile_selector(
+            "security.unset_seccomp_profile",
+            &self.security.unset_seccomp_profile,
+        )?;
+        ensure_non_empty(
+            "security.apparmor_default_profile",
+            &self.security.apparmor_default_profile,
         )?;
         ensure_non_empty("runtime.attach_socket_dir", &self.runtime.attach_socket_dir)?;
         ensure_non_empty(
@@ -1077,6 +1778,8 @@ impl Config {
                 "runtime.pids_limit must be -1 or greater than zero".to_string(),
             ));
         }
+        validate_cpu_set_string("runtime.infra_ctr_cpuset", &self.runtime.infra_ctr_cpuset)?;
+        validate_cpu_set_string("runtime.shared_cpuset", &self.runtime.shared_cpuset)?;
         if self.runtime.minimum_mappable_uid < -1 {
             return Err(Error::Config(
                 "runtime.minimum_mappable_uid must be -1 or greater".to_string(),
@@ -1100,6 +1803,25 @@ impl Config {
                     other
                 )));
             }
+        }
+        if !self.runtime.irqbalance_config_file.trim().is_empty()
+            && !Path::new(self.runtime.irqbalance_config_file.trim()).is_absolute()
+        {
+            return Err(Error::Config(
+                "runtime.irqbalance_config_file must be an absolute path when set".to_string(),
+            ));
+        }
+        if !self
+            .runtime
+            .irqbalance_config_restore_file
+            .trim()
+            .is_empty()
+            && self.runtime.irqbalance_config_restore_file.trim() != "disable"
+            && !Path::new(self.runtime.irqbalance_config_restore_file.trim()).is_absolute()
+        {
+            return Err(Error::Config(
+                "runtime.irqbalance_config_restore_file must be an absolute path or \"disable\" when set".to_string(),
+            ));
         }
         if !self.runtime.bind_mount_prefix.trim().is_empty()
             && !Path::new(self.runtime.bind_mount_prefix.trim()).is_absolute()
@@ -1131,6 +1853,27 @@ impl Config {
             ));
         }
 
+        ensure_non_empty(
+            "security.privileged_seccomp_profile",
+            &self.security.privileged_seccomp_profile,
+        )?;
+        ensure_non_empty(
+            "security.unset_seccomp_profile",
+            &self.security.unset_seccomp_profile,
+        )?;
+        if !self.security.seccomp_profile.trim().is_empty()
+            && !Path::new(self.security.seccomp_profile.trim()).is_absolute()
+        {
+            return Err(Error::Config(
+                "security.seccomp_profile must be an absolute path when set".to_string(),
+            ));
+        }
+        if self.security.selinux_category_range == 0 {
+            return Err(Error::Config(
+                "security.selinux_category_range must be greater than zero".to_string(),
+            ));
+        }
+
         ensure_non_empty("image.driver", &self.image.driver)?;
         ensure_non_empty("image.root", &self.image.root)?;
         if self.image.driver.trim() != "overlay" {
@@ -1144,6 +1887,184 @@ impl Config {
         {
             return Err(Error::Config(
                 "image.global_auth_file must be an absolute path when set".to_string(),
+            ));
+        }
+        if !self.image.namespaced_auth_dir.trim().is_empty()
+            && !Path::new(self.image.namespaced_auth_dir.trim()).is_absolute()
+        {
+            return Err(Error::Config(
+                "image.namespaced_auth_dir must be an absolute path when set".to_string(),
+            ));
+        }
+        match self.image.default_transport.trim() {
+            "" | "docker://" => {}
+            other => {
+                return Err(Error::Config(format!(
+                    "image.default_transport must be empty or \"docker://\", got {}",
+                    other
+                )));
+            }
+        }
+        match self.image.short_name_mode.trim() {
+            "disabled" | "enforcing" => {}
+            other => {
+                return Err(Error::Config(format!(
+                    "image.short_name_mode must be \"disabled\" or \"enforcing\", got {}",
+                    other
+                )));
+            }
+        }
+        if self.image.max_concurrent_downloads == 0 {
+            return Err(Error::Config(
+                "image.max_concurrent_downloads must be greater than zero".to_string(),
+            ));
+        }
+        if !self.image.registry_config_dir.trim().is_empty()
+            && !Path::new(self.image.registry_config_dir.trim()).is_absolute()
+        {
+            return Err(Error::Config(
+                "image.registry_config_dir must be an absolute path when set".to_string(),
+            ));
+        }
+        if !self.image.decryption_keys_path.trim().is_empty()
+            && !Path::new(self.image.decryption_keys_path.trim()).is_absolute()
+        {
+            return Err(Error::Config(
+                "image.decryption_keys_path must be an absolute path when set".to_string(),
+            ));
+        }
+        ensure_non_empty(
+            "image.decryption_decoder_path",
+            &self.image.decryption_decoder_path,
+        )?;
+        if !self.image.decryption_keyprovider_config.trim().is_empty()
+            && !Path::new(self.image.decryption_keyprovider_config.trim()).is_absolute()
+        {
+            return Err(Error::Config(
+                "image.decryption_keyprovider_config must be an absolute path when set".to_string(),
+            ));
+        }
+        if self
+            .image
+            .additional_artifact_stores
+            .iter()
+            .any(|path| path.trim().is_empty())
+        {
+            return Err(Error::Config(
+                "image.additional_artifact_stores entries must not be empty".to_string(),
+            ));
+        }
+        for store in &self.image.additional_artifact_stores {
+            if !Path::new(store.trim()).is_absolute() {
+                return Err(Error::Config(format!(
+                    "image.additional_artifact_stores entry must be an absolute path, got {}",
+                    store
+                )));
+            }
+        }
+        if !self.image.signature_policy.trim().is_empty()
+            && !Path::new(self.image.signature_policy.trim()).is_absolute()
+        {
+            return Err(Error::Config(
+                "image.signature_policy must be an absolute path when set".to_string(),
+            ));
+        }
+        if !self.image.signature_policy_dir.trim().is_empty()
+            && !Path::new(self.image.signature_policy_dir.trim()).is_absolute()
+        {
+            return Err(Error::Config(
+                "image.signature_policy_dir must be an absolute path when set".to_string(),
+            ));
+        }
+        if !self.image.storage_options.is_empty() {
+            return Err(Error::Config(
+                "image.storage_options is not supported by crius yet; overlay image storage uses fixed backend parameters".to_string(),
+            ));
+        }
+        match self.image.image_volumes.trim() {
+            "mkdir" | "bind" | "ignore" => {}
+            other => {
+                return Err(Error::Config(format!(
+                    "image.image_volumes must be \"mkdir\", \"bind\", or \"ignore\", got {}",
+                    other
+                )));
+            }
+        }
+        if self
+            .image
+            .pinned_images
+            .iter()
+            .any(|pattern| pattern.trim().is_empty())
+        {
+            return Err(Error::Config(
+                "image.pinned_images entries must not be empty".to_string(),
+            ));
+        }
+        if !self.image.big_files_temporary_dir.trim().is_empty()
+            && !Path::new(self.image.big_files_temporary_dir.trim()).is_absolute()
+        {
+            return Err(Error::Config(
+                "image.big_files_temporary_dir must be an absolute path when set".to_string(),
+            ));
+        }
+
+        if self.metrics.enable {
+            let using_socket = !self.metrics.socket_path.trim().is_empty();
+            if using_socket {
+                if !Path::new(self.metrics.socket_path.trim()).is_absolute() {
+                    return Err(Error::Config(
+                        "metrics.socket_path must be an absolute path when set".to_string(),
+                    ));
+                }
+            } else if self.metrics.host.trim().is_empty() {
+                return Err(Error::Config(
+                    "metrics.host must not be empty when metrics.enable is true".to_string(),
+                ));
+            }
+            if self.metrics.enable_tls {
+                if using_socket {
+                    return Err(Error::Config(
+                        "metrics.enable_tls is only supported for TCP listeners".to_string(),
+                    ));
+                }
+                for (field, value) in [
+                    ("metrics.tls_cert_file", self.metrics.tls_cert_file.trim()),
+                    ("metrics.tls_key_file", self.metrics.tls_key_file.trim()),
+                ] {
+                    if value.is_empty() {
+                        return Err(Error::Config(format!(
+                            "{field} must not be empty when metrics.enable_tls is true"
+                        )));
+                    }
+                    if !Path::new(value).is_absolute() {
+                        return Err(Error::Config(format!("{field} must be an absolute path")));
+                    }
+                }
+            }
+            if !self.metrics.tls_ca_file.trim().is_empty()
+                && !Path::new(self.metrics.tls_ca_file.trim()).is_absolute()
+            {
+                return Err(Error::Config(
+                    "metrics.tls_ca_file must be an absolute path when set".to_string(),
+                ));
+            }
+            if !matches!(
+                self.metrics.tls_min_version.trim(),
+                "VersionTLS12" | "VersionTLS13"
+            ) {
+                return Err(Error::Config(
+                    "metrics.tls_min_version must be VersionTLS12 or VersionTLS13".to_string(),
+                ));
+            }
+            validate_metrics_collectors(&self.metrics.collectors)?;
+        }
+
+        if self.tracing.enable {
+            ensure_non_empty("tracing.endpoint", &self.tracing.endpoint)?;
+        }
+        if self.tracing.sampling_rate_per_million > 1_000_000 {
+            return Err(Error::Config(
+                "tracing.sampling_rate_per_million must be between 0 and 1000000".to_string(),
             ));
         }
 
@@ -1172,11 +2093,26 @@ impl Config {
                     monitor_env,
                 )?;
             }
+            validate_runtime_snapshotter(
+                &format!("runtime.runtimes.{handler}.snapshotter"),
+                &handler_config.snapshotter,
+            )?;
             if !handler_config.monitor_path.trim().is_empty() {
                 ensure_non_empty(
                     &format!("runtime.runtimes.{handler}.monitor_path"),
                     &handler_config.monitor_path,
                 )?;
+            }
+            validate_optional_existing_absolute_path(
+                &format!("runtime.runtimes.{handler}.runtime_config_path"),
+                &handler_config.runtime_config_path,
+            )?;
+            validate_platform_runtime_paths(
+                &format!("runtime.runtimes.{handler}.platform_runtime_paths"),
+                &handler_config.platform_runtime_paths,
+            )?;
+            if let Some(monitor_cgroup) = handler_config.monitor_cgroup.as_deref() {
+                resolve_monitor_cgroup(monitor_cgroup, self.runtime.effective_cgroup_driver())?;
             }
             validate_annotation_prefix_list(
                 &format!("runtime.runtimes.{handler}.allowed_annotations"),
@@ -1205,7 +2141,29 @@ impl Config {
             ensure_non_empty("logging.file", file)?;
         }
 
+        ensure_vec_non_empty("nri.cdi_spec_dirs", &self.nri.cdi_spec_dirs)?;
+        for dir in &self.nri.cdi_spec_dirs {
+            ensure_non_empty("nri.cdi_spec_dirs", dir)?;
+            if !Path::new(dir.trim()).is_absolute() {
+                return Err(Error::Config(format!(
+                    "nri.cdi_spec_dirs entry must be an absolute path, got {}",
+                    dir.trim()
+                )));
+            }
+        }
+
         Ok(())
+    }
+}
+
+fn rewrite_default_string(target: &mut String, current_defaults: &[&str], replacement: String) {
+    let trimmed = target.trim();
+    if trimmed.is_empty()
+        || current_defaults
+            .iter()
+            .any(|candidate| trimmed == *candidate)
+    {
+        *target = replacement;
     }
 }
 
@@ -1452,6 +2410,71 @@ fn validate_included_pod_metrics(values: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn validate_metrics_collectors(values: &[String]) -> Result<()> {
+    const ALLOWED: &[&str] = &["runtime", "resources", "images"];
+    if values.is_empty() {
+        return Err(Error::Config(
+            "metrics.collectors must contain at least one collector".to_string(),
+        ));
+    }
+    for value in values {
+        let normalized = value.trim();
+        if !ALLOWED.contains(&normalized) {
+            return Err(Error::Config(format!(
+                "invalid metrics collector {normalized}; available collectors: {:?}",
+                ALLOWED
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_snapshotter(name: &str, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if matches!(trimmed, "internal-overlay-untar" | "internal-cached-rootfs") {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "{name} must be empty, \"internal-overlay-untar\", or \"internal-cached-rootfs\", got {trimmed}"
+    )))
+}
+
+fn validate_cpu_set_string(field: &str, value: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+
+    for entry in value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        if let Some((start, end)) = entry.split_once('-') {
+            let start = start.trim().parse::<u32>().map_err(|_| {
+                Error::Config(format!("{field} contains invalid CPU range start: {entry}"))
+            })?;
+            let end = end.trim().parse::<u32>().map_err(|_| {
+                Error::Config(format!("{field} contains invalid CPU range end: {entry}"))
+            })?;
+            if start > end {
+                return Err(Error::Config(format!(
+                    "{field} contains descending CPU range: {entry}"
+                )));
+            }
+        } else {
+            entry.parse::<u32>().map_err(|_| {
+                Error::Config(format!("{field} contains invalid CPU entry: {entry}"))
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 fn ensure_non_empty(name: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         return Err(Error::Config(format!("{name} must not be empty")));
@@ -1519,9 +2542,7 @@ fn validate_seccomp_profile_selector(name: &str, value: &str) -> Result<()> {
 fn validate_annotation_prefix_list(name: &str, values: &[String]) -> Result<()> {
     for value in values {
         if value.trim().is_empty() {
-            return Err(Error::Config(format!(
-                "{name} entries must not be empty"
-            )));
+            return Err(Error::Config(format!("{name} entries must not be empty")));
         }
     }
     Ok(())
@@ -1530,14 +2551,10 @@ fn validate_annotation_prefix_list(name: &str, values: &[String]) -> Result<()> 
 fn validate_annotation_map(name: &str, values: &HashMap<String, String>) -> Result<()> {
     for (key, value) in values {
         if key.trim().is_empty() {
-            return Err(Error::Config(format!(
-                "{name} keys must not be empty"
-            )));
+            return Err(Error::Config(format!("{name} keys must not be empty")));
         }
         if value.trim().is_empty() {
-            return Err(Error::Config(format!(
-                "{name}.{key} must not be empty"
-            )));
+            return Err(Error::Config(format!("{name}.{key} must not be empty")));
         }
     }
     Ok(())
@@ -1546,9 +2563,7 @@ fn validate_annotation_map(name: &str, values: &HashMap<String, String>) -> Resu
 fn validate_capability_list(name: &str, values: &[String]) -> Result<()> {
     for value in values {
         if value.trim().is_empty() {
-            return Err(Error::Config(format!(
-                "{name} entries must not be empty"
-            )));
+            return Err(Error::Config(format!("{name} entries must not be empty")));
         }
     }
     Ok(())
@@ -1557,10 +2572,107 @@ fn validate_capability_list(name: &str, values: &[String]) -> Result<()> {
 fn validate_sysctl_assignments(name: &str, values: &[String]) -> Result<()> {
     for value in values {
         parse_sysctl_assignment(value).map_err(|message| {
-            Error::Config(format!("{name} contains invalid entry {value:?}: {message}"))
+            Error::Config(format!(
+                "{name} contains invalid entry {value:?}: {message}"
+            ))
         })?;
     }
     Ok(())
+}
+
+fn validate_ulimit_assignments(name: &str, values: &[String]) -> Result<()> {
+    for value in values {
+        parse_ulimit_assignment(value).map_err(|message| {
+            Error::Config(format!(
+                "{name} contains invalid entry {value:?}: {message}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_allowed_devices(name: &str, values: &[String]) -> Result<()> {
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(Error::Config(format!("{name} entries must not be empty")));
+        }
+        if !Path::new(trimmed).is_absolute() {
+            return Err(Error::Config(format!(
+                "{name} contains non-absolute device path {trimmed}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_additional_devices(name: &str, values: &[String]) -> Result<()> {
+    for value in values {
+        parse_additional_device(value).map_err(|message| {
+            Error::Config(format!(
+                "{name} contains invalid entry {value:?}: {message}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn parse_additional_device(value: &str) -> std::result::Result<(String, String, String), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("entry must not be empty".to_string());
+    }
+
+    let parts: Vec<&str> = trimmed.split(':').collect();
+    if parts.len() > 3 {
+        return Err("expected /src[:/dst[:rwm]] format".to_string());
+    }
+
+    let source = parts[0].trim();
+    if source.is_empty() || !Path::new(source).is_absolute() {
+        return Err("source path must be an absolute path".to_string());
+    }
+
+    let mut destination = source.to_string();
+    let mut permissions = "rwm".to_string();
+
+    if let Some(second) = parts.get(1) {
+        let second = second.trim();
+        if !second.is_empty() {
+            if second.starts_with('/') {
+                destination = second.to_string();
+            } else {
+                permissions = parse_device_permissions(second)?;
+            }
+        }
+    }
+
+    if let Some(third) = parts.get(2) {
+        permissions = parse_device_permissions(third.trim())?;
+    }
+
+    if !destination.starts_with("/dev/") {
+        return Err("destination path must live under /dev".to_string());
+    }
+
+    Ok((source.to_string(), destination, permissions))
+}
+
+fn parse_device_permissions(value: &str) -> std::result::Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("device permissions must not be empty".to_string());
+    }
+    let mut seen = HashSet::new();
+    for ch in trimmed.chars() {
+        if !matches!(ch, 'r' | 'w' | 'm') {
+            return Err(format!("invalid device permission character {ch}"));
+        }
+        if !seen.insert(ch) {
+            return Err(format!("duplicate device permission character {ch}"));
+        }
+    }
+    Ok(trimmed.to_string())
 }
 
 fn parse_sysctl_assignment(value: &str) -> std::result::Result<(String, String), String> {
@@ -1583,6 +2695,67 @@ fn parse_sysctl_assignment(value: &str) -> std::result::Result<(String, String),
     Ok((key.to_string(), raw_value.to_string()))
 }
 
+fn parse_ulimit_assignment(value: &str) -> std::result::Result<crate::oci::spec::Rlimit, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("entry must not be empty".to_string());
+    }
+    let (name, limits) = trimmed
+        .split_once('=')
+        .ok_or_else(|| "expected name=soft:hard format".to_string())?;
+    let (soft, hard) = limits
+        .split_once(':')
+        .ok_or_else(|| "expected name=soft:hard format".to_string())?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name must not be empty".to_string());
+    }
+    let soft = soft
+        .trim()
+        .parse::<u64>()
+        .map_err(|err| format!("invalid soft limit: {err}"))?;
+    let hard = hard
+        .trim()
+        .parse::<u64>()
+        .map_err(|err| format!("invalid hard limit: {err}"))?;
+    let upper = name.to_ascii_uppercase();
+    let rtype = if upper.starts_with("RLIMIT_") {
+        upper
+    } else {
+        format!("RLIMIT_{upper}")
+    };
+    Ok(crate::oci::spec::Rlimit { rtype, soft, hard })
+}
+
+fn validate_timezone(name: &str, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "Local" {
+        return Ok(());
+    }
+    if trimmed.starts_with('/') {
+        return Err(Error::Config(format!(
+            "{name} must be empty, \"Local\", or an IANA timezone name"
+        )));
+    }
+    if trimmed
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(Error::Config(format!(
+            "{name} must be a valid IANA timezone path"
+        )));
+    }
+    let zoneinfo = Path::new("/usr/share/zoneinfo").join(trimmed);
+    if !zoneinfo.exists() {
+        return Err(Error::Config(format!(
+            "invalid timezone {}: {} does not exist",
+            trimmed,
+            zoneinfo.display()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_listen_address(listen: &str, allow_tcp_service: bool) -> Result<()> {
     if let Some(path) = listen.strip_prefix("unix://") {
         return ensure_non_empty("api.listen", path);
@@ -1601,10 +2774,141 @@ fn validate_listen_address(listen: &str, allow_tcp_service: bool) -> Result<()> 
     Ok(())
 }
 
+fn validate_unix_listen_address(field_name: &str, listen: &str) -> Result<()> {
+    let Some(path) = listen.strip_prefix("unix://") else {
+        return Err(Error::Config(format!(
+            "{field_name} value {listen} must use unix://"
+        )));
+    };
+    ensure_non_empty(field_name, path)
+}
+
 fn validate_log_filter(filter: &str) -> Result<()> {
     tracing_subscriber::EnvFilter::try_new(filter)
         .map(|_| ())
         .map_err(|err| Error::Config(format!("invalid logging.level {filter}: {err}")))
+}
+
+fn detect_system_cgroup_driver() -> CgroupDriverConfig {
+    let systemd_active = Path::new("/run/systemd/system").exists()
+        || std::fs::read_to_string("/proc/1/comm")
+            .map(|content| content.trim() == "systemd")
+            .unwrap_or(false);
+    let cgroup_v2 = Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
+    let systemd_cgroup_layout = Path::new("/sys/fs/cgroup/system.slice").exists()
+        || Path::new("/sys/fs/cgroup/user.slice").exists()
+        || Path::new("/sys/fs/cgroup/systemd").exists();
+
+    if systemd_active && (cgroup_v2 || systemd_cgroup_layout) {
+        CgroupDriverConfig::Systemd
+    } else {
+        CgroupDriverConfig::Cgroupfs
+    }
+}
+
+fn current_platform_key() -> String {
+    format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn resolve_platform_runtime_path(
+    default_runtime_path: &str,
+    platform_runtime_paths: &HashMap<String, String>,
+) -> Result<String> {
+    let default_runtime_path = default_runtime_path.trim();
+    let selected = platform_runtime_paths
+        .get(&current_platform_key())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_runtime_path);
+    if selected.is_empty() {
+        return Err(Error::Config(format!(
+            "runtime path for platform {} must not be empty",
+            current_platform_key()
+        )));
+    }
+    Ok(selected.to_string())
+}
+
+fn resolve_monitor_cgroup(raw: &str, cgroup_driver: CgroupDriverConfig) -> Result<String> {
+    let trimmed = raw.trim();
+    match cgroup_driver {
+        CgroupDriverConfig::Systemd => {
+            if trimmed.is_empty() {
+                return Ok("system.slice".to_string());
+            }
+            if trimmed == "pod" || trimmed.ends_with(".slice") {
+                return Ok(trimmed.to_string());
+            }
+            Err(Error::Config(format!(
+                "monitor cgroup should be \"pod\", empty, or a systemd slice ending with .slice, got {trimmed}"
+            )))
+        }
+        CgroupDriverConfig::Cgroupfs => {
+            if trimmed.is_empty() || trimmed == "pod" {
+                return Ok(trimmed.to_string());
+            }
+            Err(Error::Config(format!(
+                "monitor cgroup should be \"pod\" or empty for cgroupfs, got {trimmed}"
+            )))
+        }
+    }
+}
+
+fn validate_optional_existing_absolute_path(name: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Ok(());
+    }
+    let path = Path::new(value.trim());
+    if !path.is_absolute() {
+        return Err(Error::Config(format!(
+            "{name} must be an absolute path when set"
+        )));
+    }
+    if !path.exists() {
+        return Err(Error::Config(format!(
+            "{name} does not exist: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_platform_runtime_paths(name: &str, values: &HashMap<String, String>) -> Result<()> {
+    for (platform, path) in values {
+        let platform = platform.trim();
+        let path = path.trim();
+        if platform.is_empty() {
+            return Err(Error::Config(format!(
+                "{name} contains an empty platform key"
+            )));
+        }
+        if !platform.contains('/') {
+            return Err(Error::Config(format!(
+                "{name}.{platform} must use os/arch format"
+            )));
+        }
+        if path.is_empty() {
+            return Err(Error::Config(format!(
+                "{name}.{platform} must not be empty"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_absolute_path_list(name: &str, values: &[String]) -> Result<()> {
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(Error::Config(format!("{name} entries must not be empty")));
+        }
+        if !Path::new(trimmed).is_absolute() {
+            return Err(Error::Config(format!(
+                "{name} entry must be an absolute path, got {trimmed}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1638,14 +2942,21 @@ mod tests {
                     RuntimeHandlerConfig {
                         runtime_path: "/usr/bin/kata-runtime".to_string(),
                         runtime_root: "/run/crius/kata".to_string(),
+                        runtime_config_path: String::new(),
+                        platform_runtime_paths: HashMap::new(),
                         monitor_path: "/usr/bin/kata-shim".to_string(),
+                        monitor_cgroup: None,
                         monitor_env: Some(vec!["RUST_LOG=debug".to_string()]),
+                        stream_websockets: None,
                         allowed_annotations: vec!["io.example.runtime/".to_string()],
                         default_annotations: HashMap::from([(
                             "io.example.runtime/default".to_string(),
                             "kata".to_string(),
                         )]),
+                        privileged_without_host_devices: false,
+                        privileged_without_host_devices_all_devices_allowed: false,
                         container_create_timeout: Some(15),
+                        snapshotter: "internal-cached-rootfs".to_string(),
                         cni_conf_dir: String::new(),
                         cni_max_conf_num: None,
                         inherit_default_runtime: false,
@@ -1663,43 +2974,66 @@ mod tests {
         };
 
         let resolved = config.resolved_runtimes().unwrap();
+        let expected_monitor_cgroup =
+            resolve_monitor_cgroup("", config.effective_cgroup_driver()).unwrap();
         assert_eq!(
             resolved.get("runc"),
             Some(&ResolvedRuntimeHandlerConfig {
                 runtime_path: "/usr/bin/runc".to_string(),
+                runtime_config_path: String::new(),
                 runtime_root: "/run/crius".to_string(),
+                platform_runtime_paths: HashMap::new(),
                 monitor_path: "/usr/bin/crius-shim".to_string(),
+                monitor_cgroup: expected_monitor_cgroup.clone(),
                 monitor_env: vec!["PATH=/usr/bin".to_string()],
+                stream_websockets: false,
                 allowed_annotations: Vec::new(),
                 default_annotations: HashMap::new(),
+                privileged_without_host_devices: false,
+                privileged_without_host_devices_all_devices_allowed: false,
                 container_create_timeout: DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS,
+                snapshotter: "internal-overlay-untar".to_string(),
             })
         );
         assert_eq!(
             resolved.get("kata"),
             Some(&ResolvedRuntimeHandlerConfig {
                 runtime_path: "/usr/bin/kata-runtime".to_string(),
+                runtime_config_path: String::new(),
                 runtime_root: "/run/crius/kata".to_string(),
+                platform_runtime_paths: HashMap::new(),
                 monitor_path: "/usr/bin/kata-shim".to_string(),
+                monitor_cgroup: expected_monitor_cgroup.clone(),
                 monitor_env: vec!["RUST_LOG=debug".to_string()],
+                stream_websockets: false,
                 allowed_annotations: vec!["io.example.runtime/".to_string()],
                 default_annotations: HashMap::from([(
                     "io.example.runtime/default".to_string(),
                     "kata".to_string(),
                 )]),
+                privileged_without_host_devices: false,
+                privileged_without_host_devices_all_devices_allowed: false,
                 container_create_timeout: MIN_CONTAINER_CREATE_TIMEOUT_SECS,
+                snapshotter: "internal-cached-rootfs".to_string(),
             })
         );
         assert_eq!(
             resolved.get("crun"),
             Some(&ResolvedRuntimeHandlerConfig {
                 runtime_path: "/usr/bin/runc".to_string(),
+                runtime_config_path: String::new(),
                 runtime_root: "/run/crius".to_string(),
+                platform_runtime_paths: HashMap::new(),
                 monitor_path: "/usr/bin/crius-shim".to_string(),
+                monitor_cgroup: expected_monitor_cgroup,
                 monitor_env: vec!["PATH=/usr/bin".to_string()],
+                stream_websockets: false,
                 allowed_annotations: Vec::new(),
                 default_annotations: HashMap::new(),
+                privileged_without_host_devices: false,
+                privileged_without_host_devices_all_devices_allowed: false,
                 container_create_timeout: DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS,
+                snapshotter: "internal-overlay-untar".to_string(),
             })
         );
     }
@@ -1823,6 +3157,23 @@ mod tests {
     }
 
     #[test]
+    fn network_config_accepts_teardown_timeout() {
+        let config: Config = toml::from_str(
+            r#"
+            root = "/var/lib/crius"
+
+            [network]
+            plugin = "cni"
+            teardown_timeout = "90s"
+            "#,
+        )
+        .expect("teardown_timeout should deserialize");
+
+        assert_eq!(config.network.teardown_timeout.as_secs(), 90);
+        assert_eq!(config.network.cni_config().teardown_timeout().as_secs(), 90);
+    }
+
+    #[test]
     fn runtime_handler_config_accepts_cni_conf_dir() {
         let config: Config = toml::from_str(
             r#"
@@ -1937,6 +3288,214 @@ mod tests {
     }
 
     #[test]
+    fn runtime_handler_config_accepts_runtime_config_path() {
+        let dir = tempdir().unwrap();
+        let runtime_config_path = dir.path().join("kata-config.toml");
+        fs::write(&runtime_config_path, "sandbox = true\n").unwrap();
+        let config_path = dir.path().join("crius.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+                root = "/var/lib/crius"
+
+                [runtime]
+                runtime_type = "runc"
+                runtime_path = "/usr/bin/runc"
+                root = "/run/crius"
+                handlers = ["runc", "kata"]
+
+                [runtime.runtimes.kata]
+                runtime_path = "/usr/bin/kata-runtime"
+                runtime_root = "/run/crius/kata"
+                runtime_config_path = "{}"
+                "#,
+                runtime_config_path.display()
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).expect("handler runtime_config_path should load");
+        assert_eq!(
+            config.runtime.runtimes["kata"].runtime_config_path,
+            runtime_config_path.display().to_string()
+        );
+    }
+
+    #[test]
+    fn runtime_config_accepts_default_mounts_file_and_reject_list() {
+        let dir = tempdir().unwrap();
+        let mounts_path = dir.path().join("mounts.conf");
+        fs::write(&mounts_path, "/etc/hosts:/run/hosts\n").unwrap();
+        let config_path = dir.path().join("crius.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+                root = "/var/lib/crius"
+
+                [runtime]
+                runtime_type = "runc"
+                runtime_path = "/usr/bin/runc"
+                root = "/run/crius"
+                handlers = ["runc"]
+                default_mounts_file = "{}"
+                absent_mount_sources_to_reject = ["/etc/hostname"]
+                "#,
+                mounts_path.display()
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).expect("mount policy config should load");
+        assert_eq!(
+            config.runtime.default_mounts_file,
+            mounts_path.display().to_string()
+        );
+        assert_eq!(
+            config.runtime.absent_mount_sources_to_reject,
+            vec!["/etc/hostname".to_string()]
+        );
+    }
+
+    #[test]
+    fn runtime_config_accepts_base_spec_timezone_and_default_ulimits() {
+        let dir = tempdir().unwrap();
+        let base_spec = dir.path().join("base-spec.json");
+        fs::write(
+            &base_spec,
+            r#"{"ociVersion":"1.0.2","process":{"args":["/bin/sh"],"cwd":"/"}}"#,
+        )
+        .unwrap();
+        let config_path = dir.path().join("crius.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+                root = "/var/lib/crius"
+
+                [runtime]
+                runtime_type = "runc"
+                runtime_path = "/usr/bin/runc"
+                root = "/run/crius"
+                base_runtime_spec = "{}"
+                timezone = "UTC"
+                default_ulimits = ["nofile=1024:2048"]
+                add_inheritable_capabilities = true
+                disable_proc_mount = true
+                "#,
+                base_spec.display()
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).expect("base spec config should load");
+        assert_eq!(
+            config.runtime.base_runtime_spec,
+            base_spec.display().to_string()
+        );
+        assert_eq!(config.runtime.timezone, "UTC");
+        assert_eq!(
+            config.runtime.default_ulimits,
+            vec!["nofile=1024:2048".to_string()]
+        );
+        assert!(config.runtime.add_inheritable_capabilities);
+        assert!(config.runtime.disable_proc_mount);
+    }
+
+    #[test]
+    fn nri_config_accepts_cdi_settings_from_file() {
+        let config: Config = toml::from_str(
+            r#"
+            root = "/var/lib/crius"
+
+            [nri]
+            enable = true
+            enable_cdi = false
+            cdi_spec_dirs = ["/etc/cdi", "/var/run/cdi"]
+            "#,
+        )
+        .expect("nri cdi settings should deserialize");
+
+        assert!(config.nri.enable);
+        assert!(!config.nri.enable_cdi);
+        assert_eq!(config.nri.cdi_spec_dirs, vec!["/etc/cdi", "/var/run/cdi"]);
+    }
+
+    #[test]
+    fn resolved_runtimes_prefer_platform_specific_runtime_path() {
+        let mut config = RuntimeConfig {
+            runtime_type: "runc".to_string(),
+            runtime_path: "/usr/bin/runc".to_string(),
+            root: "/run/crius".to_string(),
+            ..Default::default()
+        };
+        config
+            .platform_runtime_paths
+            .insert(current_platform_key(), "/usr/bin/runc-platform".to_string());
+
+        let resolved = config.resolved_runtimes().unwrap();
+        assert_eq!(
+            resolved
+                .get("runc")
+                .map(|value| value.runtime_path.as_str()),
+            Some("/usr/bin/runc-platform")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_monitor_cgroup_slice_for_cgroupfs() {
+        let mut config = Config::default();
+        config.runtime.cgroup_driver = Some(CgroupDriverConfig::Cgroupfs);
+        config.runtime.monitor_cgroup = "system.slice".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("cgroupfs monitor slice must fail");
+        assert!(err
+            .to_string()
+            .contains("monitor cgroup should be \"pod\" or empty for cgroupfs"));
+    }
+
+    #[test]
+    fn validate_rejects_relative_absent_mount_source_entry() {
+        let mut config = Config::default();
+        config.runtime.absent_mount_sources_to_reject = vec!["etc/hostname".to_string()];
+
+        let err = config
+            .validate()
+            .expect_err("relative reject path must fail validation");
+        assert!(err
+            .to_string()
+            .contains("runtime.absent_mount_sources_to_reject entry must be an absolute path"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_timezone() {
+        let mut config = Config::default();
+        config.runtime.timezone = "Invalid/Timezone".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("invalid timezone must fail validation");
+        assert!(err.to_string().contains("invalid timezone"));
+    }
+
+    #[test]
+    fn parsed_default_ulimits_normalizes_rlimit_names() {
+        let config = RuntimeConfig {
+            default_ulimits: vec!["nofile=1024:2048".to_string()],
+            ..Default::default()
+        };
+
+        let parsed = config.parsed_default_ulimits().unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].rtype, "RLIMIT_NOFILE");
+        assert_eq!(parsed[0].soft, 1024);
+        assert_eq!(parsed[0].hard, 2048);
+    }
+
+    #[test]
     fn runtime_handler_config_accepts_container_create_timeout() {
         let config: Config = toml::from_str(
             r#"
@@ -1960,6 +3519,61 @@ mod tests {
             config.runtime.runtimes["kata"].container_create_timeout,
             Some(600)
         );
+    }
+
+    #[test]
+    fn runtime_handler_config_accepts_privileged_device_flags() {
+        let config: Config = toml::from_str(
+            r#"
+            root = "/var/lib/crius"
+
+            [runtime]
+            runtime_type = "runc"
+            runtime_path = "/usr/bin/runc"
+            root = "/run/crius"
+            handlers = ["runc", "kata"]
+
+            [runtime.runtimes.kata]
+            runtime_path = "/usr/bin/kata-runtime"
+            runtime_root = "/run/crius/kata"
+            privileged_without_host_devices = true
+            privileged_without_host_devices_all_devices_allowed = true
+            "#,
+        )
+        .expect("handler device policy flags should deserialize");
+
+        assert!(config.runtime.runtimes["kata"].privileged_without_host_devices);
+        assert!(
+            config.runtime.runtimes["kata"].privileged_without_host_devices_all_devices_allowed
+        );
+    }
+
+    #[test]
+    fn runtime_config_accepts_device_policy_fields_from_file() {
+        let config: Config = toml::from_str(
+            r#"
+            root = "/var/lib/crius"
+
+            [runtime]
+            runtime_type = "runc"
+            runtime_path = "/usr/bin/runc"
+            root = "/run/crius"
+            allowed_devices = ["/dev/null", "/dev/zero"]
+            additional_devices = ["/dev/null:/dev/custom-null:rw"]
+            device_ownership_from_security_context = true
+            "#,
+        )
+        .expect("runtime device policy fields should deserialize");
+
+        assert_eq!(
+            config.runtime.allowed_devices,
+            vec!["/dev/null".to_string(), "/dev/zero".to_string()]
+        );
+        assert_eq!(
+            config.runtime.additional_devices,
+            vec!["/dev/null:/dev/custom-null:rw".to_string()]
+        );
+        assert!(config.runtime.device_ownership_from_security_context);
     }
 
     #[test]
@@ -2134,19 +3748,29 @@ mod tests {
             io_uid = 1000
             io_gid = 2000
             pids_limit = 2048
+            infra_ctr_cpuset = "1"
+            shared_cpuset = "2-3"
             exec_cpu_affinity = "first"
             read_only = true
             no_pivot = true
             default_env = ["HTTP_PROXY=http://proxy.internal", "LANG=C.UTF-8"]
             default_capabilities = ["CHOWN", "NET_BIND_SERVICE"]
             default_sysctls = ["net.ipv4.ip_forward = 1", "kernel.shm_rmid_forced=1"]
-            seccomp_profile = "/etc/crius/seccomp-default.json"
-            unset_seccomp_profile = "unconfined"
             log_to_journald = true
             no_sync_log = true
             restrict_oom_score_adj = true
             enable_unprivileged_ports = true
             enable_unprivileged_icmp = true
+
+            [security]
+            seccomp_profile = "/etc/crius/seccomp-default.json"
+            privileged_seccomp_profile = "localhost/privileged.json"
+            unset_seccomp_profile = "unconfined"
+            apparmor_default_profile = "crius-default"
+            disable_apparmor = true
+            enable_selinux = true
+            selinux_category_range = 32
+            hostnetwork_disable_selinux = false
             "#;
         let dir = tempdir().unwrap();
         let path = dir.path().join("crius.toml");
@@ -2158,7 +3782,7 @@ mod tests {
             vec!["PATH=/usr/bin", "RUST_LOG=debug"]
         );
         assert_eq!(config.runtime.attach_socket_dir, "/var/run/crius/attach");
-        assert_eq!(config.runtime.container_exits_dir, "/var/run/crius/exits");
+        assert_eq!(config.runtime.container_exits_dir, "/run/crius/exits");
         assert_eq!(
             config.runtime.clean_shutdown_file,
             "/var/lib/crius/clean.shutdown"
@@ -2191,6 +3815,8 @@ mod tests {
         assert_eq!(config.runtime.io_uid, 1000);
         assert_eq!(config.runtime.io_gid, 2000);
         assert_eq!(config.runtime.pids_limit, 2048);
+        assert_eq!(config.runtime.infra_ctr_cpuset, "1");
+        assert_eq!(config.runtime.shared_cpuset, "2-3");
         assert_eq!(config.runtime.exec_cpu_affinity, "first");
         assert!(config.runtime.read_only);
         assert!(config.runtime.no_pivot);
@@ -2213,10 +3839,19 @@ mod tests {
             ]
         );
         assert_eq!(
-            config.runtime.seccomp_profile,
+            config.security.seccomp_profile,
             "/etc/crius/seccomp-default.json"
         );
-        assert_eq!(config.runtime.unset_seccomp_profile, "unconfined");
+        assert_eq!(
+            config.security.privileged_seccomp_profile,
+            "localhost/privileged.json"
+        );
+        assert_eq!(config.security.unset_seccomp_profile, "unconfined");
+        assert_eq!(config.security.apparmor_default_profile, "crius-default");
+        assert!(config.security.disable_apparmor);
+        assert!(config.security.enable_selinux);
+        assert_eq!(config.security.selinux_category_range, 32);
+        assert!(!config.security.hostnetwork_disable_selinux);
         assert_eq!(
             config.runtime.container_stop_timeout,
             MIN_CONTAINER_STOP_TIMEOUT_SECS
@@ -2260,6 +3895,60 @@ mod tests {
     }
 
     #[test]
+    fn image_config_accepts_namespaced_auth_dir_from_file() {
+        let config: Config = toml::from_str(
+            r#"
+            root = "/var/lib/crius"
+
+            [image]
+            driver = "overlay"
+            root = "/var/lib/containers/storage"
+            namespaced_auth_dir = "/var/lib/kubelet/credentialprovider"
+            "#,
+        )
+        .expect("namespaced auth dir should deserialize");
+
+        assert_eq!(
+            config.image.namespaced_auth_dir,
+            "/var/lib/kubelet/credentialprovider"
+        );
+    }
+
+    #[test]
+    fn image_config_accepts_pull_policy_fields_from_file() {
+        let config: Config = toml::from_str(
+            r#"
+            root = "/var/lib/crius"
+
+            [image]
+            driver = "overlay"
+            root = "/var/lib/containers/storage"
+            default_transport = "docker://"
+            short_name_mode = "enforcing"
+            pull_progress_timeout = "30s"
+            max_concurrent_downloads = 5
+            pull_retry_count = 2
+            registry_config_dir = "/etc/containerd/certs.d"
+            image_volumes = "ignore"
+            pinned_images = ["busybox*", "*pause*"]
+            "#,
+        )
+        .expect("image pull policy fields should deserialize");
+
+        assert_eq!(config.image.default_transport, "docker://");
+        assert_eq!(config.image.short_name_mode, "enforcing");
+        assert_eq!(config.image.pull_progress_timeout.as_secs(), 30);
+        assert_eq!(config.image.max_concurrent_downloads, 5);
+        assert_eq!(config.image.pull_retry_count, 2);
+        assert_eq!(config.image.registry_config_dir, "/etc/containerd/certs.d");
+        assert_eq!(config.image.image_volumes, "ignore");
+        assert_eq!(
+            config.image.pinned_images,
+            vec!["busybox*".to_string(), "*pause*".to_string()]
+        );
+    }
+
+    #[test]
     fn validate_rejects_relative_image_global_auth_file() {
         let mut config = Config::default();
         config.image.global_auth_file = "config.json".to_string();
@@ -2273,29 +3962,134 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_relative_image_namespaced_auth_dir() {
+        let mut config = Config::default();
+        config.image.namespaced_auth_dir = "credentialprovider".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("relative namespaced auth dir must fail validation");
+        assert!(err
+            .to_string()
+            .contains("image.namespaced_auth_dir must be an absolute path when set"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_image_short_name_mode() {
+        let mut config = Config::default();
+        config.image.short_name_mode = "permissive".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("invalid short name mode must fail validation");
+        assert!(err
+            .to_string()
+            .contains("image.short_name_mode must be \"disabled\" or \"enforcing\""));
+    }
+
+    #[test]
+    fn validate_rejects_relative_image_registry_config_dir() {
+        let mut config = Config::default();
+        config.image.registry_config_dir = "certs.d".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("relative registry config dir must fail validation");
+        assert!(err
+            .to_string()
+            .contains("image.registry_config_dir must be an absolute path when set"));
+    }
+
+    #[test]
+    fn validate_rejects_non_empty_image_storage_options() {
+        let mut config = Config::default();
+        config.image.storage_options =
+            vec!["overlay.mount_program=/usr/bin/fuse-overlayfs".to_string()];
+
+        let err = config
+            .validate()
+            .expect_err("non-empty image storage options must fail validation");
+        assert!(err
+            .to_string()
+            .contains("image.storage_options is not supported by crius yet"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_image_volumes_mode() {
+        let mut config = Config::default();
+        config.image.image_volumes = "tmpfs".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("invalid image volume mode must fail validation");
+        assert!(err
+            .to_string()
+            .contains("image.image_volumes must be \"mkdir\", \"bind\", or \"ignore\""));
+    }
+
+    #[test]
+    fn validate_rejects_empty_pinned_image_pattern() {
+        let mut config = Config::default();
+        config.image.pinned_images = vec![String::new()];
+
+        let err = config
+            .validate()
+            .expect_err("empty pinned image pattern must fail validation");
+        assert!(err
+            .to_string()
+            .contains("image.pinned_images entries must not be empty"));
+    }
+
+    #[test]
+    fn validate_rejects_enabled_drop_infra_ctr() {
+        let mut config = Config::default();
+        config.runtime.drop_infra_ctr = true;
+
+        let err = config
+            .validate()
+            .expect_err("drop infra ctr must fail validation");
+        assert!(err
+            .to_string()
+            .contains("runtime.drop_infra_ctr=true is not supported by crius"));
+    }
+
+    #[test]
+    fn validate_rejects_relative_pinns_path() {
+        let mut config = Config::default();
+        config.runtime.pinns_path = "pinns".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("relative pinns path must fail validation");
+        assert!(err
+            .to_string()
+            .contains("runtime.pinns_path must be an absolute path when set"));
+    }
+
+    #[test]
     fn validate_rejects_relative_runtime_seccomp_profile() {
         let mut config = Config::default();
-        config.runtime.seccomp_profile = "profiles/default.json".to_string();
+        config.security.seccomp_profile = "profiles/default.json".to_string();
 
         let err = config
             .validate()
             .expect_err("relative runtime seccomp profile must fail validation");
         assert!(err
             .to_string()
-            .contains("runtime.seccomp_profile must be an absolute path when set"));
+            .contains("security.seccomp_profile must be an absolute path when set"));
     }
 
     #[test]
     fn validate_rejects_invalid_runtime_unset_seccomp_profile() {
         let mut config = Config::default();
-        config.runtime.unset_seccomp_profile = "runtime/unknown".to_string();
+        config.security.unset_seccomp_profile = "runtime/unknown".to_string();
 
         let err = config
             .validate()
             .expect_err("invalid unset seccomp profile selector must fail validation");
         assert!(err
             .to_string()
-            .contains("runtime.unset_seccomp_profile must be empty"));
+            .contains("security.unset_seccomp_profile must be empty"));
     }
 
     #[test]
@@ -2309,6 +4103,32 @@ mod tests {
         assert!(err
             .to_string()
             .contains("runtime.pids_limit must be -1 or greater than zero"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_infra_ctr_cpuset() {
+        let mut config = Config::default();
+        config.runtime.infra_ctr_cpuset = "3-1".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("descending infra ctr cpuset must fail validation");
+        assert!(err
+            .to_string()
+            .contains("runtime.infra_ctr_cpuset contains descending CPU range"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_shared_cpuset() {
+        let mut config = Config::default();
+        config.runtime.shared_cpuset = "cpu0".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("invalid shared cpuset must fail validation");
+        assert!(err
+            .to_string()
+            .contains("runtime.shared_cpuset contains invalid CPU entry"));
     }
 
     #[test]
@@ -2361,6 +4181,19 @@ mod tests {
         assert!(err
             .to_string()
             .contains("runtime.default_sysctls contains invalid entry"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_additional_device_entry() {
+        let mut config = Config::default();
+        config.runtime.additional_devices = vec!["/dev/null:relative:rw".to_string()];
+
+        let err = config
+            .validate()
+            .expect_err("invalid additional device entry must fail validation");
+        assert!(err
+            .to_string()
+            .contains("runtime.additional_devices contains invalid entry"));
     }
 
     #[test]
@@ -2655,6 +4488,41 @@ mod tests {
     }
 
     #[test]
+    fn api_config_accepts_listen_aliases() {
+        let config: Config = toml::from_str(
+            r#"
+            root = "/var/lib/crius"
+
+            [api]
+            listen = "unix:///run/crius/crius.sock"
+            listen_aliases = ["unix:///var/run/containerd/containerd.sock", "unix:///var/run/crio/crio.sock"]
+            "#,
+        )
+        .expect("listen aliases should deserialize");
+
+        assert_eq!(
+            config.api.listen_aliases,
+            vec![
+                "unix:///var/run/containerd/containerd.sock".to_string(),
+                "unix:///var/run/crio/crio.sock".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_rejects_non_unix_listen_aliases() {
+        let mut config = Config::default();
+        config.api.listen_aliases = vec!["127.0.0.1:12345".to_string()];
+
+        let err = config
+            .validate()
+            .expect_err("non-unix aliases must fail validation");
+        assert!(err
+            .to_string()
+            .contains("api.listen_aliases value 127.0.0.1:12345 must use unix://"));
+    }
+
+    #[test]
     fn validate_rejects_zero_grpc_max_send_msg_size() {
         let mut config = Config::default();
         config.api.grpc_max_send_msg_size = 0;
@@ -2735,6 +4603,7 @@ mod tests {
             tls_key_file = "/etc/crius/tls/tls.key"
             tls_ca_file = "/etc/crius/tls/ca.crt"
             tls_min_version = "VersionTLS13"
+            tls_cipher_suites = ["TLS13_AES_256_GCM_SHA384", "TLS13_AES_128_GCM_SHA256"]
             request_token_ttl = "45s"
             port_forward_stream_creation_timeout = "10s"
             port_forward_idle_timeout = "1h"
@@ -2744,9 +4613,13 @@ mod tests {
 
         assert!(config.api.streaming.enable_tls);
         assert_eq!(config.api.streaming.tls_min_version, "VersionTLS13");
+        assert_eq!(config.api.streaming.tls_cert_file, "/etc/crius/tls/tls.crt");
         assert_eq!(
-            config.api.streaming.tls_cert_file,
-            "/etc/crius/tls/tls.crt"
+            config.api.streaming.tls_cipher_suites,
+            vec![
+                "TLS13_AES_256_GCM_SHA384".to_string(),
+                "TLS13_AES_128_GCM_SHA256".to_string()
+            ]
         );
     }
 
@@ -2770,6 +4643,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let _guard = EnvGuard::set_many(&[
             ("CRIUS_LISTEN", "unix:///tmp/env.sock"),
+            (
+                "CRIUS_LISTEN_ALIASES",
+                "unix:///var/run/containerd/containerd.sock,unix:///var/run/crio/crio.sock",
+            ),
             ("CRIUS_ALLOW_TCP_SERVICE", "true"),
             ("CRIUS_ENABLE_POD_EVENTS", "false"),
             ("CRIUS_INCLUDED_POD_METRICS", "cpu,memory"),
@@ -2778,11 +4655,17 @@ mod tests {
             ("CRIUS_EXEC_SYNC_IO_DRAIN_TIMEOUT", "125ms"),
             ("CRIUS_STREAM_ADDRESS", "127.0.0.2"),
             ("CRIUS_STREAM_PORT", "10020"),
+            (
+                "CRIUS_STREAM_TLS_CIPHER_SUITES",
+                "TLS13_AES_256_GCM_SHA384,TLS13_AES_128_GCM_SHA256",
+            ),
             ("CRIUS_STREAM_REQUEST_TOKEN_TTL", "40s"),
             ("CRIUS_STREAM_PORT_FORWARD_STREAM_CREATION_TIMEOUT", "70s"),
             ("CRIUS_STREAM_IDLE_TIMEOUT", "3h"),
             ("CRIUS_RUNTIME_HANDLERS", "kata,runsc"),
             ("CRIUS_PAUSE_COMMAND", "/custom-pause"),
+            ("CRIUS_PINNS_PATH", "/usr/bin/pinns"),
+            ("CRIUS_DROP_INFRA_CTR", "false"),
             ("CRIUS_MONITOR_ENV", "PATH=/custom/bin,RUST_LOG=trace"),
             ("CRIUS_CGROUP_DRIVER", "systemd"),
             (
@@ -2800,6 +4683,7 @@ mod tests {
             ),
             ("CRIUS_CNI_MAX_CONF_NUM", "3"),
             ("CRIUS_CNI_IP_PREF", "ipv4"),
+            ("CRIUS_CNI_TEARDOWN_TIMEOUT", "75s"),
             ("CRIUS_CNI_DEFAULT_NETWORK", "cluster-bridge"),
             ("CRIUS_DISABLE_HOSTPORT_MAPPING", "true"),
             ("CRIUS_LOG_LEVEL", "debug"),
@@ -2828,6 +4712,22 @@ mod tests {
             ("CRIUS_ENABLE_CRIU_SUPPORT", "false"),
             ("CRIUS_INTERNAL_WIPE", "false"),
             ("CRIUS_INTERNAL_REPAIR", "false"),
+            (
+                "CRIUS_IMAGE_NAMESPACED_AUTH_DIR",
+                "/var/lib/kubelet/credentialprovider",
+            ),
+            ("CRIUS_IMAGE_DEFAULT_TRANSPORT", "docker://"),
+            ("CRIUS_IMAGE_SHORT_NAME_MODE", "enforcing"),
+            ("CRIUS_IMAGE_PULL_PROGRESS_TIMEOUT", "25s"),
+            ("CRIUS_MAX_CONCURRENT_DOWNLOADS", "5"),
+            ("CRIUS_IMAGE_PULL_RETRY_COUNT", "2"),
+            ("CRIUS_IMAGE_REGISTRY_CONFIG_DIR", "/etc/containerd/certs.d"),
+            ("CRIUS_IMAGE_STORAGE_OPTIONS", ""),
+            ("CRIUS_IMAGE_VOLUMES", "bind"),
+            ("CRIUS_PINNED_IMAGES", "busybox*,*pause*"),
+            ("CRIUS_ALLOWED_DEVICES", "/dev/null,/dev/zero"),
+            ("CRIUS_ADDITIONAL_DEVICES", "/dev/null:/dev/custom-null:rw"),
+            ("CRIUS_DEVICE_OWNERSHIP_FROM_SECURITY_CONTEXT", "true"),
             ("CRIUS_BIND_MOUNT_PREFIX", "/host-prefix"),
             ("CRIUS_DISABLE_CGROUP", "true"),
             ("CRIUS_TOLERATE_MISSING_HUGETLB_CONTROLLER", "false"),
@@ -2839,12 +4739,22 @@ mod tests {
             ("CRIUS_IO_UID", "3000"),
             ("CRIUS_IO_GID", "4000"),
             ("CRIUS_PIDS_LIMIT", "4096"),
+            ("CRIUS_INFRA_CTR_CPUSET", "1"),
+            ("CRIUS_SHARED_CPUSET", "2-3"),
             ("CRIUS_EXEC_CPU_AFFINITY", "first"),
             ("CRIUS_READ_ONLY", "true"),
             ("CRIUS_NO_PIVOT", "true"),
             ("CRIUS_CONTAINER_STOP_TIMEOUT", "7"),
             ("CRIUS_ENABLE_UNPRIVILEGED_PORTS", "true"),
             ("CRIUS_ENABLE_UNPRIVILEGED_ICMP", "true"),
+            ("CRIUS_PRIVILEGED_SECCOMP_PROFILE", "unconfined"),
+            ("CRIUS_APPARMOR_DEFAULT_PROFILE", "custom-default"),
+            ("CRIUS_DISABLE_APPARMOR", "true"),
+            ("CRIUS_ENABLE_SELINUX", "true"),
+            ("CRIUS_SELINUX_CATEGORY_RANGE", "64"),
+            ("CRIUS_HOSTNETWORK_DISABLE_SELINUX", "false"),
+            ("CRIUS_ENABLE_CDI", "false"),
+            ("CRIUS_CDI_SPEC_DIRS", "/etc/cdi:/var/run/cdi:/opt/cdi"),
         ]);
 
         let mut config = Config::default();
@@ -2869,6 +4779,13 @@ mod tests {
         config.apply_env_overrides().unwrap();
 
         assert_eq!(config.api.listen, "unix:///tmp/env.sock");
+        assert_eq!(
+            config.api.listen_aliases,
+            vec![
+                "unix:///var/run/containerd/containerd.sock".to_string(),
+                "unix:///var/run/crio/crio.sock".to_string()
+            ]
+        );
         assert!(config.api.allow_tcp_service);
         assert!(!config.api.enable_pod_events);
         assert_eq!(config.api.included_pod_metrics, vec!["cpu", "memory"]);
@@ -2877,6 +4794,13 @@ mod tests {
         assert_eq!(config.api.exec_sync_io_drain_timeout.as_millis(), 125);
         assert_eq!(config.api.streaming.address, "127.0.0.2");
         assert_eq!(config.api.streaming.port, 10020);
+        assert_eq!(
+            config.api.streaming.tls_cipher_suites,
+            vec![
+                "TLS13_AES_256_GCM_SHA384".to_string(),
+                "TLS13_AES_128_GCM_SHA256".to_string()
+            ]
+        );
         assert_eq!(config.api.streaming.request_token_ttl.as_secs(), 40);
         assert_eq!(
             config
@@ -2895,6 +4819,8 @@ mod tests {
             vec!["kata", "runsc", "runc"]
         );
         assert_eq!(config.runtime.pause_command, "/custom-pause");
+        assert_eq!(config.runtime.pinns_path, "/usr/bin/pinns");
+        assert!(!config.runtime.drop_infra_ctr);
         assert_eq!(
             config.runtime.cgroup_driver,
             Some(CgroupDriverConfig::Systemd)
@@ -2918,6 +4844,42 @@ mod tests {
         assert_eq!(config.runtime.criu_image_path, "/custom/criu-images");
         assert_eq!(config.runtime.criu_work_path, "/custom/criu-work");
         assert!(!config.runtime.enable_criu_support);
+        assert_eq!(
+            config.image.namespaced_auth_dir,
+            "/var/lib/kubelet/credentialprovider"
+        );
+        assert_eq!(config.image.default_transport, "docker://");
+        assert_eq!(config.image.short_name_mode, "enforcing");
+        assert_eq!(config.image.pull_progress_timeout.as_secs(), 25);
+        assert_eq!(config.image.max_concurrent_downloads, 5);
+        assert_eq!(config.image.pull_retry_count, 2);
+        assert_eq!(config.image.registry_config_dir, "/etc/containerd/certs.d");
+        assert!(config.image.storage_options.is_empty());
+        assert_eq!(config.image.image_volumes, "bind");
+        assert_eq!(
+            config.image.pinned_images,
+            vec!["busybox*".to_string(), "*pause*".to_string()]
+        );
+        assert_eq!(
+            config.runtime.allowed_devices,
+            vec!["/dev/null".to_string(), "/dev/zero".to_string()]
+        );
+        assert_eq!(
+            config.runtime.additional_devices,
+            vec!["/dev/null:/dev/custom-null:rw".to_string()]
+        );
+        assert!(config.runtime.device_ownership_from_security_context);
+        assert_eq!(config.security.privileged_seccomp_profile, "unconfined");
+        assert_eq!(config.security.apparmor_default_profile, "custom-default");
+        assert!(config.security.disable_apparmor);
+        assert!(config.security.enable_selinux);
+        assert_eq!(config.security.selinux_category_range, 64);
+        assert!(!config.security.hostnetwork_disable_selinux);
+        assert!(!config.nri.enable_cdi);
+        assert_eq!(
+            config.nri.cdi_spec_dirs,
+            vec!["/etc/cdi", "/var/run/cdi", "/opt/cdi"]
+        );
         assert!(!config.runtime.internal_wipe);
         assert!(!config.runtime.internal_repair);
         assert_eq!(config.runtime.bind_mount_prefix, "/host-prefix");
@@ -2931,6 +4893,8 @@ mod tests {
         assert_eq!(config.runtime.io_uid, 3000);
         assert_eq!(config.runtime.io_gid, 4000);
         assert_eq!(config.runtime.pids_limit, 4096);
+        assert_eq!(config.runtime.infra_ctr_cpuset, "1");
+        assert_eq!(config.runtime.shared_cpuset, "2-3");
         assert_eq!(config.runtime.exec_cpu_affinity, "first");
         assert!(config.runtime.read_only);
         assert!(config.runtime.no_pivot);
@@ -2970,6 +4934,8 @@ mod tests {
         );
         assert_eq!(config.network.max_conf_num, 3);
         assert_eq!(config.network.ip_pref, MainIpPreference::Ipv4);
+        assert_eq!(config.network.teardown_timeout.as_secs(), 75);
+        assert_eq!(config.network.cni_config().teardown_timeout().as_secs(), 75);
         assert_eq!(
             config.network.default_network_name.as_deref(),
             Some("cluster-bridge")
@@ -2995,6 +4961,72 @@ mod tests {
 
         assert_eq!(config.api.listen, "127.0.0.1:50051");
         assert!(config.api.allow_tcp_service);
+    }
+
+    #[test]
+    fn default_stateful_paths_follow_runtime_and_persistent_roots() {
+        let mut config = Config {
+            root: "/var/lib/custom-crius".to_string(),
+            api: ApiConfig {
+                listen: DEFAULT_CRI_SOCKET_URI.to_string(),
+                ..Default::default()
+            },
+            runtime: RuntimeConfig {
+                root: "/run/custom-crius".to_string(),
+                shim_dir: DEFAULT_RUNTIME_SHIM_DIR.to_string(),
+                attach_socket_dir: DEFAULT_RUNTIME_ATTACH_SOCKET_DIR.to_string(),
+                container_exits_dir: DEFAULT_RUNTIME_CONTAINER_EXITS_DIR.to_string(),
+                clean_shutdown_file: DEFAULT_RUNTIME_CLEAN_SHUTDOWN_FILE.to_string(),
+                version_file: DEFAULT_RUNTIME_VERSION_FILE.to_string(),
+                version_file_persist: DEFAULT_RUNTIME_VERSION_FILE_PERSIST.to_string(),
+                ..Default::default()
+            },
+            nri: NriConfig {
+                socket_path: DEFAULT_NRI_SOCKET_PATH.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.normalize_runtime_settings();
+
+        assert_eq!(config.api.listen, "unix:///run/custom-crius/crius.sock");
+        assert_eq!(config.runtime.shim_dir, "/run/custom-crius/shims");
+        assert_eq!(config.runtime.attach_socket_dir, "/run/custom-crius/shims");
+        assert_eq!(
+            config.runtime.container_exits_dir,
+            "/run/custom-crius/exits"
+        );
+        assert_eq!(
+            config.runtime.clean_shutdown_file,
+            "/var/lib/custom-crius/clean.shutdown"
+        );
+        assert_eq!(config.runtime.version_file, "/run/custom-crius/version");
+        assert_eq!(
+            config.runtime.version_file_persist,
+            "/var/lib/custom-crius/version"
+        );
+        assert_eq!(config.nri.socket_path, "/run/custom-crius/nri.sock");
+    }
+
+    #[test]
+    fn legacy_runtime_clean_shutdown_path_rewrites_to_persistent_root() {
+        let mut config = Config {
+            root: "/var/lib/custom-crius".to_string(),
+            runtime: RuntimeConfig {
+                root: "/run/custom-crius".to_string(),
+                clean_shutdown_file: LEGACY_RUNTIME_CLEAN_SHUTDOWN_FILE.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.normalize_runtime_settings();
+
+        assert_eq!(
+            config.runtime.clean_shutdown_file,
+            "/var/lib/custom-crius/clean.shutdown"
+        );
     }
 
     fn env_lock() -> &'static Mutex<()> {

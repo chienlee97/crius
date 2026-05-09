@@ -395,7 +395,8 @@ impl RuntimeServiceImpl {
             let containers = self.containers.lock().await;
             containers.get(container_id).cloned()
         }?;
-        let runtime_state = Self::map_runtime_container_state(
+        let runtime_state = Self::effective_runtime_state_for_container(
+            &container,
             self.runtime_container_status_checked(container_id).await,
         );
         Some(Self::build_container_status_snapshot(
@@ -430,7 +431,8 @@ impl RuntimeServiceImpl {
 
         let mut snapshots = Vec::with_capacity(containers.len());
         for container in containers {
-            let runtime_state = Self::map_runtime_container_state(
+            let runtime_state = Self::effective_runtime_state_for_container(
+                &container,
                 self.runtime_container_status_checked(&container.id).await,
             );
             snapshots.push(Self::build_container_status_snapshot(
@@ -459,6 +461,9 @@ impl RuntimeServiceImpl {
         container: &Container,
         runtime_state: Option<i32>,
     ) {
+        if self.events.receiver_count() == 0 {
+            return;
+        }
         let pod_status = self
             .current_pod_status_snapshot(&container.pod_sandbox_id)
             .await;
@@ -481,7 +486,7 @@ impl RuntimeServiceImpl {
         pod_sandbox: &crate::proto::runtime::v1::PodSandbox,
         containers_statuses: Vec<CriContainerStatus>,
     ) {
-        if !self.config.enable_pod_events {
+        if !self.config.enable_pod_events || self.events.receiver_count() == 0 {
             return;
         }
         self.publish_event(ContainerEventResponse {
@@ -1015,8 +1020,21 @@ impl RuntimeServiceImpl {
                 _ => continue,
             };
 
+            let pod_has_required_netns = {
+                let pods = pod_sandboxes.lock().await;
+                pods.get(&pod_id)
+                    .map(Self::pod_has_required_netns)
+                    .unwrap_or(true)
+            };
             let next_pod_state = match pause_status {
-                ContainerStatus::Running => PodSandboxState::SandboxReady as i32,
+                ContainerStatus::Running if pod_has_required_netns => {
+                    PodSandboxState::SandboxReady as i32
+                }
+                ContainerStatus::Unknown
+                    if current_pod.state != PodSandboxState::SandboxReady as i32 =>
+                {
+                    current_pod.state
+                }
                 _ => PodSandboxState::SandboxNotready as i32,
             };
             if next_pod_state == current_pod.state {

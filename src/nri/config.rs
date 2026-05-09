@@ -5,6 +5,8 @@ use crate::config::{NriConfig, NriDefaultValidatorConfig};
 #[derive(Debug, Clone)]
 pub struct NriManagerConfig {
     pub enable: bool,
+    pub enable_cdi: bool,
+    pub cdi_spec_dirs: Vec<String>,
     pub runtime_name: String,
     pub runtime_version: String,
     pub socket_path: String,
@@ -20,6 +22,8 @@ impl From<NriConfig> for NriManagerConfig {
     fn from(value: NriConfig) -> Self {
         Self {
             enable: value.enable,
+            enable_cdi: value.enable_cdi,
+            cdi_spec_dirs: value.cdi_spec_dirs,
             runtime_name: value.runtime_name,
             runtime_version: value.runtime_version,
             socket_path: value.socket_path,
@@ -42,6 +46,8 @@ mod tests {
     fn converts_from_global_nri_config() {
         let config = NriConfig {
             enable: true,
+            enable_cdi: true,
+            cdi_spec_dirs: vec!["/etc/cdi".to_string(), "/var/run/cdi".to_string()],
             runtime_name: "crius".to_string(),
             runtime_version: "0.1.0".to_string(),
             socket_path: "/run/crius/nri.sock".to_string(),
@@ -63,6 +69,8 @@ mod tests {
 
         let mapped = NriManagerConfig::from(config);
         assert!(mapped.enable);
+        assert!(mapped.enable_cdi);
+        assert_eq!(mapped.cdi_spec_dirs, vec!["/etc/cdi", "/var/run/cdi"]);
         assert_eq!(mapped.runtime_name, "crius");
         assert_eq!(mapped.registration_timeout.as_millis(), 4000);
         assert_eq!(mapped.request_timeout.as_millis(), 1500);

@@ -13,6 +13,30 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod server;
+
+/// 守护进程级 runtime metrics 快照。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeMetricsSnapshot {
+    pub runtime_ready: bool,
+    pub network_ready: bool,
+    pub container_count: usize,
+    pub pod_sandbox_count: usize,
+    pub event_subscriber_count: usize,
+    pub container_stats_cache_entries: usize,
+    pub pod_stats_cache_entries: usize,
+    pub pod_metrics_cache_entries: usize,
+}
+
+/// 镜像存储 metrics 快照。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImageMetricsSnapshot {
+    pub image_count: usize,
+    pub total_image_size_bytes: u64,
+    pub image_fs_bytes_used: u64,
+    pub image_fs_inodes_used: u64,
+}
+
 /// 容器性能统计
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContainerStats {

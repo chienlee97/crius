@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crius::shim::Daemon;
+use crius::shim::{Daemon, DaemonOptions};
 use log::{debug, info};
 use std::fs;
 use std::path::PathBuf;
@@ -30,6 +30,14 @@ struct Args {
     #[clap(short, long, default_value = "runc")]
     runtime: PathBuf,
 
+    /// Optional runtime-specific configuration file path
+    #[clap(long)]
+    runtime_config_path: Option<PathBuf>,
+
+    /// Target cgroup for the shim/monitor process
+    #[clap(long)]
+    monitor_cgroup: Option<String>,
+
     /// Debug mode
     #[clap(short, long)]
     debug: bool,
@@ -45,6 +53,14 @@ struct Args {
     /// Disable pivot_root and use MS_MOVE instead
     #[clap(long)]
     no_pivot: bool,
+
+    /// Do not create a new session keyring for the container
+    #[clap(long)]
+    no_new_keyring: bool,
+
+    /// Start the runtime with systemd cgroup support
+    #[clap(long)]
+    systemd_cgroup: bool,
 
     /// Log file path
     #[clap(short, long)]
@@ -105,14 +121,20 @@ fn main() -> Result<()> {
         args.id,
         args.bundle,
         args.runtime,
-        args.exit_code_file,
-        args.attach_socket_dir,
-        args.io_uid,
-        args.io_gid,
-        args.max_container_log_line_size,
-        args.log_to_journald,
-        args.no_sync_log,
-        args.no_pivot,
+        DaemonOptions {
+            runtime_config_path: args.runtime_config_path.unwrap_or_default(),
+            monitor_cgroup: args.monitor_cgroup.unwrap_or_default(),
+            exit_code_file: args.exit_code_file,
+            attach_socket_dir: args.attach_socket_dir,
+            io_uid: args.io_uid,
+            io_gid: args.io_gid,
+            max_container_log_line_size: args.max_container_log_line_size,
+            log_to_journald: args.log_to_journald,
+            no_sync_log: args.no_sync_log,
+            no_pivot: args.no_pivot,
+            no_new_keyring: args.no_new_keyring,
+            systemd_cgroup: args.systemd_cgroup,
+        },
     );
 
     daemon.run()

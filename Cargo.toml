@@ -38,6 +38,7 @@ prost-types = "0.12"
 # 日志和错误处理
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
 thiserror = "1.0"
 anyhow = "1.0"
 

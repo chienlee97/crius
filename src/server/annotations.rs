@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) enum AnnotationScope {
+    Pod,
+    Container,
+}
+
 pub(super) struct ContainerAnnotationContext<'a> {
     pub(super) annotations: &'a mut HashMap<String, String>,
     pub(super) container_id: &'a str,
@@ -13,6 +19,66 @@ pub(super) struct ContainerAnnotationContext<'a> {
 }
 
 impl RuntimeServiceImpl {
+    fn is_reserved_annotation_namespace(key: &str) -> bool {
+        key.starts_with("io.kubernetes.cri-o.")
+            || key.starts_with("io.kubernetes.cri.")
+            || key.starts_with("io.containerd.cri.")
+            || key.starts_with("io.kubernetes.container.")
+    }
+
+    fn scope_allows_reserved_annotation(scope: AnnotationScope, key: &str) -> bool {
+        match scope {
+            AnnotationScope::Pod => matches!(
+                key,
+                CRIO_SANDBOX_ID_ANNOTATION
+                    | CRIO_SANDBOX_NAME_ANNOTATION
+                    | CRIO_POD_NAME_ANNOTATION
+                    | CRIO_POD_NAMESPACE_ANNOTATION
+                    | CRIO_SECCOMP_NOTIFIER_ACTION_ANNOTATION
+                    | CRIO_RUNTIME_HANDLER_ANNOTATION
+                    | CONTAINERD_SANDBOX_ID_ANNOTATION
+                    | CONTAINERD_SANDBOX_NAME_ANNOTATION
+                    | CONTAINERD_SANDBOX_NAMESPACE_ANNOTATION
+                    | CONTAINERD_SANDBOX_UID_ANNOTATION
+                    | CONTAINERD_RUNTIME_HANDLER_ANNOTATION
+            ),
+            AnnotationScope::Container if key.starts_with("io.kubernetes.container.") => true,
+            AnnotationScope::Container => matches!(
+                key,
+                CRIO_CONTAINER_ID_ANNOTATION
+                    | CRIO_CONTAINER_NAME_ANNOTATION
+                    | CRIO_CONTAINER_TYPE_ANNOTATION
+                    | CRIO_USER_REQUESTED_IMAGE_ANNOTATION
+                    | CRIO_IMAGE_NAME_ANNOTATION
+                    | CRIO_LOG_PATH_ANNOTATION
+                    | CRIO_SECCOMP_NOTIFIER_ACTION_ANNOTATION
+                    | CRIO_RUNTIME_HANDLER_ANNOTATION
+                    | CRIO_SANDBOX_ID_ANNOTATION
+                    | CONTAINERD_CONTAINER_TYPE_ANNOTATION
+                    | CONTAINERD_IMAGE_NAME_ANNOTATION
+                    | CONTAINERD_SANDBOX_ID_ANNOTATION
+                    | CONTAINERD_CONTAINER_NAME_ANNOTATION
+                    | CONTAINERD_RUNTIME_HANDLER_ANNOTATION
+                    | KUBERNETES_CONTAINER_NAME_ANNOTATION
+            ),
+        }
+    }
+
+    fn external_annotations_for_scope(
+        annotations: &HashMap<String, String>,
+        scope: AnnotationScope,
+    ) -> HashMap<String, String> {
+        annotations
+            .iter()
+            .filter(|(key, _)| !Self::is_internal_annotation_key(key))
+            .filter(|(key, _)| {
+                !Self::is_reserved_annotation_namespace(key)
+                    || Self::scope_allows_reserved_annotation(scope, key)
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
     fn resolved_runtime_handler_name<'a>(&'a self, runtime_handler: &'a str) -> &'a str {
         let runtime_handler = runtime_handler.trim();
         if runtime_handler.is_empty() {
@@ -44,7 +110,9 @@ impl RuntimeServiceImpl {
         };
 
         for (key, value) in &config.default_annotations {
-            annotations.entry(key.clone()).or_insert_with(|| value.clone());
+            annotations
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
         }
     }
 
@@ -186,7 +254,14 @@ impl RuntimeServiceImpl {
             "irq-load-balancing.crio.io".to_string(),
             "cpu-c-states.crio.io".to_string(),
             "cpu-freq-governor.crio.io".to_string(),
+            "seccomp-notifier-action.crio.io".to_string(),
         ]
+    }
+
+    pub(super) fn annotation_key_allowed(key: &str, allowed_prefixes: &[String]) -> bool {
+        allowed_prefixes
+            .iter()
+            .any(|prefix| !prefix.trim().is_empty() && key.starts_with(prefix))
     }
 
     pub(super) fn workload_annotation_prefixes(
@@ -230,7 +305,7 @@ impl RuntimeServiceImpl {
                 }),
         );
         allowed.extend(
-            Self::external_annotations(existing_annotations)
+            Self::external_container_annotations(existing_annotations)
                 .into_keys()
                 .collect::<Vec<_>>(),
         );
@@ -293,23 +368,38 @@ impl RuntimeServiceImpl {
         key.starts_with(INTERNAL_ANNOTATION_PREFIX)
     }
 
-    pub(super) fn external_annotations(
+    pub(super) fn external_pod_annotations(
         annotations: &HashMap<String, String>,
     ) -> HashMap<String, String> {
-        annotations
-            .iter()
-            .filter(|(key, _)| !Self::is_internal_annotation_key(key))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect()
+        Self::external_annotations_for_scope(annotations, AnnotationScope::Pod)
     }
 
-    pub(super) fn merge_external_annotations(
+    pub(super) fn external_container_annotations(
+        annotations: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        Self::external_annotations_for_scope(annotations, AnnotationScope::Container)
+    }
+
+    pub(super) fn merge_external_pod_annotations(
         base: &HashMap<String, String>,
         spec_annotations: Option<&HashMap<String, String>>,
     ) -> HashMap<String, String> {
-        let mut merged = Self::external_annotations(base);
+        let mut merged = Self::external_pod_annotations(base);
         if let Some(spec_annotations) = spec_annotations {
-            for (key, value) in Self::external_annotations(spec_annotations) {
+            for (key, value) in Self::external_pod_annotations(spec_annotations) {
+                merged.insert(key, value);
+            }
+        }
+        merged
+    }
+
+    pub(super) fn merge_external_container_annotations(
+        base: &HashMap<String, String>,
+        spec_annotations: Option<&HashMap<String, String>>,
+    ) -> HashMap<String, String> {
+        let mut merged = Self::external_container_annotations(base);
+        if let Some(spec_annotations) = spec_annotations {
+            for (key, value) in Self::external_container_annotations(spec_annotations) {
                 merged.insert(key, value);
             }
         }

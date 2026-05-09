@@ -1,15 +1,16 @@
 use super::*;
 use crate::nri::{apply_container_adjustment, NriStopContainerResult, NriUpdateContainerResult};
+use crate::proto::runtime::v1::image_service_server::ImageService;
 use crate::server::service::ContainerCreateDeadline;
 use crate::storage::ContainerRecord;
 use crate::storage::PodSandboxRecord;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{mpsc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use tempfile::tempdir;
 use tempfile::TempDir;
@@ -26,32 +27,66 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
                 "runc".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
                     runtime_path: "/definitely/missing/runc".to_string(),
+                    runtime_config_path: String::new(),
                     runtime_root: "/tmp/crius-test-runtime-root".to_string(),
+                    platform_runtime_paths: HashMap::new(),
                     monitor_path: "/definitely/missing/crius-shim".to_string(),
+                    monitor_cgroup: String::new(),
                     monitor_env: Vec::new(),
+                    stream_websockets: false,
                     allowed_annotations: Vec::new(),
                     default_annotations: HashMap::new(),
+                    privileged_without_host_devices: false,
+                    privileged_without_host_devices_all_devices_allowed: false,
                     container_create_timeout: 240,
+                    snapshotter: "internal-overlay-untar".to_string(),
                 },
             ),
             (
                 "kata".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
                     runtime_path: "/definitely/missing/kata-runtime".to_string(),
+                    runtime_config_path: String::new(),
                     runtime_root: "/tmp/crius-test-kata-runtime-root".to_string(),
+                    platform_runtime_paths: HashMap::new(),
                     monitor_path: "/definitely/missing/crius-shim".to_string(),
+                    monitor_cgroup: String::new(),
                     monitor_env: Vec::new(),
+                    stream_websockets: false,
                     allowed_annotations: Vec::new(),
                     default_annotations: HashMap::new(),
+                    privileged_without_host_devices: false,
+                    privileged_without_host_devices_all_devices_allowed: false,
                     container_create_timeout: 240,
+                    snapshotter: "internal-overlay-untar".to_string(),
                 },
             ),
         ]),
         runtime_root: PathBuf::from("/tmp/crius-test-runtime-root"),
         log_dir: PathBuf::from("/tmp/crius-test-logs"),
         runtime_path: PathBuf::from("/definitely/missing/runc"),
+        runtime_config_path: PathBuf::new(),
         image_root: PathBuf::from("/tmp/crius-test-images"),
         image_driver: "overlay".to_string(),
+        image_global_auth_file: PathBuf::new(),
+        image_namespaced_auth_dir: PathBuf::new(),
+        image_default_transport: "docker://".to_string(),
+        image_short_name_mode: "disabled".to_string(),
+        image_pull_progress_timeout: std::time::Duration::ZERO,
+        image_max_concurrent_downloads: 3,
+        image_pull_retry_count: 0,
+        image_registry_config_dir: PathBuf::new(),
+        image_decryption_keys_path: PathBuf::new(),
+        image_decryption_decoder_path: "ctd-decoder".to_string(),
+        image_decryption_keyprovider_config: PathBuf::new(),
+        image_additional_artifact_stores: Vec::new(),
+        image_signature_policy: PathBuf::new(),
+        image_signature_policy_dir: PathBuf::new(),
+        image_storage_options: Vec::new(),
+        image_volumes: "mkdir".to_string(),
+        image_pinned_images: Vec::new(),
+        image_big_files_temporary_dir: PathBuf::new(),
+        image_oci_artifact_mount_support: true,
         workloads: HashMap::new(),
         enable_pod_events: true,
         included_pod_metrics: vec!["all".to_string()],
@@ -59,7 +94,26 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
         pod_sandbox_metrics_collection_period: 0,
         grpc_max_send_msg_size: 80 * 1024 * 1024,
         grpc_max_recv_msg_size: 80 * 1024 * 1024,
+        metrics_enable: false,
+        metrics_host: "127.0.0.1".to_string(),
+        metrics_port: 9090,
+        metrics_socket_path: PathBuf::new(),
+        metrics_enable_tls: false,
+        metrics_tls_cert_file: PathBuf::new(),
+        metrics_tls_key_file: PathBuf::new(),
+        metrics_tls_ca_file: PathBuf::new(),
+        metrics_tls_min_version: "VersionTLS12".to_string(),
+        metrics_tls_cipher_suites: Vec::new(),
+        metrics_collectors: vec![
+            "runtime".to_string(),
+            "resources".to_string(),
+            "images".to_string(),
+        ],
+        tracing_enable: false,
+        tracing_endpoint: String::new(),
+        tracing_sampling_rate_per_million: 0,
         monitor_env: Vec::new(),
+        monitor_cgroup: String::new(),
         default_env: Vec::new(),
         default_capabilities: vec![
             "CHOWN".to_string(),
@@ -78,6 +132,17 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
             "AUDIT_WRITE".to_string(),
         ],
         default_sysctls: HashMap::new(),
+        default_ulimits: Vec::new(),
+        allowed_devices: Vec::new(),
+        additional_devices: Vec::new(),
+        device_ownership_from_security_context: false,
+        add_inheritable_capabilities: false,
+        base_runtime_spec: None,
+        default_mounts_file: PathBuf::new(),
+        hooks_dir: Vec::new(),
+        absent_mount_sources_to_reject: Vec::new(),
+        disable_proc_mount: false,
+        timezone: String::new(),
         attach_socket_dir: PathBuf::from("/tmp/crius-test-attach"),
         container_exits_dir: PathBuf::from("/tmp/crius-test-exits"),
         clean_shutdown_file: PathBuf::from("/tmp/crius-test-clean.shutdown"),
@@ -95,7 +160,13 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
         tolerate_missing_hugetlb_controller: true,
         separate_pull_cgroup: String::new(),
         seccomp_profile: PathBuf::new(),
+        privileged_seccomp_profile: "unconfined".to_string(),
         unset_seccomp_profile: "runtime/default".to_string(),
+        apparmor_default_profile: "crius-default".to_string(),
+        disable_apparmor: false,
+        enable_selinux: false,
+        selinux_category_range: 1024,
+        hostnetwork_disable_selinux: true,
         uid_mappings: None,
         gid_mappings: None,
         minimum_mappable_uid: -1,
@@ -103,11 +174,17 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
         io_uid: 0,
         io_gid: 0,
         pids_limit: -1,
+        infra_ctr_cpuset: String::new(),
+        shared_cpuset: String::new(),
         exec_cpu_affinity: String::new(),
+        irqbalance_config_file: PathBuf::new(),
+        irqbalance_config_restore_file: "disable".to_string(),
         read_only: false,
         no_pivot: false,
+        no_new_keyring: false,
         pause_image: "registry.k8s.io/pause:3.9".to_string(),
         pause_command: "/pause".to_string(),
+        drop_infra_ctr: false,
         cni_config: crate::network::CniConfig::default(),
         cgroup_driver: None,
         exec_sync_io_drain_timeout: Duration::ZERO,
@@ -119,6 +196,8 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
         enable_unprivileged_icmp: false,
         shim: ShimConfig {
             shim_path: PathBuf::from("/definitely/missing/crius-shim"),
+            runtime_config_path: PathBuf::new(),
+            monitor_cgroup: String::new(),
             work_dir: PathBuf::from("/tmp/crius-test-shims"),
             attach_socket_dir: PathBuf::from("/tmp/crius-test-attach"),
             container_exits_dir: PathBuf::from("/tmp/crius-test-exits"),
@@ -129,6 +208,8 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
             log_to_journald: false,
             no_sync_log: false,
             no_pivot: false,
+            no_new_keyring: false,
+            systemd_cgroup: false,
             runtime_path: PathBuf::from("/definitely/missing/runc"),
             max_container_log_line_size: 4096,
         },
@@ -144,6 +225,46 @@ fn test_service_with_env_cni() -> RuntimeServiceImpl {
     let mut config = test_runtime_config(tempdir().unwrap().keep());
     config.cni_config = crate::network::CniConfig::from_env();
     RuntimeServiceImpl::new(config)
+}
+
+fn test_runtime_container_config_with_mounts(mounts: Vec<MountConfig>) -> ContainerConfig {
+    ContainerConfig {
+        name: "test".to_string(),
+        image: "busybox:latest".to_string(),
+        command: vec!["sleep".to_string()],
+        args: vec!["1".to_string()],
+        env: Vec::new(),
+        working_dir: None,
+        mounts,
+        labels: Vec::new(),
+        annotations: Vec::new(),
+        privileged: false,
+        user: None,
+        run_as_group: None,
+        supplemental_groups: Vec::new(),
+        hostname: None,
+        tty: false,
+        stdin: false,
+        stdin_once: false,
+        log_path: None,
+        readonly_rootfs: false,
+        seccomp_notifier: None,
+        pids_limit: None,
+        no_new_privileges: None,
+        apparmor_profile: None,
+        selinux_label: None,
+        seccomp_profile: None,
+        capabilities: None,
+        cgroup_parent: None,
+        sysctls: HashMap::new(),
+        namespace_options: None,
+        namespace_paths: NamespacePaths::default(),
+        linux_resources: None,
+        devices: Vec::new(),
+        masked_paths: Vec::new(),
+        readonly_paths: Vec::new(),
+        rootfs: PathBuf::from("/tmp/crius-test-rootfs"),
+    }
 }
 
 #[test]
@@ -291,6 +412,8 @@ fn sanitize_spec_runtime_resources_clears_unsupported_extended_resources() {
             seccomp: None,
             sysctl: None,
             mount_label: None,
+            masked_paths: None,
+            readonly_paths: None,
             intel_rdt: None,
         }),
         annotations: None,
@@ -550,9 +673,9 @@ impl NriApi for FakeNri {
     }
 }
 
-fn env_lock() -> &'static StdMutex<()> {
-    static ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-    ENV_LOCK.get_or_init(|| StdMutex::new(()))
+fn env_lock() -> &'static tokio::sync::Mutex<()> {
+    static ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn write_fake_runtime_script(dir: &Path) -> PathBuf {
@@ -767,18 +890,11 @@ exit 0
     shim_path
 }
 
-fn ensure_test_shim_binary() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-
-    ONCE.call_once(|| {
-        let shim_path = PathBuf::from("/root/crius/target/debug/crius-shim");
-        if let Some(parent) = shim_path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-
-        fs::write(
-            &shim_path,
-            r#"#!/bin/sh
+fn write_test_shim_binary(dir: &Path) -> PathBuf {
+    let shim_path = dir.join("fake-crius-shim.sh");
+    fs::write(
+        &shim_path,
+        r#"#!/bin/sh
 set -eu
 exit_code_file=""
 log_file=""
@@ -812,26 +928,27 @@ while :; do
   sleep 1
 done
 "#,
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&shim_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&shim_path, perms).unwrap();
-    });
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&shim_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&shim_path, perms).unwrap();
+    shim_path
 }
 
 fn test_service_with_fake_runtime() -> (TempDir, RuntimeServiceImpl) {
-    ensure_test_shim_binary();
     let dir = tempdir().unwrap();
     let runtime_path = write_fake_runtime_script(dir.path());
-    test_service_with_runtime_path(dir, runtime_path)
+    test_service_with_runtime_path_and_shim_path_and_configure(dir, runtime_path, None, |_| {})
 }
 
-fn test_service_with_runtime_path(
-    dir: TempDir,
-    runtime_path: PathBuf,
-) -> (TempDir, RuntimeServiceImpl) {
-    test_service_with_runtime_path_and_shim_path(dir, runtime_path, None)
+fn test_service_with_fake_runtime_configure<F>(configure: F) -> (TempDir, RuntimeServiceImpl)
+where
+    F: FnOnce(&mut RuntimeConfig),
+{
+    let dir = tempdir().unwrap();
+    let runtime_path = write_fake_runtime_script(dir.path());
+    test_service_with_runtime_path_and_shim_path_and_configure(dir, runtime_path, None, configure)
 }
 
 fn test_service_with_runtime_path_and_shim_path(
@@ -839,10 +956,27 @@ fn test_service_with_runtime_path_and_shim_path(
     runtime_path: PathBuf,
     shim_path_override: Option<PathBuf>,
 ) -> (TempDir, RuntimeServiceImpl) {
-    ensure_test_shim_binary();
+    test_service_with_runtime_path_and_shim_path_and_configure(
+        dir,
+        runtime_path,
+        shim_path_override,
+        |_| {},
+    )
+}
+
+fn test_service_with_runtime_path_and_shim_path_and_configure<F>(
+    dir: TempDir,
+    runtime_path: PathBuf,
+    shim_path_override: Option<PathBuf>,
+    configure: F,
+) -> (TempDir, RuntimeServiceImpl)
+where
+    F: FnOnce(&mut RuntimeConfig),
+{
+    let default_test_shim_path = write_test_shim_binary(dir.path());
     let shim_work_dir = dir.path().join("shims");
     let shim_runtime_path = runtime_path.clone();
-    let config = RuntimeConfig {
+    let mut config = RuntimeConfig {
         root_dir: dir.path().join("root"),
         runtime: "runc".to_string(),
         runtime_handlers: vec!["runc".to_string()],
@@ -850,19 +984,46 @@ fn test_service_with_runtime_path_and_shim_path(
             "runc".to_string(),
             crate::config::ResolvedRuntimeHandlerConfig {
                 runtime_path: runtime_path.display().to_string(),
+                runtime_config_path: String::new(),
                 runtime_root: dir.path().join("runtime-root").display().to_string(),
-                monitor_path: "/root/crius/target/debug/crius-shim".to_string(),
+                platform_runtime_paths: HashMap::new(),
+                monitor_path: default_test_shim_path.display().to_string(),
+                monitor_cgroup: String::new(),
                 monitor_env: Vec::new(),
+                stream_websockets: false,
                 allowed_annotations: Vec::new(),
                 default_annotations: HashMap::new(),
+                privileged_without_host_devices: false,
+                privileged_without_host_devices_all_devices_allowed: false,
                 container_create_timeout: 240,
+                snapshotter: "internal-overlay-untar".to_string(),
             },
         )]),
         runtime_root: dir.path().join("runtime-root"),
         log_dir: dir.path().join("logs"),
         runtime_path,
+        runtime_config_path: PathBuf::new(),
         image_root: dir.path().join("images"),
         image_driver: "overlay".to_string(),
+        image_global_auth_file: PathBuf::new(),
+        image_namespaced_auth_dir: PathBuf::new(),
+        image_default_transport: "docker://".to_string(),
+        image_short_name_mode: "disabled".to_string(),
+        image_pull_progress_timeout: std::time::Duration::ZERO,
+        image_max_concurrent_downloads: 3,
+        image_pull_retry_count: 0,
+        image_registry_config_dir: PathBuf::new(),
+        image_decryption_keys_path: PathBuf::new(),
+        image_decryption_decoder_path: "ctd-decoder".to_string(),
+        image_decryption_keyprovider_config: PathBuf::new(),
+        image_additional_artifact_stores: Vec::new(),
+        image_signature_policy: PathBuf::new(),
+        image_signature_policy_dir: PathBuf::new(),
+        image_storage_options: Vec::new(),
+        image_volumes: "mkdir".to_string(),
+        image_pinned_images: Vec::new(),
+        image_big_files_temporary_dir: PathBuf::new(),
+        image_oci_artifact_mount_support: true,
         workloads: HashMap::new(),
         enable_pod_events: true,
         included_pod_metrics: vec!["all".to_string()],
@@ -870,7 +1031,26 @@ fn test_service_with_runtime_path_and_shim_path(
         pod_sandbox_metrics_collection_period: 0,
         grpc_max_send_msg_size: 80 * 1024 * 1024,
         grpc_max_recv_msg_size: 80 * 1024 * 1024,
+        metrics_enable: false,
+        metrics_host: "127.0.0.1".to_string(),
+        metrics_port: 9090,
+        metrics_socket_path: PathBuf::new(),
+        metrics_enable_tls: false,
+        metrics_tls_cert_file: PathBuf::new(),
+        metrics_tls_key_file: PathBuf::new(),
+        metrics_tls_ca_file: PathBuf::new(),
+        metrics_tls_min_version: "VersionTLS12".to_string(),
+        metrics_tls_cipher_suites: Vec::new(),
+        metrics_collectors: vec![
+            "runtime".to_string(),
+            "resources".to_string(),
+            "images".to_string(),
+        ],
+        tracing_enable: false,
+        tracing_endpoint: String::new(),
+        tracing_sampling_rate_per_million: 0,
         monitor_env: Vec::new(),
+        monitor_cgroup: String::new(),
         default_env: Vec::new(),
         default_capabilities: vec![
             "CHOWN".to_string(),
@@ -889,6 +1069,17 @@ fn test_service_with_runtime_path_and_shim_path(
             "AUDIT_WRITE".to_string(),
         ],
         default_sysctls: HashMap::new(),
+        default_ulimits: Vec::new(),
+        allowed_devices: Vec::new(),
+        additional_devices: Vec::new(),
+        device_ownership_from_security_context: false,
+        add_inheritable_capabilities: false,
+        base_runtime_spec: None,
+        default_mounts_file: PathBuf::new(),
+        hooks_dir: Vec::new(),
+        absent_mount_sources_to_reject: Vec::new(),
+        disable_proc_mount: false,
+        timezone: String::new(),
         attach_socket_dir: dir.path().join("attach"),
         container_exits_dir: dir.path().join("exits"),
         clean_shutdown_file: dir.path().join("clean.shutdown"),
@@ -906,7 +1097,13 @@ fn test_service_with_runtime_path_and_shim_path(
         tolerate_missing_hugetlb_controller: true,
         separate_pull_cgroup: String::new(),
         seccomp_profile: PathBuf::new(),
+        privileged_seccomp_profile: "unconfined".to_string(),
         unset_seccomp_profile: "runtime/default".to_string(),
+        apparmor_default_profile: "crius-default".to_string(),
+        disable_apparmor: false,
+        enable_selinux: false,
+        selinux_category_range: 1024,
+        hostnetwork_disable_selinux: true,
         uid_mappings: None,
         gid_mappings: None,
         minimum_mappable_uid: -1,
@@ -914,11 +1111,17 @@ fn test_service_with_runtime_path_and_shim_path(
         io_uid: 0,
         io_gid: 0,
         pids_limit: -1,
+        infra_ctr_cpuset: String::new(),
+        shared_cpuset: String::new(),
         exec_cpu_affinity: String::new(),
+        irqbalance_config_file: PathBuf::new(),
+        irqbalance_config_restore_file: "disable".to_string(),
         read_only: false,
         no_pivot: false,
+        no_new_keyring: false,
         pause_image: "registry.k8s.io/pause:3.9".to_string(),
         pause_command: "/pause".to_string(),
+        drop_infra_ctr: false,
         cni_config: crate::network::CniConfig::default(),
         cgroup_driver: None,
         exec_sync_io_drain_timeout: Duration::ZERO,
@@ -929,8 +1132,9 @@ fn test_service_with_runtime_path_and_shim_path(
         enable_unprivileged_ports: false,
         enable_unprivileged_icmp: false,
         shim: ShimConfig {
-            shim_path: shim_path_override
-                .unwrap_or_else(|| PathBuf::from("/root/crius/target/debug/crius-shim")),
+            shim_path: shim_path_override.unwrap_or(default_test_shim_path),
+            runtime_config_path: PathBuf::new(),
+            monitor_cgroup: String::new(),
             work_dir: shim_work_dir.clone(),
             attach_socket_dir: dir.path().join("attach"),
             container_exits_dir: dir.path().join("exits"),
@@ -941,11 +1145,14 @@ fn test_service_with_runtime_path_and_shim_path(
             log_to_journald: false,
             no_sync_log: false,
             no_pivot: false,
+            no_new_keyring: false,
+            systemd_cgroup: false,
             runtime_path: shim_runtime_path,
             max_container_log_line_size: 4096,
         },
         streaming: crate::streaming::StreamingConfig::default(),
     };
+    configure(&mut config);
     let nri_config = NriConfig {
         blockio_config_path: write_blockio_config(&dir).display().to_string(),
         ..Default::default()
@@ -993,9 +1200,9 @@ fn test_service_with_fake_runtime_and_nri_and_shim(
     fake_nri: Arc<dyn NriApi>,
     shim_path_override: Option<PathBuf>,
 ) -> (TempDir, RuntimeServiceImpl) {
-    ensure_test_shim_binary();
     let dir = tempdir().unwrap();
     let runtime_path = write_fake_runtime_script(dir.path());
+    let default_test_shim_path = write_test_shim_binary(dir.path());
     let shim_work_dir = dir.path().join("shims");
     let shim_runtime_path = runtime_path.clone();
     let config = RuntimeConfig {
@@ -1006,19 +1213,46 @@ fn test_service_with_fake_runtime_and_nri_and_shim(
             "runc".to_string(),
             crate::config::ResolvedRuntimeHandlerConfig {
                 runtime_path: runtime_path.display().to_string(),
+                runtime_config_path: String::new(),
                 runtime_root: dir.path().join("runtime-root").display().to_string(),
-                monitor_path: "/root/crius/target/debug/crius-shim".to_string(),
+                platform_runtime_paths: HashMap::new(),
+                monitor_path: default_test_shim_path.display().to_string(),
+                monitor_cgroup: String::new(),
                 monitor_env: Vec::new(),
+                stream_websockets: false,
                 allowed_annotations: Vec::new(),
                 default_annotations: HashMap::new(),
+                privileged_without_host_devices: false,
+                privileged_without_host_devices_all_devices_allowed: false,
                 container_create_timeout: 240,
+                snapshotter: "internal-overlay-untar".to_string(),
             },
         )]),
         runtime_root: dir.path().join("runtime-root"),
         log_dir: dir.path().join("logs"),
         runtime_path,
+        runtime_config_path: PathBuf::new(),
         image_root: dir.path().join("images"),
         image_driver: "overlay".to_string(),
+        image_global_auth_file: PathBuf::new(),
+        image_namespaced_auth_dir: PathBuf::new(),
+        image_default_transport: "docker://".to_string(),
+        image_short_name_mode: "disabled".to_string(),
+        image_pull_progress_timeout: std::time::Duration::ZERO,
+        image_max_concurrent_downloads: 3,
+        image_pull_retry_count: 0,
+        image_registry_config_dir: PathBuf::new(),
+        image_decryption_keys_path: PathBuf::new(),
+        image_decryption_decoder_path: "ctd-decoder".to_string(),
+        image_decryption_keyprovider_config: PathBuf::new(),
+        image_additional_artifact_stores: Vec::new(),
+        image_signature_policy: PathBuf::new(),
+        image_signature_policy_dir: PathBuf::new(),
+        image_storage_options: Vec::new(),
+        image_volumes: "mkdir".to_string(),
+        image_pinned_images: Vec::new(),
+        image_big_files_temporary_dir: PathBuf::new(),
+        image_oci_artifact_mount_support: true,
         workloads: HashMap::new(),
         enable_pod_events: true,
         included_pod_metrics: vec!["all".to_string()],
@@ -1026,7 +1260,26 @@ fn test_service_with_fake_runtime_and_nri_and_shim(
         pod_sandbox_metrics_collection_period: 0,
         grpc_max_send_msg_size: 80 * 1024 * 1024,
         grpc_max_recv_msg_size: 80 * 1024 * 1024,
+        metrics_enable: false,
+        metrics_host: "127.0.0.1".to_string(),
+        metrics_port: 9090,
+        metrics_socket_path: PathBuf::new(),
+        metrics_enable_tls: false,
+        metrics_tls_cert_file: PathBuf::new(),
+        metrics_tls_key_file: PathBuf::new(),
+        metrics_tls_ca_file: PathBuf::new(),
+        metrics_tls_min_version: "VersionTLS12".to_string(),
+        metrics_tls_cipher_suites: Vec::new(),
+        metrics_collectors: vec![
+            "runtime".to_string(),
+            "resources".to_string(),
+            "images".to_string(),
+        ],
+        tracing_enable: false,
+        tracing_endpoint: String::new(),
+        tracing_sampling_rate_per_million: 0,
         monitor_env: Vec::new(),
+        monitor_cgroup: String::new(),
         default_env: Vec::new(),
         default_capabilities: vec![
             "CHOWN".to_string(),
@@ -1045,6 +1298,17 @@ fn test_service_with_fake_runtime_and_nri_and_shim(
             "AUDIT_WRITE".to_string(),
         ],
         default_sysctls: HashMap::new(),
+        default_ulimits: Vec::new(),
+        allowed_devices: Vec::new(),
+        additional_devices: Vec::new(),
+        device_ownership_from_security_context: false,
+        add_inheritable_capabilities: false,
+        base_runtime_spec: None,
+        default_mounts_file: PathBuf::new(),
+        hooks_dir: Vec::new(),
+        absent_mount_sources_to_reject: Vec::new(),
+        disable_proc_mount: false,
+        timezone: String::new(),
         attach_socket_dir: dir.path().join("attach"),
         container_exits_dir: dir.path().join("exits"),
         clean_shutdown_file: dir.path().join("clean.shutdown"),
@@ -1062,7 +1326,13 @@ fn test_service_with_fake_runtime_and_nri_and_shim(
         tolerate_missing_hugetlb_controller: true,
         separate_pull_cgroup: String::new(),
         seccomp_profile: PathBuf::new(),
+        privileged_seccomp_profile: "unconfined".to_string(),
         unset_seccomp_profile: "runtime/default".to_string(),
+        apparmor_default_profile: "crius-default".to_string(),
+        disable_apparmor: false,
+        enable_selinux: false,
+        selinux_category_range: 1024,
+        hostnetwork_disable_selinux: true,
         uid_mappings: None,
         gid_mappings: None,
         minimum_mappable_uid: -1,
@@ -1070,11 +1340,17 @@ fn test_service_with_fake_runtime_and_nri_and_shim(
         io_uid: 0,
         io_gid: 0,
         pids_limit: -1,
+        infra_ctr_cpuset: String::new(),
+        shared_cpuset: String::new(),
         exec_cpu_affinity: String::new(),
+        irqbalance_config_file: PathBuf::new(),
+        irqbalance_config_restore_file: "disable".to_string(),
         read_only: false,
         no_pivot: false,
+        no_new_keyring: false,
         pause_image: "registry.k8s.io/pause:3.9".to_string(),
         pause_command: "/pause".to_string(),
+        drop_infra_ctr: false,
         cni_config: crate::network::CniConfig::default(),
         cgroup_driver: None,
         exec_sync_io_drain_timeout: Duration::ZERO,
@@ -1085,8 +1361,9 @@ fn test_service_with_fake_runtime_and_nri_and_shim(
         enable_unprivileged_ports: false,
         enable_unprivileged_icmp: false,
         shim: ShimConfig {
-            shim_path: shim_path_override
-                .unwrap_or_else(|| PathBuf::from("/root/crius/target/debug/crius-shim")),
+            shim_path: shim_path_override.unwrap_or(default_test_shim_path),
+            runtime_config_path: PathBuf::new(),
+            monitor_cgroup: String::new(),
             work_dir: shim_work_dir.clone(),
             attach_socket_dir: dir.path().join("attach"),
             container_exits_dir: dir.path().join("exits"),
@@ -1097,6 +1374,8 @@ fn test_service_with_fake_runtime_and_nri_and_shim(
             log_to_journald: false,
             no_sync_log: false,
             no_pivot: false,
+            no_new_keyring: false,
+            systemd_cgroup: false,
             runtime_path: shim_runtime_path,
             max_container_log_line_size: 4096,
         },
@@ -2104,6 +2383,7 @@ async fn nri_create_result_applies_adjustments_and_side_effects() {
         stdin_once: false,
         log_path: None,
         readonly_rootfs: false,
+        seccomp_notifier: None,
         pids_limit: None,
         no_new_privileges: None,
         apparmor_profile: None,
@@ -2116,6 +2396,8 @@ async fn nri_create_result_applies_adjustments_and_side_effects() {
         namespace_paths: NamespacePaths::default(),
         linux_resources: None,
         devices: Vec::new(),
+        masked_paths: Vec::new(),
+        readonly_paths: Vec::new(),
         rootfs: dir
             .path()
             .join("root")
@@ -2328,6 +2610,139 @@ fn nri_allowed_annotation_prefixes_include_existing_annotations() {
     assert!(!allowed
         .iter()
         .any(|item| item == INTERNAL_CONTAINER_STATE_KEY));
+}
+
+#[test]
+fn external_pod_annotations_filter_container_reserved_keys_but_keep_user_annotations() {
+    let annotations = HashMap::from([
+        (
+            CRIO_CONTAINER_NAME_ANNOTATION.to_string(),
+            "app".to_string(),
+        ),
+        (
+            CRIO_POD_NAMESPACE_ANNOTATION.to_string(),
+            "default".to_string(),
+        ),
+        ("example.com/custom".to_string(), "value".to_string()),
+    ]);
+
+    let filtered = RuntimeServiceImpl::external_pod_annotations(&annotations);
+
+    assert!(!filtered.contains_key(CRIO_CONTAINER_NAME_ANNOTATION));
+    assert_eq!(
+        filtered
+            .get(CRIO_POD_NAMESPACE_ANNOTATION)
+            .map(String::as_str),
+        Some("default")
+    );
+    assert_eq!(
+        filtered.get("example.com/custom").map(String::as_str),
+        Some("value")
+    );
+}
+
+#[test]
+fn external_container_annotations_filter_pod_reserved_keys_but_keep_user_annotations() {
+    let annotations = HashMap::from([
+        (
+            CRIO_POD_NAMESPACE_ANNOTATION.to_string(),
+            "default".to_string(),
+        ),
+        (
+            CRIO_CONTAINER_NAME_ANNOTATION.to_string(),
+            "app".to_string(),
+        ),
+        ("example.com/custom".to_string(), "value".to_string()),
+    ]);
+
+    let filtered = RuntimeServiceImpl::external_container_annotations(&annotations);
+
+    assert!(!filtered.contains_key(CRIO_POD_NAMESPACE_ANNOTATION));
+    assert_eq!(
+        filtered
+            .get(CRIO_CONTAINER_NAME_ANNOTATION)
+            .map(String::as_str),
+        Some("app")
+    );
+    assert_eq!(
+        filtered.get("example.com/custom").map(String::as_str),
+        Some("value")
+    );
+}
+
+#[test]
+fn external_container_annotations_keep_kubelet_container_metadata_annotations() {
+    let annotations = HashMap::from([
+        (
+            "io.kubernetes.container.restartCount".to_string(),
+            "1".to_string(),
+        ),
+        (
+            "io.kubernetes.container.terminationMessagePath".to_string(),
+            "/dev/termination-log".to_string(),
+        ),
+        (
+            "io.kubernetes.container.terminationMessagePolicy".to_string(),
+            "File".to_string(),
+        ),
+    ]);
+
+    let filtered = RuntimeServiceImpl::external_container_annotations(&annotations);
+
+    assert_eq!(
+        filtered
+            .get("io.kubernetes.container.restartCount")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        filtered
+            .get("io.kubernetes.container.terminationMessagePath")
+            .map(String::as_str),
+        Some("/dev/termination-log")
+    );
+    assert_eq!(
+        filtered
+            .get("io.kubernetes.container.terminationMessagePolicy")
+            .map(String::as_str),
+        Some("File")
+    );
+}
+
+#[test]
+fn merge_external_pod_annotations_prefers_spec_for_allowed_pod_keys_only() {
+    let base = HashMap::from([
+        (
+            CRIO_POD_NAMESPACE_ANNOTATION.to_string(),
+            "default".to_string(),
+        ),
+        ("example.com/custom".to_string(), "base".to_string()),
+    ]);
+    let spec = HashMap::from([
+        (
+            CRIO_POD_NAMESPACE_ANNOTATION.to_string(),
+            "kube-system".to_string(),
+        ),
+        (
+            CRIO_CONTAINER_NAME_ANNOTATION.to_string(),
+            "should-be-hidden".to_string(),
+        ),
+        ("example.com/custom".to_string(), "spec".to_string()),
+    ]);
+
+    let merged = RuntimeServiceImpl::merge_external_pod_annotations(&base, Some(&spec));
+
+    assert_eq!(
+        merged
+            .get(CRIO_POD_NAMESPACE_ANNOTATION)
+            .map(String::as_str),
+        Some("kube-system")
+    );
+    assert!(!merged.contains_key(CRIO_CONTAINER_NAME_ANNOTATION));
+    assert_eq!(
+        merged.get("example.com/custom").map(String::as_str),
+        Some("spec")
+    );
 }
 
 #[test]
@@ -2815,10 +3230,10 @@ fn effective_pod_sysctls_adds_unprivileged_defaults_for_non_host_network_pods() 
     let mut service = test_service();
     service.config.enable_unprivileged_ports = true;
     service.config.enable_unprivileged_icmp = true;
-    service.config.default_sysctls = HashMap::from([(
-        "kernel.shm_rmid_forced".to_string(),
-        "1".to_string(),
-    )]);
+    service.config.default_sysctls =
+        HashMap::from([("kernel.shm_rmid_forced".to_string(), "1".to_string())]);
+    service.config.default_mounts_file = PathBuf::from("/etc/containers/mounts.conf");
+    service.config.absent_mount_sources_to_reject = vec![PathBuf::from("/etc/hostname")];
 
     let namespace_options = NamespaceOption {
         network: NamespaceMode::Pod as i32,
@@ -2848,10 +3263,8 @@ fn effective_pod_sysctls_preserves_user_overrides_and_skips_host_network_default
     let mut service = test_service();
     service.config.enable_unprivileged_ports = true;
     service.config.enable_unprivileged_icmp = true;
-    service.config.default_sysctls = HashMap::from([(
-        "kernel.shm_rmid_forced".to_string(),
-        "1".to_string(),
-    )]);
+    service.config.default_sysctls =
+        HashMap::from([("kernel.shm_rmid_forced".to_string(), "1".to_string())]);
 
     let requested = HashMap::from([
         (
@@ -2862,10 +3275,7 @@ fn effective_pod_sysctls_preserves_user_overrides_and_skips_host_network_default
             "net.ipv4.ping_group_range".to_string(),
             "1 1000".to_string(),
         ),
-        (
-            "kernel.shm_rmid_forced".to_string(),
-            "0".to_string(),
-        ),
+        ("kernel.shm_rmid_forced".to_string(), "0".to_string()),
     ]);
     let host_network = NamespaceOption {
         network: NamespaceMode::Node as i32,
@@ -3071,6 +3481,53 @@ fn effective_userns_options_preserves_explicit_request_mappings() {
         .expect("userns options should be present");
     assert_eq!(userns.uids[0].host_id, 300000);
     assert_eq!(userns.gids[0].host_id, 400000);
+}
+
+#[test]
+fn effective_container_namespace_options_inherits_host_network_from_sandbox_defaults() {
+    let service = test_service();
+    let sandbox = StoredNamespaceOptions {
+        network: NamespaceMode::Node as i32,
+        pid: NamespaceMode::Pod as i32,
+        ipc: NamespaceMode::Pod as i32,
+        target_id: String::new(),
+        userns_options: None,
+    };
+    let requested = NamespaceOption {
+        network: NamespaceMode::Pod as i32,
+        pid: NamespaceMode::Pod as i32,
+        ipc: NamespaceMode::Pod as i32,
+        target_id: String::new(),
+        userns_options: None,
+    };
+
+    let options = service
+        .effective_container_namespace_options(Some(&requested), Some(&sandbox))
+        .expect("sandbox namespace options should be applied");
+
+    assert_eq!(options.network, NamespaceMode::Node as i32);
+    assert_eq!(options.pid, NamespaceMode::Pod as i32);
+    assert_eq!(options.ipc, NamespaceMode::Pod as i32);
+}
+
+#[test]
+fn effective_container_namespace_options_inherits_sandbox_when_container_request_omits_it() {
+    let service = test_service();
+    let sandbox = StoredNamespaceOptions {
+        network: NamespaceMode::Pod as i32,
+        pid: NamespaceMode::Pod as i32,
+        ipc: NamespaceMode::Node as i32,
+        target_id: String::new(),
+        userns_options: None,
+    };
+
+    let options = service
+        .effective_container_namespace_options(None, Some(&sandbox))
+        .expect("sandbox namespace options should be inherited");
+
+    assert_eq!(options.network, NamespaceMode::Pod as i32);
+    assert_eq!(options.pid, NamespaceMode::Pod as i32);
+    assert_eq!(options.ipc, NamespaceMode::Node as i32);
 }
 
 #[test]
@@ -3320,6 +3777,25 @@ fn pod_network_status_promotes_first_additional_ip_when_primary_missing() {
 }
 
 #[test]
+fn pod_network_status_returns_empty_network_for_host_network_pod() {
+    let state = StoredPodState {
+        namespace_options: Some(StoredNamespaceOptions {
+            network: NamespaceMode::Node as i32,
+            pid: NamespaceMode::Pod as i32,
+            ipc: NamespaceMode::Pod as i32,
+            target_id: String::new(),
+            userns_options: None,
+        }),
+        ..Default::default()
+    };
+
+    let status = RuntimeServiceImpl::pod_network_status_from_state(Some(&state))
+        .expect("host network pod should still report a network status object");
+    assert!(status.ip.is_empty());
+    assert!(status.additional_ips.is_empty());
+}
+
+#[test]
 fn pod_linux_status_preserves_host_pid_and_host_ipc_namespace_modes() {
     let state = StoredPodState {
         namespace_options: Some(StoredNamespaceOptions {
@@ -3394,6 +3870,8 @@ fn build_container_status_snapshot_uses_internal_timestamps_and_exit_code() {
         mounts: vec![StoredMount {
             container_path: "/data".to_string(),
             host_path: "/host/data".to_string(),
+            image: String::new(),
+            image_sub_path: String::new(),
             readonly: true,
             selinux_relabel: false,
             propagation: crate::proto::runtime::v1::MountPropagation::PropagationPrivate as i32,
@@ -3539,6 +4017,60 @@ fn build_container_status_snapshot_uses_minus_one_when_exited_exit_code_is_unkno
 }
 
 #[test]
+fn effective_runtime_state_for_container_prefers_stored_exit_when_runtime_is_unknown() {
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            started_at: Some(5),
+            finished_at: Some(8),
+            exit_code: Some(137),
+            ..Default::default()
+        },
+    )
+    .expect("store internal state");
+
+    let container = Container {
+        id: "container-exited".to_string(),
+        state: ContainerState::ContainerExited as i32,
+        metadata: Some(ContainerMetadata {
+            name: "c1".to_string(),
+            attempt: 1,
+        }),
+        annotations,
+        ..Default::default()
+    };
+
+    let runtime_state = RuntimeServiceImpl::effective_runtime_state_for_container(
+        &container,
+        crate::runtime::ContainerStatus::Unknown,
+    );
+
+    assert_eq!(runtime_state, ContainerState::ContainerExited as i32);
+}
+
+#[test]
+fn effective_runtime_state_for_container_preserves_live_store_state_when_runtime_is_unknown() {
+    let container = Container {
+        id: "container-running".to_string(),
+        state: ContainerState::ContainerRunning as i32,
+        metadata: Some(ContainerMetadata {
+            name: "c1".to_string(),
+            attempt: 1,
+        }),
+        ..Default::default()
+    };
+
+    let runtime_state = RuntimeServiceImpl::effective_runtime_state_for_container(
+        &container,
+        crate::runtime::ContainerStatus::Unknown,
+    );
+
+    assert_eq!(runtime_state, ContainerState::ContainerRunning as i32);
+}
+
+#[test]
 fn record_to_container_status_uses_minus_one_for_missing_stopped_exit_code() {
     let record = crate::storage::ContainerRecord {
         id: "container-1".to_string(),
@@ -3561,16 +4093,44 @@ fn record_to_container_status_uses_minus_one_for_missing_stopped_exit_code() {
 
 #[test]
 fn selinux_label_from_proto_uses_defaults_for_missing_parts() {
-    let label = RuntimeServiceImpl::selinux_label_from_proto(Some(
-        &crate::proto::runtime::v1::SeLinuxOption {
+    let label = RuntimeServiceImpl::selinux_label_from_proto(
+        Some(&crate::proto::runtime::v1::SeLinuxOption {
             user: String::new(),
             role: String::new(),
             r#type: "spc_t".to_string(),
             level: String::new(),
-        },
-    ));
+        }),
+        None,
+        1024,
+    );
 
     assert_eq!(label.as_deref(), Some("system_u:system_r:spc_t:s0"));
+}
+
+#[test]
+fn selinux_label_from_proto_generates_mcs_level_within_configured_range() {
+    let label = RuntimeServiceImpl::selinux_label_from_proto(
+        Some(&crate::proto::runtime::v1::SeLinuxOption {
+            user: String::new(),
+            role: String::new(),
+            r#type: "container_t".to_string(),
+            level: String::new(),
+        }),
+        Some("pod-seed"),
+        8,
+    )
+    .expect("label should be generated");
+
+    assert!(label.starts_with("system_u:system_r:container_t:s0:c"));
+    let categories = label
+        .split(":s0:c")
+        .nth(1)
+        .expect("generated label should contain s0:c");
+    let (left, right) = categories.split_once(",c").unwrap();
+    let first: u32 = left.parse().unwrap();
+    let second: u32 = right.parse().unwrap();
+    assert!(first < 8);
+    assert!(second < 8);
 }
 
 #[test]
@@ -3589,6 +4149,8 @@ fn build_nri_container_from_proto_preserves_spec_cgroups_path() {
         seccomp: None,
         sysctl: None,
         mount_label: None,
+        masked_paths: None,
+        readonly_paths: None,
         intel_rdt: None,
     });
     service
@@ -3958,7 +4520,7 @@ fn effective_seccomp_profile_uses_configured_unset_fallback() {
     let mut service = test_service();
     service.config.unset_seccomp_profile = "runtime/default".to_string();
 
-    let profile = service.effective_seccomp_profile_from_proto(None, "");
+    let profile = service.effective_seccomp_profile_from_proto(None, "", false);
     assert!(matches!(profile, Some(SeccompProfile::RuntimeDefault)));
 }
 
@@ -3974,8 +4536,130 @@ fn effective_seccomp_profile_does_not_override_explicit_unconfined() {
             localhost_ref: String::new(),
         }),
         "",
+        false,
     );
     assert!(matches!(profile, Some(SeccompProfile::Unconfined)));
+}
+
+#[test]
+fn effective_seccomp_profile_uses_privileged_fallback_for_privileged_container() {
+    let mut service = test_service();
+    service.config.privileged_seccomp_profile = "unconfined".to_string();
+
+    let profile = service.effective_seccomp_profile_from_proto(None, "", true);
+    assert!(matches!(profile, Some(SeccompProfile::Unconfined)));
+}
+
+#[test]
+fn seccomp_notifier_action_supports_v1_and_v2_annotations() {
+    let service = test_service();
+    let mut annotations = HashMap::new();
+    annotations.insert(
+        "io.kubernetes.cri-o.seccompNotifierAction".to_string(),
+        "stop".to_string(),
+    );
+    assert_eq!(
+        service
+            .seccomp_notifier_action_from_annotations(&annotations, "runc")
+            .unwrap(),
+        Some(crate::runtime::SeccompNotifierMode::Stop)
+    );
+
+    annotations.clear();
+    annotations.insert(
+        "seccomp-notifier-action.crio.io".to_string(),
+        "".to_string(),
+    );
+    assert_eq!(
+        service
+            .seccomp_notifier_action_from_annotations(&annotations, "runc")
+            .unwrap(),
+        Some(crate::runtime::SeccompNotifierMode::Log)
+    );
+}
+
+#[test]
+fn seccomp_notifier_action_rejects_conflicting_annotations() {
+    let service = test_service();
+    let annotations = HashMap::from([
+        (
+            "io.kubernetes.cri-o.seccompNotifierAction".to_string(),
+            "stop".to_string(),
+        ),
+        (
+            "seccomp-notifier-action.crio.io".to_string(),
+            "log".to_string(),
+        ),
+    ]);
+    let err = service
+        .seccomp_notifier_action_from_annotations(&annotations, "runc")
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+#[test]
+fn effective_apparmor_profile_uses_default_when_runtime_default_requested() {
+    let mut service = test_service();
+    service.config.apparmor_default_profile = "crius-default".to_string();
+
+    let result = service.effective_apparmor_profile_from_proto(
+        Some(&crate::proto::runtime::v1::SecurityProfile {
+            profile_type: crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
+                as i32,
+            localhost_ref: String::new(),
+        }),
+        "",
+        false,
+    );
+    let availability = crate::security::SecurityManager::new();
+    if availability.is_apparmor_available() {
+        assert_eq!(result.unwrap().as_deref(), Some("crius-default"));
+    } else {
+        assert_eq!(
+            result
+                .expect_err("runtime/default must fail when apparmor is unavailable")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+}
+
+#[test]
+fn effective_apparmor_profile_rejects_explicit_profile_when_disabled() {
+    let mut service = test_service();
+    service.config.disable_apparmor = true;
+
+    let err = service
+        .effective_apparmor_profile_from_proto(
+            Some(&crate::proto::runtime::v1::SecurityProfile {
+                profile_type: crate::proto::runtime::v1::security_profile::ProfileType::Localhost
+                    as i32,
+                localhost_ref: "custom-profile".to_string(),
+            }),
+            "",
+            false,
+        )
+        .expect_err("disabled apparmor must reject explicit profile");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+#[test]
+fn effective_selinux_label_skips_host_network_when_configured() {
+    let mut service = test_service();
+    service.config.enable_selinux = true;
+    service.config.hostnetwork_disable_selinux = true;
+
+    let label = service.effective_selinux_label_from_proto(
+        Some(&crate::proto::runtime::v1::SeLinuxOption {
+            user: String::new(),
+            role: String::new(),
+            r#type: "spc_t".to_string(),
+            level: String::new(),
+        }),
+        true,
+        Some("pod-seed"),
+    );
+    assert!(label.is_none());
 }
 
 #[tokio::test]
@@ -4149,6 +4833,141 @@ async fn create_container_rejects_missing_image_spec() {
         service.container_id_for_reserved_name(&name_key).is_none(),
         "invalid request must not reserve container names"
     );
+}
+
+#[tokio::test]
+async fn create_container_rejects_not_ready_sandbox() {
+    let service = test_service();
+    let mut pod = test_pod("pod-notready", HashMap::new());
+    pod.state = PodSandboxState::SandboxNotready as i32;
+    service
+        .pod_sandboxes
+        .lock()
+        .await
+        .insert("pod-notready".to_string(), pod);
+
+    let err = RuntimeService::create_container(
+        &service,
+        Request::new(CreateContainerRequest {
+            pod_sandbox_id: "pod-notready".to_string(),
+            config: Some(crate::proto::runtime::v1::ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "workload".to_string(),
+                    attempt: 1,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:latest".to_string(),
+                    user_specified_image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect_err("not-ready sandbox should be rejected");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("sandbox is not ready"));
+    assert!(err.message().contains("pod-notready"));
+}
+
+#[tokio::test]
+async fn create_container_reclaims_stale_reserved_name_without_live_container() {
+    let service = test_service();
+    let name_key = "container:workload:pod-stale-name:default:uid:1".to_string();
+    let mut stale_guard = service
+        .reserve_container_name("stale-container", &name_key)
+        .expect("stale reservation should succeed");
+    stale_guard.disarm();
+
+    let guard = service
+        .reserve_container_name_for_create("fresh-container", &name_key)
+        .await
+        .expect("stale reservation should be reclaimed");
+    let reserved = service
+        .container_id_for_reserved_name(&name_key)
+        .expect("name should be reserved for the new create attempt");
+    assert_eq!(reserved, "fresh-container");
+    drop(guard);
+}
+
+#[tokio::test]
+async fn create_container_reclaims_exited_reserved_name_without_live_runtime() {
+    let (_dir, service) = test_service_with_fake_runtime();
+    let name_key = "container:workload:pod-exited-name:default:uid:1".to_string();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            metadata_name: Some("workload".to_string()),
+            metadata_attempt: Some(1),
+            finished_at: Some(RuntimeServiceImpl::now_nanos()),
+            exit_code: Some(-1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut stale_guard = service
+        .reserve_container_name("exited-container", &name_key)
+        .expect("stale reservation should succeed");
+    stale_guard.disarm();
+    service.containers.lock().await.insert(
+        "exited-container".to_string(),
+        Container {
+            state: ContainerState::ContainerExited as i32,
+            metadata: Some(ContainerMetadata {
+                name: "workload".to_string(),
+                attempt: 1,
+            }),
+            pod_sandbox_id: "pod-exited-name".to_string(),
+            annotations: annotations.clone(),
+            ..Default::default()
+        },
+    );
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "exited-container",
+            "pod-exited-name",
+            crate::runtime::ContainerStatus::Stopped(-1),
+            "busybox:latest",
+            &["sleep".to_string()],
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+
+    let guard = service
+        .reserve_container_name_for_create("fresh-container", &name_key)
+        .await
+        .expect("exited reservation should be reclaimed");
+    let reserved = service
+        .container_id_for_reserved_name(&name_key)
+        .expect("name should be reserved for the new create attempt");
+    assert_eq!(reserved, "fresh-container");
+    assert!(service
+        .containers
+        .lock()
+        .await
+        .get("exited-container")
+        .is_none());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_container("exited-container")
+        .unwrap()
+        .is_none());
+    drop(guard);
 }
 
 #[tokio::test]
@@ -4371,9 +5190,22 @@ async fn recover_state_rebuilds_reserved_pod_and_container_names() {
 }
 
 #[tokio::test]
-async fn run_pod_sandbox_surfaces_pause_image_not_present_locally() {
+async fn run_pod_sandbox_auto_pulls_missing_pause_image_into_shared_image_service() {
     let (_dir, service) = test_service_with_fake_runtime();
-    let err = RuntimeService::run_pod_sandbox(
+    let pulls = Arc::new(StdMutex::new(Vec::new()));
+    service.image_service().set_test_pull_handler(Arc::new({
+        let pulls = pulls.clone();
+        move |request| {
+            pulls.lock().unwrap().push(request);
+            Ok(crate::image::TestPullResponse {
+                image_id: "sha256:pause-auto".to_string(),
+                size: 64,
+                ..Default::default()
+            })
+        }
+    }));
+
+    let response = RuntimeService::run_pod_sandbox(
         &service,
         Request::new(host_network_run_pod_sandbox_request(
             "pause-missing",
@@ -4383,20 +5215,86 @@ async fn run_pod_sandbox_surfaces_pause_image_not_present_locally() {
         )),
     )
     .await
-    .expect_err("missing local pause image should fail sandbox creation");
+    .expect("missing local pause image should be auto-pulled");
+    assert!(!response.into_inner().pod_sandbox_id.is_empty());
 
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert!(err.message().contains("pause image"));
-    assert!(err.message().contains("registry.k8s.io/pause:3.9"));
-    assert!(err
-        .message()
-        .contains("pull it before starting the pod sandbox"));
+    {
+        let calls = pulls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].requested_ref, "registry.k8s.io/pause:3.9");
+        assert_eq!(calls[0].canonical_ref, "registry.k8s.io/pause:3.9");
+        assert_eq!(calls[0].pull_namespace.as_deref(), Some("default"));
+        assert_eq!(calls[0].auth, crate::image::TestRegistryAuth::Anonymous);
+    }
+
+    let status = ImageService::image_status(
+        &service.image_service(),
+        Request::new(crate::proto::runtime::v1::ImageStatusRequest {
+            image: Some(crate::proto::runtime::v1::ImageSpec {
+                image: "registry.k8s.io/pause:3.9".to_string(),
+                user_specified_image: String::new(),
+                runtime_handler: String::new(),
+                annotations: HashMap::new(),
+            }),
+            verbose: false,
+        }),
+    )
+    .await
+    .expect("shared image service should expose the auto-pulled image")
+    .into_inner();
+    assert_eq!(
+        status.image.expect("pause image should exist").id,
+        "sha256:pause-auto"
+    );
 }
 
 #[tokio::test]
-async fn run_pod_sandbox_surfaces_overridden_pause_image_not_present_locally() {
-    let (_dir, service) = test_service_with_fake_runtime();
-    let err = RuntimeService::run_pod_sandbox(
+async fn run_pod_sandbox_auto_pull_prefers_namespaced_auth_for_overridden_pause_image() {
+    let (_dir, service) = test_service_with_fake_runtime_configure(|config| {
+        let auth_root = config.root_dir.join("auth");
+        let global_auth_file = auth_root.join("global.json");
+        let namespaced_auth_dir = auth_root.join("namespaced");
+        fs::create_dir_all(&namespaced_auth_dir).unwrap();
+        fs::write(
+            &global_auth_file,
+            r#"{
+                "auths": {
+                    "registry.example": {
+                        "auth": "Z2xvYmFsOnNlY3JldA=="
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let digest = format!("{:x}", Sha256::digest("registry.example/pause".as_bytes()));
+        fs::write(
+            namespaced_auth_dir.join(format!("default-{digest}.json")),
+            r#"{
+                "auths": {
+                    "registry.example": {
+                        "auth": "bmFtZXNwYWNlOnNlY3JldA=="
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        config.image_global_auth_file = global_auth_file;
+        config.image_namespaced_auth_dir = namespaced_auth_dir;
+    });
+    let pulls = Arc::new(StdMutex::new(Vec::new()));
+    service.image_service().set_test_pull_handler(Arc::new({
+        let pulls = pulls.clone();
+        move |request| {
+            pulls.lock().unwrap().push(request);
+            Ok(crate::image::TestPullResponse {
+                image_id: "sha256:pause-custom".to_string(),
+                size: 64,
+                ..Default::default()
+            })
+        }
+    }));
+
+    RuntimeService::run_pod_sandbox(
         &service,
         Request::new(host_network_run_pod_sandbox_request(
             "pause-custom-missing",
@@ -4409,13 +5307,20 @@ async fn run_pod_sandbox_surfaces_overridden_pause_image_not_present_locally() {
         )),
     )
     .await
-    .expect_err("missing overridden pause image should fail sandbox creation");
+    .expect("overridden pause image should be auto-pulled with namespaced auth");
 
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert!(err.message().contains("registry.example/pause:custom"));
-    assert!(err
-        .message()
-        .contains("pull it before starting the pod sandbox"));
+    let calls = pulls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].requested_ref, "registry.example/pause:custom");
+    assert_eq!(calls[0].canonical_ref, "registry.example/pause:custom");
+    assert_eq!(calls[0].pull_namespace.as_deref(), Some("default"));
+    assert_eq!(
+        calls[0].auth,
+        crate::image::TestRegistryAuth::Basic {
+            username: "namespace".to_string(),
+            password: "secret".to_string(),
+        }
+    );
 }
 
 #[tokio::test]
@@ -4763,24 +5668,38 @@ async fn exec_sync_uses_runtime_binary_for_non_default_handler() {
             "runc".to_string(),
             crate::config::ResolvedRuntimeHandlerConfig {
                 runtime_path: runc_runtime_path.display().to_string(),
+                runtime_config_path: String::new(),
                 runtime_root: config.runtime_root.display().to_string(),
+                platform_runtime_paths: HashMap::new(),
                 monitor_path: "/definitely/missing/crius-shim".to_string(),
+                monitor_cgroup: String::new(),
                 monitor_env: Vec::new(),
+                stream_websockets: false,
                 allowed_annotations: Vec::new(),
                 default_annotations: HashMap::new(),
+                privileged_without_host_devices: false,
+                privileged_without_host_devices_all_devices_allowed: false,
                 container_create_timeout: 240,
+                snapshotter: "internal-overlay-untar".to_string(),
             },
         ),
         (
             "kata".to_string(),
             crate::config::ResolvedRuntimeHandlerConfig {
                 runtime_path: kata_runtime_path.display().to_string(),
+                runtime_config_path: String::new(),
                 runtime_root: dir.path().join("runtime-root-kata").display().to_string(),
+                platform_runtime_paths: HashMap::new(),
                 monitor_path: "/definitely/missing/crius-shim".to_string(),
+                monitor_cgroup: String::new(),
                 monitor_env: Vec::new(),
+                stream_websockets: false,
                 allowed_annotations: Vec::new(),
                 default_annotations: HashMap::new(),
+                privileged_without_host_devices: false,
+                privileged_without_host_devices_all_devices_allowed: false,
                 container_create_timeout: 240,
+                snapshotter: "internal-overlay-untar".to_string(),
             },
         ),
     ]);
@@ -4884,12 +5803,19 @@ esac
         "runc".to_string(),
         crate::config::ResolvedRuntimeHandlerConfig {
             runtime_path: runtime_path.display().to_string(),
+            runtime_config_path: String::new(),
             runtime_root: config.runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
             monitor_path: "/definitely/missing/crius-shim".to_string(),
+            monitor_cgroup: String::new(),
             monitor_env: Vec::new(),
+            stream_websockets: false,
             allowed_annotations: Vec::new(),
             default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
             container_create_timeout: 240,
+            snapshotter: "internal-overlay-untar".to_string(),
         },
     );
     config.exec_cpu_affinity = "first".to_string();
@@ -4929,6 +5855,125 @@ esac
     assert_eq!(response.exit_code, 0);
     assert_eq!(response.stdout, b"affinity-ok");
     assert_eq!(fs::read_to_string(&affinity_path).unwrap().trim(), "0");
+}
+
+#[tokio::test]
+async fn exec_sync_prefers_shared_cpuset_when_annotation_enables_shared_cpu() {
+    let dir = tempdir().unwrap();
+    let runtime_path = dir.path().join("fake-runtime-affinity-shared.sh");
+    let affinity_path = dir.path().join("affinity.txt");
+    fs::write(
+        &runtime_path,
+        format!(
+            r#"#!/bin/bash
+set -eu
+STATE_DIR="{state_dir}"
+cmd="${{1:-}}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+case "$cmd" in
+  state)
+    id="${{1:-}}"
+    file="$STATE_DIR/$id.state"
+    if [ ! -f "$file" ]; then
+      exit 1
+    fi
+    status="$(cat "$file")"
+    pid=0
+    if [ -f "$STATE_DIR/$id.pid" ]; then
+      pid="$(cat "$STATE_DIR/$id.pid")"
+    fi
+    printf '{{"ociVersion":"1.0.2","id":"%s","status":"%s","pid":%s,"bundle":"%s","rootfs":"%s","created":"2024-01-01T00:00:00Z","owner":"root"}}\n' "$id" "$status" "$pid" "$STATE_DIR/bundle" "$STATE_DIR/rootfs"
+    ;;
+  exec)
+    awk '/Cpus_allowed_list/ {{print $2}}' /proc/self/status > "{affinity_path}"
+    printf affinity-ok
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+            state_dir = dir.path().join("runtime-state").display(),
+            affinity_path = affinity_path.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&runtime_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&runtime_path, perms).unwrap();
+
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime_path = runtime_path.clone();
+    config.runtime_root = dir.path().join("runtime-root");
+    config.runtime_configs.insert(
+        "runc".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            runtime_path: runtime_path.display().to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: config.runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/definitely/missing/crius-shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 240,
+            snapshotter: "internal-overlay-untar".to_string(),
+        },
+    );
+    config.exec_cpu_affinity = "first".to_string();
+    config.shared_cpuset = "2-3".to_string();
+    let service = RuntimeServiceImpl::new(config);
+
+    let mut annotations = HashMap::new();
+    annotations.insert(
+        "cpu-shared.crio.io/container-running".to_string(),
+        "enable".to_string(),
+    );
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            linux_resources: Some(StoredLinuxResources {
+                cpuset_cpus: "0-1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut container = test_container("container-running", "pod-1", annotations);
+    container.metadata = Some(crate::proto::runtime::v1::ContainerMetadata {
+        name: "container-running".to_string(),
+        attempt: 1,
+    });
+    service
+        .containers
+        .lock()
+        .await
+        .insert("container-running".to_string(), container);
+    set_fake_runtime_state(&dir, "container-running", "running");
+
+    let response = RuntimeService::exec_sync(
+        &service,
+        Request::new(ExecSyncRequest {
+            container_id: "container-running".to_string(),
+            cmd: vec!["true".to_string()],
+            timeout: 0,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    assert_eq!(response.exit_code, 0);
+    assert_eq!(response.stdout, b"affinity-ok");
+    assert_eq!(fs::read_to_string(&affinity_path).unwrap().trim(), "2");
 }
 
 #[tokio::test]
@@ -4980,7 +6025,7 @@ async fn attach_validates_container_is_streamable() {
     set_fake_runtime_state(&dir, "container-running", "running");
     let attach_socket = dir
         .path()
-        .join("shims")
+        .join("attach")
         .join("container-running")
         .join("attach.sock");
     fs::create_dir_all(attach_socket.parent().unwrap()).unwrap();
@@ -5115,7 +6160,6 @@ async fn attach_uses_log_stream_fallback_for_read_only_tty_when_socket_is_missin
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn attach_read_only_tty_fallback_does_not_attempt_shim_restore() {
-    let _guard = env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
     let runtime_path = write_fake_runtime_script(dir.path());
     let shim_work_dir = dir.path().join("shims");
@@ -5171,19 +6215,43 @@ sleep 1
                 "runc".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
                     runtime_path: runtime_path.display().to_string(),
+                    runtime_config_path: String::new(),
                     runtime_root: dir.path().join("runtime-root").display().to_string(),
+                    platform_runtime_paths: HashMap::new(),
                     monitor_path: fake_shim_path.display().to_string(),
+                    monitor_cgroup: String::new(),
                     monitor_env: Vec::new(),
+                    stream_websockets: false,
                     allowed_annotations: Vec::new(),
                     default_annotations: HashMap::new(),
+                    privileged_without_host_devices: false,
+                    privileged_without_host_devices_all_devices_allowed: false,
                     container_create_timeout: 240,
+                    snapshotter: "internal-overlay-untar".to_string(),
                 },
             )]),
             runtime_root: dir.path().join("runtime-root"),
             log_dir: dir.path().join("logs"),
             runtime_path,
+            runtime_config_path: PathBuf::new(),
             image_root: dir.path().join("images"),
             image_driver: "overlay".to_string(),
+            image_global_auth_file: PathBuf::new(),
+            image_namespaced_auth_dir: PathBuf::new(),
+            image_default_transport: "docker://".to_string(),
+            image_short_name_mode: "disabled".to_string(),
+            image_pull_progress_timeout: std::time::Duration::ZERO,
+            image_max_concurrent_downloads: 3,
+            image_pull_retry_count: 0,
+            image_registry_config_dir: PathBuf::new(),
+            image_additional_artifact_stores: Vec::new(),
+            image_signature_policy: PathBuf::new(),
+            image_signature_policy_dir: PathBuf::new(),
+            image_storage_options: Vec::new(),
+            image_volumes: "mkdir".to_string(),
+            image_pinned_images: Vec::new(),
+            image_big_files_temporary_dir: PathBuf::new(),
+            image_oci_artifact_mount_support: true,
             workloads: HashMap::new(),
             enable_pod_events: true,
             included_pod_metrics: vec!["all".to_string()],
@@ -5191,7 +6259,26 @@ sleep 1
             pod_sandbox_metrics_collection_period: 0,
             grpc_max_send_msg_size: 80 * 1024 * 1024,
             grpc_max_recv_msg_size: 80 * 1024 * 1024,
+            metrics_enable: false,
+            metrics_host: "127.0.0.1".to_string(),
+            metrics_port: 9090,
+            metrics_socket_path: PathBuf::new(),
+            metrics_enable_tls: false,
+            metrics_tls_cert_file: PathBuf::new(),
+            metrics_tls_key_file: PathBuf::new(),
+            metrics_tls_ca_file: PathBuf::new(),
+            metrics_tls_min_version: "VersionTLS12".to_string(),
+            metrics_tls_cipher_suites: Vec::new(),
+            metrics_collectors: vec![
+                "runtime".to_string(),
+                "resources".to_string(),
+                "images".to_string(),
+            ],
+            tracing_enable: false,
+            tracing_endpoint: String::new(),
+            tracing_sampling_rate_per_million: 0,
             monitor_env: Vec::new(),
+            monitor_cgroup: String::new(),
             default_env: Vec::new(),
             default_capabilities: vec![
                 "CHOWN".to_string(),
@@ -5210,6 +6297,17 @@ sleep 1
                 "AUDIT_WRITE".to_string(),
             ],
             default_sysctls: HashMap::new(),
+            default_ulimits: Vec::new(),
+            allowed_devices: Vec::new(),
+            additional_devices: Vec::new(),
+            device_ownership_from_security_context: false,
+            add_inheritable_capabilities: false,
+            base_runtime_spec: None,
+            default_mounts_file: PathBuf::new(),
+            hooks_dir: Vec::new(),
+            absent_mount_sources_to_reject: Vec::new(),
+            disable_proc_mount: false,
+            timezone: String::new(),
             attach_socket_dir: dir.path().join("attach"),
             container_exits_dir: dir.path().join("exits"),
             clean_shutdown_file: dir.path().join("clean.shutdown"),
@@ -5227,7 +6325,13 @@ sleep 1
             tolerate_missing_hugetlb_controller: true,
             separate_pull_cgroup: String::new(),
             seccomp_profile: PathBuf::new(),
+            privileged_seccomp_profile: "unconfined".to_string(),
             unset_seccomp_profile: "runtime/default".to_string(),
+            apparmor_default_profile: "crius-default".to_string(),
+            disable_apparmor: false,
+            enable_selinux: false,
+            selinux_category_range: 1024,
+            hostnetwork_disable_selinux: true,
             uid_mappings: None,
             gid_mappings: None,
             minimum_mappable_uid: -1,
@@ -5235,11 +6339,17 @@ sleep 1
             io_uid: 0,
             io_gid: 0,
             pids_limit: -1,
+            infra_ctr_cpuset: String::new(),
+            shared_cpuset: String::new(),
             exec_cpu_affinity: String::new(),
+            irqbalance_config_file: PathBuf::new(),
+            irqbalance_config_restore_file: "disable".to_string(),
             read_only: false,
             no_pivot: false,
+            no_new_keyring: false,
             pause_image: "registry.k8s.io/pause:3.9".to_string(),
             pause_command: "/pause".to_string(),
+            drop_infra_ctr: false,
             cni_config: crate::network::CniConfig::default(),
             cgroup_driver: None,
             exec_sync_io_drain_timeout: Duration::ZERO,
@@ -5251,6 +6361,8 @@ sleep 1
             enable_unprivileged_icmp: false,
             shim: ShimConfig {
                 shim_path: fake_shim_path.clone(),
+                runtime_config_path: PathBuf::new(),
+                monitor_cgroup: String::new(),
                 work_dir: shim_work_dir.clone(),
                 attach_socket_dir: dir.path().join("attach"),
                 container_exits_dir: dir.path().join("exits"),
@@ -5261,10 +6373,13 @@ sleep 1
                 log_to_journald: false,
                 no_sync_log: false,
                 no_pivot: false,
+                no_new_keyring: false,
+                systemd_cgroup: false,
                 runtime_path: PathBuf::from("/definitely/missing/runc"),
                 max_container_log_line_size: 4096,
             },
             streaming: crate::streaming::StreamingConfig::default(),
+            ..test_runtime_config(dir.path().join("root"))
         },
         NriConfig::default(),
         shim_work_dir.clone(),
@@ -5328,7 +6443,6 @@ sleep 1
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn attach_recreates_tty_shim_when_socket_is_missing() {
-    let _guard = env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
     let runtime_path = write_fake_runtime_script(dir.path());
     let shim_work_dir = dir.path().join("shims");
@@ -5384,19 +6498,46 @@ sleep 1
                 "runc".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
                     runtime_path: runtime_path.display().to_string(),
+                    runtime_config_path: String::new(),
                     runtime_root: dir.path().join("runtime-root").display().to_string(),
+                    platform_runtime_paths: HashMap::new(),
                     monitor_path: fake_shim_path.display().to_string(),
+                    monitor_cgroup: String::new(),
                     monitor_env: Vec::new(),
+                    stream_websockets: false,
                     allowed_annotations: Vec::new(),
                     default_annotations: HashMap::new(),
+                    privileged_without_host_devices: false,
+                    privileged_without_host_devices_all_devices_allowed: false,
                     container_create_timeout: 240,
+                    snapshotter: "internal-overlay-untar".to_string(),
                 },
             )]),
             runtime_root: dir.path().join("runtime-root"),
             log_dir: dir.path().join("logs"),
             runtime_path,
+            runtime_config_path: PathBuf::new(),
             image_root: dir.path().join("images"),
             image_driver: "overlay".to_string(),
+            image_global_auth_file: PathBuf::new(),
+            image_namespaced_auth_dir: PathBuf::new(),
+            image_default_transport: "docker://".to_string(),
+            image_short_name_mode: "disabled".to_string(),
+            image_pull_progress_timeout: std::time::Duration::ZERO,
+            image_max_concurrent_downloads: 3,
+            image_pull_retry_count: 0,
+            image_registry_config_dir: PathBuf::new(),
+            image_decryption_keys_path: PathBuf::new(),
+            image_decryption_decoder_path: "ctd-decoder".to_string(),
+            image_decryption_keyprovider_config: PathBuf::new(),
+            image_additional_artifact_stores: Vec::new(),
+            image_signature_policy: PathBuf::new(),
+            image_signature_policy_dir: PathBuf::new(),
+            image_storage_options: Vec::new(),
+            image_volumes: "mkdir".to_string(),
+            image_pinned_images: Vec::new(),
+            image_big_files_temporary_dir: PathBuf::new(),
+            image_oci_artifact_mount_support: true,
             workloads: HashMap::new(),
             enable_pod_events: true,
             included_pod_metrics: vec!["all".to_string()],
@@ -5404,7 +6545,26 @@ sleep 1
             pod_sandbox_metrics_collection_period: 0,
             grpc_max_send_msg_size: 80 * 1024 * 1024,
             grpc_max_recv_msg_size: 80 * 1024 * 1024,
+            metrics_enable: false,
+            metrics_host: "127.0.0.1".to_string(),
+            metrics_port: 9090,
+            metrics_socket_path: PathBuf::new(),
+            metrics_enable_tls: false,
+            metrics_tls_cert_file: PathBuf::new(),
+            metrics_tls_key_file: PathBuf::new(),
+            metrics_tls_ca_file: PathBuf::new(),
+            metrics_tls_min_version: "VersionTLS12".to_string(),
+            metrics_tls_cipher_suites: Vec::new(),
+            metrics_collectors: vec![
+                "runtime".to_string(),
+                "resources".to_string(),
+                "images".to_string(),
+            ],
+            tracing_enable: false,
+            tracing_endpoint: String::new(),
+            tracing_sampling_rate_per_million: 0,
             monitor_env: Vec::new(),
+            monitor_cgroup: String::new(),
             default_env: Vec::new(),
             default_capabilities: vec![
                 "CHOWN".to_string(),
@@ -5423,6 +6583,17 @@ sleep 1
                 "AUDIT_WRITE".to_string(),
             ],
             default_sysctls: HashMap::new(),
+            default_ulimits: Vec::new(),
+            allowed_devices: Vec::new(),
+            additional_devices: Vec::new(),
+            device_ownership_from_security_context: false,
+            add_inheritable_capabilities: false,
+            base_runtime_spec: None,
+            default_mounts_file: PathBuf::new(),
+            hooks_dir: Vec::new(),
+            absent_mount_sources_to_reject: Vec::new(),
+            disable_proc_mount: false,
+            timezone: String::new(),
             attach_socket_dir: dir.path().join("attach"),
             container_exits_dir: dir.path().join("exits"),
             clean_shutdown_file: dir.path().join("clean.shutdown"),
@@ -5440,7 +6611,13 @@ sleep 1
             tolerate_missing_hugetlb_controller: true,
             separate_pull_cgroup: String::new(),
             seccomp_profile: PathBuf::new(),
+            privileged_seccomp_profile: "unconfined".to_string(),
             unset_seccomp_profile: "runtime/default".to_string(),
+            apparmor_default_profile: "crius-default".to_string(),
+            disable_apparmor: false,
+            enable_selinux: false,
+            selinux_category_range: 1024,
+            hostnetwork_disable_selinux: true,
             uid_mappings: None,
             gid_mappings: None,
             minimum_mappable_uid: -1,
@@ -5448,11 +6625,17 @@ sleep 1
             io_uid: 0,
             io_gid: 0,
             pids_limit: -1,
+            infra_ctr_cpuset: String::new(),
+            shared_cpuset: String::new(),
             exec_cpu_affinity: String::new(),
+            irqbalance_config_file: PathBuf::new(),
+            irqbalance_config_restore_file: "disable".to_string(),
             read_only: false,
             no_pivot: false,
+            no_new_keyring: false,
             pause_image: "registry.k8s.io/pause:3.9".to_string(),
             pause_command: "/pause".to_string(),
+            drop_infra_ctr: false,
             cni_config: crate::network::CniConfig::default(),
             cgroup_driver: None,
             exec_sync_io_drain_timeout: Duration::ZERO,
@@ -5464,6 +6647,8 @@ sleep 1
             enable_unprivileged_icmp: false,
             shim: ShimConfig {
                 shim_path: fake_shim_path.clone(),
+                runtime_config_path: PathBuf::new(),
+                monitor_cgroup: String::new(),
                 work_dir: shim_work_dir.clone(),
                 attach_socket_dir: dir.path().join("attach"),
                 container_exits_dir: dir.path().join("exits"),
@@ -5474,6 +6659,8 @@ sleep 1
                 log_to_journald: false,
                 no_sync_log: false,
                 no_pivot: false,
+                no_new_keyring: false,
+                systemd_cgroup: false,
                 runtime_path: PathBuf::from("/definitely/missing/runc"),
                 max_container_log_line_size: 4096,
             },
@@ -5546,7 +6733,7 @@ sleep 1
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn attach_recovers_tty_shim_after_recover_state_when_socket_is_missing() {
-    let _guard = env_lock().lock().unwrap();
+    let _guard = env_lock().lock().await;
     let dir = tempdir().unwrap();
     let runtime_path = write_fake_runtime_script(dir.path());
     let shim_work_dir = dir.path().join("shims");
@@ -5602,19 +6789,46 @@ sleep 1
                 "runc".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
                     runtime_path: runtime_path.display().to_string(),
+                    runtime_config_path: String::new(),
                     runtime_root: dir.path().join("runtime-root").display().to_string(),
+                    platform_runtime_paths: HashMap::new(),
                     monitor_path: fake_shim_path.display().to_string(),
+                    monitor_cgroup: String::new(),
                     monitor_env: Vec::new(),
+                    stream_websockets: false,
                     allowed_annotations: Vec::new(),
                     default_annotations: HashMap::new(),
+                    privileged_without_host_devices: false,
+                    privileged_without_host_devices_all_devices_allowed: false,
                     container_create_timeout: 240,
+                    snapshotter: "internal-overlay-untar".to_string(),
                 },
             )]),
             runtime_root: dir.path().join("runtime-root"),
             log_dir: dir.path().join("logs"),
             runtime_path,
+            runtime_config_path: PathBuf::new(),
             image_root: dir.path().join("images"),
             image_driver: "overlay".to_string(),
+            image_global_auth_file: PathBuf::new(),
+            image_namespaced_auth_dir: PathBuf::new(),
+            image_default_transport: "docker://".to_string(),
+            image_short_name_mode: "disabled".to_string(),
+            image_pull_progress_timeout: std::time::Duration::ZERO,
+            image_max_concurrent_downloads: 3,
+            image_pull_retry_count: 0,
+            image_registry_config_dir: PathBuf::new(),
+            image_decryption_keys_path: PathBuf::new(),
+            image_decryption_decoder_path: "ctd-decoder".to_string(),
+            image_decryption_keyprovider_config: PathBuf::new(),
+            image_additional_artifact_stores: Vec::new(),
+            image_signature_policy: PathBuf::new(),
+            image_signature_policy_dir: PathBuf::new(),
+            image_storage_options: Vec::new(),
+            image_volumes: "mkdir".to_string(),
+            image_pinned_images: Vec::new(),
+            image_big_files_temporary_dir: PathBuf::new(),
+            image_oci_artifact_mount_support: true,
             workloads: HashMap::new(),
             enable_pod_events: true,
             included_pod_metrics: vec!["all".to_string()],
@@ -5622,7 +6836,26 @@ sleep 1
             pod_sandbox_metrics_collection_period: 0,
             grpc_max_send_msg_size: 80 * 1024 * 1024,
             grpc_max_recv_msg_size: 80 * 1024 * 1024,
+            metrics_enable: false,
+            metrics_host: "127.0.0.1".to_string(),
+            metrics_port: 9090,
+            metrics_socket_path: PathBuf::new(),
+            metrics_enable_tls: false,
+            metrics_tls_cert_file: PathBuf::new(),
+            metrics_tls_key_file: PathBuf::new(),
+            metrics_tls_ca_file: PathBuf::new(),
+            metrics_tls_min_version: "VersionTLS12".to_string(),
+            metrics_tls_cipher_suites: Vec::new(),
+            metrics_collectors: vec![
+                "runtime".to_string(),
+                "resources".to_string(),
+                "images".to_string(),
+            ],
+            tracing_enable: false,
+            tracing_endpoint: String::new(),
+            tracing_sampling_rate_per_million: 0,
             monitor_env: Vec::new(),
+            monitor_cgroup: String::new(),
             default_env: Vec::new(),
             default_capabilities: vec![
                 "CHOWN".to_string(),
@@ -5641,6 +6874,17 @@ sleep 1
                 "AUDIT_WRITE".to_string(),
             ],
             default_sysctls: HashMap::new(),
+            default_ulimits: Vec::new(),
+            allowed_devices: Vec::new(),
+            additional_devices: Vec::new(),
+            device_ownership_from_security_context: false,
+            add_inheritable_capabilities: false,
+            base_runtime_spec: None,
+            default_mounts_file: PathBuf::new(),
+            hooks_dir: Vec::new(),
+            absent_mount_sources_to_reject: Vec::new(),
+            disable_proc_mount: false,
+            timezone: String::new(),
             attach_socket_dir: dir.path().join("attach"),
             container_exits_dir: dir.path().join("exits"),
             clean_shutdown_file: dir.path().join("clean.shutdown"),
@@ -5658,7 +6902,13 @@ sleep 1
             tolerate_missing_hugetlb_controller: true,
             separate_pull_cgroup: String::new(),
             seccomp_profile: PathBuf::new(),
+            privileged_seccomp_profile: "unconfined".to_string(),
             unset_seccomp_profile: "runtime/default".to_string(),
+            apparmor_default_profile: "crius-default".to_string(),
+            disable_apparmor: false,
+            enable_selinux: false,
+            selinux_category_range: 1024,
+            hostnetwork_disable_selinux: true,
             uid_mappings: None,
             gid_mappings: None,
             minimum_mappable_uid: -1,
@@ -5666,11 +6916,17 @@ sleep 1
             io_uid: 0,
             io_gid: 0,
             pids_limit: -1,
+            infra_ctr_cpuset: String::new(),
+            shared_cpuset: String::new(),
             exec_cpu_affinity: String::new(),
+            irqbalance_config_file: PathBuf::new(),
+            irqbalance_config_restore_file: "disable".to_string(),
             read_only: false,
             no_pivot: false,
+            no_new_keyring: false,
             pause_image: "registry.k8s.io/pause:3.9".to_string(),
             pause_command: "/pause".to_string(),
+            drop_infra_ctr: false,
             cni_config: crate::network::CniConfig::default(),
             cgroup_driver: None,
             exec_sync_io_drain_timeout: Duration::ZERO,
@@ -5682,6 +6938,8 @@ sleep 1
             enable_unprivileged_icmp: false,
             shim: ShimConfig {
                 shim_path: fake_shim_path.clone(),
+                runtime_config_path: PathBuf::new(),
+                monitor_cgroup: String::new(),
                 work_dir: shim_work_dir.clone(),
                 attach_socket_dir: dir.path().join("attach"),
                 container_exits_dir: dir.path().join("exits"),
@@ -5692,6 +6950,8 @@ sleep 1
                 log_to_journald: false,
                 no_sync_log: false,
                 no_pivot: false,
+                no_new_keyring: false,
+                systemd_cgroup: false,
                 runtime_path: PathBuf::from("/definitely/missing/runc"),
                 max_container_log_line_size: 4096,
             },
@@ -5816,9 +7076,12 @@ async fn container_status_verbose_returns_json_info() {
             log_path: Some("/var/log/pods/c1.log".to_string()),
             tty: true,
             privileged: true,
+            seccomp_notifier_action: Some("stop".to_string()),
             mounts: vec![StoredMount {
                 container_path: "/data".to_string(),
                 host_path: "/host/data".to_string(),
+                image: String::new(),
+                image_sub_path: String::new(),
                 readonly: false,
                 selinux_relabel: false,
                 propagation: crate::proto::runtime::v1::MountPropagation::PropagationPrivate as i32,
@@ -5832,6 +7095,9 @@ async fn container_status_verbose_returns_json_info() {
         "container-1".to_string(),
         test_container("container-1", "pod-1", annotations),
     );
+    service
+        .ensure_seccomp_notifier("container-1", crate::runtime::SeccompNotifierMode::Stop)
+        .unwrap();
     set_fake_runtime_state(&dir, "container-1", "running");
     let bundle_dir = dir.path().join("runtime-root").join("container-1");
     fs::create_dir_all(&bundle_dir).unwrap();
@@ -5865,6 +7131,7 @@ async fn container_status_verbose_returns_json_info() {
     assert_eq!(info["sandboxID"], "pod-1");
     assert_eq!(info["privileged"], true);
     assert_eq!(info["user"], "1000");
+    assert_eq!(info["seccompNotifierAction"], "stop");
     assert_eq!(info["runtimeSpec"]["process"]["cwd"], "/");
     assert_eq!(response.status.unwrap().mounts.len(), 1);
 }
@@ -6045,16 +7312,57 @@ async fn status_verbose_returns_structured_config() {
     service.config.streaming.tls_key_file = "/etc/crius/tls/tls.key".to_string();
     service.config.streaming.tls_ca_file = "/etc/crius/tls/ca.crt".to_string();
     service.config.streaming.tls_min_version = "VersionTLS13".to_string();
+    service.config.privileged_seccomp_profile = "unconfined".to_string();
+    service.config.apparmor_default_profile = "crius-default".to_string();
+    service.config.disable_apparmor = true;
+    service.config.enable_selinux = true;
+    service.config.selinux_category_range = 64;
+    service.config.hostnetwork_disable_selinux = false;
+    service.nri_config.enable = true;
+    service.nri_config.enable_cdi = false;
+    service.nri_config.cdi_spec_dirs = vec!["/etc/cdi".to_string(), "/var/run/cdi".to_string()];
+    service.nri_config.plugin_path = "/opt/nri/plugins".to_string();
+    service.nri_config.plugin_config_path = "/etc/nri/conf.d".to_string();
+    service.nri_config.blockio_config_path = "/etc/nri/blockio.json".to_string();
     service.config.default_env = vec![
-        ("HTTP_PROXY".to_string(), "http://proxy.internal".to_string()),
+        (
+            "HTTP_PROXY".to_string(),
+            "http://proxy.internal".to_string(),
+        ),
         ("LANG".to_string(), "C.UTF-8".to_string()),
     ];
     service.config.default_capabilities =
         vec!["CAP_CHOWN".to_string(), "CAP_NET_BIND_SERVICE".to_string()];
-    service.config.default_sysctls = HashMap::from([(
-        "kernel.shm_rmid_forced".to_string(),
-        "1".to_string(),
-    )]);
+    service.config.default_sysctls =
+        HashMap::from([("kernel.shm_rmid_forced".to_string(), "1".to_string())]);
+    service.config.image_default_transport = "docker://".to_string();
+    service.config.image_short_name_mode = "enforcing".to_string();
+    service.config.image_pull_progress_timeout = std::time::Duration::from_secs(25);
+    service.config.image_max_concurrent_downloads = 5;
+    service.config.image_pull_retry_count = 2;
+    service.config.image_registry_config_dir = PathBuf::from("/etc/containerd/certs.d");
+    service.config.image_storage_options = Vec::new();
+    service.config.image_volumes = "bind".to_string();
+    service.config.image_pinned_images = vec![
+        "busybox*".to_string(),
+        "registry.k8s.io/pause:3.9".to_string(),
+    ];
+    service.config.hooks_dir = vec![
+        PathBuf::from("/usr/share/containers/oci/hooks.d"),
+        PathBuf::from("/etc/crius/hooks.d"),
+    ];
+    service.config.infra_ctr_cpuset = "1".to_string();
+    service.config.shared_cpuset = "2-3".to_string();
+    service.config.no_new_keyring = true;
+    service.config.allowed_devices = vec![PathBuf::from("/dev/null"), PathBuf::from("/dev/zero")];
+    service.config.additional_devices = vec![crate::runtime::DeviceMapping {
+        source: PathBuf::from("/dev/null"),
+        destination: PathBuf::from("/dev/custom-null"),
+        permissions: "rw".to_string(),
+    }];
+    service.config.device_ownership_from_security_context = true;
+    service.config.default_mounts_file = PathBuf::from("/etc/containers/mounts.conf");
+    service.config.absent_mount_sources_to_reject = vec![PathBuf::from("/etc/hostname")];
     service
         .config
         .runtime_configs
@@ -6066,16 +7374,53 @@ async fn status_verbose_returns_structured_config() {
         .runtime_configs
         .get_mut("kata")
         .unwrap()
+        .runtime_config_path = "/etc/kata/config.toml".to_string();
+    service
+        .config
+        .runtime_configs
+        .get_mut("kata")
+        .unwrap()
+        .platform_runtime_paths = HashMap::from([(
+        "linux/amd64".to_string(),
+        "/usr/bin/kata-runtime-amd64".to_string(),
+    )]);
+    service
+        .config
+        .runtime_configs
+        .get_mut("kata")
+        .unwrap()
+        .monitor_cgroup = "system.slice".to_string();
+    service
+        .config
+        .runtime_configs
+        .get_mut("kata")
+        .unwrap()
+        .stream_websockets = true;
+    service
+        .config
+        .runtime_configs
+        .get_mut("kata")
+        .unwrap()
         .allowed_annotations = vec!["io.example.runtime/".to_string()];
     service
         .config
         .runtime_configs
         .get_mut("kata")
         .unwrap()
-        .default_annotations = HashMap::from([(
-        "io.example.runtime/default".to_string(),
-        "kata".to_string(),
-    )]);
+        .default_annotations =
+        HashMap::from([("io.example.runtime/default".to_string(), "kata".to_string())]);
+    service
+        .config
+        .runtime_configs
+        .get_mut("kata")
+        .unwrap()
+        .privileged_without_host_devices = true;
+    service
+        .config
+        .runtime_configs
+        .get_mut("kata")
+        .unwrap()
+        .privileged_without_host_devices_all_devices_allowed = true;
     service
         .config
         .cni_config
@@ -6084,6 +7429,10 @@ async fn status_verbose_returns_structured_config() {
         .config
         .cni_config
         .set_netns_mounts_under_state_dir(true);
+    service
+        .config
+        .cni_config
+        .set_namespace_helper_path(Some(PathBuf::from("/usr/bin/pinns")));
     service
         .config
         .cni_config
@@ -6105,6 +7454,84 @@ async fn status_verbose_returns_structured_config() {
     assert!(!config["runtimeHandlers"].as_array().unwrap().is_empty());
     assert_eq!(config["imageRoot"], "/tmp/crius-test-images");
     assert_eq!(config["imageDriver"], "overlay");
+    assert_eq!(config["imageGlobalAuthFile"], "");
+    assert_eq!(config["imageNamespacedAuthDir"], "");
+    assert_eq!(config["imageDefaultTransport"], "docker://");
+    assert_eq!(config["imageShortNameMode"], "enforcing");
+    assert_eq!(config["imagePullProgressTimeoutMillis"], 25000);
+    assert_eq!(config["imageMaxConcurrentDownloads"], 5);
+    assert_eq!(config["imagePullRetryCount"], 2);
+    assert_eq!(config["imageRegistryConfigDir"], "/etc/containerd/certs.d");
+    assert_eq!(config["imageStorageOptions"], serde_json::json!([]));
+    assert_eq!(config["imageVolumes"], "bind");
+    assert_eq!(
+        config["pinnedImages"],
+        serde_json::json!(["busybox*", "registry.k8s.io/pause:3.9"])
+    );
+    assert_eq!(config["imageLayout"]["mode"], "single-store-root");
+    assert_eq!(
+        config["imageLayout"]["imageRecordPathPattern"],
+        "/tmp/crius-test-images/images/<imageID>"
+    );
+    assert_eq!(config["imageLayout"]["separateImageStoreSupported"], false);
+    assert_eq!(
+        config["imageSnapshotModel"]["snapshotter"],
+        "internal-overlay-untar"
+    );
+    assert_eq!(
+        config["imageSnapshotModel"]["externalSnapshotterSupported"],
+        false
+    );
+    assert_eq!(
+        config["imageSnapshotModel"]["runtimeSnapshotterOverrideSupported"],
+        true
+    );
+    assert_eq!(
+        config["imageSnapshotModel"]["snapshotAnnotationPassthrough"],
+        false
+    );
+    assert_eq!(config["imageSnapshotModel"]["discardUnpackedLayers"], false);
+    assert_eq!(config["imageSnapshotModel"]["pullOptionPassthrough"], false);
+    assert_eq!(
+        config["snapshotStatsCollection"]["strategy"],
+        "on-demand-rootfs-walk"
+    );
+    assert_eq!(
+        config["snapshotStatsCollection"]["backgroundCollector"],
+        false
+    );
+    assert!(config["cgroupSupport"]["drivers"]["systemd"]["supported"]
+        .as_bool()
+        .unwrap());
+    assert!(config["cgroupSupport"]["drivers"]["cgroupfs"]["supported"]
+        .as_bool()
+        .unwrap());
+    assert_eq!(
+        config["cgroupSupport"]["resourceUpdateStrategy"],
+        "runtime-update-resources"
+    );
+    assert_eq!(
+        config["cgroupSupport"]["resourceClasses"]["blockio"]["supported"],
+        true
+    );
+    assert_eq!(
+        config["cgroupSupport"]["resourceClasses"]["blockio"]["configPath"],
+        "/etc/nri/blockio.json"
+    );
+    assert!(config["cgroupSupport"]["resourceClasses"]["rdt"]["supported"].is_boolean());
+    assert_eq!(
+        config["cgroupSupport"]["resourceClasses"]["rdt"]["resctrlPath"],
+        "/sys/fs/resctrl"
+    );
+    assert_eq!(
+        config["recovery"]["policy"]["repairScope"],
+        "sqlite-persistence-only"
+    );
+    assert!(config["recovery"]["policy"]["wipeScope"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "orphanShimArtifacts"));
     assert_eq!(
         config["runtimeHandlerConfigs"]["kata"]["runtimePath"],
         "/definitely/missing/kata-runtime"
@@ -6113,34 +7540,74 @@ async fn status_verbose_returns_structured_config() {
         config["runtimeHandlerConfigs"]["kata"]["monitorPath"],
         "/definitely/missing/crius-shim"
     );
+    assert!(
+        config["runtimeHandlerConfigs"]["kata"]["runtimeDetectedFeatures"]["available"]
+            .is_boolean()
+    );
+    assert!(
+        config["runtimeHandlerConfigs"]["kata"]["runtimeDetectedFeatures"]["idmapMounts"]
+            .is_boolean()
+    );
+    assert!(
+        config["runtimeHandlerConfigs"]["kata"]["runtimeDetectedFeatures"]
+            ["recursiveReadOnlyMounts"]
+            .is_boolean()
+    );
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["runtimeConfigPath"],
+        "/etc/kata/config.toml"
+    );
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["platformRuntimePaths"]["linux/amd64"],
+        "/usr/bin/kata-runtime-amd64"
+    );
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["monitorCgroup"],
+        "system.slice"
+    );
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["streamWebsockets"],
+        true
+    );
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["privilegedWithoutHostDevices"],
+        true
+    );
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["privilegedWithoutHostDevicesAllDevicesAllowed"],
+        true
+    );
     assert_eq!(
         config["runtimeHandlerConfigs"]["runc"]["runtimeRoot"],
         "/tmp/crius-test-runtime-root"
     );
     assert!(config["monitorEnv"].as_array().unwrap().is_empty());
+    assert_eq!(config["defaultEnv"][0], "HTTP_PROXY=http://proxy.internal");
+    assert_eq!(config["defaultCapabilities"][0], "CAP_CHOWN");
+    assert_eq!(config["defaultSysctls"]["kernel.shm_rmid_forced"], "1");
+    assert_eq!(config["allowedDevices"][0], "/dev/null");
     assert_eq!(
-        config["defaultEnv"][0],
-        "HTTP_PROXY=http://proxy.internal"
+        config["additionalDevices"][0],
+        "/dev/null:/dev/custom-null:rw"
     );
+    assert_eq!(config["deviceOwnershipFromSecurityContext"], true);
+    assert_eq!(config["defaultMountsFile"], "/etc/containers/mounts.conf");
     assert_eq!(
-        config["defaultCapabilities"][0],
-        "CAP_CHOWN"
+        config["hooksDir"],
+        serde_json::json!(["/usr/share/containers/oci/hooks.d", "/etc/crius/hooks.d"])
     );
-    assert_eq!(
-        config["defaultSysctls"]["kernel.shm_rmid_forced"],
-        "1"
-    );
+    assert_eq!(config["absentMountSourcesToReject"][0], "/etc/hostname");
     assert_eq!(config["grpcMaxSendMsgSize"], 12345);
     assert_eq!(config["grpcMaxRecvMsgSize"], 23456);
+    assert_eq!(config["privilegedSeccompProfile"], "unconfined");
+    assert_eq!(config["apparmorDefaultProfile"], "crius-default");
+    assert_eq!(config["disableApparmor"], true);
+    assert_eq!(config["enableSelinux"], true);
+    assert_eq!(config["selinuxCategoryRange"], 64);
+    assert_eq!(config["hostnetworkDisableSelinux"], false);
     assert_eq!(config["streaming"]["enableTls"], true);
-    assert_eq!(
-        config["streaming"]["tlsCertFile"],
-        "/etc/crius/tls/tls.crt"
-    );
-    assert_eq!(
-        config["streaming"]["tlsMinVersion"],
-        "VersionTLS13"
-    );
+    assert_eq!(config["streaming"]["tlsCertFile"], "/etc/crius/tls/tls.crt");
+    assert_eq!(config["streaming"]["tlsMinVersion"], "VersionTLS13");
     assert_eq!(config["reload"]["strategy"], "restart-only");
     assert_eq!(config["reload"]["signalReload"], false);
     assert_eq!(
@@ -6179,6 +7646,20 @@ async fn status_verbose_returns_structured_config() {
     assert_eq!(config["runtimeHandlerConfigs"]["kata"]["cniMaxConfNum"], 2);
     assert_eq!(config["runtimeHandlerConfigs"]["runc"]["cniMaxConfNum"], 0);
     assert!(config["runtimeHandlerConfigs"]["runc"]["cniConfDir"].is_null());
+    assert!(config["securityAvailability"]["selinuxAvailable"].is_boolean());
+    assert!(config["securityAvailability"]["apparmorAvailable"].is_boolean());
+    assert!(config["securityAvailability"]["seccompAvailable"].is_boolean());
+    assert!(config["securityAvailability"]["seccompNotifierSupported"].is_boolean());
+    assert!(config["securityAvailability"]["seccompNotifierBaseDir"].is_string());
+    assert!(config["securityAvailability"]["seccompNotifierActiveContainers"].is_array());
+    assert_eq!(config["imageDecryption"]["enabled"], false);
+    assert_eq!(config["imageDecryption"]["keyModel"], "");
+    assert_eq!(config["nri"]["enabled"], true);
+    assert_eq!(config["nri"]["enableCdi"], false);
+    assert_eq!(config["nri"]["cdiSpecDirs"][0], "/etc/cdi");
+    assert_eq!(config["nri"]["pluginPath"], "/opt/nri/plugins");
+    assert_eq!(config["nri"]["pluginConfigPath"], "/etc/nri/conf.d");
+    assert_eq!(config["nri"]["blockioConfigPath"], "/etc/nri/blockio.json");
     assert_eq!(
         config["workloads"]
             .as_object()
@@ -6214,11 +7695,20 @@ async fn status_verbose_returns_structured_config() {
     assert_eq!(config["tolerateMissingHugetlbController"], true);
     assert_eq!(config["separatePullCgroup"], "");
     assert_eq!(config["pidsLimit"], -1);
+    assert_eq!(config["infraCtrCpuset"], "1");
+    assert_eq!(config["sharedCpuset"], "2-3");
     assert_eq!(config["execCpuAffinity"], "");
     assert_eq!(config["readOnly"], false);
     assert_eq!(config["noPivot"], false);
+    assert_eq!(config["noNewKeyring"], true);
     assert_eq!(config["pauseImage"], "registry.k8s.io/pause:3.9");
     assert_eq!(config["pauseCommand"], "/pause");
+    assert_eq!(config["dropInfraCtr"], false);
+    assert_eq!(config["pinnsPath"], "/usr/bin/pinns");
+    assert_eq!(
+        config["shimPidfilePattern"],
+        "/tmp/crius-test-shims/<containerID>/shim.pid"
+    );
     assert_eq!(config["logToJournald"], false);
     assert_eq!(config["noSyncLog"], false);
     assert_eq!(config["enablePodEvents"], true);
@@ -6259,7 +7749,7 @@ async fn status_verbose_returns_structured_config() {
     assert_eq!(config["runtimeFeatures"]["containerStats"], true);
     assert_eq!(config["runtimeFeatures"]["podSandboxStats"], true);
     assert_eq!(config["runtimeFeatures"]["podSandboxMetrics"], true);
-    assert_eq!(config["runtimeFeatures"]["podLifecycleEvents"], true);
+    assert_eq!(config["runtimeFeatures"]["podLifecycleEvents"], false);
     assert_eq!(config["runtimeFeatures"]["checkpointContainer"], true);
     assert_eq!(
         response.status.unwrap().conditions.len(),
@@ -6279,10 +7769,7 @@ fn runtime_registry_returns_handler_specific_create_timeout() {
                 PathBuf::from("/tmp/crius-test-runtime-root"),
             ),
         )]),
-        HashMap::from([
-            ("runc".to_string(), 240),
-            ("kata".to_string(), 600),
-        ]),
+        HashMap::from([("runc".to_string(), 240), ("kata".to_string(), 600)]),
     );
 
     assert_eq!(runtime.container_create_timeout_for_handler(""), 240);
@@ -6352,12 +7839,19 @@ exit 0
         "runc".to_string(),
         crate::config::ResolvedRuntimeHandlerConfig {
             runtime_path: runtime_path.display().to_string(),
+            runtime_config_path: String::new(),
             runtime_root: config.runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
             monitor_path: "/definitely/missing/crius-shim".to_string(),
+            monitor_cgroup: String::new(),
             monitor_env: Vec::new(),
+            stream_websockets: false,
             allowed_annotations: Vec::new(),
             default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
             container_create_timeout: 240,
+            snapshotter: "internal-overlay-untar".to_string(),
         },
     );
     let service = RuntimeServiceImpl::new(config);
@@ -6404,12 +7898,19 @@ async fn status_reports_runtime_not_ready_when_binary_is_not_executable() {
         "runc".to_string(),
         crate::config::ResolvedRuntimeHandlerConfig {
             runtime_path: runtime_path.display().to_string(),
+            runtime_config_path: String::new(),
             runtime_root: config.runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
             monitor_path: "/definitely/missing/crius-shim".to_string(),
+            monitor_cgroup: String::new(),
             monitor_env: Vec::new(),
+            stream_websockets: false,
             allowed_annotations: Vec::new(),
             default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
             container_create_timeout: 240,
+            snapshotter: "internal-overlay-untar".to_string(),
         },
     );
     let service = RuntimeServiceImpl::new(config);
@@ -6711,7 +8212,7 @@ async fn host_network_pod_verbose_info_omits_managed_netns_and_runtime_pod_cidr(
 
 #[tokio::test]
 async fn network_health_requires_declared_plugin_binary() {
-    let _guard = env_lock().lock().unwrap();
+    let _guard = env_lock().lock().await;
     let dir = tempdir().unwrap();
     let config_dir = dir.path().join("cni-conf");
     let plugin_dir = dir.path().join("cni-bin");
@@ -6740,7 +8241,7 @@ async fn network_health_requires_declared_plugin_binary() {
 
 #[tokio::test]
 async fn network_health_requires_plugin_to_be_executable() {
-    let _guard = env_lock().lock().unwrap();
+    let _guard = env_lock().lock().await;
     let dir = tempdir().unwrap();
     let config_dir = dir.path().join("cni-conf");
     let plugin_dir = dir.path().join("cni-bin");
@@ -7665,7 +9166,7 @@ async fn start_container_rejects_exited_container_with_failed_precondition() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn start_container_undoes_nri_when_runtime_start_fails() {
-    let _guard = env_lock().lock().unwrap();
+    let _guard = env_lock().lock().await;
     let fake_nri = Arc::new(FakeNri::default());
     let (dir, service) = test_service_with_fake_runtime_and_nri_and_shim(
         fake_nri.clone(),
@@ -7903,10 +9404,7 @@ async fn start_container_fails_when_runtime_keeps_container_in_created_state() {
         .unwrap()
         .unwrap();
     assert_eq!(persisted.state, "created");
-    assert!(matches!(
-        timeout(Duration::from_millis(50), rx.recv()).await,
-        Err(_)
-    ));
+    assert!(timeout(Duration::from_millis(50), rx.recv()).await.is_err());
 }
 
 #[tokio::test]
@@ -8072,7 +9570,7 @@ async fn finalize_container_stop_state_only_sets_finished_at_for_exited_state() 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn remove_after_failed_start_does_not_repeat_nri_stop() {
-    let _guard = env_lock().lock().unwrap();
+    let _guard = env_lock().lock().await;
     let fake_nri = Arc::new(FakeNri::default());
     let (dir, service) = test_service_with_fake_runtime_and_nri_and_shim(
         fake_nri.clone(),
@@ -8377,6 +9875,86 @@ async fn stop_container_skips_nri_for_already_exited_container() {
     .await
     .expect("stop should succeed");
 
+    assert!(fake_nri.calls.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn stop_container_converts_unknown_runtime_state_to_exited() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (_dir, service) = test_service_with_fake_runtime_and_nri(fake_nri.clone());
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState::default(),
+    )
+    .unwrap();
+
+    service.pod_sandboxes.lock().await.insert(
+        "pod-unknown".to_string(),
+        test_pod("pod-unknown", HashMap::new()),
+    );
+    let mut container = test_container("container-unknown", "pod-unknown", annotations.clone());
+    container.state = ContainerState::ContainerRunning as i32;
+    service
+        .containers
+        .lock()
+        .await
+        .insert("container-unknown".to_string(), container);
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "container-unknown",
+            "pod-unknown",
+            crate::runtime::ContainerStatus::Running,
+            "busybox:latest",
+            &["sleep".to_string(), "10".to_string()],
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+
+    RuntimeService::stop_container(
+        &service,
+        Request::new(StopContainerRequest {
+            container_id: "container-unknown".to_string(),
+            timeout: 1,
+        }),
+    )
+    .await
+    .expect("stop should succeed for unknown runtime state");
+
+    let container = service
+        .containers
+        .lock()
+        .await
+        .get("container-unknown")
+        .cloned()
+        .expect("container should remain tracked");
+    assert_eq!(container.state, ContainerState::ContainerExited as i32);
+
+    let state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+        &container.annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+    )
+    .expect("internal state should be updated");
+    assert!(state.finished_at.is_some());
+    assert_eq!(state.exit_code, Some(-1));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let persisted = service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_container("container-unknown")
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.state, "stopped");
+    assert_eq!(persisted.exit_code, Some(-1));
     assert!(fake_nri.calls.lock().await.is_empty());
 }
 
@@ -9044,57 +10622,6 @@ async fn reopen_container_log_validates_running_state_and_log_path() {
     .unwrap_err();
     assert_eq!(running.code(), tonic::Code::FailedPrecondition);
     assert!(running.message().contains("reopen log control socket"));
-}
-
-#[tokio::test]
-#[ignore = "requires unix socket bind permissions in the current test environment"]
-async fn reopen_container_log_notifies_shim_socket_when_available() {
-    let (dir, service) = test_service_with_fake_runtime();
-
-    let log_path = dir.path().join("logs").join("running.log");
-    let mut running_annotations = HashMap::new();
-    RuntimeServiceImpl::insert_internal_state(
-        &mut running_annotations,
-        INTERNAL_CONTAINER_STATE_KEY,
-        &StoredContainerState {
-            log_path: Some(log_path.display().to_string()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    service.containers.lock().await.insert(
-        "container-running".to_string(),
-        test_container("container-running", "pod-1", running_annotations),
-    );
-    set_fake_runtime_state(&dir, "container-running", "running");
-
-    let reopen_socket = dir
-        .path()
-        .join("shims")
-        .join("container-running")
-        .join("reopen.sock");
-    fs::create_dir_all(reopen_socket.parent().unwrap()).unwrap();
-    let listener = UnixListener::bind(&reopen_socket).unwrap();
-    let log_path_for_server = log_path.clone();
-    let (tx, rx) = mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        fs::write(&log_path_for_server, "").unwrap();
-        stream.write_all(b"OK\n").unwrap();
-        tx.send(()).unwrap();
-    });
-
-    RuntimeService::reopen_container_log(
-        &service,
-        Request::new(ReopenContainerLogRequest {
-            container_id: "container-running".to_string(),
-        }),
-    )
-    .await
-    .unwrap();
-    rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    server.join().unwrap();
-    assert!(log_path.exists(), "expected reopen to touch the log file");
 }
 
 #[tokio::test]
@@ -10345,6 +11872,8 @@ async fn inspect_and_info_endpoints_return_consistent_snapshots() {
             mounts: vec![StoredMount {
                 container_path: "/data".to_string(),
                 host_path: "/host/data".to_string(),
+                image: String::new(),
+                image_sub_path: String::new(),
                 readonly: false,
                 selinux_relabel: false,
                 propagation: crate::proto::runtime::v1::MountPropagation::PropagationPrivate as i32,
@@ -10396,7 +11925,7 @@ async fn inspect_and_info_endpoints_return_consistent_snapshots() {
 
     let config: serde_json::Value =
         serde_json::from_str(status.info.get("config").unwrap()).unwrap();
-    assert_eq!(config["runtimeFeatures"]["containerEvents"], true);
+    assert_eq!(config["runtimeFeatures"]["containerEvents"], false);
     assert_eq!(container.status.as_ref().unwrap().reason, "Running");
     assert_eq!(container.status.as_ref().unwrap().mounts.len(), 1);
     assert!(container.info.contains_key("info"));
@@ -10465,6 +11994,158 @@ async fn list_container_stats_applies_id_pod_and_label_filters() {
             .expect("container stats should include attributes")
             .id,
         "container-alpha-123"
+    );
+}
+
+#[tokio::test]
+async fn list_pod_sandbox_prefers_ready_newer_sandboxes_first() {
+    let service = test_service();
+
+    let old_not_ready = crate::proto::runtime::v1::PodSandbox {
+        id: "pod-old".to_string(),
+        metadata: Some(PodSandboxMetadata {
+            name: "etcd-vm-crius".to_string(),
+            uid: "uid-1".to_string(),
+            namespace: "kube-system".to_string(),
+            attempt: 1,
+        }),
+        state: PodSandboxState::SandboxNotready as i32,
+        created_at: 1,
+        ..Default::default()
+    };
+    let new_ready = crate::proto::runtime::v1::PodSandbox {
+        id: "pod-new".to_string(),
+        metadata: Some(PodSandboxMetadata {
+            name: "etcd-vm-crius".to_string(),
+            uid: "uid-1".to_string(),
+            namespace: "kube-system".to_string(),
+            attempt: 2,
+        }),
+        state: PodSandboxState::SandboxReady as i32,
+        created_at: 2,
+        ..Default::default()
+    };
+    let newer_not_ready = crate::proto::runtime::v1::PodSandbox {
+        id: "pod-newer-not-ready".to_string(),
+        metadata: Some(PodSandboxMetadata {
+            name: "kube-controller-manager-vm-crius".to_string(),
+            uid: "uid-2".to_string(),
+            namespace: "kube-system".to_string(),
+            attempt: 3,
+        }),
+        state: PodSandboxState::SandboxNotready as i32,
+        created_at: 3,
+        ..Default::default()
+    };
+
+    {
+        let mut pods = service.pod_sandboxes.lock().await;
+        pods.insert(old_not_ready.id.clone(), old_not_ready);
+        pods.insert(new_ready.id.clone(), new_ready);
+        pods.insert(newer_not_ready.id.clone(), newer_not_ready);
+    }
+
+    let response =
+        RuntimeService::list_pod_sandbox(&service, Request::new(ListPodSandboxRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+
+    let ids: Vec<_> = response.items.into_iter().map(|pod| pod.id).collect();
+    assert_eq!(ids[0], "pod-new");
+    assert_eq!(ids[1], "pod-newer-not-ready");
+    assert_eq!(ids.len(), 2);
+}
+
+#[tokio::test]
+async fn pod_sandbox_status_demotes_stale_ready_duplicate_sandbox() {
+    let service = test_service();
+
+    let old_ready = crate::proto::runtime::v1::PodSandbox {
+        id: "pod-old-ready".to_string(),
+        metadata: Some(PodSandboxMetadata {
+            name: "etcd-vm-crius".to_string(),
+            uid: "uid-duplicate".to_string(),
+            namespace: "kube-system".to_string(),
+            attempt: 1,
+        }),
+        state: PodSandboxState::SandboxReady as i32,
+        created_at: 1,
+        ..Default::default()
+    };
+    let new_ready = crate::proto::runtime::v1::PodSandbox {
+        id: "pod-new-ready".to_string(),
+        metadata: Some(PodSandboxMetadata {
+            name: "etcd-vm-crius".to_string(),
+            uid: "uid-duplicate".to_string(),
+            namespace: "kube-system".to_string(),
+            attempt: 2,
+        }),
+        state: PodSandboxState::SandboxReady as i32,
+        created_at: 2,
+        ..Default::default()
+    };
+
+    {
+        let mut pods = service.pod_sandboxes.lock().await;
+        pods.insert(old_ready.id.clone(), old_ready);
+        pods.insert(new_ready.id.clone(), new_ready);
+    }
+
+    let old_status = RuntimeService::pod_sandbox_status(
+        &service,
+        Request::new(PodSandboxStatusRequest {
+            pod_sandbox_id: "pod-old-ready".to_string(),
+            verbose: false,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .status
+    .unwrap();
+    let new_status = RuntimeService::pod_sandbox_status(
+        &service,
+        Request::new(PodSandboxStatusRequest {
+            pod_sandbox_id: "pod-new-ready".to_string(),
+            verbose: false,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .status
+    .unwrap();
+    let list =
+        RuntimeService::list_pod_sandbox(&service, Request::new(ListPodSandboxRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+
+    assert_eq!(old_status.state, PodSandboxState::SandboxNotready as i32);
+    assert_eq!(new_status.state, PodSandboxState::SandboxReady as i32);
+    assert_eq!(list.items[0].id, "pod-new-ready");
+    assert_eq!(list.items[0].state, PodSandboxState::SandboxReady as i32);
+    assert_eq!(list.items.len(), 1);
+}
+
+#[test]
+fn pause_process_root_match_scopes_to_runtime_pod_root() {
+    let pod_root = PathBuf::from("/var/lib/crius/pods");
+    assert!(
+        RuntimeServiceImpl::pause_process_root_matches_runtime_pod_root(
+            Path::new("/var/lib/crius/pods/pod-a/pause-rootfs"),
+            &pod_root
+        )
+    );
+    assert!(
+        !RuntimeServiceImpl::pause_process_root_matches_runtime_pod_root(Path::new("/"), &pod_root)
+    );
+    assert!(
+        !RuntimeServiceImpl::pause_process_root_matches_runtime_pod_root(
+            Path::new("/var/lib/other-runtime/pods/pod-a/pause-rootfs"),
+            &pod_root
+        )
     );
 }
 
@@ -10559,7 +12240,19 @@ fn stats_cache_is_fresh_only_within_positive_period() {
 #[test]
 fn build_pod_metrics_returns_all_metrics_when_configured_with_all() {
     let service = test_service();
-    let metrics = service.build_pod_metrics("pod-all", 1, 10, 20, 30, 40, 50, 60, 70);
+    let metrics = service.build_pod_metrics(
+        "pod-all",
+        1,
+        crate::server::stats::PodMetricTotals {
+            cpu_usage: 10,
+            memory_usage: 20,
+            memory_limit: 30,
+            pids: 40,
+            filesystem_usage: 50,
+            rx_bytes: 60,
+            tx_bytes: 70,
+        },
+    );
     let names: Vec<&str> = metrics.iter().map(|metric| metric.name.as_str()).collect();
     assert_eq!(
         names,
@@ -10949,8 +12642,19 @@ async fn list_pod_sandbox_metrics_respects_included_pod_metrics_configuration() 
     let mut service = test_service();
     service.config.included_pod_metrics = vec!["cpu".to_string(), "network".to_string()];
 
-    let pod_metrics =
-        service.build_pod_metrics("pod-metrics-filtered", 1, 10, 20, 30, 40, 50, 60, 70);
+    let pod_metrics = service.build_pod_metrics(
+        "pod-metrics-filtered",
+        1,
+        crate::server::stats::PodMetricTotals {
+            cpu_usage: 10,
+            memory_usage: 20,
+            memory_limit: 30,
+            pids: 40,
+            filesystem_usage: 50,
+            rx_bytes: 60,
+            tx_bytes: 70,
+        },
+    );
     let metric_names: Vec<&str> = pod_metrics
         .iter()
         .map(|metric| metric.name.as_str())
@@ -11138,10 +12842,9 @@ async fn pod_events_can_be_disabled() {
         .await;
 
     assert!(
-        matches!(
-            timeout(Duration::from_millis(100), stream.next()).await,
-            Err(_)
-        ),
+        timeout(Duration::from_millis(100), stream.next())
+            .await
+            .is_err(),
         "disabled pod events should not enqueue stream items"
     );
 }
@@ -12626,6 +14329,182 @@ async fn recover_state_marks_ready_pod_notready_when_netns_is_missing() {
 }
 
 #[tokio::test]
+async fn recover_state_preserves_ready_pod_when_pause_runtime_state_is_unknown() {
+    let (dir, service) = test_service_with_fake_runtime();
+    let netns_path = dir.path().join("recover-unknown.netns");
+    fs::write(&netns_path, "netns").unwrap();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            runtime_handler: "runc".to_string(),
+            netns_path: Some(netns_path.display().to_string()),
+            pause_container_id: Some("pause-unknown".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service
+        .persistence
+        .lock()
+        .await
+        .storage_mut()
+        .save_pod_sandbox(&PodSandboxRecord {
+            id: "pod-recover-unknown".to_string(),
+            state: "ready".to_string(),
+            name: "pod-recover-unknown".to_string(),
+            namespace: "default".to_string(),
+            uid: "uid-recover-unknown".to_string(),
+            created_at: RuntimeServiceImpl::now_nanos(),
+            netns_path: netns_path.display().to_string(),
+            labels: "{}".to_string(),
+            annotations: serde_json::to_string(&annotations).unwrap(),
+            pause_container_id: Some("pause-unknown".to_string()),
+            ip: Some("10.88.0.22".to_string()),
+        })
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    let pod = service
+        .pod_sandboxes
+        .lock()
+        .await
+        .get("pod-recover-unknown")
+        .cloned()
+        .unwrap();
+    assert_eq!(pod.state, PodSandboxState::SandboxReady as i32);
+
+    let persisted = service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_pod_sandbox("pod-recover-unknown")
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.state, "ready");
+}
+
+#[tokio::test]
+async fn list_pod_sandbox_preserves_ready_state_when_pause_running_but_pid_is_missing() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "pause-running", "running");
+    let _ = fs::remove_file(dir.path().join("runtime-state").join("pause-running.pid"));
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            runtime_handler: "runc".to_string(),
+            pause_container_id: Some("pause-running".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service.pod_sandboxes.lock().await.insert(
+        "pod-ready-running-no-pid".to_string(),
+        crate::proto::runtime::v1::PodSandbox {
+            id: "pod-ready-running-no-pid".to_string(),
+            metadata: Some(PodSandboxMetadata {
+                name: "kube-apiserver-vm-crius".to_string(),
+                uid: "logical-pod-uid".to_string(),
+                namespace: "kube-system".to_string(),
+                attempt: 1,
+            }),
+            state: PodSandboxState::SandboxReady as i32,
+            created_at: RuntimeServiceImpl::now_nanos(),
+            labels: HashMap::from([(
+                "io.kubernetes.pod.uid".to_string(),
+                "logical-pod-uid".to_string(),
+            )]),
+            annotations,
+            runtime_handler: "runc".to_string(),
+        },
+    );
+
+    let response =
+        RuntimeService::list_pod_sandbox(&service, Request::new(ListPodSandboxRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+
+    assert_eq!(response.items.len(), 1);
+    assert_eq!(
+        response.items[0].state,
+        PodSandboxState::SandboxReady as i32
+    );
+}
+
+#[tokio::test]
+async fn runtime_state_refresh_keeps_sandbox_ready_when_pause_running_but_pid_is_missing() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "pause-refresh-running", "running");
+    let _ = fs::remove_file(
+        dir.path()
+            .join("runtime-state")
+            .join("pause-refresh-running.pid"),
+    );
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            runtime_handler: "runc".to_string(),
+            pause_container_id: Some("pause-refresh-running".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service.pod_sandboxes.lock().await.insert(
+        "pod-refresh-running-no-pid".to_string(),
+        crate::proto::runtime::v1::PodSandbox {
+            id: "pod-refresh-running-no-pid".to_string(),
+            metadata: Some(PodSandboxMetadata {
+                name: "kube-apiserver-vm-crius".to_string(),
+                uid: "logical-pod-uid".to_string(),
+                namespace: "kube-system".to_string(),
+                attempt: 1,
+            }),
+            state: PodSandboxState::SandboxReady as i32,
+            created_at: RuntimeServiceImpl::now_nanos(),
+            labels: HashMap::from([(
+                "io.kubernetes.pod.uid".to_string(),
+                "logical-pod-uid".to_string(),
+            )]),
+            annotations,
+            runtime_handler: "runc".to_string(),
+        },
+    );
+
+    RuntimeServiceImpl::refresh_runtime_state_and_publish_events(
+        &service.runtime,
+        &service.config,
+        &service.containers,
+        &service.pod_sandboxes,
+        &service.persistence,
+        &service.events,
+    )
+    .await;
+
+    let pod = service
+        .pod_sandboxes
+        .lock()
+        .await
+        .get("pod-refresh-running-no-pid")
+        .cloned()
+        .unwrap();
+    assert_eq!(pod.state, PodSandboxState::SandboxReady as i32);
+}
+
+#[tokio::test]
 async fn remove_pod_sandbox_cascades_recovered_containers_after_restart() {
     let (dir, service) = test_service_with_fake_runtime();
     set_fake_runtime_state(&dir, "recover-container", "running");
@@ -12793,6 +14672,248 @@ async fn pod_queries_refresh_pause_container_state_on_query() {
     assert_eq!(
         inspect.status.unwrap().state,
         PodSandboxState::SandboxNotready as i32
+    );
+}
+
+#[tokio::test]
+async fn pod_queries_mark_ready_sandbox_notready_when_pause_runtime_state_is_unknown() {
+    let (_dir, service) = test_service_with_fake_runtime();
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            runtime_handler: "runc".to_string(),
+            pause_container_id: Some("pause-unknown".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    service.pod_sandboxes.lock().await.insert(
+        "pod-unknown".to_string(),
+        crate::proto::runtime::v1::PodSandbox {
+            state: PodSandboxState::SandboxReady as i32,
+            ..test_pod("pod-unknown", annotations)
+        },
+    );
+
+    let list =
+        RuntimeService::list_pod_sandbox(&service, Request::new(ListPodSandboxRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+    assert_eq!(list.items.len(), 1);
+    assert_eq!(list.items[0].state, PodSandboxState::SandboxNotready as i32);
+
+    let inspect = RuntimeService::pod_sandbox_status(
+        &service,
+        Request::new(PodSandboxStatusRequest {
+            pod_sandbox_id: "pod-unknown".to_string(),
+            verbose: false,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(
+        inspect.status.unwrap().state,
+        PodSandboxState::SandboxNotready as i32
+    );
+}
+
+#[tokio::test]
+async fn list_pod_sandbox_deduplicates_logical_control_plane_duplicates() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "pause-old", "stopped");
+    set_fake_runtime_state(&dir, "pause-new", "running");
+
+    let make_annotations = |pause_container_id: &str| {
+        let mut annotations = HashMap::new();
+        RuntimeServiceImpl::insert_internal_state(
+            &mut annotations,
+            INTERNAL_POD_STATE_KEY,
+            &StoredPodState {
+                runtime_handler: "runc".to_string(),
+                pause_container_id: Some(pause_container_id.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        annotations
+    };
+
+    service.pod_sandboxes.lock().await.insert(
+        "sandbox-old".to_string(),
+        crate::proto::runtime::v1::PodSandbox {
+            id: "sandbox-old".to_string(),
+            metadata: Some(PodSandboxMetadata {
+                name: "etcd-vm-crius".to_string(),
+                uid: "logical-pod-uid".to_string(),
+                namespace: "kube-system".to_string(),
+                attempt: 1,
+            }),
+            state: PodSandboxState::SandboxNotready as i32,
+            created_at: 100,
+            labels: HashMap::from([
+                ("component".to_string(), "etcd".to_string()),
+                (
+                    "io.kubernetes.pod.uid".to_string(),
+                    "logical-pod-uid".to_string(),
+                ),
+            ]),
+            annotations: make_annotations("pause-old"),
+            ..Default::default()
+        },
+    );
+    service.pod_sandboxes.lock().await.insert(
+        "sandbox-new".to_string(),
+        crate::proto::runtime::v1::PodSandbox {
+            id: "sandbox-new".to_string(),
+            metadata: Some(PodSandboxMetadata {
+                name: "etcd-vm-crius".to_string(),
+                uid: "logical-pod-uid".to_string(),
+                namespace: "kube-system".to_string(),
+                attempt: 2,
+            }),
+            state: PodSandboxState::SandboxReady as i32,
+            created_at: 200,
+            labels: HashMap::from([
+                ("component".to_string(), "etcd".to_string()),
+                (
+                    "io.kubernetes.pod.uid".to_string(),
+                    "logical-pod-uid".to_string(),
+                ),
+            ]),
+            annotations: make_annotations("pause-new"),
+            ..Default::default()
+        },
+    );
+
+    let response =
+        RuntimeService::list_pod_sandbox(&service, Request::new(ListPodSandboxRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+
+    assert_eq!(response.items.len(), 1);
+    assert_eq!(response.items[0].id, "sandbox-new");
+    assert_eq!(
+        response.items[0].state,
+        PodSandboxState::SandboxReady as i32
+    );
+    assert_eq!(
+        response.items[0].metadata.as_ref().map(|m| m.attempt),
+        Some(2)
+    );
+}
+
+#[tokio::test]
+async fn list_containers_deduplicates_logical_control_plane_duplicates() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "ctr-old", "stopped");
+    set_fake_runtime_state(&dir, "ctr-new", "running");
+
+    service.pod_sandboxes.lock().await.insert(
+        "pod-1".to_string(),
+        crate::proto::runtime::v1::PodSandbox {
+            id: "pod-1".to_string(),
+            metadata: Some(PodSandboxMetadata {
+                name: "kube-controller-manager-vm-crius".to_string(),
+                uid: "logical-pod-uid".to_string(),
+                namespace: "kube-system".to_string(),
+                attempt: 1,
+            }),
+            state: PodSandboxState::SandboxReady as i32,
+            created_at: 10,
+            labels: HashMap::from([
+                (
+                    "component".to_string(),
+                    "kube-controller-manager".to_string(),
+                ),
+                (
+                    "io.kubernetes.pod.uid".to_string(),
+                    "logical-pod-uid".to_string(),
+                ),
+            ]),
+            ..Default::default()
+        },
+    );
+
+    let old = Container {
+        id: "ctr-old".to_string(),
+        pod_sandbox_id: "pod-1".to_string(),
+        metadata: Some(ContainerMetadata {
+            name: "kube-controller-manager".to_string(),
+            attempt: 1,
+        }),
+        state: ContainerState::ContainerExited as i32,
+        created_at: 100,
+        image: Some(ImageSpec {
+            image: "k8s.m.daocloud.io/kube-controller-manager:v1.29.1".to_string(),
+            ..Default::default()
+        }),
+        image_ref: "sha256:old".to_string(),
+        labels: HashMap::from([
+            (
+                "component".to_string(),
+                "kube-controller-manager".to_string(),
+            ),
+            (
+                "io.kubernetes.pod.uid".to_string(),
+                "logical-pod-uid".to_string(),
+            ),
+        ]),
+        annotations: HashMap::new(),
+    };
+    let new = Container {
+        id: "ctr-new".to_string(),
+        pod_sandbox_id: "pod-1".to_string(),
+        metadata: Some(ContainerMetadata {
+            name: "kube-controller-manager".to_string(),
+            attempt: 2,
+        }),
+        state: ContainerState::ContainerRunning as i32,
+        created_at: 200,
+        image: Some(ImageSpec {
+            image: "k8s.m.daocloud.io/kube-controller-manager:v1.29.1".to_string(),
+            ..Default::default()
+        }),
+        image_ref: "sha256:new".to_string(),
+        labels: HashMap::from([
+            (
+                "component".to_string(),
+                "kube-controller-manager".to_string(),
+            ),
+            (
+                "io.kubernetes.pod.uid".to_string(),
+                "logical-pod-uid".to_string(),
+            ),
+        ]),
+        annotations: HashMap::new(),
+    };
+    service.containers.lock().await.insert(old.id.clone(), old);
+    service.containers.lock().await.insert(new.id.clone(), new);
+
+    let response =
+        RuntimeService::list_containers(&service, Request::new(ListContainersRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+
+    assert_eq!(response.containers.len(), 1);
+    assert_eq!(response.containers[0].id, "ctr-new");
+    assert_eq!(
+        response.containers[0].state,
+        ContainerState::ContainerRunning as i32
+    );
+    assert_eq!(
+        response.containers[0]
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.attempt),
+        Some(2)
     );
 }
 
@@ -13072,4 +15193,325 @@ async fn recover_state_cleans_orphaned_pod_workspaces_but_keeps_recovered_ones()
         !orphan_workspace.exists(),
         "recover_state should clean orphaned pod workspaces"
     );
+}
+
+#[test]
+fn runtime_mounts_from_proto_resolves_oci_artifact_mounts() {
+    let (dir, service) = test_service_with_fake_runtime();
+    let artifact_dir = service
+        .config
+        .image_root
+        .join("artifacts")
+        .join("sha256:test-artifact");
+    fs::create_dir_all(&artifact_dir).unwrap();
+    fs::write(artifact_dir.join("0.tar.gz"), b"hello artifact").unwrap();
+    fs::write(
+        artifact_dir.join("metadata.json"),
+        serde_json::to_vec(&crate::image::CriusImage {
+            id: "sha256:test-artifact".to_string(),
+            repo_tags: vec!["registry.example.com/artifact:latest".to_string()],
+            repo_digests: vec!["registry.example.com/artifact@sha256:test-artifact".to_string()],
+            size: 14,
+            pinned: false,
+            pulled_at: 0,
+            source_reference: None,
+            os: None,
+            architecture: None,
+            config_user: None,
+            config_env: Vec::new(),
+            config_entrypoint: Vec::new(),
+            config_cmd: Vec::new(),
+            config_working_dir: None,
+            annotations: HashMap::new(),
+            declared_volumes: Vec::new(),
+            manifest_media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+            selected_manifest_digest: None,
+            selected_platform: None,
+            stored_layers: Vec::new(),
+            artifact_type: Some("application/vnd.example.artifact".to_string()),
+            artifact_blobs: vec![crate::image::ArtifactBlobMeta {
+                digest: "sha256:blob".to_string(),
+                media_type: "text/plain".to_string(),
+                path: "artifact.txt".to_string(),
+                size: 14,
+                annotations: HashMap::from([(
+                    "org.opencontainers.image.title".to_string(),
+                    "artifact.txt".to_string(),
+                )]),
+            }],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mounts = service
+        .runtime_mounts_from_proto(
+            &[crate::proto::runtime::v1::Mount {
+                container_path: "/root/artifact".to_string(),
+                host_path: String::new(),
+                readonly: false,
+                selinux_relabel: false,
+                propagation: crate::proto::runtime::v1::MountPropagation::PropagationPrivate as i32,
+                uid_mappings: Vec::new(),
+                gid_mappings: Vec::new(),
+                recursive_read_only: false,
+                image: Some(crate::proto::runtime::v1::ImageSpec {
+                    image: "registry.example.com/artifact:latest".to_string(),
+                    user_specified_image: "registry.example.com/artifact:latest".to_string(),
+                    runtime_handler: String::new(),
+                    annotations: HashMap::new(),
+                }),
+                image_sub_path: String::new(),
+            }],
+            true,
+        )
+        .unwrap();
+
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].source, artifact_dir.join("0.tar.gz"));
+    assert_eq!(
+        mounts[0].destination,
+        PathBuf::from("/root/artifact/artifact.txt")
+    );
+    assert!(mounts[0].read_only);
+    assert_eq!(
+        mounts[0].requested_image.as_deref(),
+        Some("registry.example.com/artifact:latest")
+    );
+
+    drop(dir);
+}
+
+#[test]
+fn runtime_mounts_from_proto_rejects_oci_artifact_file_target() {
+    let (dir, service) = test_service_with_fake_runtime();
+    let err = service
+        .runtime_mounts_from_proto(
+            &[crate::proto::runtime::v1::Mount {
+                container_path: "/root/artifact.txt".to_string(),
+                host_path: String::new(),
+                readonly: false,
+                selinux_relabel: false,
+                propagation: crate::proto::runtime::v1::MountPropagation::PropagationPrivate as i32,
+                uid_mappings: Vec::new(),
+                gid_mappings: Vec::new(),
+                recursive_read_only: false,
+                image: Some(crate::proto::runtime::v1::ImageSpec {
+                    image: "registry.example.com/artifact:latest".to_string(),
+                    user_specified_image: "registry.example.com/artifact:latest".to_string(),
+                    runtime_handler: String::new(),
+                    annotations: HashMap::new(),
+                }),
+                image_sub_path: String::new(),
+            }],
+            true,
+        )
+        .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("directory"));
+
+    drop(dir);
+}
+
+#[test]
+fn runtime_mounts_from_proto_rejects_missing_host_path_for_bind_mount() {
+    let (_dir, service) = test_service_with_fake_runtime();
+    let err = service
+        .runtime_mounts_from_proto(
+            &[crate::proto::runtime::v1::Mount {
+                container_path: "/data".to_string(),
+                host_path: String::new(),
+                readonly: false,
+                selinux_relabel: false,
+                propagation: crate::proto::runtime::v1::MountPropagation::PropagationPrivate as i32,
+                uid_mappings: Vec::new(),
+                gid_mappings: Vec::new(),
+                recursive_read_only: false,
+                image: None,
+                image_sub_path: String::new(),
+            }],
+            true,
+        )
+        .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("host_path"));
+}
+
+#[test]
+fn runtime_mounts_from_proto_preserves_mount_semantics_for_runtime() {
+    let (_dir, service) = test_service_with_fake_runtime();
+    let mounts = service
+        .runtime_mounts_from_proto(
+            &[crate::proto::runtime::v1::Mount {
+                container_path: "/data".to_string(),
+                host_path: "/host/data".to_string(),
+                readonly: true,
+                selinux_relabel: true,
+                propagation: crate::proto::runtime::v1::MountPropagation::PropagationHostToContainer
+                    as i32,
+                uid_mappings: vec![crate::proto::runtime::v1::IdMapping {
+                    host_id: 1000,
+                    container_id: 0,
+                    length: 1,
+                }],
+                gid_mappings: vec![crate::proto::runtime::v1::IdMapping {
+                    host_id: 2000,
+                    container_id: 0,
+                    length: 1,
+                }],
+                recursive_read_only: false,
+                image: None,
+                image_sub_path: String::new(),
+            }],
+            true,
+        )
+        .unwrap();
+
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].source, PathBuf::from("/host/data"));
+    assert_eq!(mounts[0].destination, PathBuf::from("/data"));
+    assert!(mounts[0].read_only);
+    assert_eq!(
+        mounts[0].missing_source_policy,
+        crate::runtime::MissingMountSourcePolicy::CreateDirectory
+    );
+    assert!(mounts[0].selinux_relabel);
+    assert_eq!(
+        mounts[0].propagation,
+        crate::runtime::MountPropagationMode::HostToContainer
+    );
+    assert_eq!(mounts[0].uid_mappings.len(), 1);
+    assert_eq!(mounts[0].gid_mappings.len(), 1);
+}
+
+#[test]
+fn runtime_mounts_from_proto_rejects_recursive_read_only_with_non_private_propagation() {
+    let (_dir, service) = test_service_with_fake_runtime();
+    let err = service
+        .runtime_mounts_from_proto(
+            &[crate::proto::runtime::v1::Mount {
+                container_path: "/data".to_string(),
+                host_path: "/host/data".to_string(),
+                readonly: true,
+                selinux_relabel: false,
+                propagation: crate::proto::runtime::v1::MountPropagation::PropagationHostToContainer
+                    as i32,
+                uid_mappings: Vec::new(),
+                gid_mappings: Vec::new(),
+                recursive_read_only: true,
+                image: None,
+                image_sub_path: String::new(),
+            }],
+            true,
+        )
+        .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("propagation"));
+}
+
+#[test]
+fn runtime_mounts_from_proto_keeps_restore_mount_sources_strict() {
+    let (_dir, service) = test_service_with_fake_runtime();
+    let mounts = service
+        .runtime_mounts_from_proto(
+            &[crate::proto::runtime::v1::Mount {
+                container_path: "/data".to_string(),
+                host_path: "/host/data".to_string(),
+                readonly: false,
+                selinux_relabel: false,
+                propagation: crate::proto::runtime::v1::MountPropagation::PropagationPrivate as i32,
+                uid_mappings: Vec::new(),
+                gid_mappings: Vec::new(),
+                recursive_read_only: false,
+                image: None,
+                image_sub_path: String::new(),
+            }],
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        mounts[0].missing_source_policy,
+        crate::runtime::MissingMountSourcePolicy::Reject
+    );
+}
+
+#[test]
+fn runtime_mount_validation_reports_rro_unsupported_as_failed_precondition() {
+    let (dir, service) = test_service_with_fake_runtime();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    let runtime = service.runtime.runtime_for_handler("runc").unwrap();
+    let config = test_runtime_container_config_with_mounts(vec![MountConfig {
+        source,
+        destination: PathBuf::from("/data"),
+        read_only: true,
+        missing_source_policy: crate::runtime::MissingMountSourcePolicy::Reject,
+        selinux_relabel: false,
+        propagation: crate::runtime::MountPropagationMode::Private,
+        recursive_read_only: true,
+        uid_mappings: Vec::new(),
+        gid_mappings: Vec::new(),
+        requested_image: None,
+        image_sub_path: None,
+    }]);
+
+    let err = runtime.validate_mount_requests(&config).unwrap_err();
+    let status = err.to_status();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(status.message().contains("recursive_read_only"));
+}
+
+#[test]
+fn runtime_mount_validation_reports_selinux_relabel_without_label() {
+    let (dir, service) = test_service_with_fake_runtime();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    let runtime = service.runtime.runtime_for_handler("runc").unwrap();
+    let config = test_runtime_container_config_with_mounts(vec![MountConfig {
+        source,
+        destination: PathBuf::from("/data"),
+        read_only: false,
+        missing_source_policy: crate::runtime::MissingMountSourcePolicy::Reject,
+        selinux_relabel: true,
+        propagation: crate::runtime::MountPropagationMode::Private,
+        recursive_read_only: false,
+        uid_mappings: Vec::new(),
+        gid_mappings: Vec::new(),
+        requested_image: None,
+        image_sub_path: None,
+    }]);
+
+    let err = runtime.validate_mount_requests(&config).unwrap_err();
+    let status = err.to_status();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(status.message().contains("SELinux"));
+}
+
+#[test]
+fn runtime_mount_validation_reports_missing_source_as_failed_precondition() {
+    let (dir, service) = test_service_with_fake_runtime();
+    let source = dir.path().join("missing");
+    let runtime = service.runtime.runtime_for_handler("runc").unwrap();
+    let config = test_runtime_container_config_with_mounts(vec![MountConfig {
+        source: source.clone(),
+        destination: PathBuf::from("/data"),
+        read_only: false,
+        missing_source_policy: crate::runtime::MissingMountSourcePolicy::Reject,
+        selinux_relabel: false,
+        propagation: crate::runtime::MountPropagationMode::Private,
+        recursive_read_only: false,
+        uid_mappings: Vec::new(),
+        gid_mappings: Vec::new(),
+        requested_image: None,
+        image_sub_path: None,
+    }]);
+
+    let err = runtime.validate_mount_requests(&config).unwrap_err();
+    let status = err.to_status();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(status.message().contains(source.to_string_lossy().as_ref()));
 }

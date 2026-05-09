@@ -336,7 +336,7 @@ impl MultiNetworkManager {
         // 使用基础CNI管理器设置网络
         let status = self
             .cni_manager
-            .setup_pod_network(pod_id, netns, pod_name, pod_namespace, None)
+            .setup_pod_network(pod_id, netns, pod_name, pod_namespace, "", None)
             .await?;
 
         Ok(NetworkInterfaceStatus {
@@ -382,7 +382,7 @@ impl MultiNetworkManager {
         } else {
             // 如果没有缓存，尝试清理默认网络
             self.cni_manager
-                .teardown_pod_network(pod_id, netns, "", "")
+                .teardown_pod_network(pod_id, netns, "", "", "")
                 .await?;
         }
 
@@ -399,7 +399,7 @@ impl MultiNetworkManager {
     ) -> Result<()> {
         // 调用CNI DEL命令
         self.cni_manager
-            .teardown_pod_network(pod_id, netns, "", "")
+            .teardown_pod_network(pod_id, netns, "", "", "")
             .await?;
         Ok(())
     }

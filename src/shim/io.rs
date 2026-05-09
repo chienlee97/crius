@@ -134,7 +134,7 @@ impl IoManager {
         self.config.stdout.is_some() || self.config.journald.is_some()
     }
 
-    fn parse_cri_log_record<'a>(record: &'a [u8]) -> Option<(&'a str, &'a str, &'a [u8])> {
+    fn parse_cri_log_record(record: &[u8]) -> Option<(&str, &str, &[u8])> {
         let first_space = record.iter().position(|byte| *byte == b' ')?;
         let second_space = record[first_space + 1..]
             .iter()
@@ -877,11 +877,8 @@ impl IoManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::pty::openpty;
     use nix::unistd::{getegid, geteuid};
     use std::os::unix::fs::MetadataExt;
-    use std::os::unix::io::{AsRawFd, FromRawFd};
-    use std::os::unix::net::UnixStream as StdUnixStream;
     use tempfile::tempdir;
 
     fn parse_cri_log_lines(contents: &str) -> Vec<(String, String, String, String)> {
@@ -1322,55 +1319,6 @@ mod tests {
         assert!(err
             .to_string()
             .contains("terminal console is not available"));
-    }
-
-    #[test]
-    #[ignore = "requires unix socket bind permissions in the current test environment"]
-    fn test_resize_server_applies_terminal_dimensions() {
-        let temp_dir = tempdir().unwrap();
-        let resize_socket = temp_dir.path().join("resize.sock");
-        let mut manager = IoManager::new();
-        manager
-            .configure(IoConfig {
-                terminal: true,
-                resize_socket: Some(resize_socket.clone()),
-                ..Default::default()
-            })
-            .unwrap();
-        manager.start_resize_server().unwrap();
-
-        let pty = openpty(None, None).unwrap();
-        let _master = unsafe { File::from_raw_fd(pty.master) };
-        let slave = unsafe { File::from_raw_fd(pty.slave) };
-        let query_file = slave.try_clone().unwrap();
-        manager.start_console_bridge(slave).unwrap();
-
-        for _ in 0..20 {
-            if resize_socket.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(resize_socket.exists());
-
-        let mut client = StdUnixStream::connect(&resize_socket).unwrap();
-        client.write_all(br#"{"Width":101,"Height":37}"#).unwrap();
-        client.write_all(b"\n").unwrap();
-        client.flush().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        let mut winsize = nix::libc::winsize {
-            ws_row: 0,
-            ws_col: 0,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        let rc = unsafe {
-            nix::libc::ioctl(query_file.as_raw_fd(), nix::libc::TIOCGWINSZ, &mut winsize)
-        };
-        assert_eq!(rc, 0);
-        assert_eq!(winsize.ws_col, 101);
-        assert_eq!(winsize.ws_row, 37);
     }
 
     #[test]

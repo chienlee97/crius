@@ -1,5 +1,15 @@
 use super::*;
 
+pub(super) struct PodMetricTotals {
+    pub(super) cpu_usage: u64,
+    pub(super) memory_usage: u64,
+    pub(super) memory_limit: u64,
+    pub(super) pids: u64,
+    pub(super) filesystem_usage: u64,
+    pub(super) rx_bytes: u64,
+    pub(super) tx_bytes: u64,
+}
+
 impl RuntimeServiceImpl {
     pub(super) fn stats_cache_is_fresh(
         collected_at: std::time::Instant,
@@ -80,13 +90,7 @@ impl RuntimeServiceImpl {
         &self,
         pod_id: &str,
         timestamp: i64,
-        total_cpu_usage: u64,
-        total_memory_usage: u64,
-        total_memory_limit: u64,
-        total_pids: u64,
-        total_filesystem_usage: u64,
-        total_rx_bytes: u64,
-        total_tx_bytes: u64,
+        totals: PodMetricTotals,
     ) -> Vec<crate::proto::runtime::v1::Metric> {
         use crate::proto::runtime::v1::{Metric, MetricType, UInt64Value};
 
@@ -98,7 +102,7 @@ impl RuntimeServiceImpl {
                 metric_type: MetricType::Counter as i32,
                 label_values: vec![pod_id.to_string()],
                 value: Some(UInt64Value {
-                    value: total_cpu_usage,
+                    value: totals.cpu_usage,
                 }),
             });
         }
@@ -109,7 +113,7 @@ impl RuntimeServiceImpl {
                 metric_type: MetricType::Gauge as i32,
                 label_values: vec![pod_id.to_string()],
                 value: Some(UInt64Value {
-                    value: total_memory_usage,
+                    value: totals.memory_usage,
                 }),
             });
             metrics.push(Metric {
@@ -118,7 +122,7 @@ impl RuntimeServiceImpl {
                 metric_type: MetricType::Gauge as i32,
                 label_values: vec![pod_id.to_string()],
                 value: Some(UInt64Value {
-                    value: total_memory_usage,
+                    value: totals.memory_usage,
                 }),
             });
             metrics.push(Metric {
@@ -127,7 +131,7 @@ impl RuntimeServiceImpl {
                 metric_type: MetricType::Gauge as i32,
                 label_values: vec![pod_id.to_string()],
                 value: Some(UInt64Value {
-                    value: total_memory_limit,
+                    value: totals.memory_limit,
                 }),
             });
         }
@@ -137,7 +141,7 @@ impl RuntimeServiceImpl {
                 timestamp,
                 metric_type: MetricType::Gauge as i32,
                 label_values: vec![pod_id.to_string()],
-                value: Some(UInt64Value { value: total_pids }),
+                value: Some(UInt64Value { value: totals.pids }),
             });
         }
         if self.pod_metric_enabled("disk") {
@@ -147,7 +151,7 @@ impl RuntimeServiceImpl {
                 metric_type: MetricType::Gauge as i32,
                 label_values: vec![pod_id.to_string()],
                 value: Some(UInt64Value {
-                    value: total_filesystem_usage,
+                    value: totals.filesystem_usage,
                 }),
             });
         }
@@ -158,7 +162,7 @@ impl RuntimeServiceImpl {
                 metric_type: MetricType::Counter as i32,
                 label_values: vec![pod_id.to_string()],
                 value: Some(UInt64Value {
-                    value: total_rx_bytes,
+                    value: totals.rx_bytes,
                 }),
             });
             metrics.push(Metric {
@@ -167,7 +171,7 @@ impl RuntimeServiceImpl {
                 metric_type: MetricType::Counter as i32,
                 label_values: vec![pod_id.to_string()],
                 value: Some(UInt64Value {
-                    value: total_tx_bytes,
+                    value: totals.tx_bytes,
                 }),
             });
         }
@@ -231,7 +235,7 @@ impl RuntimeServiceImpl {
             id: container.id.clone(),
             metadata: container.metadata.clone(),
             labels: container.labels.clone(),
-            annotations: Self::external_annotations(&container.annotations),
+            annotations: Self::external_container_annotations(&container.annotations),
         });
     }
 
@@ -245,7 +249,13 @@ impl RuntimeServiceImpl {
             PodSandboxAttributes, PodSandboxStats, ProcessUsage, UInt64Value,
         };
 
-        let containers = self.containers.lock().await;
+        let containers: Vec<(String, Container)> = {
+            let containers = self.containers.lock().await;
+            containers
+                .iter()
+                .map(|(container_id, container)| (container_id.clone(), container.clone()))
+                .collect()
+        };
         let mut total_cpu_usage = 0u64;
         let mut total_memory_usage = 0u64;
         let mut total_memory_limit = 0u64;
@@ -260,7 +270,7 @@ impl RuntimeServiceImpl {
         let collector = MetricsCollector::new().ok()?;
         let pod_uid = pod.metadata.as_ref().map(|m| m.uid.clone());
 
-        for (container_id, container) in containers.iter() {
+        for (container_id, container) in containers {
             let belongs_to_pod = container.pod_sandbox_id == pod_id
                 || pod_uid
                     .as_ref()
@@ -273,9 +283,10 @@ impl RuntimeServiceImpl {
                     .unwrap_or(false);
 
             if belongs_to_pod {
-                let cgroup_parent = self.container_cgroup_hint(container_id, container).await;
+                let cgroup_parent = self.container_cgroup_hint(&container_id, &container).await;
 
-                if let Ok(stats) = collector.collect_container_stats(container_id, &cgroup_parent) {
+                if let Ok(stats) = collector.collect_container_stats(&container_id, &cgroup_parent)
+                {
                     if let Some(ref cpu) = stats.cpu {
                         total_cpu_usage += cpu.usage_total;
                     }
@@ -286,7 +297,7 @@ impl RuntimeServiceImpl {
                     if let Some(ref pids) = stats.pids {
                         total_pids += pids.current;
                     }
-                    if let Some(network) = self.container_network_stats(container_id).await {
+                    if let Some(network) = self.container_network_stats(&container_id).await {
                         total_rx_bytes = total_rx_bytes.saturating_add(network.rx_bytes);
                         total_rx_errors = total_rx_errors.saturating_add(network.rx_errors);
                         total_tx_bytes = total_tx_bytes.saturating_add(network.tx_bytes);
@@ -295,7 +306,7 @@ impl RuntimeServiceImpl {
                     has_stats = true;
 
                     let mut proto_stats = self.convert_to_proto_container_stats(stats);
-                    Self::populate_container_stats_attributes(&mut proto_stats, container);
+                    Self::populate_container_stats_attributes(&mut proto_stats, &container);
                     container_stats_list.push(proto_stats);
                 }
             }
@@ -328,7 +339,7 @@ impl RuntimeServiceImpl {
                 id: pod_id.to_string(),
                 metadata: pod.metadata.clone(),
                 labels: pod.labels.clone(),
-                annotations: Self::external_annotations(&pod.annotations),
+                annotations: Self::external_pod_annotations(&pod.annotations),
             }),
             linux: Some(LinuxPodSandboxStats {
                 cpu: Some(CpuUsage {
@@ -426,7 +437,13 @@ impl RuntimeServiceImpl {
         };
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let containers = self.containers.lock().await;
+        let containers: Vec<(String, Container)> = {
+            let containers = self.containers.lock().await;
+            containers
+                .iter()
+                .map(|(container_id, container)| (container_id.clone(), container.clone()))
+                .collect()
+        };
         let mut container_metrics_list = Vec::new();
         let pod_uid = pod.metadata.as_ref().map(|m| m.uid.clone());
 
@@ -438,7 +455,7 @@ impl RuntimeServiceImpl {
         let mut total_rx_bytes = 0u64;
         let mut total_tx_bytes = 0u64;
 
-        for (container_id, container) in containers.iter() {
+        for (container_id, container) in containers {
             let belongs_to_pod = container.pod_sandbox_id == pod_id
                 || pod_uid
                     .as_ref()
@@ -464,7 +481,7 @@ impl RuntimeServiceImpl {
 
                 if let Ok(collector) = MetricsCollector::new() {
                     if let Ok(stats) =
-                        collector.collect_container_stats(container_id, &cgroup_parent)
+                        collector.collect_container_stats(&container_id, &cgroup_parent)
                     {
                         let container_cpu = stats.cpu.as_ref().map(|c| c.usage_total).unwrap_or(0);
                         let container_mem = stats.memory.as_ref().map(|m| m.usage).unwrap_or(0);
@@ -472,10 +489,10 @@ impl RuntimeServiceImpl {
                             stats.memory.as_ref().map(|m| m.limit).unwrap_or(0);
                         let container_pids = stats.pids.as_ref().map(|p| p.current).unwrap_or(0);
                         let container_fs_usage = self
-                            .container_writable_layer_usage(container_id)
+                            .container_writable_layer_usage(&container_id)
                             .and_then(|usage| usage.used_bytes.map(|bytes| bytes.value))
                             .unwrap_or(0);
-                        let container_network = self.container_network_stats(container_id).await;
+                        let container_network = self.container_network_stats(&container_id).await;
 
                         total_cpu_usage += container_cpu;
                         total_memory_usage += container_mem;
@@ -531,7 +548,7 @@ impl RuntimeServiceImpl {
                         ];
 
                         container_metrics_list.push(ContainerMetrics {
-                            container_id: container_id.clone(),
+                            container_id,
                             metrics: container_metric_list,
                         });
                     }
@@ -550,13 +567,15 @@ impl RuntimeServiceImpl {
         let metrics = self.build_pod_metrics(
             pod_id,
             timestamp,
-            total_cpu_usage,
-            total_memory_usage,
-            total_memory_limit,
-            total_pids,
-            total_filesystem_usage,
-            total_rx_bytes,
-            total_tx_bytes,
+            PodMetricTotals {
+                cpu_usage: total_cpu_usage,
+                memory_usage: total_memory_usage,
+                memory_limit: total_memory_limit,
+                pids: total_pids,
+                filesystem_usage: total_filesystem_usage,
+                rx_bytes: total_rx_bytes,
+                tx_bytes: total_tx_bytes,
+            },
         );
 
         Some(PodSandboxMetrics {
@@ -604,11 +623,12 @@ impl RuntimeServiceImpl {
         let req = request.into_inner();
         let container_id = self.resolve_container_id(&req.container_id).await?;
 
-        let containers = self.containers.lock().await;
-        let container = containers
-            .get(&container_id)
-            .ok_or_else(|| Status::not_found("Container not found"))?;
-        let stats = self.cached_container_stats(&container_id, container).await;
+        let container = {
+            let containers = self.containers.lock().await;
+            containers.get(&container_id).cloned()
+        }
+        .ok_or_else(|| Status::not_found("Container not found"))?;
+        let stats = self.cached_container_stats(&container_id, &container).await;
 
         Ok(Response::new(ContainerStatsResponse { stats }))
     }
@@ -645,9 +665,15 @@ impl RuntimeServiceImpl {
             None
         };
 
-        let containers = self.containers.lock().await;
+        let containers: Vec<(String, Container)> = {
+            let containers = self.containers.lock().await;
+            containers
+                .iter()
+                .map(|(container_id, container)| (container_id.clone(), container.clone()))
+                .collect()
+        };
         let mut all_stats = Vec::new();
-        for (container_id, container) in containers.iter() {
+        for (container_id, container) in containers {
             if matches!(
                 container.state,
                 x if x == ContainerState::ContainerExited as i32
@@ -656,12 +682,12 @@ impl RuntimeServiceImpl {
                 continue;
             }
             if let Some(filter) = &filter {
-                if !Self::container_matches_stats_filter(container, filter) {
+                if !Self::container_matches_stats_filter(&container, filter) {
                     continue;
                 }
             }
 
-            if let Some(stats) = self.cached_container_stats(container_id, container).await {
+            if let Some(stats) = self.cached_container_stats(&container_id, &container).await {
                 all_stats.push(stats);
             }
         }
@@ -679,11 +705,12 @@ impl RuntimeServiceImpl {
         let req = request.into_inner();
         let pod_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
 
-        let pods = self.pod_sandboxes.lock().await;
-        let pod = pods
-            .get(&pod_id)
-            .ok_or_else(|| Status::not_found("Pod sandbox not found"))?;
-        let stats = self.cached_pod_stats(&pod_id, pod).await;
+        let pod = {
+            let pods = self.pod_sandboxes.lock().await;
+            pods.get(&pod_id).cloned()
+        }
+        .ok_or_else(|| Status::not_found("Pod sandbox not found"))?;
+        let stats = self.cached_pod_stats(&pod_id, &pod).await;
 
         Ok(Response::new(PodSandboxStatsResponse { stats }))
     }
@@ -789,11 +816,16 @@ impl RuntimeServiceImpl {
         &self,
         _request: Request<ListPodSandboxMetricsRequest>,
     ) -> Result<Response<ListPodSandboxMetricsResponse>, Status> {
-        let pods = self.pod_sandboxes.lock().await;
+        let pods: Vec<(String, crate::proto::runtime::v1::PodSandbox)> = {
+            let pods = self.pod_sandboxes.lock().await;
+            pods.iter()
+                .map(|(pod_id, pod)| (pod_id.clone(), pod.clone()))
+                .collect()
+        };
         let mut pod_metrics_list = Vec::new();
 
-        for (pod_id, pod) in pods.iter() {
-            if let Some(metrics) = self.cached_pod_sandbox_metrics(pod_id, pod).await {
+        for (pod_id, pod) in pods {
+            if let Some(metrics) = self.cached_pod_sandbox_metrics(&pod_id, &pod).await {
                 pod_metrics_list.push(metrics);
             }
         }

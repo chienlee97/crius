@@ -426,6 +426,7 @@ dependencies = [
  "tonic-reflection",
  "tower",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "ttrpc",
  "ttrpc-codegen",

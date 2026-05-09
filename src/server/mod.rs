@@ -50,18 +50,18 @@ use crate::config::{NriAnnotationWorkloadConfig, NriConfig};
 use crate::metrics::MetricsCollector;
 use crate::network::{CniConfig, DefaultNetworkManager, NetworkManager};
 use crate::nri::{
-    apply_container_adjustment_with_blockio_config, disallowed_annotation_adjustment_keys,
-    filter_annotation_adjustments_by_allowlist, linux_resources_from_cri, oci_args, oci_env,
-    oci_hooks, oci_linux_container, oci_mounts, oci_rlimits, oci_user, resolve_blockio_class,
-    resolve_rdt_class, validate_adjustment_resources_with_min_memory,
-    validate_container_adjustment, validate_container_update, validate_update_linux_resources,
-    NopNri, NriApi, NriContainerEvent, NriCreateContainerResult, NriDomain, NriManager,
-    NriManagerConfig, NriPodEvent, NriStopContainerResult, RuntimeSnapshot,
+    disallowed_annotation_adjustment_keys, filter_annotation_adjustments_by_allowlist,
+    linux_resources_from_cri, oci_args, oci_env, oci_hooks, oci_linux_container, oci_mounts,
+    oci_rlimits, oci_user, resolve_blockio_class, resolve_rdt_class,
+    validate_adjustment_resources_with_min_memory, validate_container_adjustment,
+    validate_container_update, validate_update_linux_resources, NopNri, NriApi, NriContainerEvent,
+    NriCreateContainerResult, NriDomain, NriManager, NriManagerConfig, NriPodEvent,
+    NriStopContainerResult, RuntimeSnapshot,
 };
 use crate::pod::{PodSandboxConfig, PodSandboxManager};
 use crate::runtime::{
-    default_shim_work_dir, ContainerConfig, ContainerRuntime, ContainerStatus, DeviceMapping,
-    MountConfig, NamespacePaths, RuncRuntime, SeccompProfile, ShimConfig, ShimProcess,
+    ContainerConfig, ContainerRuntime, ContainerStatus, DeviceMapping, MountConfig, NamespacePaths,
+    RuncRuntime, SeccompProfile, ShimConfig, ShimProcess,
 };
 use crate::streaming::StreamingServer;
 
@@ -71,13 +71,16 @@ mod events;
 mod pod_handlers;
 mod recovery;
 mod responses;
+mod seccomp_notifier;
 mod service;
 mod stats;
 mod status;
 mod streaming_handlers;
 
 pub(super) use service::RuntimeRegistry;
-pub use service::{RuntimeConfig, RuntimeServiceImpl};
+pub use service::{
+    IrqBalanceRestoreStatus, RuntimeConfig, RuntimeMetricsProvider, RuntimeServiceImpl,
+};
 
 const INTERNAL_ANNOTATION_PREFIX: &str = "io.crius.internal/";
 const INTERNAL_POD_STATE_KEY: &str = "io.crius.internal/pod-state";
@@ -92,6 +95,8 @@ const CRIO_USER_REQUESTED_IMAGE_ANNOTATION: &str = "io.kubernetes.cri-o.Image";
 const CRIO_IMAGE_NAME_ANNOTATION: &str = "io.kubernetes.cri-o.ImageName";
 const CRIO_LOG_PATH_ANNOTATION: &str = "io.kubernetes.cri-o.LogPath";
 const CRIO_RUNTIME_HANDLER_ANNOTATION: &str = "io.kubernetes.cri-o.RuntimeHandler";
+const CRIO_SECCOMP_NOTIFIER_ACTION_ANNOTATION: &str = "io.kubernetes.cri-o.seccompNotifierAction";
+const CRIO_SECCOMP_NOTIFIER_ACTION_V2_ANNOTATION: &str = "seccomp-notifier-action.crio.io";
 const CRIO_SANDBOX_ID_ANNOTATION: &str = "io.kubernetes.cri-o.SandboxID";
 const CRIO_SANDBOX_NAME_ANNOTATION: &str = "io.kubernetes.cri-o.SandboxName";
 const CRIO_POD_NAME_ANNOTATION: &str = "io.kubernetes.cri-o.Name";
@@ -547,13 +552,13 @@ impl StoredSecurityProfile {
                 localhost_ref: String::new(),
             },
             SeccompProfile::Unconfined => Self {
-                profile_type:
-                    crate::proto::runtime::v1::security_profile::ProfileType::Unconfined as i32,
+                profile_type: crate::proto::runtime::v1::security_profile::ProfileType::Unconfined
+                    as i32,
                 localhost_ref: String::new(),
             },
             SeccompProfile::Localhost(path) => Self {
-                profile_type:
-                    crate::proto::runtime::v1::security_profile::ProfileType::Localhost as i32,
+                profile_type: crate::proto::runtime::v1::security_profile::ProfileType::Localhost
+                    as i32,
                 localhost_ref: path.to_string_lossy().to_string(),
             },
         }
@@ -684,6 +689,7 @@ struct StoredContainerState {
     no_new_privileges: Option<bool>,
     apparmor_profile: Option<String>,
     seccomp_profile: Option<StoredSecurityProfile>,
+    seccomp_notifier_action: Option<String>,
     metadata_name: Option<String>,
     metadata_attempt: Option<u32>,
     started_at: Option<i64>,
@@ -718,6 +724,8 @@ struct CniTemplateContext {
 struct StoredMount {
     container_path: String,
     host_path: String,
+    image: String,
+    image_sub_path: String,
     readonly: bool,
     selinux_relabel: bool,
     propagation: i32,
@@ -1487,7 +1495,7 @@ impl RuntimeServiceImpl {
         }
         pod.labels = Self::merge_labels(&pod_sandbox.labels, pause_spec_annotations);
         pod.annotations =
-            Self::merge_external_annotations(&pod_sandbox.annotations, pause_spec_annotations);
+            Self::merge_external_pod_annotations(&pod_sandbox.annotations, pause_spec_annotations);
         pod.runtime_handler = pod_sandbox.runtime_handler.clone();
         if let Some(state) = pod_state.as_ref() {
             if let Some(ip) = state.ip.as_ref().filter(|ip| !ip.is_empty()) {
@@ -1601,7 +1609,7 @@ impl RuntimeServiceImpl {
         };
         nri_container.labels = Self::merge_labels(&container.labels, spec_annotations);
         nri_container.annotations =
-            Self::merge_external_annotations(&container.annotations, spec_annotations);
+            Self::merge_external_container_annotations(&container.annotations, spec_annotations);
         nri_container.created_at = Self::normalize_timestamp_nanos(container.created_at);
         nri_container.started_at = stored_state
             .as_ref()
@@ -2007,6 +2015,18 @@ impl RuntimeServiceImpl {
         if let Some(profile) = profile {
             match profile.profile_type {
                 x if x
+                    == crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
+                        as i32 =>
+                {
+                    Some("runtime/default".to_string())
+                }
+                x if x
+                    == crate::proto::runtime::v1::security_profile::ProfileType::Unconfined
+                        as i32 =>
+                {
+                    Some("unconfined".to_string())
+                }
+                x if x
                     == crate::proto::runtime::v1::security_profile::ProfileType::Localhost
                         as i32 =>
                 {
@@ -2022,6 +2042,45 @@ impl RuntimeServiceImpl {
             None
         } else {
             Some(deprecated_profile.to_string())
+        }
+    }
+
+    fn security_availability() -> crate::security::SecurityManager {
+        crate::security::SecurityManager::new()
+    }
+
+    fn effective_apparmor_profile_from_proto(
+        &self,
+        profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
+        deprecated_profile: &str,
+        privileged: bool,
+    ) -> Result<Option<String>, Status> {
+        let requested = Self::security_profile_name(profile, deprecated_profile);
+        let security = Self::security_availability();
+        if self.config.disable_apparmor || !security.is_apparmor_available() {
+            return match requested.as_deref() {
+                Some(profile)
+                    if !profile.eq_ignore_ascii_case("unconfined") && !profile.is_empty() =>
+                {
+                    Err(Status::failed_precondition(
+                        "apparmor is not available or is disabled for this node",
+                    ))
+                }
+                _ => Ok(None),
+            };
+        }
+
+        if privileged {
+            return Ok(None);
+        }
+
+        match requested.as_deref() {
+            None => Ok(Some(self.config.apparmor_default_profile.clone())),
+            Some(profile) if profile.eq_ignore_ascii_case("runtime/default") => {
+                Ok(Some(self.config.apparmor_default_profile.clone()))
+            }
+            Some(profile) if profile.eq_ignore_ascii_case("unconfined") => Ok(None),
+            Some(profile) => Ok(Some(profile.to_string())),
         }
     }
 
@@ -2052,8 +2111,32 @@ impl RuntimeServiceImpl {
             .unwrap_or("")
     }
 
+    fn generated_selinux_level(seed: &str, category_range: u32) -> String {
+        let effective_range = category_range.max(1);
+        if effective_range == 1 {
+            return "s0:c0,c0".to_string();
+        }
+
+        let digest = Sha256::digest(seed.as_bytes());
+        let first =
+            u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) % effective_range;
+        let mut second =
+            u32::from_le_bytes([digest[4], digest[5], digest[6], digest[7]]) % effective_range;
+        if second == first {
+            second = (second + 1) % effective_range;
+        }
+        let (low, high) = if first <= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        format!("s0:c{low},c{high}")
+    }
+
     fn selinux_label_from_proto(
         options: Option<&crate::proto::runtime::v1::SeLinuxOption>,
+        auto_level_seed: Option<&str>,
+        selinux_category_range: u32,
     ) -> Option<String> {
         let options = options?;
         if options.user.is_empty()
@@ -2080,11 +2163,35 @@ impl RuntimeServiceImpl {
             options.r#type.as_str()
         };
         let level = if options.level.is_empty() {
-            "s0"
+            auto_level_seed
+                .map(|seed| Self::generated_selinux_level(seed, selinux_category_range))
+                .unwrap_or_else(|| "s0".to_string())
         } else {
-            options.level.as_str()
+            options.level.clone()
         };
         Some(format!("{}:{}:{}:{}", user, role, selinux_type, level))
+    }
+
+    fn effective_selinux_label_from_proto(
+        &self,
+        options: Option<&crate::proto::runtime::v1::SeLinuxOption>,
+        host_network: bool,
+        auto_level_seed: Option<&str>,
+    ) -> Option<String> {
+        if !self.config.enable_selinux {
+            return None;
+        }
+
+        let security = Self::security_availability();
+        if !security.is_selinux_available() {
+            return None;
+        }
+
+        if host_network && self.config.hostnetwork_disable_selinux {
+            return None;
+        }
+
+        Self::selinux_label_from_proto(options, auto_level_seed, self.config.selinux_category_range)
     }
 
     fn seccomp_profile_from_proto(
@@ -2154,10 +2261,18 @@ impl RuntimeServiceImpl {
         &self,
         profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
         deprecated_profile: &str,
+        privileged: bool,
     ) -> Option<SeccompProfile> {
-        Self::seccomp_profile_from_proto(profile, deprecated_profile).or_else(|| {
-            Self::seccomp_profile_from_selector(&self.config.unset_seccomp_profile)
-        })
+        match Self::seccomp_profile_from_proto(profile, deprecated_profile) {
+            Some(SeccompProfile::RuntimeDefault) if privileged => {
+                Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
+            }
+            Some(explicit) => Some(explicit),
+            None if privileged => {
+                Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
+            }
+            None => Self::seccomp_profile_from_selector(&self.config.unset_seccomp_profile),
+        }
     }
 
     fn stored_seccomp_profile_from_proto(
@@ -2182,12 +2297,68 @@ impl RuntimeServiceImpl {
         &self,
         profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
         deprecated_profile: &str,
+        privileged: bool,
     ) -> Option<StoredSecurityProfile> {
-        Self::stored_seccomp_profile_from_proto(profile, deprecated_profile).or_else(|| {
-            Self::seccomp_profile_from_selector(&self.config.unset_seccomp_profile)
+        match Self::stored_seccomp_profile_from_proto(profile, deprecated_profile) {
+            Some(StoredSecurityProfile { profile_type, .. })
+                if privileged
+                    && profile_type
+                        == crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
+                            as i32 =>
+            {
+                Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
+                    .as_ref()
+                    .map(StoredSecurityProfile::from_runtime_seccomp)
+            }
+            Some(explicit) => Some(explicit),
+            None if privileged => {
+                Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
+                    .as_ref()
+                    .map(StoredSecurityProfile::from_runtime_seccomp)
+            }
+            None => Self::seccomp_profile_from_selector(&self.config.unset_seccomp_profile)
                 .as_ref()
-                .map(StoredSecurityProfile::from_runtime_seccomp)
-        })
+                .map(StoredSecurityProfile::from_runtime_seccomp),
+        }
+    }
+
+    fn seccomp_notifier_action_from_annotations(
+        &self,
+        pod_annotations: &HashMap<String, String>,
+        runtime_handler: &str,
+    ) -> Result<Option<crate::runtime::SeccompNotifierMode>, Status> {
+        let allowed = self.nri_allowed_annotation_prefixes(
+            pod_annotations,
+            pod_annotations,
+            runtime_handler,
+        )?;
+        let v1 = pod_annotations.get(CRIO_SECCOMP_NOTIFIER_ACTION_ANNOTATION);
+        let v2 = pod_annotations.get(CRIO_SECCOMP_NOTIFIER_ACTION_V2_ANNOTATION);
+        let (key, raw) = match (v1, v2) {
+            (Some(v1), Some(v2)) if v1.trim() != v2.trim() => {
+                return Err(Status::invalid_argument(format!(
+                    "conflicting seccomp notifier annotations: {}={} vs {}={}",
+                    CRIO_SECCOMP_NOTIFIER_ACTION_ANNOTATION,
+                    v1,
+                    CRIO_SECCOMP_NOTIFIER_ACTION_V2_ANNOTATION,
+                    v2
+                )))
+            }
+            (_, Some(v2)) => (CRIO_SECCOMP_NOTIFIER_ACTION_V2_ANNOTATION, v2.as_str()),
+            (Some(v1), None) => (CRIO_SECCOMP_NOTIFIER_ACTION_ANNOTATION, v1.as_str()),
+            (None, None) => return Ok(None),
+        };
+        if !Self::annotation_key_allowed(key, &allowed) {
+            return Ok(None);
+        }
+        match raw.trim() {
+            "" | "log" => Ok(Some(crate::runtime::SeccompNotifierMode::Log)),
+            "stop" => Ok(Some(crate::runtime::SeccompNotifierMode::Stop)),
+            other => Err(Status::invalid_argument(format!(
+                "unsupported seccomp notifier action {}; expected empty/log/stop",
+                other
+            ))),
+        }
     }
 
     fn resolve_runtime_handler(&self, requested: &str) -> Result<String, Status> {
@@ -2713,6 +2884,33 @@ impl RuntimeServiceImpl {
             })
     }
 
+    async fn runtime_handler_name_for_container_request(
+        &self,
+        container_id: &str,
+    ) -> Result<String, Status> {
+        let annotations = {
+            let containers = self.containers.lock().await;
+            containers
+                .get(container_id)
+                .map(|container| container.annotations.clone())
+        };
+
+        if let Some(annotations) = annotations {
+            return Ok(self
+                .runtime
+                .runtime_handler_name_for_annotations_map(&annotations));
+        }
+
+        self.runtime
+            .runtime_handler_name_for_container(container_id)
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to resolve runtime handler for container {}: {}",
+                    container_id, e
+                ))
+            })
+    }
+
     async fn runtime_container_pid_checked(&self, container_id: &str) -> Option<i32> {
         let runtime = self
             .runtime_for_container_request(container_id)
@@ -2724,6 +2922,107 @@ impl RuntimeServiceImpl {
             .ok()
             .and_then(Result::ok)
             .flatten()
+    }
+
+    pub(super) async fn cleanup_stale_logical_pod_sandbox(
+        &self,
+        stale_pod_id: &str,
+    ) -> Result<(), Status> {
+        let pod = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes.get(stale_pod_id).cloned()
+        };
+        let Some(pod) = pod else {
+            return Ok(());
+        };
+
+        let pod_state =
+            Self::read_internal_state::<StoredPodState>(&pod.annotations, INTERNAL_POD_STATE_KEY);
+        let container_ids: Vec<String> = {
+            let containers = self.containers.lock().await;
+            containers
+                .values()
+                .filter(|container| container.pod_sandbox_id == stale_pod_id)
+                .map(|container| container.id.clone())
+                .collect()
+        };
+        for container_id in &container_ids {
+            match self.cleanup_stale_logical_container(container_id).await {
+                Ok(()) => {}
+                Err(status) if status.code() == tonic::Code::NotFound => {}
+                Err(status) => return Err(status),
+            }
+        }
+
+        let cleaned_via_manager = {
+            let mut pod_manager = self.pod_manager.lock().await;
+            let has_entry = pod_manager.get_pod_sandbox(stale_pod_id).is_some();
+            if has_entry {
+                pod_manager
+                    .remove_pod_sandbox(stale_pod_id)
+                    .await
+                    .map_err(|err| {
+                        Status::internal(format!(
+                            "Failed to remove stale pod sandbox {}: {}",
+                            stale_pod_id, err
+                        ))
+                    })?;
+            }
+            has_entry
+        };
+        if !cleaned_via_manager {
+            self.fallback_cleanup_pod_sandbox_resources(
+                stale_pod_id,
+                &pod,
+                pod_state.as_ref(),
+                true,
+            )
+            .await;
+        }
+
+        let pod_remove_event = self.nri_pod_event(stale_pod_id).await;
+        if let Err(err) = self.nri.stop_pod_sandbox(pod_remove_event.clone()).await {
+            log::warn!(
+                "NRI StopPodSandbox failed for stale sandbox {}: {}",
+                stale_pod_id,
+                err
+            );
+        }
+        if let Err(err) = self.nri.remove_pod_sandbox(pod_remove_event).await {
+            log::warn!(
+                "NRI RemovePodSandbox failed for stale sandbox {}: {}",
+                stale_pod_id,
+                err
+            );
+        }
+
+        {
+            let mut pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes.remove(stale_pod_id);
+        }
+        self.release_pod_name(stale_pod_id);
+
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = persistence.delete_pod_sandbox(stale_pod_id) {
+            log::warn!(
+                "Failed to delete stale pod sandbox {} from database: {}",
+                stale_pod_id,
+                err
+            );
+        }
+
+        Ok(())
+    }
+
+    pub(super) async fn cleanup_stale_logical_container(
+        &self,
+        stale_container_id: &str,
+    ) -> Result<(), Status> {
+        match self.remove_container_internal(stale_container_id).await {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(()),
+            Err(status) => Err(status),
+        }
     }
 
     async fn runtime_cgroup_hint_checked(&self, container_id: &str) -> Option<PathBuf> {
@@ -2908,6 +3207,11 @@ impl RuntimeServiceImpl {
     }
 
     async fn resolve_pod_sandbox_id(&self, requested_id: &str) -> Result<String, Status> {
+        if let Ok(removed) = self.removed_pod_sandbox_ids.lock() {
+            if removed.contains(requested_id) {
+                return Err(Status::not_found("Pod sandbox not found"));
+            }
+        }
         let pod_sandboxes = self.pod_sandboxes.lock().await;
         if pod_sandboxes.contains_key(requested_id) {
             return Ok(requested_id.to_string());
@@ -2930,6 +3234,11 @@ impl RuntimeServiceImpl {
     }
 
     async fn resolve_container_id(&self, requested_id: &str) -> Result<String, Status> {
+        if let Ok(removed) = self.removed_container_ids.lock() {
+            if removed.contains(requested_id) {
+                return Err(Status::not_found("Container not found"));
+            }
+        }
         let containers = self.containers.lock().await;
         if containers.contains_key(requested_id) {
             return Ok(requested_id.to_string());
@@ -2962,12 +3271,24 @@ impl RuntimeServiceImpl {
             .map_err(|e| Status::internal(format!("Failed to list containers: {}", e)))?;
         drop(persistence);
 
+        if let Ok(removed) = self.removed_container_ids.lock() {
+            if removed.contains(requested_id) {
+                return Ok(None);
+            }
+        }
         if records.iter().any(|record| record.id == requested_id) {
             return Ok(Some(requested_id.to_string()));
         }
 
         let matches: Vec<String> = records
             .into_iter()
+            .filter(|record| {
+                self.removed_container_ids
+                    .lock()
+                    .ok()
+                    .map(|removed| !removed.contains(&record.id))
+                    .unwrap_or(true)
+            })
             .filter(|record| record.id.starts_with(requested_id))
             .map(|record| record.id)
             .collect();
@@ -3053,7 +3374,6 @@ impl RuntimeServiceImpl {
             labels: serde_json::from_str(&record.labels).unwrap_or_default(),
             annotations,
             created_at: record.created_at,
-            ..Default::default()
         };
 
         if let Some(mut state) = container_state {
@@ -3895,28 +4215,25 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<GetEventsRequest>,
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
-        log::info!("Get container events");
-
+        let mut events = self.events.subscribe();
         let (tx, rx) = tokio::sync::mpsc::channel(128);
-        let mut subscriber = self.events.subscribe();
+
         tokio::spawn(async move {
             loop {
-                match subscriber.recv().await {
+                match events.recv().await {
                     Ok(event) => {
-                        if let Err(e) = tx.send(Ok(event)).await {
-                            log::debug!("Container events subscriber disconnected: {}", e);
+                        if tx.send(Ok(event)).await.is_err() {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        if let Err(e) = tx
-                            .send(Err(Status::resource_exhausted(format!(
-                                "missed {} container events due to slow consumer",
-                                skipped
-                            ))))
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if tx
+                            .send(Err(Status::resource_exhausted(
+                                "CRI event stream lagged behind producer",
+                            )))
                             .await
+                            .is_err()
                         {
-                            log::debug!("Container events subscriber disconnected: {}", e);
                             break;
                         }
                     }
@@ -3925,8 +4242,7 @@ impl RuntimeService for RuntimeServiceImpl {
             }
         });
 
-        let stream = ReceiverStream::new(rx);
-        Ok(Response::new(stream))
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     //
