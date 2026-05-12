@@ -30,6 +30,9 @@ pub struct ContainerRecord {
     pub annotations: String, // JSON
     pub exit_code: Option<i32>,
     pub exit_time: Option<i64>,
+    pub runtime_handler: Option<String>,
+    pub runtime_backend: Option<String>,
+    pub snapshot_key: Option<String>,
 }
 
 /// Pod沙箱记录
@@ -46,6 +49,77 @@ pub struct PodSandboxRecord {
     pub annotations: String, // JSON
     pub pause_container_id: Option<String>,
     pub ip: Option<String>,
+}
+
+/// 镜像记录
+#[derive(Debug, Clone)]
+pub struct ImageRecord {
+    pub id: String,
+    pub size: u64,
+    pub pinned: bool,
+    pub pulled_at: i64,
+    pub source_reference: Option<String>,
+    pub os: Option<String>,
+    pub architecture: Option<String>,
+    pub config_user: Option<String>,
+    pub config_env_json: String,
+    pub config_entrypoint_json: String,
+    pub config_cmd_json: String,
+    pub config_working_dir: Option<String>,
+    pub annotations_json: String,
+    pub declared_volumes_json: String,
+    pub manifest_media_type: Option<String>,
+    pub selected_manifest_digest: Option<String>,
+    pub selected_platform: Option<String>,
+    pub stored_layers_json: String,
+    pub artifact_type: Option<String>,
+    pub artifact_blobs_json: String,
+    pub cache_path: Option<String>,
+}
+
+/// 镜像引用记录
+#[derive(Debug, Clone)]
+pub struct ImageRefRecord {
+    pub reference: String,
+    pub image_id: String,
+    pub namespace: Option<String>,
+    pub ref_kind: String,
+}
+
+/// 快照记录
+#[derive(Debug, Clone)]
+pub struct SnapshotRecord {
+    pub key: String,
+    pub image_id: String,
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub state: String,
+    pub mountpoint: String,
+}
+
+/// runtime工件记录
+#[derive(Debug, Clone)]
+pub struct RuntimeArtifactRecord {
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub artifact_kind: String,
+    pub path: String,
+    pub runtime_handler: Option<String>,
+    pub runtime_root: Option<String>,
+}
+
+/// shim进程记录
+#[derive(Debug, Clone)]
+pub struct ShimProcessRecord {
+    pub container_id: String,
+    pub shim_pid: u32,
+    pub work_dir: String,
+    pub socket_path: String,
+    pub exit_code_file: String,
+    pub log_file: String,
+    pub bundle_path: String,
+    pub state: String,
+    pub last_seen_at: i64,
 }
 
 impl StorageManager {
@@ -82,7 +156,10 @@ impl StorageManager {
                 labels TEXT NOT NULL DEFAULT '{}',
                 annotations TEXT NOT NULL DEFAULT '{}',
                 exit_code INTEGER,
-                exit_time INTEGER
+                exit_time INTEGER,
+                runtime_handler TEXT,
+                runtime_backend TEXT,
+                snapshot_key TEXT
             )",
                 [],
             )
@@ -145,6 +222,132 @@ impl StorageManager {
             "CREATE INDEX IF NOT EXISTS idx_events_time ON state_events(timestamp)",
             [],
         )?;
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS images (
+                id TEXT PRIMARY KEY,
+                size INTEGER NOT NULL,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                pulled_at INTEGER NOT NULL DEFAULT 0,
+                source_reference TEXT,
+                os TEXT,
+                architecture TEXT,
+                config_user TEXT,
+                config_env_json TEXT NOT NULL DEFAULT '[]',
+                config_entrypoint_json TEXT NOT NULL DEFAULT '[]',
+                config_cmd_json TEXT NOT NULL DEFAULT '[]',
+                config_working_dir TEXT,
+                annotations_json TEXT NOT NULL DEFAULT '{}',
+                declared_volumes_json TEXT NOT NULL DEFAULT '[]',
+                manifest_media_type TEXT,
+                selected_manifest_digest TEXT,
+                selected_platform TEXT,
+                stored_layers_json TEXT NOT NULL DEFAULT '[]',
+                artifact_type TEXT,
+                artifact_blobs_json TEXT NOT NULL DEFAULT '[]',
+                cache_path TEXT
+            )",
+                [],
+            )
+            .context("Failed to create images table")?;
+
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS image_refs (
+                reference TEXT NOT NULL,
+                image_id TEXT NOT NULL,
+                namespace TEXT NOT NULL DEFAULT '',
+                ref_kind TEXT NOT NULL,
+                PRIMARY KEY(reference, image_id, namespace, ref_kind)
+            )",
+                [],
+            )
+            .context("Failed to create image_refs table")?;
+
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS snapshots (
+                key TEXT PRIMARY KEY,
+                image_id TEXT NOT NULL,
+                owner_kind TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                mountpoint TEXT NOT NULL
+            )",
+                [],
+            )
+            .context("Failed to create snapshots table")?;
+
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS runtime_artifacts (
+                owner_kind TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                artifact_kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                runtime_handler TEXT,
+                runtime_root TEXT,
+                PRIMARY KEY(owner_kind, owner_id, artifact_kind, path)
+            )",
+                [],
+            )
+            .context("Failed to create runtime_artifacts table")?;
+
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS shim_processes (
+                container_id TEXT PRIMARY KEY,
+                shim_pid INTEGER NOT NULL,
+                work_dir TEXT NOT NULL,
+                socket_path TEXT NOT NULL,
+                exit_code_file TEXT NOT NULL,
+                log_file TEXT NOT NULL,
+                bundle_path TEXT NOT NULL,
+                state TEXT NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            )",
+                [],
+            )
+            .context("Failed to create shim_processes table")?;
+
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                old_state TEXT,
+                new_state TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                details TEXT
+            )",
+                [],
+            )
+            .context("Failed to create events table")?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_image_refs_image_id ON image_refs(image_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snapshots_owner ON snapshots(owner_kind, owner_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runtime_artifacts_owner ON runtime_artifacts(owner_kind, owner_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shim_processes_state ON shim_processes(state)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_entity_new ON events(entity_type, entity_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_time_new ON events(timestamp)",
+            [],
+        )?;
 
         debug!("Database tables initialized");
         Ok(())
@@ -169,8 +372,8 @@ impl StorageManager {
     pub fn save_container(&mut self, record: &ContainerRecord) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO containers 
-             (id, pod_id, state, image, command, created_at, labels, annotations, exit_code, exit_time)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, pod_id, state, image, command, created_at, labels, annotations, exit_code, exit_time, runtime_handler, runtime_backend, snapshot_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
                 &record.id,
                 &record.pod_id,
@@ -182,6 +385,9 @@ impl StorageManager {
                 &record.annotations,
                 record.exit_code,
                 record.exit_time,
+                record.runtime_handler.as_deref(),
+                record.runtime_backend.as_deref(),
+                record.snapshot_key.as_deref(),
             ],
         ).context("Failed to save container")?;
 
@@ -239,7 +445,7 @@ impl StorageManager {
     /// 获取容器记录
     pub fn get_container(&self, container_id: &str) -> Result<Option<ContainerRecord>> {
         let record = self.conn.query_row(
-            "SELECT id, pod_id, state, image, command, created_at, labels, annotations, exit_code, exit_time
+            "SELECT id, pod_id, state, image, command, created_at, labels, annotations, exit_code, exit_time, runtime_handler, runtime_backend, snapshot_key
              FROM containers WHERE id = ?1",
             [container_id],
             |row| {
@@ -254,6 +460,9 @@ impl StorageManager {
                     annotations: row.get(7)?,
                     exit_code: row.get(8)?,
                     exit_time: row.get(9)?,
+                    runtime_handler: row.get(10)?,
+                    runtime_backend: row.get(11)?,
+                    snapshot_key: row.get(12)?,
                 })
             },
         ).optional().context("Failed to get container")?;
@@ -264,7 +473,7 @@ impl StorageManager {
     /// 获取所有容器
     pub fn list_containers(&self) -> Result<Vec<ContainerRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, pod_id, state, image, command, created_at, labels, annotations, exit_code, exit_time
+            "SELECT id, pod_id, state, image, command, created_at, labels, annotations, exit_code, exit_time, runtime_handler, runtime_backend, snapshot_key
              FROM containers"
         )?;
 
@@ -281,6 +490,9 @@ impl StorageManager {
                     annotations: row.get(7)?,
                     exit_code: row.get(8)?,
                     exit_time: row.get(9)?,
+                    runtime_handler: row.get(10)?,
+                    runtime_backend: row.get(11)?,
+                    snapshot_key: row.get(12)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -292,7 +504,7 @@ impl StorageManager {
     /// 获取Pod下的所有容器
     pub fn list_containers_by_pod(&self, pod_id: &str) -> Result<Vec<ContainerRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, pod_id, state, image, command, created_at, labels, annotations, exit_code, exit_time
+            "SELECT id, pod_id, state, image, command, created_at, labels, annotations, exit_code, exit_time, runtime_handler, runtime_backend, snapshot_key
              FROM containers WHERE pod_id = ?1"
         )?;
 
@@ -309,6 +521,9 @@ impl StorageManager {
                     annotations: row.get(7)?,
                     exit_code: row.get(8)?,
                     exit_time: row.get(9)?,
+                    runtime_handler: row.get(10)?,
+                    runtime_backend: row.get(11)?,
+                    snapshot_key: row.get(12)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -457,6 +672,357 @@ impl StorageManager {
         Ok(())
     }
 
+    pub fn save_image(&mut self, record: &ImageRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO images
+             (id, size, pinned, pulled_at, source_reference, os, architecture, config_user,
+              config_env_json, config_entrypoint_json, config_cmd_json, config_working_dir,
+              annotations_json, declared_volumes_json, manifest_media_type, selected_manifest_digest,
+              selected_platform, stored_layers_json, artifact_type, artifact_blobs_json, cache_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            rusqlite::params![
+                &record.id,
+                record.size,
+                record.pinned,
+                record.pulled_at,
+                record.source_reference.as_deref(),
+                record.os.as_deref(),
+                record.architecture.as_deref(),
+                record.config_user.as_deref(),
+                &record.config_env_json,
+                &record.config_entrypoint_json,
+                &record.config_cmd_json,
+                record.config_working_dir.as_deref(),
+                &record.annotations_json,
+                &record.declared_volumes_json,
+                record.manifest_media_type.as_deref(),
+                record.selected_manifest_digest.as_deref(),
+                record.selected_platform.as_deref(),
+                &record.stored_layers_json,
+                record.artifact_type.as_deref(),
+                &record.artifact_blobs_json,
+                record.cache_path.as_deref(),
+            ],
+        ).context("Failed to save image")?;
+        Ok(())
+    }
+
+    pub fn get_image(&self, image_id: &str) -> Result<Option<ImageRecord>> {
+        let record = self.conn.query_row(
+            "SELECT id, size, pinned, pulled_at, source_reference, os, architecture, config_user,
+                    config_env_json, config_entrypoint_json, config_cmd_json, config_working_dir,
+                    annotations_json, declared_volumes_json, manifest_media_type, selected_manifest_digest,
+                    selected_platform, stored_layers_json, artifact_type, artifact_blobs_json, cache_path
+             FROM images WHERE id = ?1",
+            [image_id],
+            |row| {
+                Ok(ImageRecord {
+                    id: row.get(0)?,
+                    size: row.get(1)?,
+                    pinned: row.get(2)?,
+                    pulled_at: row.get(3)?,
+                    source_reference: row.get(4)?,
+                    os: row.get(5)?,
+                    architecture: row.get(6)?,
+                    config_user: row.get(7)?,
+                    config_env_json: row.get(8)?,
+                    config_entrypoint_json: row.get(9)?,
+                    config_cmd_json: row.get(10)?,
+                    config_working_dir: row.get(11)?,
+                    annotations_json: row.get(12)?,
+                    declared_volumes_json: row.get(13)?,
+                    manifest_media_type: row.get(14)?,
+                    selected_manifest_digest: row.get(15)?,
+                    selected_platform: row.get(16)?,
+                    stored_layers_json: row.get(17)?,
+                    artifact_type: row.get(18)?,
+                    artifact_blobs_json: row.get(19)?,
+                    cache_path: row.get(20)?,
+                })
+            },
+        ).optional().context("Failed to get image")?;
+        Ok(record)
+    }
+
+    pub fn list_images(&self) -> Result<Vec<ImageRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, size, pinned, pulled_at, source_reference, os, architecture, config_user,
+                    config_env_json, config_entrypoint_json, config_cmd_json, config_working_dir,
+                    annotations_json, declared_volumes_json, manifest_media_type, selected_manifest_digest,
+                    selected_platform, stored_layers_json, artifact_type, artifact_blobs_json, cache_path
+             FROM images",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                Ok(ImageRecord {
+                    id: row.get(0)?,
+                    size: row.get(1)?,
+                    pinned: row.get(2)?,
+                    pulled_at: row.get(3)?,
+                    source_reference: row.get(4)?,
+                    os: row.get(5)?,
+                    architecture: row.get(6)?,
+                    config_user: row.get(7)?,
+                    config_env_json: row.get(8)?,
+                    config_entrypoint_json: row.get(9)?,
+                    config_cmd_json: row.get(10)?,
+                    config_working_dir: row.get(11)?,
+                    annotations_json: row.get(12)?,
+                    declared_volumes_json: row.get(13)?,
+                    manifest_media_type: row.get(14)?,
+                    selected_manifest_digest: row.get(15)?,
+                    selected_platform: row.get(16)?,
+                    stored_layers_json: row.get(17)?,
+                    artifact_type: row.get(18)?,
+                    artifact_blobs_json: row.get(19)?,
+                    cache_path: row.get(20)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list images")?;
+        Ok(records)
+    }
+
+    pub fn replace_image_refs(&mut self, image_id: &str, refs: &[ImageRefRecord]) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM image_refs WHERE image_id = ?1", [image_id])
+            .context("Failed to delete old image refs")?;
+        for record in refs {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO image_refs (reference, image_id, namespace, ref_kind)
+                 VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        &record.reference,
+                        &record.image_id,
+                        record.namespace.as_deref().unwrap_or(""),
+                        &record.ref_kind,
+                    ],
+                )
+                .context("Failed to save image ref")?;
+        }
+        Ok(())
+    }
+
+    pub fn list_image_refs(&self, image_id: Option<&str>) -> Result<Vec<ImageRefRecord>> {
+        let sql = if image_id.is_some() {
+            "SELECT reference, image_id, namespace, ref_kind FROM image_refs WHERE image_id = ?1"
+        } else {
+            "SELECT reference, image_id, namespace, ref_kind FROM image_refs"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let mapper = |row: &rusqlite::Row<'_>| {
+            Ok(ImageRefRecord {
+                reference: row.get(0)?,
+                image_id: row.get(1)?,
+                namespace: {
+                    let value: String = row.get(2)?;
+                    (!value.is_empty()).then_some(value)
+                },
+                ref_kind: row.get(3)?,
+            })
+        };
+        let records = match image_id {
+            Some(id) => stmt.query_map([id], mapper)?,
+            None => stmt.query_map([], mapper)?,
+        }
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to list image refs")?;
+        Ok(records)
+    }
+
+    pub fn delete_image(&mut self, image_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM image_refs WHERE image_id = ?1", [image_id])
+            .context("Failed to delete image refs")?;
+        self.conn
+            .execute("DELETE FROM images WHERE id = ?1", [image_id])
+            .context("Failed to delete image")?;
+        Ok(())
+    }
+
+    pub fn save_snapshot(&mut self, record: &SnapshotRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO snapshots (key, image_id, owner_kind, owner_id, state, mountpoint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                &record.key,
+                &record.image_id,
+                &record.owner_kind,
+                &record.owner_id,
+                &record.state,
+                &record.mountpoint,
+            ],
+        ).context("Failed to save snapshot")?;
+        Ok(())
+    }
+
+    pub fn list_snapshots(&self) -> Result<Vec<SnapshotRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, image_id, owner_kind, owner_id, state, mountpoint FROM snapshots",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                Ok(SnapshotRecord {
+                    key: row.get(0)?,
+                    image_id: row.get(1)?,
+                    owner_kind: row.get(2)?,
+                    owner_id: row.get(3)?,
+                    state: row.get(4)?,
+                    mountpoint: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list snapshots")?;
+        Ok(records)
+    }
+
+    pub fn delete_snapshot(&mut self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM snapshots WHERE key = ?1", [key])
+            .context("Failed to delete snapshot")?;
+        Ok(())
+    }
+
+    pub fn replace_runtime_artifacts(
+        &mut self,
+        owner_kind: &str,
+        owner_id: &str,
+        records: &[RuntimeArtifactRecord],
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM runtime_artifacts WHERE owner_kind = ?1 AND owner_id = ?2",
+                [owner_kind, owner_id],
+            )
+            .context("Failed to delete runtime artifacts")?;
+        for record in records {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO runtime_artifacts
+                 (owner_kind, owner_id, artifact_kind, path, runtime_handler, runtime_root)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        &record.owner_kind,
+                        &record.owner_id,
+                        &record.artifact_kind,
+                        &record.path,
+                        record.runtime_handler.as_deref(),
+                        record.runtime_root.as_deref(),
+                    ],
+                )
+                .context("Failed to save runtime artifact")?;
+        }
+        Ok(())
+    }
+
+    pub fn list_runtime_artifacts(&self) -> Result<Vec<RuntimeArtifactRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT owner_kind, owner_id, artifact_kind, path, runtime_handler, runtime_root
+             FROM runtime_artifacts",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                Ok(RuntimeArtifactRecord {
+                    owner_kind: row.get(0)?,
+                    owner_id: row.get(1)?,
+                    artifact_kind: row.get(2)?,
+                    path: row.get(3)?,
+                    runtime_handler: row.get(4)?,
+                    runtime_root: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list runtime artifacts")?;
+        Ok(records)
+    }
+
+    pub fn delete_runtime_artifacts(&mut self, owner_kind: &str, owner_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM runtime_artifacts WHERE owner_kind = ?1 AND owner_id = ?2",
+                [owner_kind, owner_id],
+            )
+            .context("Failed to delete runtime artifacts")?;
+        Ok(())
+    }
+
+    pub fn save_shim_process(&mut self, record: &ShimProcessRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO shim_processes
+             (container_id, shim_pid, work_dir, socket_path, exit_code_file, log_file, bundle_path, state, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                &record.container_id,
+                record.shim_pid,
+                &record.work_dir,
+                &record.socket_path,
+                &record.exit_code_file,
+                &record.log_file,
+                &record.bundle_path,
+                &record.state,
+                record.last_seen_at,
+            ],
+        ).context("Failed to save shim process")?;
+        Ok(())
+    }
+
+    pub fn get_shim_process(&self, container_id: &str) -> Result<Option<ShimProcessRecord>> {
+        let record = self.conn.query_row(
+            "SELECT container_id, shim_pid, work_dir, socket_path, exit_code_file, log_file, bundle_path, state, last_seen_at
+             FROM shim_processes WHERE container_id = ?1",
+            [container_id],
+            |row| {
+                Ok(ShimProcessRecord {
+                    container_id: row.get(0)?,
+                    shim_pid: row.get(1)?,
+                    work_dir: row.get(2)?,
+                    socket_path: row.get(3)?,
+                    exit_code_file: row.get(4)?,
+                    log_file: row.get(5)?,
+                    bundle_path: row.get(6)?,
+                    state: row.get(7)?,
+                    last_seen_at: row.get(8)?,
+                })
+            },
+        ).optional().context("Failed to get shim process")?;
+        Ok(record)
+    }
+
+    pub fn list_shim_processes(&self) -> Result<Vec<ShimProcessRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT container_id, shim_pid, work_dir, socket_path, exit_code_file, log_file, bundle_path, state, last_seen_at
+             FROM shim_processes",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                Ok(ShimProcessRecord {
+                    container_id: row.get(0)?,
+                    shim_pid: row.get(1)?,
+                    work_dir: row.get(2)?,
+                    socket_path: row.get(3)?,
+                    exit_code_file: row.get(4)?,
+                    log_file: row.get(5)?,
+                    bundle_path: row.get(6)?,
+                    state: row.get(7)?,
+                    last_seen_at: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list shim processes")?;
+        Ok(records)
+    }
+
+    pub fn delete_shim_process(&mut self, container_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM shim_processes WHERE container_id = ?1",
+                [container_id],
+            )
+            .context("Failed to delete shim process")?;
+        Ok(())
+    }
+
     /// 记录状态变更事件
     fn record_state_event(
         &mut self,
@@ -469,7 +1035,7 @@ impl StorageManager {
 
         self.conn
             .execute(
-                "INSERT INTO state_events (entity_type, entity_id, old_state, new_state, timestamp)
+                "INSERT INTO events (entity_type, entity_id, old_state, new_state, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5)",
                 [
                     entity_type,
@@ -488,7 +1054,7 @@ impl StorageManager {
     pub fn get_recent_events(&self, entity_type: &str, since: i64) -> Result<Vec<StateEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, entity_type, entity_id, old_state, new_state, timestamp, details
-             FROM state_events
+             FROM events
              WHERE entity_type = ?1 AND timestamp >= ?2
              ORDER BY timestamp DESC",
         )?;
@@ -537,6 +1103,7 @@ pub mod persistence;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image::{ArtifactBlobMeta, StoredLayerMeta};
     use tempfile::tempdir;
 
     #[test]
@@ -567,6 +1134,9 @@ mod tests {
             annotations: "{}".to_string(),
             exit_code: None,
             exit_time: None,
+            runtime_handler: None,
+            runtime_backend: None,
+            snapshot_key: None,
         };
 
         manager.save_container(&container).unwrap();
@@ -634,5 +1204,116 @@ mod tests {
         manager.delete_pod_sandbox("pod-1").unwrap();
         let deleted = manager.get_pod_sandbox("pod-1").unwrap();
         assert!(deleted.is_none());
+    }
+
+    #[test]
+    fn test_unified_ledger_tables_crud() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let mut manager = StorageManager::new(&db_path).unwrap();
+
+        manager
+            .save_image(&ImageRecord {
+                id: "sha256:image-1".to_string(),
+                size: 42,
+                pinned: true,
+                pulled_at: 1,
+                source_reference: Some("busybox:latest".to_string()),
+                os: Some("linux".to_string()),
+                architecture: Some("amd64".to_string()),
+                config_user: Some("0".to_string()),
+                config_env_json: "[\"A=B\"]".to_string(),
+                config_entrypoint_json: "[\"/bin/sh\"]".to_string(),
+                config_cmd_json: "[\"-c\",\"echo hi\"]".to_string(),
+                config_working_dir: Some("/".to_string()),
+                annotations_json: "{\"team\":\"runtime\"}".to_string(),
+                declared_volumes_json: "[\"/data\"]".to_string(),
+                manifest_media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+                selected_manifest_digest: Some("sha256:manifest".to_string()),
+                selected_platform: Some("linux/amd64".to_string()),
+                stored_layers_json: serde_json::to_string(&vec![StoredLayerMeta {
+                    digest: "sha256:layer".to_string(),
+                    path: "blobs/sha256/la/yer".to_string(),
+                    media_type: "application/vnd.oci.image.layer.v1.tar".to_string(),
+                    source_media_type: "application/vnd.oci.image.layer.v1.tar".to_string(),
+                    encrypted: false,
+                }])
+                .unwrap(),
+                artifact_type: None,
+                artifact_blobs_json: serde_json::to_string(&Vec::<ArtifactBlobMeta>::new())
+                    .unwrap(),
+                cache_path: Some("/tmp/cache".to_string()),
+            })
+            .unwrap();
+        manager
+            .replace_image_refs(
+                "sha256:image-1",
+                &[
+                    ImageRefRecord {
+                        reference: "busybox:latest".to_string(),
+                        image_id: "sha256:image-1".to_string(),
+                        namespace: None,
+                        ref_kind: "tag".to_string(),
+                    },
+                    ImageRefRecord {
+                        reference: "docker.io/library/busybox@sha256:image-1".to_string(),
+                        image_id: "sha256:image-1".to_string(),
+                        namespace: None,
+                        ref_kind: "digest".to_string(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(manager.get_image("sha256:image-1").unwrap().is_some());
+        assert_eq!(
+            manager
+                .list_image_refs(Some("sha256:image-1"))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        manager
+            .save_snapshot(&SnapshotRecord {
+                key: "container-1".to_string(),
+                image_id: "sha256:image-1".to_string(),
+                owner_kind: "container".to_string(),
+                owner_id: "container-1".to_string(),
+                state: "prepared".to_string(),
+                mountpoint: "/tmp/rootfs".to_string(),
+            })
+            .unwrap();
+        assert_eq!(manager.list_snapshots().unwrap().len(), 1);
+
+        manager
+            .replace_runtime_artifacts(
+                "container",
+                "container-1",
+                &[RuntimeArtifactRecord {
+                    owner_kind: "container".to_string(),
+                    owner_id: "container-1".to_string(),
+                    artifact_kind: "bundle".to_string(),
+                    path: "/tmp/bundle".to_string(),
+                    runtime_handler: Some("runc".to_string()),
+                    runtime_root: Some("/run/crius".to_string()),
+                }],
+            )
+            .unwrap();
+        assert_eq!(manager.list_runtime_artifacts().unwrap().len(), 1);
+
+        manager
+            .save_shim_process(&ShimProcessRecord {
+                container_id: "container-1".to_string(),
+                shim_pid: 1234,
+                work_dir: "/tmp/shims".to_string(),
+                socket_path: "/tmp/shims/container-1/attach.sock".to_string(),
+                exit_code_file: "/tmp/exits/container-1".to_string(),
+                log_file: "/tmp/shims/container-1/shim.log".to_string(),
+                bundle_path: "/tmp/bundle".to_string(),
+                state: "running".to_string(),
+                last_seen_at: 1,
+            })
+            .unwrap();
+        assert!(manager.get_shim_process("container-1").unwrap().is_some());
     }
 }

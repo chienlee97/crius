@@ -378,6 +378,7 @@ async fn main() -> Result<(), Error> {
             ),
             runtime_path: PathBuf::from(&config.runtime.runtime_path),
             max_container_log_line_size: config.logging.max_container_log_line_size,
+            state_db_path: config.root.join("crius.db").into(),
         },
         streaming: config.api.streaming.clone(),
     };
@@ -1263,6 +1264,7 @@ mod tests {
                 systemd_cgroup: false,
                 runtime_path: PathBuf::from("/definitely/missing/runc"),
                 max_container_log_line_size: 4096,
+                state_db_path: PathBuf::from("/tmp/crius-main-test.db"),
             },
             streaming: StreamingConfig::default(),
         }

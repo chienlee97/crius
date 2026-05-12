@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use super::content_store::FsContentStore;
 use super::metadata_store::FilesystemImageMetadataStore;
 use super::ImageMeta;
+use crate::storage::{SnapshotRecord, StorageManager};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotMode {
@@ -37,6 +38,7 @@ pub struct FilesystemSnapshotter {
     storage_root: PathBuf,
     metadata_store: FilesystemImageMetadataStore,
     content_store: FsContentStore,
+    ledger_db_path: Option<PathBuf>,
 }
 
 impl FilesystemSnapshotter {
@@ -45,12 +47,14 @@ impl FilesystemSnapshotter {
         storage_root: impl AsRef<Path>,
         metadata_store: FilesystemImageMetadataStore,
         content_store: FsContentStore,
+        ledger_db_path: Option<PathBuf>,
     ) -> Self {
         Self {
             mode,
             storage_root: storage_root.as_ref().to_path_buf(),
             metadata_store,
             content_store,
+            ledger_db_path,
         }
     }
 
@@ -180,6 +184,17 @@ impl Snapshotter for FilesystemSnapshotter {
                 Self::copy_rootfs_tree(&cached_rootfs, destination)?;
             }
         }
+        if let Some(db_path) = self.ledger_db_path.as_ref() {
+            let mut storage = StorageManager::new(db_path)?;
+            storage.save_snapshot(&SnapshotRecord {
+                key: key.to_string(),
+                image_id: metadata.id.clone(),
+                owner_kind: "container".to_string(),
+                owner_id: key.to_string(),
+                state: "prepared".to_string(),
+                mountpoint: destination.display().to_string(),
+            })?;
+        }
         Ok(PreparedSnapshot {
             key: key.to_string(),
             image_id: metadata.id,
@@ -234,8 +249,10 @@ mod tests {
     #[test]
     fn prepares_rootfs_from_content_store_blob() {
         let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("crius.db");
         let content_store = FsContentStore::new(dir.path()).unwrap();
-        let metadata_store = FilesystemImageMetadataStore::new(dir.path(), Vec::new());
+        let metadata_store =
+            FilesystemImageMetadataStore::new(dir.path(), Vec::new(), Some(db_path.clone()));
 
         let source = dir.path().join("layer-src");
         std::fs::create_dir_all(source.join("etc")).unwrap();
@@ -273,6 +290,7 @@ mod tests {
             dir.path(),
             metadata_store,
             content_store,
+            Some(db_path.clone()),
         );
         let rootfs = dir.path().join("rootfs");
         snapshotter
@@ -282,5 +300,9 @@ mod tests {
             std::fs::read_to_string(rootfs.join("etc/hello")).unwrap(),
             "world"
         );
+        let storage = crate::storage::StorageManager::new(db_path).unwrap();
+        let snapshots = storage.list_snapshots().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].owner_id, "container-1");
     }
 }

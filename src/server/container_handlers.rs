@@ -2188,6 +2188,7 @@ impl RuntimeServiceImpl {
         let pod_sandbox_id_for_persist = pod_sandbox_id.clone();
         let container_image_ref_for_persist = container_image_ref.clone();
         let command_for_persist = container_config.command.clone();
+        let runtime_handler_for_persist = runtime_handler.to_string();
         tokio::spawn(async move {
             if removed_container_ids
                 .lock()
@@ -2241,6 +2242,18 @@ impl RuntimeServiceImpl {
                     err
                 );
             } else {
+                if let Err(err) = persistence.update_container_ledger_metadata(
+                    &created_id_for_persist,
+                    Some(&runtime_handler_for_persist),
+                    Some("runc"),
+                    Some(&created_id_for_persist),
+                ) {
+                    log::error!(
+                        "Failed to persist ledger metadata for container {}: {}",
+                        created_id_for_persist,
+                        err
+                    );
+                }
                 log::info!("Container {} persisted to database", created_id_for_persist);
             }
         });

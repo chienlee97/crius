@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use crate::storage::{ShimProcessRecord, StorageManager};
+
 const DEFAULT_SHIM_WORK_DIR: &str = "/var/run/crius/shims";
 const SHIM_METADATA_FILE: &str = "shim.json";
 const SHIM_PIDFILE_NAME: &str = "shim.pid";
@@ -57,6 +59,8 @@ pub struct ShimConfig {
     pub runtime_path: PathBuf,
     /// CRI 单条日志记录切分阈值（字节）。
     pub max_container_log_line_size: usize,
+    /// 状态账本数据库路径。
+    pub state_db_path: PathBuf,
 }
 
 impl Default for ShimConfig {
@@ -79,6 +83,7 @@ impl Default for ShimConfig {
             systemd_cgroup: false,
             runtime_path: PathBuf::from("runc"),
             max_container_log_line_size: 4096,
+            state_db_path: PathBuf::new(),
         }
     }
 }
@@ -109,6 +114,13 @@ pub struct ShimManager {
 }
 
 impl ShimManager {
+    fn ledger_storage(&self) -> Result<Option<StorageManager>> {
+        if self.config.state_db_path.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(StorageManager::new(&self.config.state_db_path)?))
+    }
+
     fn exit_code_file_path(&self, container_id: &str) -> PathBuf {
         self.config.container_exits_dir.join(container_id)
     }
@@ -145,6 +157,19 @@ impl ShimManager {
     }
 
     fn persist_process_metadata(&self, process: &ShimProcess) -> Result<()> {
+        if let Some(mut storage) = self.ledger_storage()? {
+            storage.save_shim_process(&ShimProcessRecord {
+                container_id: process.container_id.clone(),
+                shim_pid: process.shim_pid,
+                work_dir: self.config.work_dir.display().to_string(),
+                socket_path: process.socket_path.display().to_string(),
+                exit_code_file: process.exit_code_file.display().to_string(),
+                log_file: process.log_file.display().to_string(),
+                bundle_path: process.bundle_path.display().to_string(),
+                state: "running".to_string(),
+                last_seen_at: chrono::Utc::now().timestamp(),
+            })?;
+        }
         let metadata_path = self.metadata_path(&process.container_id);
         if let Some(parent) = metadata_path.parent() {
             fs::create_dir_all(parent)?;
@@ -167,6 +192,9 @@ impl ShimManager {
     }
 
     fn remove_process_metadata(&self, container_id: &str) -> Result<()> {
+        if let Some(mut storage) = self.ledger_storage()? {
+            let _ = storage.delete_shim_process(container_id);
+        }
         let metadata_path = self.metadata_path(container_id);
         if metadata_path.exists() {
             fs::remove_file(metadata_path)?;
@@ -196,6 +224,30 @@ impl ShimManager {
     }
 
     fn restore_processes_from_disk(config: &ShimConfig) -> Vec<ShimProcess> {
+        if !config.state_db_path.as_os_str().is_empty() {
+            if let Ok(storage) = StorageManager::new(&config.state_db_path) {
+                if let Ok(records) = storage.list_shim_processes() {
+                    let restored = records
+                        .into_iter()
+                        .filter(|record| {
+                            Self::process_exists(record.shim_pid)
+                                || Path::new(&record.exit_code_file).exists()
+                        })
+                        .map(|record| ShimProcess {
+                            container_id: record.container_id,
+                            shim_pid: record.shim_pid,
+                            exit_code_file: PathBuf::from(record.exit_code_file),
+                            log_file: PathBuf::from(record.log_file),
+                            socket_path: PathBuf::from(record.socket_path),
+                            bundle_path: PathBuf::from(record.bundle_path),
+                        })
+                        .collect::<Vec<_>>();
+                    if !restored.is_empty() {
+                        return restored;
+                    }
+                }
+            }
+        }
         let mut restored = Vec::new();
         let Ok(entries) = fs::read_dir(&config.work_dir) else {
             return restored;
@@ -600,6 +652,54 @@ mod tests {
             manager.read_shim_pidfile("container-1").unwrap(),
             Some(std::process::id())
         );
+    }
+
+    #[test]
+    fn test_shim_manager_restores_live_metadata_from_ledger() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("crius.db");
+        let mut storage = StorageManager::new(&db_path).unwrap();
+        storage
+            .save_shim_process(&ShimProcessRecord {
+                container_id: "container-ledger".to_string(),
+                shim_pid: std::process::id(),
+                work_dir: temp_dir.path().join("shims").display().to_string(),
+                socket_path: temp_dir
+                    .path()
+                    .join("attach")
+                    .join("container-ledger")
+                    .join("attach.sock")
+                    .display()
+                    .to_string(),
+                exit_code_file: temp_dir
+                    .path()
+                    .join("exits")
+                    .join("container-ledger")
+                    .display()
+                    .to_string(),
+                log_file: temp_dir
+                    .path()
+                    .join("shims")
+                    .join("container-ledger")
+                    .join("shim.log")
+                    .display()
+                    .to_string(),
+                bundle_path: temp_dir.path().join("bundle").display().to_string(),
+                state: "running".to_string(),
+                last_seen_at: 1,
+            })
+            .unwrap();
+
+        let manager = ShimManager::new(ShimConfig {
+            work_dir: temp_dir.path().join("shims"),
+            attach_socket_dir: temp_dir.path().join("attach"),
+            container_exits_dir: temp_dir.path().join("exits"),
+            state_db_path: db_path,
+            ..Default::default()
+        });
+        let shims = manager.list_shims();
+        assert_eq!(shims.len(), 1);
+        assert_eq!(shims[0].container_id, "container-ledger");
     }
 
     #[test]

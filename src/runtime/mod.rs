@@ -23,6 +23,7 @@ use crate::oci::spec::{
 use crate::proto::runtime::v1::{
     Capability, LinuxContainerResources, NamespaceMode, NamespaceOption,
 };
+use crate::storage::{RuntimeArtifactRecord, StorageManager};
 
 pub mod shim_manager;
 pub use shim_manager::{default_shim_work_dir, ShimConfig, ShimManager, ShimProcess};
@@ -466,6 +467,7 @@ pub struct RuncRuntime {
     runtime_config_path: PathBuf,
     root: PathBuf,
     image_storage_root: PathBuf,
+    state_db_path: Option<PathBuf>,
     shim_manager: Option<Arc<ShimManager>>,
     default_env: Vec<(String, String)>,
     default_capabilities: Vec<String>,
@@ -499,6 +501,13 @@ pub struct RuncRuntime {
 }
 
 impl RuncRuntime {
+    fn ledger_storage(&self) -> Result<Option<StorageManager>> {
+        match self.state_db_path.as_ref() {
+            Some(path) if !path.as_os_str().is_empty() => Ok(Some(StorageManager::new(path)?)),
+            _ => Ok(None),
+        }
+    }
+
     fn ensure_container_create_not_expired(
         &self,
         deadline: std::time::Instant,
@@ -2425,8 +2434,10 @@ impl RuncRuntime {
             crate::image::metadata_store::FilesystemImageMetadataStore::new(
                 &self.image_storage_root,
                 Vec::new(),
+                self.state_db_path.clone(),
             ),
             crate::image::content_store::FsContentStore::new(&self.image_storage_root)?,
+            self.state_db_path.clone(),
         );
         snapshotter.prepare(container_id, image_ref, rootfs_dir)?;
         self.ensure_minimum_rootfs_layout(image_ref, rootfs_dir)?;
@@ -2719,6 +2730,7 @@ impl RuncRuntime {
             runtime_config_path: PathBuf::new(),
             root,
             image_storage_root,
+            state_db_path: None,
             shim_manager: None,
             default_env: Vec::new(),
             default_capabilities: Self::default_capabilities(),
@@ -2769,12 +2781,15 @@ impl RuncRuntime {
     ) -> Self {
         let no_pivot = shim_config.no_pivot;
         let runtime_config_path = shim_config.runtime_config_path.clone();
+        let state_db_path = (!shim_config.state_db_path.as_os_str().is_empty())
+            .then(|| shim_config.state_db_path.clone());
         let shim_manager = Arc::new(ShimManager::new(shim_config));
         Self {
             runtime_path,
             runtime_config_path,
             root,
             image_storage_root,
+            state_db_path,
             shim_manager: Some(shim_manager),
             default_env: Vec::new(),
             default_capabilities: Self::default_capabilities(),
@@ -2812,7 +2827,13 @@ impl RuncRuntime {
     pub fn enable_shim(&mut self, config: ShimConfig) {
         self.no_pivot = config.no_pivot;
         self.runtime_config_path = config.runtime_config_path.clone();
+        self.state_db_path =
+            (!config.state_db_path.as_os_str().is_empty()).then(|| config.state_db_path.clone());
         self.shim_manager = Some(Arc::new(ShimManager::new(config)));
+    }
+
+    pub fn set_state_db_path(&mut self, path: PathBuf) {
+        self.state_db_path = (!path.as_os_str().is_empty()).then_some(path);
     }
 
     pub fn set_restrict_oom_score_adj(&mut self, restrict: bool) {
@@ -3398,6 +3419,31 @@ impl RuncRuntime {
         // 当前运行时使用 OCI spec.root.path 作为 rootfs 来源，bundle 内不再强制准备 rootfs 目录。
         let _ = rootfs;
 
+        if let Some(mut storage) = self.ledger_storage()? {
+            storage.replace_runtime_artifacts(
+                "container",
+                container_id,
+                &[
+                    RuntimeArtifactRecord {
+                        owner_kind: "container".to_string(),
+                        owner_id: container_id.to_string(),
+                        artifact_kind: "bundle".to_string(),
+                        path: bundle_path.display().to_string(),
+                        runtime_handler: None,
+                        runtime_root: Some(self.root.display().to_string()),
+                    },
+                    RuntimeArtifactRecord {
+                        owner_kind: "container".to_string(),
+                        owner_id: container_id.to_string(),
+                        artifact_kind: "rootfs".to_string(),
+                        path: rootfs.display().to_string(),
+                        runtime_handler: None,
+                        runtime_root: Some(self.root.display().to_string()),
+                    },
+                ],
+            )?;
+        }
+
         info!(
             "Created bundle for container {} at {:?}",
             container_id, bundle_path
@@ -3863,6 +3909,10 @@ impl ContainerRuntime for RuncRuntime {
                     legacy_container_root_dir.display()
                 )
             })?;
+        }
+        if let Some(mut storage) = self.ledger_storage()? {
+            let _ = storage.replace_runtime_artifacts("container", container_id, &[]);
+            let _ = storage.delete_snapshot(container_id);
         }
 
         info!("Container {} removed", container_id);
@@ -6138,6 +6188,46 @@ esac
                 |option| option.starts_with(INTERNAL_UID_MAPPINGS_MOUNT_OPTION_PREFIX)
                     || option.starts_with(INTERNAL_GID_MAPPINGS_MOUNT_OPTION_PREFIX)
             ));
+    }
+
+    #[test]
+    fn test_write_bundle_persists_runtime_artifacts_when_ledger_enabled() {
+        let temp_dir = tempdir().unwrap();
+        let runtime_path = write_runtime_features_script(
+            temp_dir.path(),
+            r#"{
+  "ociVersionMin": "1.0.0",
+  "ociVersionMax": "1.2.0",
+  "mountOptions": ["ro"],
+  "linux": { "mountExtensions": { "idmap": { "enabled": true } } }
+}"#,
+            0,
+        );
+        let mut runtime = RuncRuntime::new(runtime_path, temp_dir.path().join("containers"));
+        let db_path = temp_dir.path().join("crius.db");
+        runtime.set_state_db_path(db_path.clone());
+        let rootfs = temp_dir.path().join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+        let mut spec = Spec::new("1.0.2");
+        spec.root = Some(Root {
+            path: rootfs.display().to_string(),
+            readonly: Some(false),
+        });
+
+        runtime.write_bundle("ledger-test", &rootfs, &spec).unwrap();
+
+        let storage = crate::storage::StorageManager::new(db_path).unwrap();
+        let artifacts = storage.list_runtime_artifacts().unwrap();
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.owner_kind == "container"
+                && artifact.owner_id == "ledger-test"
+                && artifact.artifact_kind == "bundle"
+        }));
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.owner_kind == "container"
+                && artifact.owner_id == "ledger-test"
+                && artifact.artifact_kind == "rootfs"
+        }));
     }
 
     #[test]

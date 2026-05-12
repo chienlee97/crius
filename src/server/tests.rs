@@ -212,6 +212,7 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
             systemd_cgroup: false,
             runtime_path: PathBuf::from("/definitely/missing/runc"),
             max_container_log_line_size: 4096,
+            state_db_path: PathBuf::from("/tmp/crius-test.db"),
         },
         streaming: crate::streaming::StreamingConfig::default(),
     }
@@ -1149,6 +1150,7 @@ where
             systemd_cgroup: false,
             runtime_path: shim_runtime_path,
             max_container_log_line_size: 4096,
+            state_db_path: dir.path().join("root").join("crius.db"),
         },
         streaming: crate::streaming::StreamingConfig::default(),
     };
@@ -1378,6 +1380,7 @@ fn test_service_with_fake_runtime_and_nri_and_shim(
             systemd_cgroup: false,
             runtime_path: shim_runtime_path,
             max_container_log_line_size: 4096,
+            state_db_path: dir.path().join("root").join("crius.db"),
         },
         streaming: crate::streaming::StreamingConfig::default(),
     };
@@ -4083,6 +4086,9 @@ fn record_to_container_status_uses_minus_one_for_missing_stopped_exit_code() {
         annotations: "{}".to_string(),
         exit_code: None,
         exit_time: Some(2),
+        runtime_handler: None,
+        runtime_backend: None,
+        snapshot_key: None,
     };
 
     assert_eq!(
@@ -6377,6 +6383,7 @@ sleep 1
                 systemd_cgroup: false,
                 runtime_path: PathBuf::from("/definitely/missing/runc"),
                 max_container_log_line_size: 4096,
+                state_db_path: dir.path().join("root").join("crius.db"),
             },
             streaming: crate::streaming::StreamingConfig::default(),
             ..test_runtime_config(dir.path().join("root"))
@@ -6663,6 +6670,7 @@ sleep 1
                 systemd_cgroup: false,
                 runtime_path: PathBuf::from("/definitely/missing/runc"),
                 max_container_log_line_size: 4096,
+                state_db_path: dir.path().join("root").join("crius.db"),
             },
             streaming: crate::streaming::StreamingConfig::default(),
         },
@@ -6954,6 +6962,7 @@ sleep 1
                 systemd_cgroup: false,
                 runtime_path: PathBuf::from("/definitely/missing/runc"),
                 max_container_log_line_size: 4096,
+                state_db_path: dir.path().join("root").join("crius.db"),
             },
             streaming: crate::streaming::StreamingConfig::default(),
         },
@@ -8223,6 +8232,169 @@ async fn run_pod_sandbox_persists_runtime_pod_cidr_in_verbose_info() {
     .into_inner();
     let info: serde_json::Value = serde_json::from_str(response.info.get("info").unwrap()).unwrap();
     assert_eq!(info["runtimePodCIDR"], "10.88.0.0/16");
+}
+
+#[tokio::test]
+async fn run_pod_sandbox_persists_pod_runtime_artifacts_to_ledger() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (_dir, service) = test_service_with_fake_runtime_and_nri(fake_nri);
+    service.image_service().set_test_pull_handler(Arc::new(|_| {
+        Ok(crate::image::TestPullResponse {
+            image_id: "sha256:pause-ledger-artifacts".to_string(),
+            size: 1,
+            annotations: HashMap::new(),
+            declared_volumes: Vec::new(),
+        })
+    }));
+    let response = RuntimeService::run_pod_sandbox(
+        &service,
+        Request::new(host_network_run_pod_sandbox_request(
+            "pod-ledger-artifacts",
+            "default",
+            "uid-ledger-artifacts",
+            HashMap::new(),
+        )),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let pod_id = response.pod_sandbox_id;
+
+    for _ in 0..50 {
+        let artifacts = service
+            .persistence
+            .lock()
+            .await
+            .list_runtime_artifacts()
+            .unwrap();
+        if artifacts.iter().any(|artifact| {
+            artifact.owner_kind == "pod"
+                && artifact.owner_id == pod_id
+                && artifact.artifact_kind == "workspace"
+        }) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    panic!("expected pod runtime artifacts to be persisted");
+}
+
+#[tokio::test]
+async fn create_container_persists_container_ledger_metadata() {
+    let fake_nri = Arc::new(FakeNri::default());
+    let (_dir, service) = test_service_with_fake_runtime_and_nri(fake_nri);
+    service.image_service().set_test_pull_handler(Arc::new(|_| {
+        Ok(crate::image::TestPullResponse {
+            image_id: "sha256:pause-container-ledger".to_string(),
+            size: 1,
+            annotations: HashMap::new(),
+            declared_volumes: Vec::new(),
+        })
+    }));
+    let pod_response = RuntimeService::run_pod_sandbox(
+        &service,
+        Request::new(host_network_run_pod_sandbox_request(
+            "container-ledger",
+            "default",
+            "uid-container-ledger",
+            HashMap::new(),
+        )),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    ImageService::pull_image(
+        &service.image_service(),
+        Request::new(crate::proto::runtime::v1::PullImageRequest {
+            image: Some(ImageSpec {
+                image: "docker.io/library/busybox:latest".to_string(),
+                user_specified_image: "docker.io/library/busybox:latest".to_string(),
+                ..Default::default()
+            }),
+            auth: None,
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let container_id = RuntimeService::create_container(
+        &service,
+        Request::new(CreateContainerRequest {
+            pod_sandbox_id: pod_response.pod_sandbox_id,
+            config: Some(crate::proto::runtime::v1::ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "ctr-ledger".to_string(),
+                    attempt: 1,
+                }),
+                image: Some(ImageSpec {
+                    image: "docker.io/library/busybox:latest".to_string(),
+                    user_specified_image: "docker.io/library/busybox:latest".to_string(),
+                    ..Default::default()
+                }),
+                command: vec!["sleep".to_string(), "10".to_string()],
+                linux: Some(crate::proto::runtime::v1::LinuxContainerConfig::default()),
+                ..Default::default()
+            }),
+            sandbox_config: Some(crate::proto::runtime::v1::PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: "container-ledger".to_string(),
+                    uid: "uid-container-ledger".to_string(),
+                    namespace: "default".to_string(),
+                    attempt: 1,
+                }),
+                hostname: "container-ledger".to_string(),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                log_directory: String::new(),
+                dns_config: None,
+                port_mappings: Vec::new(),
+                linux: Some(crate::proto::runtime::v1::LinuxPodSandboxConfig {
+                    security_context: Some(
+                        crate::proto::runtime::v1::LinuxSandboxSecurityContext {
+                            namespace_options: Some(NamespaceOption {
+                                network: NamespaceMode::Pod as i32,
+                                pid: NamespaceMode::Pod as i32,
+                                ipc: NamespaceMode::Pod as i32,
+                                target_id: String::new(),
+                                userns_options: None,
+                            }),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .container_id;
+
+    for _ in 0..50 {
+        if let Some(record) = service
+            .persistence
+            .lock()
+            .await
+            .storage()
+            .get_container(&container_id)
+            .unwrap()
+        {
+            if record.runtime_handler.as_deref() == Some("runc")
+                && record.runtime_backend.as_deref() == Some("runc")
+                && record.snapshot_key.as_deref() == Some(container_id.as_str())
+            {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    panic!("expected container ledger metadata to be persisted");
 }
 
 #[tokio::test]
@@ -13761,6 +13933,9 @@ async fn recover_state_does_not_replay_historical_events() {
             annotations: "{}".to_string(),
             exit_code: None,
             exit_time: None,
+            runtime_handler: None,
+            runtime_backend: None,
+            snapshot_key: None,
         })
         .unwrap();
 
@@ -13812,6 +13987,9 @@ async fn recover_state_re_registers_exit_monitor_for_running_container() {
             annotations: serde_json::to_string(&annotations).unwrap(),
             exit_code: None,
             exit_time: None,
+            runtime_handler: None,
+            runtime_backend: None,
+            snapshot_key: None,
         })
         .unwrap();
 

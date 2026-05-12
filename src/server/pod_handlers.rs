@@ -892,6 +892,7 @@ impl RuntimeServiceImpl {
         let pod_sandboxes = self.pod_sandboxes.clone();
         let removed_pod_sandbox_ids = self.removed_pod_sandbox_ids.clone();
         let pod_id_for_persist = pod_id.clone();
+        let pod_root_dir_for_persist = self.config.root_dir.join("pods").join(&pod_id);
         tokio::spawn(async move {
             if removed_pod_sandbox_ids
                 .lock()
@@ -945,6 +946,37 @@ impl RuntimeServiceImpl {
                     err
                 );
             } else {
+                let mut artifacts = vec![crate::storage::RuntimeArtifactRecord {
+                    owner_kind: "pod".to_string(),
+                    owner_id: pod_id_for_persist.clone(),
+                    artifact_kind: "workspace".to_string(),
+                    path: pod_root_dir_for_persist.display().to_string(),
+                    runtime_handler: Some(current_pod.runtime_handler.clone().trim().to_string())
+                        .filter(|value| !value.is_empty()),
+                    runtime_root: None,
+                }];
+                if !netns_path.is_empty() {
+                    artifacts.push(crate::storage::RuntimeArtifactRecord {
+                        owner_kind: "pod".to_string(),
+                        owner_id: pod_id_for_persist.clone(),
+                        artifact_kind: "netns".to_string(),
+                        path: netns_path.clone(),
+                        runtime_handler: Some(
+                            current_pod.runtime_handler.clone().trim().to_string(),
+                        )
+                        .filter(|value| !value.is_empty()),
+                        runtime_root: None,
+                    });
+                }
+                if let Err(err) =
+                    persistence.replace_runtime_artifacts("pod", &pod_id_for_persist, &artifacts)
+                {
+                    log::error!(
+                        "Failed to persist runtime artifacts for pod sandbox {}: {}",
+                        pod_id_for_persist,
+                        err
+                    );
+                }
                 log::info!("Pod sandbox {} persisted to database", pod_id_for_persist);
             }
         });
@@ -1393,6 +1425,7 @@ impl RuntimeServiceImpl {
                     e
                 );
             } else {
+                let _ = persistence.delete_runtime_artifacts("pod", &pod_id_for_delete);
                 log::info!("Pod sandbox {} removed from database", pod_id_for_delete);
             }
         });

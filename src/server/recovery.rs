@@ -172,6 +172,9 @@ impl RuntimeServiceImpl {
             })
             .collect();
         known_ids.extend(known_pause_ids);
+        if let Ok(artifacts) = self.persistence.lock().await.list_runtime_artifacts() {
+            known_ids.extend(artifacts.into_iter().map(|artifact| artifact.owner_id));
+        }
         known_ids
     }
 
@@ -218,6 +221,17 @@ impl RuntimeServiceImpl {
                         path.display(),
                         err
                     );
+                } else if let Err(err) = self
+                    .persistence
+                    .lock()
+                    .await
+                    .delete_runtime_artifacts("container", id)
+                {
+                    log::warn!(
+                        "Failed to delete orphaned runtime artifact ledger entries for {}: {}",
+                        id,
+                        err
+                    );
                 }
             }
         }
@@ -249,6 +263,17 @@ impl RuntimeServiceImpl {
                 log::warn!(
                     "Failed to remove orphaned pod workspace {}: {}",
                     path.display(),
+                    err
+                );
+            } else if let Err(err) = self
+                .persistence
+                .lock()
+                .await
+                .delete_runtime_artifacts("pod", id)
+            {
+                log::warn!(
+                    "Failed to delete orphaned pod artifact ledger entries for {}: {}",
+                    id,
                     err
                 );
             }

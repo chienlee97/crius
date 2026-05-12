@@ -100,6 +100,7 @@ pub struct ImageMetricsProvider {
 #[derive(Debug, Clone)]
 pub struct ImageServiceOptions {
     pub storage_path: PathBuf,
+    pub ledger_db_path: Option<PathBuf>,
     pub storage_driver: String,
     pub global_auth_file: Option<PathBuf>,
     pub namespaced_auth_dir: Option<PathBuf>,
@@ -1453,6 +1454,7 @@ impl ImageServiceImpl {
     pub fn new_with_options(options: ImageServiceOptions) -> Result<Self, Error> {
         let ImageServiceOptions {
             storage_path,
+            ledger_db_path,
             storage_driver,
             global_auth_file,
             namespaced_auth_dir,
@@ -1489,6 +1491,7 @@ impl ImageServiceImpl {
         let metadata_store = Arc::new(FilesystemImageMetadataStore::new(
             &storage_path,
             additional_artifact_stores.clone(),
+            ledger_db_path,
         ));
 
         Ok(Self {
@@ -2881,16 +2884,8 @@ impl ImageService for ImageServiceImpl {
                             .as_ref()
                             .map(Self::is_artifact_meta)
                             .unwrap_or(false);
-                        let record_dir =
-                            Self::local_record_dir(&self.storage_path, &image_id, is_artifact);
-                        if record_dir.exists() {
-                            info!("Removing image directory: {:?}", record_dir);
-                            if let Err(e) = tokio::fs::remove_dir_all(&record_dir).await {
-                                error!("Failed to remove image directory {:?}: {}", record_dir, e);
-                                // 即使磁盘清理失败，也返回成功，因为内存中的信息已经删除
-                            } else {
-                                info!("Successfully removed image directory: {:?}", record_dir);
-                            }
+                        if let Err(err) = self.metadata_store.delete_by_id(&image_id, is_artifact) {
+                            error!("Failed to delete image metadata for {}: {}", image_id, err);
                         }
                     }
 
@@ -2959,6 +2954,7 @@ mod tests {
     ) -> Result<ImageServiceImpl, Error> {
         ImageServiceImpl::new_with_options(ImageServiceOptions {
             storage_path: storage_path.to_path_buf(),
+            ledger_db_path: None,
             storage_driver: storage_driver.to_string(),
             global_auth_file: global_auth_file.map(Path::to_path_buf),
             namespaced_auth_dir: namespaced_auth_dir.map(Path::to_path_buf),
@@ -3300,6 +3296,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let service = ImageServiceImpl::new_with_options(ImageServiceOptions {
             storage_path: dir.path().to_path_buf(),
+            ledger_db_path: None,
             storage_driver: "overlay".to_string(),
             global_auth_file: None,
             namespaced_auth_dir: None,
@@ -3358,6 +3355,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let service = ImageServiceImpl::new_with_options(ImageServiceOptions {
             storage_path: dir.path().to_path_buf(),
+            ledger_db_path: None,
             storage_driver: "overlay".to_string(),
             global_auth_file: None,
             namespaced_auth_dir: None,
@@ -4157,6 +4155,9 @@ server = "https://docker.io"
                 annotations: "{}".to_string(),
                 exit_code: None,
                 exit_time: None,
+                runtime_handler: None,
+                runtime_backend: None,
+                snapshot_key: None,
             })
             .unwrap();
 
@@ -4461,6 +4462,7 @@ server = "https://docker.io"
 
         let service = ImageServiceImpl::new_with_options(ImageServiceOptions {
             storage_path: dir.path().join("storage"),
+            ledger_db_path: None,
             storage_driver: "overlay".to_string(),
             global_auth_file: None,
             namespaced_auth_dir: None,
@@ -4553,6 +4555,7 @@ server = "https://docker.io"
 
         let service = ImageServiceImpl::new_with_options(ImageServiceOptions {
             storage_path: dir.path().join("storage"),
+            ledger_db_path: None,
             storage_driver: "overlay".to_string(),
             global_auth_file: None,
             namespaced_auth_dir: None,
@@ -4612,6 +4615,7 @@ cat
 
         let service = ImageServiceImpl::new_with_options(ImageServiceOptions {
             storage_path: dir.path().join("storage"),
+            ledger_db_path: None,
             storage_driver: "overlay".to_string(),
             global_auth_file: None,
             namespaced_auth_dir: None,

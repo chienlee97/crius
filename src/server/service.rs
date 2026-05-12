@@ -1426,6 +1426,7 @@ impl RuntimeServiceImpl {
                     runtime
                         .set_container_create_timeout_secs(runtime_config.container_create_timeout);
                     runtime.set_container_stop_timeout_secs(config.container_stop_timeout);
+                    runtime.set_state_db_path(config.root_dir.join("crius.db"));
                     runtime.set_criu_path(config.criu_path.clone());
                     runtime.set_restrict_oom_score_adj(config.restrict_oom_score_adj);
                     runtime.set_bind_mount_prefix(config.bind_mount_prefix.clone());
@@ -1446,6 +1447,7 @@ impl RuntimeServiceImpl {
             RuntimeRegistry::new(config.runtime.clone(), runtimes, container_create_timeouts);
         let image_service = ImageServiceImpl::new_with_options(ImageServiceOptions {
             storage_path: config.image_root.clone(),
+            ledger_db_path: Some(config.root_dir.join("crius.db")),
             storage_driver: config.image_driver.clone(),
             global_auth_file: (!config.image_global_auth_file.as_os_str().is_empty())
                 .then(|| config.image_global_auth_file.clone()),
