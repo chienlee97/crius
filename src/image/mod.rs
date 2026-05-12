@@ -1,4 +1,7 @@
+pub mod content_store;
+pub mod metadata_store;
 pub mod policy;
+pub mod snapshotter;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -25,6 +28,8 @@ use crate::proto::runtime::v1::{
     RemoveImageRequest, RemoveImageResponse, UInt64Value,
 };
 use crate::storage::StorageManager;
+use content_store::{ContentStore, FsContentStore};
+use metadata_store::FilesystemImageMetadataStore;
 
 /// crius镜像
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -61,6 +66,8 @@ pub struct ImageServiceImpl {
     images: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Image>>>,
     storage_path: PathBuf,
     storage_driver: String,
+    content_store: Arc<FsContentStore>,
+    metadata_store: Arc<FilesystemImageMetadataStore>,
     global_auth_file: Option<PathBuf>,
     namespaced_auth_dir: Option<PathBuf>,
     default_transport: String,
@@ -76,7 +83,7 @@ pub struct ImageServiceImpl {
     pinned_image_patterns: Vec<String>,
     signature_policy: Option<PathBuf>,
     signature_policy_dir: Option<PathBuf>,
-    big_files_temporary_dir: Option<PathBuf>,
+    _big_files_temporary_dir: Option<PathBuf>,
     in_progress_pulls: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     #[cfg(test)]
     test_pull_handler: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<TestPullHandler>>>>,
@@ -85,7 +92,9 @@ pub struct ImageServiceImpl {
 #[derive(Clone)]
 pub struct ImageMetricsProvider {
     images: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Image>>>,
-    storage_path: PathBuf,
+    _storage_path: PathBuf,
+    content_store: Arc<FsContentStore>,
+    metadata_store: Arc<FilesystemImageMetadataStore>,
 }
 
 #[derive(Debug, Clone)]
@@ -159,10 +168,25 @@ struct PulledImageMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct StoredLayerMeta {
+    #[serde(default)]
+    pub digest: String,
     pub path: String,
     pub media_type: String,
     pub source_media_type: String,
     pub encrypted: bool,
+}
+
+impl StoredLayerMeta {
+    fn relative_display_path(&self) -> Option<String> {
+        let path = Path::new(self.path.trim());
+        if self.path.trim().is_empty() {
+            return None;
+        }
+        path.strip_prefix("blobs")
+            .ok()
+            .map(|value| value.display().to_string())
+            .or_else(|| Some(self.path.clone()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -182,16 +206,11 @@ pub struct ResolvedArtifactMount {
 }
 
 #[derive(Debug)]
-struct StagedLayer {
-    index: usize,
-    path: PathBuf,
-}
-
-#[derive(Debug)]
 struct PulledLayerData {
-    index: usize,
     bytes: Vec<u8>,
     media_type: String,
+    source_media_type: String,
+    encrypted: bool,
 }
 
 struct PersistedPullImage {
@@ -936,20 +955,12 @@ impl ImageServiceImpl {
             .as_nanos() as i64
     }
 
-    fn image_records_dir(root: &Path) -> PathBuf {
-        root.join("images")
-    }
-
     fn artifact_records_dir(root: &Path) -> PathBuf {
-        root.join("artifacts")
+        FilesystemImageMetadataStore::artifact_records_dir(root)
     }
 
     fn local_record_dir(root: &Path, id: &str, artifact: bool) -> PathBuf {
-        if artifact {
-            Self::artifact_records_dir(root).join(id)
-        } else {
-            Self::image_records_dir(root).join(id)
-        }
+        FilesystemImageMetadataStore::local_record_dir(root, id, artifact)
     }
 
     fn is_artifact_meta(meta: &ImageMeta) -> bool {
@@ -960,51 +971,11 @@ impl ImageServiceImpl {
     }
 
     fn load_meta_from_record_dir(record_dir: &Path) -> Option<ImageMeta> {
-        let raw = std::fs::read(record_dir.join("metadata.json")).ok()?;
-        serde_json::from_slice(&raw).ok()
-    }
-
-    fn load_meta_for_image_id(&self, image_id: &str) -> Option<ImageMeta> {
-        let main_roots = std::iter::once(self.storage_path.as_path())
-            .chain(self.additional_artifact_stores.iter().map(PathBuf::as_path));
-        for root in main_roots {
-            for artifact in [false, true] {
-                let record_dir = Self::local_record_dir(root, image_id, artifact);
-                if let Some(mut meta) = Self::load_meta_from_record_dir(&record_dir) {
-                    meta.pinned = self.image_is_pinned_meta(&meta);
-                    return Some(meta);
-                }
-            }
-        }
-        None
+        FilesystemImageMetadataStore::load_meta_from_record_dir(record_dir)
     }
 
     fn additional_artifact_store_roots(&self) -> impl Iterator<Item = &Path> {
         self.additional_artifact_stores.iter().map(PathBuf::as_path)
-    }
-
-    fn load_records_from_dir(
-        &self,
-        records_dir: &Path,
-        images: &mut HashMap<String, Image>,
-    ) -> Result<(), Error> {
-        if !records_dir.exists() {
-            return Ok(());
-        }
-
-        for entry in std::fs::read_dir(records_dir).context("Failed to read records directory")? {
-            let entry = entry.context("Failed to read record entry")?;
-            let Some(mut meta) = Self::load_meta_from_record_dir(&entry.path()) else {
-                continue;
-            };
-            meta.pinned = self.image_is_pinned_meta(&meta);
-            let image = Self::image_from_meta(&meta);
-            for tag in &meta.repo_tags {
-                images.insert(tag.clone(), image.clone());
-            }
-        }
-
-        Ok(())
     }
 
     fn artifact_mount_candidates(
@@ -1175,29 +1146,26 @@ impl ImageServiceImpl {
 
     fn build_image_verbose_info(
         image: &Image,
-        storage_path: &Path,
-        additional_artifact_stores: &[PathBuf],
+        metadata_store: &FilesystemImageMetadataStore,
+        content_store: &FsContentStore,
         storage_driver: &str,
     ) -> Result<HashMap<String, String>, Status> {
-        let mut candidate_dirs = additional_artifact_stores
-            .iter()
-            .map(|root| Self::artifact_records_dir(root).join(&image.id))
-            .collect::<Vec<_>>();
-        candidate_dirs.push(Self::image_records_dir(storage_path).join(&image.id));
-        candidate_dirs.push(Self::artifact_records_dir(storage_path).join(&image.id));
-        let image_dir = candidate_dirs
-            .into_iter()
-            .find(|path| path.join("metadata.json").exists())
-            .unwrap_or_else(|| Self::image_records_dir(storage_path).join(&image.id));
-        let meta = Self::load_meta_from_record_dir(&image_dir);
-        let layer_files = meta
+        let stored = metadata_store.load_by_id(&image.id);
+        let image_dir = stored
             .as_ref()
+            .map(|record| record.record_dir.clone())
+            .unwrap_or_else(|| {
+                FilesystemImageMetadataStore::image_records_dir(metadata_store.storage_root())
+                    .join(&image.id)
+            });
+        let meta = stored.as_ref().map(|record| &record.meta);
+        let layer_files = meta
             .map(|meta| {
                 if !meta.stored_layers.is_empty() {
                     return meta
                         .stored_layers
                         .iter()
-                        .map(|layer| layer.path.clone())
+                        .filter_map(StoredLayerMeta::relative_display_path)
                         .collect::<Vec<_>>();
                 }
                 Vec::new()
@@ -1222,8 +1190,8 @@ impl ImageServiceImpl {
                     })
                     .collect::<Vec<_>>()
             });
-        let (snapshot_bytes, snapshot_inodes) =
-            Self::collect_path_usage(&image_dir).unwrap_or((0, 0));
+        let (metadata_bytes, metadata_inodes) = metadata_store.usage().unwrap_or((0, 0));
+        let (content_bytes, content_inodes) = content_store.total_usage().unwrap_or((0, 0));
         let collected_at = Self::now_nanos();
 
         let payload = serde_json::json!({
@@ -1232,43 +1200,38 @@ impl ImageServiceImpl {
             "repoDigests": image.repo_digests,
             "size": image.size,
             "pinned": image.pinned,
-            "pulledAt": meta.as_ref().map(|meta| meta.pulled_at),
-            "sourceReference": meta.as_ref().and_then(|meta| meta.source_reference.clone()),
-            "os": meta.as_ref().and_then(|meta| meta.os.clone()),
-            "architecture": meta.as_ref().and_then(|meta| meta.architecture.clone()),
-            "configUser": meta.as_ref().and_then(|meta| meta.config_user.clone()),
+            "pulledAt": meta.map(|meta| meta.pulled_at),
+            "sourceReference": meta.and_then(|meta| meta.source_reference.clone()),
+            "os": meta.and_then(|meta| meta.os.clone()),
+            "architecture": meta.and_then(|meta| meta.architecture.clone()),
+            "configUser": meta.and_then(|meta| meta.config_user.clone()),
             "annotations": meta
-                .as_ref()
                 .map(|meta| meta.annotations.clone())
                 .unwrap_or_default(),
             "declaredVolumes": meta
-                .as_ref()
                 .map(|meta| meta.declared_volumes.clone())
                 .unwrap_or_default(),
             "manifestMediaType": meta
-                .as_ref()
                 .and_then(|meta| meta.manifest_media_type.clone()),
             "selectedManifestDigest": meta
-                .as_ref()
                 .and_then(|meta| meta.selected_manifest_digest.clone()),
             "selectedPlatform": meta
-                .as_ref()
                 .and_then(|meta| meta.selected_platform.clone()),
             "storedLayers": meta
-                .as_ref()
                 .map(|meta| meta.stored_layers.clone())
                 .unwrap_or_default(),
-            "artifactType": meta.as_ref().and_then(|meta| meta.artifact_type.clone()),
+            "artifactType": meta.and_then(|meta| meta.artifact_type.clone()),
             "artifactBlobs": meta
-                .as_ref()
                 .map(|meta| meta.artifact_blobs.clone())
                 .unwrap_or_default(),
             "storagePath": image_dir.display().to_string(),
             "storageDriver": storage_driver,
             "layers": layer_files,
             "snapshotStats": {
-                "usedBytes": snapshot_bytes,
-                "inodesUsed": snapshot_inodes,
+                "metadataBytes": metadata_bytes,
+                "metadataInodes": metadata_inodes,
+                "contentBytes": content_bytes,
+                "contentInodes": content_inodes,
                 "layerCount": layer_files.len(),
                 "collectedAt": collected_at,
             },
@@ -1282,30 +1245,6 @@ impl ImageServiceImpl {
             })?,
         );
         Ok(info)
-    }
-
-    fn collect_path_usage(path: &Path) -> io::Result<(u64, u64)> {
-        if !path.exists() {
-            return Ok((0, 0));
-        }
-
-        let mut used_bytes = 0u64;
-        let mut inodes_used = 0u64;
-
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let metadata = entry.metadata()?;
-            inodes_used += 1;
-            if metadata.is_dir() {
-                let (child_bytes, child_inodes) = Self::collect_path_usage(&entry.path())?;
-                used_bytes = used_bytes.saturating_add(child_bytes);
-                inodes_used = inodes_used.saturating_add(child_inodes);
-            } else {
-                used_bytes = used_bytes.saturating_add(metadata.len());
-            }
-        }
-
-        Ok((used_bytes, inodes_used))
     }
 
     fn database_path(&self) -> Option<PathBuf> {
@@ -1349,12 +1288,6 @@ impl ImageServiceImpl {
         crate::image::policy::evaluate_signature_policy(&policy, reference).map_err(|err| {
             Status::failed_precondition(format!("signature policy rejected {}: {}", reference, err))
         })
-    }
-
-    fn staged_layers_dir(&self) -> PathBuf {
-        self.big_files_temporary_dir
-            .clone()
-            .unwrap_or_else(|| self.storage_path.join("tmp"))
     }
 
     fn decrypted_media_type_for(source_media_type: &str) -> Result<(String, &'static str), Status> {
@@ -1446,73 +1379,6 @@ impl ImageServiceImpl {
         Ok((output.stdout, decrypted_media_type))
     }
 
-    fn stage_layers(&self, layers: Vec<PulledLayerData>) -> Result<Vec<StagedLayer>, Status> {
-        let staging_root = self.staged_layers_dir();
-        std::fs::create_dir_all(&staging_root).map_err(|err| {
-            Status::internal(format!(
-                "failed to create image staging directory {}: {}",
-                staging_root.display(),
-                err
-            ))
-        })?;
-        let stage_id = uuid::Uuid::new_v4().to_string();
-        let stage_dir = staging_root.join(stage_id);
-        std::fs::create_dir_all(&stage_dir).map_err(|err| {
-            Status::internal(format!(
-                "failed to create image staging workspace {}: {}",
-                stage_dir.display(),
-                err
-            ))
-        })?;
-
-        let mut staged = Vec::with_capacity(layers.len());
-        for layer in layers {
-            let extension = Self::plain_media_type_to_extension(&layer.media_type);
-            let path = stage_dir.join(format!("{}.{}", layer.index, extension));
-            if let Err(err) = std::fs::write(&path, layer.bytes) {
-                let _ = std::fs::remove_dir_all(&stage_dir);
-                return Err(Status::internal(format!(
-                    "failed to stage image layer {} in {}: {}",
-                    layer.index,
-                    path.display(),
-                    err
-                )));
-            }
-            staged.push(StagedLayer {
-                index: layer.index,
-                path,
-            });
-        }
-        Ok(staged)
-    }
-
-    fn persist_staged_layers(
-        &self,
-        image_dir: &Path,
-        staged_layers: &[StagedLayer],
-    ) -> Result<(), Status> {
-        for staged in staged_layers {
-            let layer_path = image_dir.join(format!("{}.tar.gz", staged.index));
-            std::fs::rename(&staged.path, &layer_path)
-                .or_else(|_| std::fs::copy(&staged.path, &layer_path).map(|_| ()))
-                .map_err(|err| {
-                    Status::internal(format!(
-                        "failed to persist staged layer {} to {}: {}",
-                        staged.path.display(),
-                        layer_path.display(),
-                        err
-                    ))
-                })?;
-        }
-        if let Some(stage_dir) = staged_layers
-            .first()
-            .and_then(|staged| staged.path.parent().map(PathBuf::from))
-        {
-            let _ = std::fs::remove_dir_all(stage_dir);
-        }
-        Ok(())
-    }
-
     fn image_is_in_use(
         &self,
         requested_ref: &str,
@@ -1578,7 +1444,9 @@ impl ImageServiceImpl {
     pub fn metrics_provider(&self) -> ImageMetricsProvider {
         ImageMetricsProvider {
             images: self.images.clone(),
-            storage_path: self.storage_path.clone(),
+            _storage_path: self.storage_path.clone(),
+            content_store: self.content_store.clone(),
+            metadata_store: self.metadata_store.clone(),
         }
     }
 
@@ -1617,11 +1485,18 @@ impl ImageServiceImpl {
         }
 
         let images = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let content_store = Arc::new(FsContentStore::new(&storage_path)?);
+        let metadata_store = Arc::new(FilesystemImageMetadataStore::new(
+            &storage_path,
+            additional_artifact_stores.clone(),
+        ));
 
         Ok(Self {
             images,
             storage_path,
             storage_driver,
+            content_store,
+            metadata_store,
             global_auth_file,
             namespaced_auth_dir,
             default_transport,
@@ -1637,7 +1512,7 @@ impl ImageServiceImpl {
             pinned_image_patterns,
             signature_policy,
             signature_policy_dir,
-            big_files_temporary_dir,
+            _big_files_temporary_dir: big_files_temporary_dir,
             in_progress_pulls: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_pull_handler: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -1704,32 +1579,15 @@ impl ImageServiceImpl {
 
     // 加载本地镜像
     pub async fn load_local_images(&self) -> Result<(), Error> {
-        info!("load_local_images called");
-        let images_dir = Self::image_records_dir(&self.storage_path);
-        let artifacts_dir = Self::artifact_records_dir(&self.storage_path);
-        info!("Images directory: {:?}", images_dir);
-        info!("Artifacts directory: {:?}", artifacts_dir);
-
-        if !images_dir.exists() {
-            std::fs::create_dir_all(&images_dir)?;
-        }
-        if !artifacts_dir.exists() {
-            std::fs::create_dir_all(&artifacts_dir)?;
-        }
-
         let mut images = self.images.lock().await;
         images.clear();
-        info!("Reading image records from directory");
-        self.load_records_from_dir(&images_dir, &mut images)?;
-        info!("Reading artifact records from directory");
-        self.load_records_from_dir(&artifacts_dir, &mut images)?;
-        for root in self.additional_artifact_store_roots() {
-            let artifact_dir = Self::artifact_records_dir(root);
-            info!(
-                "Reading additional artifact records from {:?}",
-                artifact_dir
-            );
-            self.load_records_from_dir(&artifact_dir, &mut images)?;
+        for record in self.metadata_store.load_all()? {
+            let mut meta = record.meta;
+            meta.pinned = self.image_is_pinned_meta(&meta);
+            let image = Self::image_from_meta(&meta);
+            for tag in &meta.repo_tags {
+                images.insert(tag.clone(), image.clone());
+            }
         }
 
         Ok(())
@@ -1747,40 +1605,18 @@ impl ImageServiceImpl {
             }
         }
 
-        let mut roots = vec![self.storage_path.clone()];
-        roots.extend(self.additional_artifact_stores.iter().cloned());
-        for root in roots {
-            for records_dir in [
-                Self::image_records_dir(&root),
-                Self::artifact_records_dir(&root),
-            ] {
-                if !records_dir.exists() {
-                    continue;
-                }
-                let entries = match std::fs::read_dir(&records_dir) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("Failed to read records directory {:?}: {}", records_dir, e);
-                        continue;
-                    }
-                };
-
-                for entry in entries.flatten() {
-                    let record_dir = entry.path();
-                    let Some(mut meta) = Self::load_meta_from_record_dir(&record_dir) else {
-                        continue;
-                    };
-                    meta.pinned = self.image_is_pinned_meta(&meta);
-                    let image = Self::image_from_meta(&meta);
-                    if Self::image_matches_ref(&image, image_ref) {
-                        let mut images = self.images.lock().await;
-                        for tag in &meta.repo_tags {
-                            images.insert(tag.clone(), image.clone());
-                        }
-                        return Some(image);
-                    }
-                }
+        if let Ok(Some(record)) = self
+            .metadata_store
+            .find_by_reference(image_ref, Self::image_matches_ref)
+        {
+            let mut meta = record.meta;
+            meta.pinned = self.image_is_pinned_meta(&meta);
+            let image = Self::image_from_meta(&meta);
+            let mut images = self.images.lock().await;
+            for tag in &meta.repo_tags {
+                images.insert(tag.clone(), image.clone());
             }
+            return Some(image);
         }
 
         None
@@ -1788,22 +1624,7 @@ impl ImageServiceImpl {
 
     // 保存镜像元数据
     async fn save_image_metadata(&self, image: &CriusImage) -> Result<(), Error> {
-        let record_dir = Self::local_record_dir(
-            &self.storage_path,
-            &image.id,
-            image
-                .artifact_type
-                .as_ref()
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false),
-        );
-        let meta_path = record_dir.join("metadata.json");
-        if !meta_path.exists() {
-            std::fs::create_dir_all(meta_path.parent().unwrap())
-                .context("Failed to create metadata directory")?;
-        }
-        let meta_data = serde_json::to_vec(image).context("Failed to serialize metadata")?;
-        std::fs::write(meta_path, meta_data).context("Failed to write metadata")?;
+        self.metadata_store.save(image)?;
         Ok(())
     }
 
@@ -1833,13 +1654,25 @@ impl ImageServiceImpl {
         std::fs::create_dir_all(&record_dir).map_err(|e: io::Error| {
             Status::internal(format!("Failed to create image record directory: {}", e))
         })?;
-        let staged_layers = self.stage_layers(layers_to_persist)?;
-        info!(
-            "Persisting {} staged blobs to {:?}",
-            staged_layers.len(),
-            record_dir
-        );
-        self.persist_staged_layers(&record_dir, &staged_layers)?;
+        let persisted_layers = layers_to_persist
+            .into_iter()
+            .map(|layer| {
+                self.content_store
+                    .put_blob("", &layer.media_type, &layer.bytes)
+                    .map(|info| StoredLayerMeta {
+                        digest: info.digest,
+                        path: info.relative_path.display().to_string(),
+                        media_type: layer.media_type.clone(),
+                        source_media_type: layer.source_media_type,
+                        encrypted: layer.encrypted,
+                    })
+                    .map_err(|err| {
+                        Status::internal(format!("Failed to persist layer blob: {}", err))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut pulled_metadata = pulled_metadata;
+        pulled_metadata.stored_layers = persisted_layers;
 
         self.save_image_metadata(&CriusImage {
             id: image_id.clone(),
@@ -1922,14 +1755,16 @@ impl ImageServiceImpl {
             .parse()
             .map_err(|e| Status::invalid_argument(format!("Invalid image reference: {}", e)))?;
         let layers_to_persist = vec![PulledLayerData {
-            index: 0,
             bytes: TEST_EMPTY_LAYER_TAR_GZ.to_vec(),
             media_type: TEST_PULL_LAYER_MEDIA_TYPE.to_string(),
+            source_media_type: TEST_PULL_LAYER_MEDIA_TYPE.to_string(),
+            encrypted: false,
         }];
         let metadata = PulledImageMetadata {
             annotations: response.annotations,
             declared_volumes: response.declared_volumes,
             stored_layers: vec![StoredLayerMeta {
+                digest: String::new(),
                 path: "0.tar.gz".to_string(),
                 media_type: TEST_PULL_LAYER_MEDIA_TYPE.to_string(),
                 source_media_type: TEST_PULL_LAYER_MEDIA_TYPE.to_string(),
@@ -1950,7 +1785,9 @@ impl ImageServiceImpl {
     }
 
     fn load_image_metadata(&self, image_id: &str) -> Option<ImageMeta> {
-        self.load_meta_for_image_id(image_id)
+        self.metadata_store
+            .load_by_id(image_id)
+            .map(|record| record.meta)
     }
 
     async fn persist_local_image_alias(
@@ -2634,15 +2471,17 @@ impl ImageServiceImpl {
             };
             let extension = Self::plain_media_type_to_extension(&media_type);
             stored_layers.push(StoredLayerMeta {
+                digest: String::new(),
                 path: format!("{idx}.{extension}"),
                 media_type: media_type.clone(),
-                source_media_type,
+                source_media_type: source_media_type.clone(),
                 encrypted,
             });
             layer_data.push(PulledLayerData {
-                index: idx,
                 bytes,
                 media_type,
+                source_media_type,
+                encrypted,
             });
         }
         metadata.stored_layers = stored_layers;
@@ -2669,13 +2508,13 @@ impl ImageMetricsProvider {
             grouped
         };
         let total_image_size_bytes = grouped.values().map(|image| image.size).sum();
-        let (image_fs_bytes_used, image_fs_inodes_used) =
-            ImageServiceImpl::collect_path_usage(&self.storage_path).unwrap_or((0, 0));
+        let (metadata_bytes, metadata_inodes) = self.metadata_store.usage().unwrap_or((0, 0));
+        let (content_bytes, content_inodes) = self.content_store.total_usage().unwrap_or((0, 0));
         crate::metrics::ImageMetricsSnapshot {
             image_count: grouped.len(),
             total_image_size_bytes,
-            image_fs_bytes_used,
-            image_fs_inodes_used,
+            image_fs_bytes_used: metadata_bytes.saturating_add(content_bytes),
+            image_fs_inodes_used: metadata_inodes.saturating_add(content_inodes),
         }
     }
 }
@@ -2770,8 +2609,8 @@ impl ImageService for ImageServiceImpl {
                     info: if req.verbose {
                         Self::build_image_verbose_info(
                             &image,
-                            &self.storage_path,
-                            &self.additional_artifact_stores,
+                            &self.metadata_store,
+                            &self.content_store,
                             &self.storage_driver,
                         )?
                     } else {
@@ -3070,20 +2909,21 @@ impl ImageService for ImageServiceImpl {
         &self,
         _request: Request<ImageFsInfoRequest>,
     ) -> Result<Response<ImageFsInfoResponse>, Status> {
-        let images_dir = self.storage_path.join("images");
-        let (used_bytes, inodes_used) =
-            Self::collect_path_usage(&images_dir).map_err(|e: io::Error| {
-                Status::internal(format!(
-                    "Failed to collect image filesystem usage from {}: {}",
-                    images_dir.display(),
-                    e
-                ))
-            })?;
+        let (metadata_bytes, metadata_inodes) = self
+            .metadata_store
+            .usage()
+            .map_err(|e| Status::internal(format!("Failed to collect metadata usage: {}", e)))?;
+        let (content_bytes, content_inodes) = self
+            .content_store
+            .total_usage()
+            .map_err(|e| Status::internal(format!("Failed to collect content usage: {}", e)))?;
+        let used_bytes = metadata_bytes.saturating_add(content_bytes);
+        let inodes_used = metadata_inodes.saturating_add(content_inodes);
 
         let usage = FilesystemUsage {
             timestamp: Self::now_nanos(),
             fs_id: Some(FilesystemIdentifier {
-                mountpoint: images_dir.display().to_string(),
+                mountpoint: self.storage_path.display().to_string(),
             }),
             used_bytes: Some(UInt64Value { value: used_bytes }),
             inodes_used: Some(UInt64Value { value: inodes_used }),
@@ -3106,6 +2946,7 @@ mod tests {
     use chrono::Utc;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::{tempdir, TempDir};
 
     fn test_image_service_result_with_options(
@@ -4232,7 +4073,7 @@ server = "https://docker.io"
                 .as_ref()
                 .expect("expected filesystem identifier")
                 .mountpoint,
-            dir.path().join("images").display().to_string()
+            dir.path().display().to_string()
         );
         let used_bytes = usage
             .used_bytes
@@ -4243,6 +4084,49 @@ server = "https://docker.io"
             used_bytes >= 14,
             "expected used bytes >= 14, got {}",
             used_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_persists_layers_into_content_store_and_metadata() {
+        let (dir, service) = test_image_service_in_tempdir();
+        service.set_test_pull_handler(Arc::new(|_| {
+            Ok(TestPullResponse {
+                image_id: "sha256:blob-backed".to_string(),
+                size: TEST_EMPTY_LAYER_TAR_GZ.len() as u64,
+                annotations: HashMap::new(),
+                declared_volumes: Vec::new(),
+            })
+        }));
+
+        ImageService::pull_image(
+            &service,
+            Request::new(PullImageRequest {
+                image: Some(ImageSpec {
+                    image: "repo/blob-backed:latest".to_string(),
+                    user_specified_image: "repo/blob-backed:latest".to_string(),
+                    ..Default::default()
+                }),
+                auth: None,
+                sandbox_config: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let meta = service
+            .load_image_metadata("sha256:blob-backed")
+            .expect("expected image metadata");
+        assert_eq!(meta.stored_layers.len(), 1);
+        assert!(
+            !meta.stored_layers[0].digest.is_empty(),
+            "expected stored layer digest to be recorded"
+        );
+        let blob_path = dir.path().join(&meta.stored_layers[0].path);
+        assert!(
+            blob_path.exists(),
+            "expected blob-backed layer path {} to exist",
+            blob_path.display()
         );
     }
 

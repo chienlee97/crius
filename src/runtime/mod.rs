@@ -876,7 +876,18 @@ impl RuncRuntime {
             return Ok(ImageRuntimeDefaults::default());
         }
 
-        let metadata = self.image_metadata(image_ref)?;
+        let metadata = match self.image_metadata(image_ref) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                if matches!(
+                    err.downcast_ref::<ImageAvailabilityError>(),
+                    Some(ImageAvailabilityError::NotPresentLocally { .. })
+                ) {
+                    return Ok(ImageRuntimeDefaults::default());
+                }
+                return Err(err);
+            }
+        };
         let env = metadata
             .config_env
             .iter()
@@ -2132,33 +2143,6 @@ impl RuncRuntime {
         Ok(())
     }
 
-    fn unpack_layer_with_tar(layer_file: &Path, rootfs_dir: &Path) -> Result<()> {
-        let mut command = Command::new("tar");
-        if layer_file.extension().and_then(|ext| ext.to_str()) == Some("gz") {
-            command.arg("-xzf");
-        } else {
-            command.arg("-xf");
-        }
-        let output = command
-            .arg(layer_file)
-            .arg("-C")
-            .arg(rootfs_dir)
-            .arg("--no-same-owner")
-            .arg("--no-same-permissions")
-            .output()
-            .with_context(|| format!("Failed to execute tar for {:?}", layer_file))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!(
-                "Failed to unpack layer archive {:?}: {}",
-                layer_file,
-                stderr.trim()
-            ));
-        }
-        Ok(())
-    }
-
     fn normalize_image_id(id: &str) -> &str {
         id.strip_prefix("sha256:").unwrap_or(id)
     }
@@ -2398,47 +2382,6 @@ impl RuncRuntime {
         Ok(mounts)
     }
 
-    fn layer_files_for_image_dir(&self, image_ref: &str, image_dir: &Path) -> Result<Vec<PathBuf>> {
-        if let Ok(metadata) = self.image_metadata(image_ref) {
-            if !metadata.stored_layers.is_empty() {
-                let mut layer_files = metadata
-                    .stored_layers
-                    .iter()
-                    .map(|layer| image_dir.join(&layer.path))
-                    .collect::<Vec<_>>();
-                layer_files.sort_by_key(|p| {
-                    p.file_stem()
-                        .and_then(|s| s.to_str())
-                        .and_then(|s| s.split('.').next())
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .unwrap_or(u32::MAX)
-                });
-                return Ok(layer_files);
-            }
-        }
-        let mut layer_files: Vec<PathBuf> = std::fs::read_dir(image_dir)?
-            .filter_map(|e| e.ok().map(|v| v.path()))
-            .filter(|p| matches!(p.extension().and_then(|s| s.to_str()), Some("gz" | "tar")))
-            .collect();
-        layer_files.sort_by_key(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.split('.').next())
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(u32::MAX)
-        });
-
-        if layer_files.is_empty() {
-            return Err(ImageAvailabilityError::NoLayers {
-                image_ref: image_ref.to_string(),
-                image_dir: image_dir.to_path_buf(),
-            }
-            .into());
-        }
-
-        Ok(layer_files)
-    }
-
     fn ensure_minimum_rootfs_layout(&self, image_ref: &str, rootfs_dir: &Path) -> Result<()> {
         // Ensure minimum runtime paths exist for scratch-like images (e.g. pause).
         std::fs::create_dir_all(rootfs_dir.join("dev"))
@@ -2464,106 +2407,34 @@ impl RuncRuntime {
         Ok(())
     }
 
-    fn populate_rootfs_from_image(
-        &self,
-        image_ref: &str,
-        rootfs_dir: &Path,
-        container_id: &str,
-    ) -> Result<()> {
-        if rootfs_dir.exists() {
-            std::fs::remove_dir_all(rootfs_dir)
-                .with_context(|| format!("Failed to clean rootfs directory: {:?}", rootfs_dir))?;
-        }
-        std::fs::create_dir_all(rootfs_dir)
-            .with_context(|| format!("Failed to create rootfs directory: {:?}", rootfs_dir))?;
-
-        let image_dir = self.resolve_image_dir(image_ref)?;
-        let layer_files = self.layer_files_for_image_dir(image_ref, &image_dir)?;
-
-        for layer_file in &layer_files {
-            Self::unpack_layer_with_tar(layer_file, rootfs_dir)
-                .with_context(|| format!("Failed to unpack layer archive: {:?}", layer_file))?;
-        }
-
-        self.ensure_minimum_rootfs_layout(image_ref, rootfs_dir)?;
-
-        info!(
-            "Prepared rootfs for container {} from image {}",
-            container_id, image_ref
-        );
-        Ok(())
-    }
-
-    fn cached_rootfs_dir_for_image(&self, image_ref: &str) -> Result<PathBuf> {
-        let image_dir = self.resolve_image_dir(image_ref)?;
-        let image_id = image_dir
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| anyhow::anyhow!("invalid image directory name for {}", image_ref))?;
-        Ok(self
-            .image_storage_root
-            .join("snapshots")
-            .join(image_id)
-            .join("rootfs"))
-    }
-
-    fn copy_rootfs_tree(&self, source: &Path, destination: &Path) -> Result<()> {
-        if destination.exists() {
-            std::fs::remove_dir_all(destination).with_context(|| {
-                format!(
-                    "Failed to clean destination rootfs directory {}",
-                    destination.display()
-                )
-            })?;
-        }
-        std::fs::create_dir_all(destination).with_context(|| {
-            format!(
-                "Failed to create destination rootfs directory {}",
-                destination.display()
-            )
-        })?;
-        let output = Command::new("cp")
-            .arg("-a")
-            .arg(format!("{}/.", source.display()))
-            .arg(destination)
-            .output()
-            .with_context(|| format!("Failed to execute cp for {}", source.display()))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(anyhow::anyhow!(
-                "failed to copy cached rootfs from {} to {}: {}",
-                source.display(),
-                destination.display(),
-                stderr
-            ));
-        }
-        Ok(())
-    }
-
     fn prepare_rootfs_from_image(
         &self,
         image_ref: &str,
         rootfs_dir: &Path,
         container_id: &str,
     ) -> Result<()> {
-        match self.rootfs_snapshotter {
-            RootfsSnapshotter::InternalOverlayUntar => {
-                self.populate_rootfs_from_image(image_ref, rootfs_dir, container_id)
-            }
-            RootfsSnapshotter::InternalCachedRootfs => {
-                let cached_rootfs = self.cached_rootfs_dir_for_image(image_ref)?;
-                if !cached_rootfs.exists() {
-                    self.populate_rootfs_from_image(image_ref, &cached_rootfs, container_id)?;
-                }
-                self.copy_rootfs_tree(&cached_rootfs, rootfs_dir)?;
-                self.ensure_minimum_rootfs_layout(image_ref, rootfs_dir)?;
-                info!(
-                    "Prepared rootfs for container {} from cached snapshot of image {}",
-                    container_id, image_ref
-                );
-                Ok(())
-            }
-        }
+        use crate::image::snapshotter::{FilesystemSnapshotter, SnapshotMode, Snapshotter};
+
+        let mode = match self.rootfs_snapshotter {
+            RootfsSnapshotter::InternalOverlayUntar => SnapshotMode::InternalOverlayUntar,
+            RootfsSnapshotter::InternalCachedRootfs => SnapshotMode::InternalCachedRootfs,
+        };
+        let snapshotter = FilesystemSnapshotter::new(
+            mode,
+            &self.image_storage_root,
+            crate::image::metadata_store::FilesystemImageMetadataStore::new(
+                &self.image_storage_root,
+                Vec::new(),
+            ),
+            crate::image::content_store::FsContentStore::new(&self.image_storage_root)?,
+        );
+        snapshotter.prepare(container_id, image_ref, rootfs_dir)?;
+        self.ensure_minimum_rootfs_layout(image_ref, rootfs_dir)?;
+        info!(
+            "Prepared rootfs for container {} from image {} via snapshotter",
+            container_id, image_ref
+        );
+        Ok(())
     }
 
     fn spec_from_restore_template(
@@ -5508,21 +5379,41 @@ esac
     }
 
     #[test]
-    fn test_populate_rootfs_from_plain_tar_layer() {
+    fn test_prepare_rootfs_from_image_uses_content_store_blob_paths() {
         let (runtime, temp_dir) = create_test_runtime();
-        let image_dir = temp_dir
-            .path()
-            .join("storage")
-            .join("images")
-            .join("sha256:plain-tar");
+        let storage_root = temp_dir.path().join("storage");
+        let image_dir = storage_root.join("images").join("sha256:blob-image");
         std::fs::create_dir_all(&image_dir).unwrap();
+
+        let layer_source = temp_dir.path().join("blob-layer-src");
+        std::fs::create_dir_all(layer_source.join("usr/bin")).unwrap();
+        std::fs::write(layer_source.join("usr/bin/hello"), "blob world").unwrap();
+        let tar_path = temp_dir.path().join("blob-layer.tar");
+        let status = Command::new("tar")
+            .arg("-cf")
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&layer_source)
+            .arg(".")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let tar_bytes = std::fs::read(&tar_path).unwrap();
+        let digest = crate::image::content_store::FsContentStore::compute_digest(&tar_bytes);
+        let blob_path = storage_root.join(
+            crate::image::content_store::FsContentStore::relative_blob_path_for_digest(&digest),
+        );
+        std::fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
+        std::fs::write(&blob_path, &tar_bytes).unwrap();
+
         std::fs::write(
             image_dir.join("metadata.json"),
             serde_json::json!({
-                "id": "sha256:plain-tar",
-                "repo_tags": ["plain:latest"],
+                "id": "sha256:blob-image",
+                "repo_tags": ["blob:latest"],
                 "stored_layers": [{
-                    "path": "0.tar",
+                    "digest": digest,
+                    "path": blob_path.strip_prefix(&storage_root).unwrap().display().to_string(),
                     "media_type": "application/vnd.oci.image.layer.v1.tar",
                     "source_media_type": "application/vnd.oci.image.layer.v1.tar",
                     "encrypted": false
@@ -5532,27 +5423,13 @@ esac
         )
         .unwrap();
 
-        let content_dir = temp_dir.path().join("plain-layer");
-        std::fs::create_dir_all(content_dir.join("etc")).unwrap();
-        std::fs::write(content_dir.join("etc/hello"), "world").unwrap();
-        let tar_path = image_dir.join("0.tar");
-        let status = Command::new("tar")
-            .arg("-cf")
-            .arg(&tar_path)
-            .arg("-C")
-            .arg(&content_dir)
-            .arg(".")
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let rootfs = temp_dir.path().join("rootfs");
+        let rootfs = temp_dir.path().join("rootfs-blob");
         runtime
-            .populate_rootfs_from_image("plain:latest", &rootfs, "container-1")
+            .prepare_rootfs_from_image("blob:latest", &rootfs, "container-blob")
             .unwrap();
         assert_eq!(
-            std::fs::read_to_string(rootfs.join("etc/hello")).unwrap(),
-            "world"
+            std::fs::read_to_string(rootfs.join("usr/bin/hello")).unwrap(),
+            "blob world"
         );
     }
 
