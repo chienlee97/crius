@@ -38,8 +38,8 @@ use crate::proto::runtime::v1::{
     PodSandboxStatsResponse, PodSandboxStatus, PodSandboxStatusRequest, PodSandboxStatusResponse,
     RemoveContainerRequest, RemoveContainerResponse, RemovePodSandboxRequest,
     RemovePodSandboxResponse, ReopenContainerLogRequest, ReopenContainerLogResponse,
-    RuntimeCondition, RuntimeConfigRequest, RuntimeConfigResponse, RuntimeStatus,
-    StartContainerRequest, StartContainerResponse, StopContainerRequest, StopContainerResponse,
+    RuntimeConfigRequest, RuntimeConfigResponse, RuntimeStatus, StartContainerRequest,
+    StartContainerResponse, StopContainerRequest, StopContainerResponse,
     UpdateContainerResourcesRequest, UpdateContainerResourcesResponse,
     UpdatePodSandboxResourcesRequest, UpdatePodSandboxResourcesResponse,
     UpdateRuntimeConfigRequest, UpdateRuntimeConfigResponse,
@@ -79,7 +79,8 @@ mod streaming_handlers;
 
 pub(super) use service::RuntimeRegistry;
 pub use service::{
-    IrqBalanceRestoreStatus, RuntimeConfig, RuntimeMetricsProvider, RuntimeServiceImpl,
+    IrqBalanceRestoreStatus, RuntimeConfig, RuntimeMetricsProvider, RuntimeReloadState,
+    RuntimeReloadableConfig, RuntimeServiceImpl,
 };
 
 const INTERNAL_ANNOTATION_PREFIX: &str = "io.crius.internal/";
@@ -4152,34 +4153,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<GetEventsRequest>,
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
-        let mut events = self.events.subscribe();
-        let (tx, rx) = tokio::sync::mpsc::channel(128);
-
-        tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(event) => {
-                        if tx.send(Ok(event)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if tx
-                            .send(Err(Status::resource_exhausted(
-                                "CRI event stream lagged behind producer",
-                            )))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(self.internal_services.events.stream()))
     }
 
     //

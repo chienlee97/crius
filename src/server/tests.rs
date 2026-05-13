@@ -7859,6 +7859,23 @@ async fn status_verbose_returns_structured_config() {
     assert!(config["securityAvailability"]["seccompNotifierSupported"].is_boolean());
     assert!(config["securityAvailability"]["seccompNotifierBaseDir"].is_string());
     assert!(config["securityAvailability"]["seccompNotifierActiveContainers"].is_array());
+    assert_eq!(
+        config["internalServices"]["introspection"]["runtimeBackend"]["defaultHandler"],
+        "runc"
+    );
+    assert_eq!(
+        config["internalServices"]["introspection"]["snapshotBackend"]["snapshotter"]["default"],
+        "internal-overlay-untar"
+    );
+    assert_eq!(
+        config["internalServices"]["introspection"]["rootless"]["networkMode"],
+        "pasta"
+    );
+    assert!(config["internalServices"]["health"]["runtime"]["ready"].is_boolean());
+    assert!(config["internalServices"]["health"]["network"]["ready"].is_boolean());
+    assert!(config["internalServices"]["events"]["subscriberCount"]
+        .as_u64()
+        .is_some());
     assert_eq!(config["imageDecryption"]["enabled"], false);
     assert_eq!(config["imageDecryption"]["keyModel"], "");
     assert_eq!(config["nri"]["enabled"], true);

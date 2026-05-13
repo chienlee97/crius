@@ -19,6 +19,7 @@ pub mod rootless;
 pub mod runtime;
 pub mod security;
 pub mod server;
+pub mod services;
 pub mod shim_rpc;
 pub mod state;
 pub mod storage;

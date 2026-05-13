@@ -89,6 +89,7 @@ pub struct RuntimeServiceImpl {
     pub(super) persistence: Arc<Mutex<PersistenceManager>>,
     pub(super) streaming: Arc<Mutex<Option<StreamingServer>>>,
     pub(super) events: tokio::sync::broadcast::Sender<ContainerEventResponse>,
+    pub(super) internal_services: crate::services::InternalServices,
     pub(super) shim_work_dir: PathBuf,
     pub(super) attach_socket_dir: PathBuf,
     pub(super) container_exits_dir: PathBuf,
@@ -1705,6 +1706,9 @@ impl RuntimeServiceImpl {
             .expect("Failed to create persistence manager");
         let persistence = Arc::new(Mutex::new(persistence));
         let (events, _) = tokio::sync::broadcast::channel(256);
+        let internal_services = crate::services::InternalServices::new(
+            crate::services::EventService::from_sender(events.clone()),
+        );
         let nri: Arc<dyn NriApi> = injected_nri.unwrap_or_else(|| {
             if nri_manager_config.enable {
                 Arc::new(NriManager::with_domain(
@@ -1813,6 +1817,7 @@ impl RuntimeServiceImpl {
             persistence,
             streaming: Arc::new(Mutex::new(None)),
             events,
+            internal_services,
             shim_work_dir: resolved_shim_work_dir,
             attach_socket_dir,
             container_exits_dir,
@@ -2098,6 +2103,7 @@ impl RuntimeServiceImpl {
             persistence: self.persistence.clone(),
             streaming: self.streaming.clone(),
             events: self.events.clone(),
+            internal_services: self.internal_services.clone(),
             shim_work_dir: self.shim_work_dir.clone(),
             attach_socket_dir: self.attach_socket_dir.clone(),
             container_exits_dir: self.container_exits_dir.clone(),

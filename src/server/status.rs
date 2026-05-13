@@ -399,53 +399,6 @@ impl RuntimeServiceImpl {
         env!("CARGO_PKG_VERSION")
     }
 
-    pub(super) fn runtime_readiness(&self) -> (bool, String, String) {
-        let path = &self.config.runtime_path;
-        let metadata = match std::fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                return (
-                    false,
-                    "RuntimeBinaryMissing".to_string(),
-                    format!("runtime binary does not exist at {}", path.display()),
-                );
-            }
-        };
-
-        if !metadata.is_file() {
-            return (
-                false,
-                "RuntimeBinaryInvalid".to_string(),
-                format!("runtime path is not a regular file: {}", path.display()),
-            );
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o111 == 0 {
-                return (
-                    false,
-                    "RuntimeBinaryNotExecutable".to_string(),
-                    format!("runtime binary is not executable: {}", path.display()),
-                );
-            }
-        }
-
-        let version = self
-            .runtime_binary_version()
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-        (
-            true,
-            "RuntimeIsReady".to_string(),
-            format!(
-                "runtime binary is available at {} ({})",
-                path.display(),
-                version
-            ),
-        )
-    }
-
     pub(super) fn runtime_feature_flags(&self) -> serde_json::Value {
         json!({
             "exec": true,
@@ -775,21 +728,18 @@ impl RuntimeServiceImpl {
         request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
         let req = request.into_inner();
-        let (runtime_ready, runtime_reason, runtime_message) = self.runtime_readiness();
+        let runtime_condition = self
+            .internal_services
+            .health
+            .runtime_condition_for_path(&self.config.runtime_path, self.runtime_binary_version());
         let cni_load_status = self.probe_cni_load_status().await;
         let reload_state = self.current_reload_state();
         let reloadable_config = self.current_reloadable_config();
-        let (mut network_ready, mut network_reason, mut network_message) =
-            cni_load_status.condition();
-        if let Some(error) = reload_state.last_reload_error.clone() {
-            network_ready = false;
-            network_reason = "ConfigReloadFailed".to_string();
-            network_message = error;
-        } else if let Some(error) = reload_state.last_cni_watch_error.clone() {
-            network_ready = false;
-            network_reason = "NetworkConfigReloadFailed".to_string();
-            network_message = error;
-        }
+        let network_condition = self.internal_services.health.network_condition(
+            &cni_load_status,
+            reload_state.last_reload_error.as_deref(),
+            reload_state.last_cni_watch_error.as_deref(),
+        );
         let info = if req.verbose {
             let runtime_network_config = self.runtime_network_config.lock().await.clone();
             let resource_class_support = crate::security::resource_classes::feature_support(Some(
@@ -988,26 +938,7 @@ impl RuntimeServiceImpl {
                 "restrictOomScoreAdj": self.config.restrict_oom_score_adj,
                 "enableUnprivilegedPorts": self.config.enable_unprivileged_ports,
                 "enableUnprivilegedIcmp": self.config.enable_unprivileged_icmp,
-                "rootless": {
-                    "enabled": self.config.rootless.enabled,
-                    "currentUid": self.config.rootless.current_uid,
-                    "currentGid": self.config.rootless.current_gid,
-                    "inUserNamespace": self.config.rootless.in_user_namespace,
-                    "xdgRuntimeDir": self.config.rootless.xdg_runtime_dir.display().to_string(),
-                    "xdgDataHome": self.config.rootless.xdg_data_home.display().to_string(),
-                    "storageRoot": self.config.rootless.storage_root.display().to_string(),
-                    "runtimeRoot": self.config.rootless.runtime_root.display().to_string(),
-                    "netnsDir": self.config.rootless.netns_dir.display().to_string(),
-                    "networkMode": self.config.rootless.network_mode.as_str(),
-                    "useFuseOverlayfs": self.config.rootless.use_fuse_overlayfs,
-                    "disableCgroup": self.config.rootless.disable_cgroup,
-                    "tolerateMissingHugetlbController": self
-                        .config
-                        .rootless
-                        .tolerate_missing_hugetlb_controller,
-                    "slirp4netnsPath": self.config.rootless.slirp4netns_path.display().to_string(),
-                    "pastaPath": self.config.rootless.pasta_path.display().to_string(),
-                },
+                "rootless": self.internal_services.introspection.rootless(&self.config.rootless),
                 "cniMaxConfNum": self.config.cni_config.max_conf_num(),
                 "cniConfTemplate": self
                     .config
@@ -1204,6 +1135,32 @@ impl RuntimeServiceImpl {
                 },
                 "runtimeFeatures": self.runtime_feature_flags(),
                 "securityAvailability": self.security_availability_info(),
+                "internalServices": {
+                    "events": {
+                        "subscriberCount": self.internal_services.events.subscriber_count(),
+                    },
+                    "introspection": {
+                        "runtimeBackend": self.internal_services.introspection.runtime_backend(&self.config),
+                        "snapshotBackend": self.internal_services.introspection.snapshot_backend(&self.config),
+                        "rootless": self.internal_services.introspection.rootless(&self.config.rootless),
+                        "featureFlags": self.internal_services.introspection.feature_flags(
+                            self.runtime_feature_flags(),
+                            self.security_availability_info(),
+                            &self.nri_config,
+                            resource_class_support.clone(),
+                        ),
+                    },
+                    "health": {
+                        "runtime": runtime_condition.clone(),
+                        "network": network_condition.clone(),
+                        "watchers": self.internal_services.health.watcher_status(
+                            reload_state.watcher_active,
+                            reload_state.last_reload_error.as_deref(),
+                            reload_state.last_cni_watch_error.as_deref(),
+                            true,
+                        ),
+                    },
+                },
                 "nri": {
                     "enabled": self.nri_config.enable,
                     "enableCdi": self.nri_config.enable_cdi,
@@ -1212,79 +1169,19 @@ impl RuntimeServiceImpl {
                     "pluginConfigPath": self.nri_config.plugin_config_path,
                     "blockioConfigPath": self.nri_config.blockio_config_path,
                 },
-                "reload": {
-                    "strategy": "config-file-watch-and-cni-watch",
-                    "signalReload": false,
-                    "configFileWatch": reload_state.config_file_watch,
-                    "configFilePath": self.config.config_path.as_ref().map(|path| {
-                        path.display().to_string()
-                    }),
-                    "watcherActive": reload_state.watcher_active,
-                    "cniWatchDirs": reload_state.cni_watch_dirs.clone(),
-                    "reloadableFields": [
-                        "runtime.pause_image",
-                        "image.pinned_images",
-                        "image.registry_config_dir",
-                        "image.global_auth_file",
-                        "image.namespaced_auth_dir",
-                        "image.signature_policy",
-                        "image.signature_policy_dir",
-                        "image.decryption_keys_path",
-                        "image.decryption_decoder_path",
-                        "image.decryption_keyprovider_config",
-                        "security.seccomp_profile",
-                        "security.apparmor_default_profile",
-                        "network.config_dirs",
-                        "network.conf_template",
-                        "network.max_conf_num",
-                        "network.default_network_name",
-                    ],
-                    "current": {
-                        "pauseImage": reloadable_config.pause_image.clone(),
-                        "pinnedImages": reloadable_config.pinned_images.clone(),
-                        "registryConfigDir": reloadable_config.registry_config_dir.display().to_string(),
-                        "globalAuthFile": reloadable_config.global_auth_file.display().to_string(),
-                        "namespacedAuthDir": reloadable_config.namespaced_auth_dir.display().to_string(),
-                        "signaturePolicy": reloadable_config.signature_policy.display().to_string(),
-                        "signaturePolicyDir": reloadable_config.signature_policy_dir.display().to_string(),
-                        "decryptionKeysPath": reloadable_config.decryption_keys_path.display().to_string(),
-                        "decryptionDecoderPath": reloadable_config.decryption_decoder_path.clone(),
-                        "decryptionKeyproviderConfig": reloadable_config
-                            .decryption_keyprovider_config
-                            .display()
-                            .to_string(),
-                        "seccompProfile": reloadable_config.seccomp_profile.display().to_string(),
-                        "apparmorDefaultProfile": reloadable_config.apparmor_default_profile.clone(),
-                        "cniConfigDirs": reloadable_config
-                            .cni_config_dirs
-                            .iter()
-                            .map(|dir| dir.display().to_string())
-                            .collect::<Vec<_>>(),
-                        "cniConfTemplate": reloadable_config
-                            .cni_conf_template
-                            .as_ref()
-                            .map(|path| path.display().to_string()),
-                        "cniMaxConfNum": reloadable_config.cni_max_conf_num,
-                        "cniDefaultNetworkName": reloadable_config.cni_default_network_name.clone(),
-                    },
-                    "lastReloadAtUnixMillis": reload_state.last_reload_at_unix_millis,
-                    "lastReloadSource": reload_state.last_reload_source.clone(),
-                    "lastReloadFields": reload_state.last_reload_fields.clone(),
-                    "lastReloadError": reload_state.last_reload_error.clone(),
-                    "lastCniWatchAtUnixMillis": reload_state.last_cni_watch_at_unix_millis,
-                    "lastCniWatchError": reload_state.last_cni_watch_error.clone(),
-                    "runtimeConfigApiOnly": [
-                        "UpdateRuntimeConfig.network_config.pod_cidr"
-                    ],
-                },
+                "reload": self.internal_services.introspection.reload(
+                    self.config.config_path.as_deref(),
+                    &reloadable_config,
+                    &reload_state,
+                ),
                 "runtimeNetworkConfig": runtime_network_config.as_ref().map(|cfg| {
                     json!({
                         "podCIDR": cfg.pod_cidr,
                     })
                 }),
                 "lastCniLoadStatus": cni_load_status,
-                "networkReady": network_ready,
-                "networkReason": network_reason.clone(),
+                "networkReady": network_condition.ready,
+                "networkReason": network_condition.reason.clone(),
                 "cgroupDriver": self.cgroup_driver().as_str_name(),
                 "cgroupSupport": {
                     "activeVersion": Self::detected_cgroup_version(),
@@ -1403,18 +1300,8 @@ impl RuntimeServiceImpl {
         Ok(Response::new(StatusResponse {
             status: Some(RuntimeStatus {
                 conditions: vec![
-                    RuntimeCondition {
-                        r#type: "RuntimeReady".to_string(),
-                        status: runtime_ready,
-                        reason: runtime_reason,
-                        message: runtime_message,
-                    },
-                    RuntimeCondition {
-                        r#type: "NetworkReady".to_string(),
-                        status: network_ready,
-                        reason: network_reason,
-                        message: network_message,
-                    },
+                    runtime_condition.runtime_condition(),
+                    network_condition.network_condition(),
                 ],
             }),
             info,

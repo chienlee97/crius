@@ -84,9 +84,7 @@ impl RuntimeServiceImpl {
     }
 
     pub(super) fn publish_event(&self, event: ContainerEventResponse) {
-        if let Err(err) = self.events.send(event) {
-            log::debug!("Dropping CRI event without subscribers: {}", err);
-        }
+        self.internal_services.events.publish(event);
     }
 
     pub(super) fn exit_code_path(&self, container_id: &str) -> PathBuf {
