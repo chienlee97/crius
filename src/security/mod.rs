@@ -9,7 +9,12 @@
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+
+pub mod apparmor;
+pub mod cdi;
+pub mod devices;
+pub mod resource_classes;
+pub mod selinux;
 
 /// 安全配置
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -179,14 +184,12 @@ impl SecurityManager {
 
     /// 检查SELinux是否可用
     fn check_selinux_available() -> bool {
-        // 检查/selinux或/sys/fs/selinux是否存在
-        Path::new("/sys/fs/selinux").exists() || Path::new("/selinux").exists()
+        selinux::is_available()
     }
 
     /// 检查AppArmor是否可用
     fn check_apparmor_available() -> bool {
-        // 检查/sys/kernel/security/apparmor是否存在
-        Path::new("/sys/kernel/security/apparmor").exists()
+        apparmor::is_available()
     }
 
     /// 检查Seccomp是否可用

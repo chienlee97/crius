@@ -2021,37 +2021,7 @@ impl RuntimeServiceImpl {
         profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
         deprecated_profile: &str,
     ) -> Option<String> {
-        if let Some(profile) = profile {
-            match profile.profile_type {
-                x if x
-                    == crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
-                        as i32 =>
-                {
-                    Some("runtime/default".to_string())
-                }
-                x if x
-                    == crate::proto::runtime::v1::security_profile::ProfileType::Unconfined
-                        as i32 =>
-                {
-                    Some("unconfined".to_string())
-                }
-                x if x
-                    == crate::proto::runtime::v1::security_profile::ProfileType::Localhost
-                        as i32 =>
-                {
-                    if profile.localhost_ref.is_empty() {
-                        None
-                    } else {
-                        Some(profile.localhost_ref.clone())
-                    }
-                }
-                _ => None,
-            }
-        } else if deprecated_profile.is_empty() {
-            None
-        } else {
-            Some(deprecated_profile.to_string())
-        }
+        crate::security::apparmor::profile_name(profile, deprecated_profile)
     }
 
     fn security_availability() -> crate::security::SecurityManager {
@@ -2066,35 +2036,18 @@ impl RuntimeServiceImpl {
     ) -> Result<Option<String>, Status> {
         let requested = Self::security_profile_name(profile, deprecated_profile);
         let security = Self::security_availability();
-        if self.config.disable_apparmor || !security.is_apparmor_available() {
-            return match requested.as_deref() {
-                Some(profile)
-                    if !profile.eq_ignore_ascii_case("unconfined") && !profile.is_empty() =>
-                {
-                    Err(Status::failed_precondition(
-                        "apparmor is not available or is disabled for this node",
-                    ))
-                }
-                _ => Ok(None),
-            };
-        }
-
-        if privileged {
-            return Ok(None);
-        }
-
         let default_profile = self
             .current_reloadable_config()
             .apparmor_default_profile
             .clone();
-        match requested.as_deref() {
-            None => Ok(Some(default_profile.clone())),
-            Some(profile) if profile.eq_ignore_ascii_case("runtime/default") => {
-                Ok(Some(default_profile))
-            }
-            Some(profile) if profile.eq_ignore_ascii_case("unconfined") => Ok(None),
-            Some(profile) => Ok(Some(profile.to_string())),
-        }
+        crate::security::apparmor::effective_profile(
+            requested,
+            &default_profile,
+            privileged,
+            self.config.disable_apparmor,
+            security.is_apparmor_available(),
+        )
+        .map_err(|err| Status::failed_precondition(err.to_string()))
     }
 
     #[allow(deprecated)]
@@ -2124,65 +2077,17 @@ impl RuntimeServiceImpl {
             .unwrap_or("")
     }
 
-    fn generated_selinux_level(seed: &str, category_range: u32) -> String {
-        let effective_range = category_range.max(1);
-        if effective_range == 1 {
-            return "s0:c0,c0".to_string();
-        }
-
-        let digest = Sha256::digest(seed.as_bytes());
-        let first =
-            u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) % effective_range;
-        let mut second =
-            u32::from_le_bytes([digest[4], digest[5], digest[6], digest[7]]) % effective_range;
-        if second == first {
-            second = (second + 1) % effective_range;
-        }
-        let (low, high) = if first <= second {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        format!("s0:c{low},c{high}")
-    }
-
+    #[cfg(test)]
     fn selinux_label_from_proto(
         options: Option<&crate::proto::runtime::v1::SeLinuxOption>,
         auto_level_seed: Option<&str>,
         selinux_category_range: u32,
     ) -> Option<String> {
-        let options = options?;
-        if options.user.is_empty()
-            && options.role.is_empty()
-            && options.r#type.is_empty()
-            && options.level.is_empty()
-        {
-            return None;
-        }
-
-        let user = if options.user.is_empty() {
-            "system_u"
-        } else {
-            options.user.as_str()
-        };
-        let role = if options.role.is_empty() {
-            "system_r"
-        } else {
-            options.role.as_str()
-        };
-        let selinux_type = if options.r#type.is_empty() {
-            "container_t"
-        } else {
-            options.r#type.as_str()
-        };
-        let level = if options.level.is_empty() {
-            auto_level_seed
-                .map(|seed| Self::generated_selinux_level(seed, selinux_category_range))
-                .unwrap_or_else(|| "s0".to_string())
-        } else {
-            options.level.clone()
-        };
-        Some(format!("{}:{}:{}:{}", user, role, selinux_type, level))
+        crate::security::selinux::label_from_options(
+            options,
+            auto_level_seed,
+            selinux_category_range,
+        )
     }
 
     fn effective_selinux_label_from_proto(
@@ -2191,20 +2096,18 @@ impl RuntimeServiceImpl {
         host_network: bool,
         auto_level_seed: Option<&str>,
     ) -> Option<String> {
-        if !self.config.enable_selinux {
-            return None;
-        }
-
         let security = Self::security_availability();
-        if !security.is_selinux_available() {
-            return None;
-        }
-
-        if host_network && self.config.hostnetwork_disable_selinux {
-            return None;
-        }
-
-        Self::selinux_label_from_proto(options, auto_level_seed, self.config.selinux_category_range)
+        crate::security::selinux::effective_label(
+            options,
+            host_network,
+            auto_level_seed,
+            crate::security::selinux::SelinuxPolicy {
+                enabled: self.config.enable_selinux,
+                available: security.is_selinux_available(),
+                category_range: self.config.selinux_category_range,
+                hostnetwork_disable: self.config.hostnetwork_disable_selinux,
+            },
+        )
     }
 
     fn seccomp_profile_from_proto(

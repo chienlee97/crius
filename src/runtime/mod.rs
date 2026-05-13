@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use log::{debug, error, info};
 use nix::libc;
-use nix::sys::stat::{major, makedev, minor, mknod, stat, Mode, SFlag};
+use nix::sys::stat::{major, makedev, minor, mknod, Mode, SFlag};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -21,6 +21,7 @@ use crate::oci::spec::{
 use crate::proto::runtime::v1::{
     Capability, LinuxContainerResources, NamespaceMode, NamespaceOption,
 };
+pub use crate::security::devices::DeviceMapping;
 use crate::storage::{RuntimeArtifactRecord, StorageManager};
 
 pub mod backend;
@@ -375,14 +376,6 @@ impl MountSemanticsError {
             }
         }
     }
-}
-
-/// 设备映射配置
-#[derive(Debug, Clone)]
-pub struct DeviceMapping {
-    pub source: PathBuf,
-    pub destination: PathBuf,
-    pub permissions: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2028,58 +2021,6 @@ impl RuncRuntime {
         oci_resources
     }
 
-    fn device_mappings_to_oci(
-        devices: &[DeviceMapping],
-        owner_uid: Option<u32>,
-        owner_gid: Option<u32>,
-    ) -> Result<(Vec<OciDevice>, Vec<LinuxDeviceCgroup>)> {
-        let mut oci_devices = Vec::new();
-        let mut cgroup_rules = Vec::new();
-
-        for device in devices {
-            let file_stat = stat(&device.source)
-                .with_context(|| format!("Failed to stat device path {:?}", device.source))?;
-            let file_type = SFlag::from_bits_truncate(file_stat.st_mode);
-            let device_type = if file_type.contains(SFlag::S_IFCHR) {
-                "c"
-            } else if file_type.contains(SFlag::S_IFBLK) {
-                "b"
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Unsupported device type for {:?}",
-                    device.source
-                ));
-            };
-
-            let major_id = major(file_stat.st_rdev) as i64;
-            let minor_id = minor(file_stat.st_rdev) as i64;
-            let access = if device.permissions.trim().is_empty() {
-                "rwm".to_string()
-            } else {
-                device.permissions.clone()
-            };
-
-            oci_devices.push(OciDevice {
-                device_type: device_type.to_string(),
-                path: device.destination.to_string_lossy().to_string(),
-                major: Some(major_id),
-                minor: Some(minor_id),
-                file_mode: Some((file_stat.st_mode & 0o777) as u32),
-                uid: owner_uid.or(Some(file_stat.st_uid)),
-                gid: owner_gid.or(Some(file_stat.st_gid)),
-            });
-            cgroup_rules.push(LinuxDeviceCgroup {
-                allow: true,
-                device_type: Some(device_type.to_string()),
-                major: Some(major_id),
-                minor: Some(minor_id),
-                access: Some(access),
-            });
-        }
-
-        Ok((oci_devices, cgroup_rules))
-    }
-
     fn host_devices() -> Result<Vec<OciDevice>> {
         let mut devices = Vec::new();
         Self::collect_host_devices(Path::new("/dev"), &mut devices)?;
@@ -3308,47 +3249,37 @@ impl RuncRuntime {
                 unified: None,
             });
 
-        let (owner_uid, owner_gid) = if self.device_ownership_from_security_context {
-            let uid = config
-                .user
-                .as_deref()
-                .and_then(|value| value.trim().parse::<u32>().ok())
-                .filter(|value| *value > 0);
-            let gid = config.run_as_group.filter(|value| *value > 0);
-            (uid, gid)
-        } else {
-            (None, None)
-        };
+        let device_ownership = crate::security::devices::ownership_from_security_context(
+            self.device_ownership_from_security_context,
+            config.user.as_deref(),
+            config.run_as_group,
+        );
 
         if !self.additional_devices.is_empty() {
-            let (extra_devices, extra_cgroup_rules) =
-                Self::device_mappings_to_oci(&self.additional_devices, owner_uid, owner_gid)?;
-            devices.extend(extra_devices);
+            let resolved = crate::security::devices::mappings_to_oci(
+                &self.additional_devices,
+                device_ownership,
+            )?;
+            devices.extend(resolved.devices);
             resources
                 .devices
                 .get_or_insert_with(Vec::new)
-                .extend(extra_cgroup_rules);
+                .extend(resolved.cgroup_rules);
         }
 
         if !config.devices.is_empty() {
-            if !self.allowed_devices.is_empty() {
-                for device in &config.devices {
-                    if !self.allowed_devices.contains(&device.source) {
-                        return Err(anyhow::anyhow!(
-                            "device {} is not allowed by runtime.allowed_devices",
-                            device.source.display()
-                        ));
-                    }
-                }
-            }
+            crate::security::devices::validate_allowed_devices(
+                &config.devices,
+                &self.allowed_devices,
+            )?;
 
-            let (extra_devices, extra_cgroup_rules) =
-                Self::device_mappings_to_oci(&config.devices, owner_uid, owner_gid)?;
-            devices.extend(extra_devices);
+            let resolved =
+                crate::security::devices::mappings_to_oci(&config.devices, device_ownership)?;
+            devices.extend(resolved.devices);
             resources
                 .devices
                 .get_or_insert_with(Vec::new)
-                .extend(extra_cgroup_rules);
+                .extend(resolved.cgroup_rules);
         }
 
         if let Some(limit) = config.pids_limit {

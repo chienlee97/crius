@@ -792,6 +792,9 @@ impl RuntimeServiceImpl {
         }
         let info = if req.verbose {
             let runtime_network_config = self.runtime_network_config.lock().await.clone();
+            let resource_class_support = crate::security::resource_classes::feature_support(Some(
+                &self.nri_config.blockio_config_path,
+            ));
             let payload = json!({
                 "runtimeName": self.cri_runtime_name(),
                 "runtimeVersion": self.cri_runtime_version(),
@@ -1290,13 +1293,17 @@ impl RuntimeServiceImpl {
                     "tolerateMissingHugetlbController": self.config.tolerate_missing_hugetlb_controller,
                     "resourceClasses": {
                         "blockio": {
-                            "supported": !self.nri_config.blockio_config_path.trim().is_empty(),
-                            "configPath": self.nri_config.blockio_config_path.clone(),
+                            "supported": resource_class_support.blockio_supported,
+                            "configPath": resource_class_support
+                                .blockio_config_path
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_default(),
                             "softFailure": "drop-class-when-config-missing",
                         },
                         "rdt": {
-                            "supported": std::path::Path::new("/sys/fs/resctrl").exists(),
-                            "resctrlPath": "/sys/fs/resctrl",
+                            "supported": resource_class_support.rdt_supported,
+                            "resctrlPath": resource_class_support.rdt_resctrl_path.display().to_string(),
                             "softFailure": "drop-class-when-resctrl-missing",
                         },
                     },

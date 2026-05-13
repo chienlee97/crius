@@ -1,6 +1,4 @@
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::PathBuf;
+use std::collections::HashMap;
 
 use crate::nri::{NriError, Result};
 use crate::nri_proto::api as nri_api;
@@ -9,107 +7,10 @@ use crate::oci::spec::{
     LinuxMemory, LinuxPids, LinuxResources, Mount, Namespace, Process, Rlimit, Seccomp, SeccompArg,
     SeccompSyscall, Spec,
 };
-use serde::Deserialize;
 
 const REMOVAL_PREFIX: &str = "-";
 const INTERNAL_ANNOTATION_PREFIX: &str = "io.crius.internal/";
 const CHECKPOINT_LOCATION_ANNOTATION_KEY: &str = "io.crius.checkpoint.location";
-const DEFAULT_CDI_SPEC_DIRS: [&str; 2] = ["/etc/cdi", "/var/run/cdi"];
-const BLOCKIO_CONFIG_ENV: &str = "CRIUS_NRI_BLOCKIO_CONFIG";
-const POD_QOS_RDT_CLASS: &str = "/PodQos";
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-struct BlockIoClassConfig {
-    classes: HashMap<String, LinuxBlockIo>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum BlockIoConfigFile {
-    Wrapped(BlockIoClassConfig),
-    Flat(HashMap<String, LinuxBlockIo>),
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-struct CdiSpec {
-    kind: String,
-    devices: Vec<CdiDeviceSpec>,
-    container_edits: CdiContainerEdits,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-struct CdiDeviceSpec {
-    name: String,
-    container_edits: CdiContainerEdits,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-struct CdiContainerEdits {
-    env: Vec<String>,
-    device_nodes: Vec<CdiDeviceNode>,
-    hooks: Vec<CdiHook>,
-    mounts: Vec<CdiMount>,
-    intel_rdt: Option<CdiIntelRdt>,
-    additional_gids: Vec<u32>,
-    net_devices: Vec<CdiNetDevice>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-struct CdiDeviceNode {
-    path: String,
-    host_path: Option<String>,
-    #[serde(rename = "type")]
-    device_type: String,
-    major: i64,
-    minor: i64,
-    file_mode: Option<u32>,
-    permissions: String,
-    uid: Option<u32>,
-    gid: Option<u32>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-struct CdiMount {
-    host_path: String,
-    container_path: String,
-    options: Vec<String>,
-    #[serde(rename = "type")]
-    mount_type: String,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-struct CdiHook {
-    hook_name: String,
-    path: String,
-    args: Vec<String>,
-    env: Vec<String>,
-    timeout: Option<i32>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-struct CdiIntelRdt {
-    #[serde(alias = "closID")]
-    clos_id: String,
-    l3_cache_schema: String,
-    mem_bw_schema: String,
-    schemata: Vec<String>,
-    enable_monitoring: bool,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-struct CdiNetDevice {
-    host_interface_name: String,
-    name: String,
-}
 
 #[derive(Debug, Clone)]
 pub struct AdjustmentOptions<'a> {
@@ -126,108 +27,6 @@ impl Default for AdjustmentOptions<'_> {
             cdi_spec_dirs: None,
         }
     }
-}
-
-fn cdi_spec_dirs(configured_dirs: Option<&[String]>) -> Vec<PathBuf> {
-    configured_dirs
-        .filter(|dirs| !dirs.is_empty())
-        .map(|dirs| dirs.iter().map(PathBuf::from).collect())
-        .or_else(|| {
-            std::env::var("CDI_SPEC_DIRS")
-                .ok()
-                .map(|dirs| {
-                    dirs.split(':')
-                        .filter(|entry| !entry.is_empty())
-                        .map(PathBuf::from)
-                        .collect::<Vec<_>>()
-                })
-                .filter(|dirs| !dirs.is_empty())
-        })
-        .unwrap_or_else(|| DEFAULT_CDI_SPEC_DIRS.iter().map(PathBuf::from).collect())
-}
-
-fn load_cdi_specs(configured_dirs: Option<&[String]>) -> Result<Vec<CdiSpec>> {
-    let mut specs = Vec::new();
-    for dir in cdi_spec_dirs(configured_dirs) {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(NriError::Plugin(format!(
-                    "failed to read CDI directory {}: {}",
-                    dir.display(),
-                    err
-                )))
-            }
-        };
-        for entry in entries {
-            let entry = entry.map_err(|err| {
-                NriError::Plugin(format!(
-                    "failed to read CDI entry in {}: {}",
-                    dir.display(),
-                    err
-                ))
-            })?;
-            let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-            let content = fs::read_to_string(&path).map_err(|err| {
-                NriError::Plugin(format!(
-                    "failed to read CDI spec {}: {}",
-                    path.display(),
-                    err
-                ))
-            })?;
-            let spec = serde_json::from_str::<CdiSpec>(&content).map_err(|err| {
-                NriError::Plugin(format!(
-                    "failed to parse CDI spec {}: {}",
-                    path.display(),
-                    err
-                ))
-            })?;
-            specs.push(spec);
-        }
-    }
-    Ok(specs)
-}
-
-fn merge_cdi_edits(base: &mut CdiContainerEdits, extra: &CdiContainerEdits) {
-    base.env.extend(extra.env.clone());
-    base.device_nodes.extend(extra.device_nodes.clone());
-    base.hooks.extend(extra.hooks.clone());
-    base.mounts.extend(extra.mounts.clone());
-    base.additional_gids.extend(extra.additional_gids.clone());
-    base.net_devices.extend(extra.net_devices.clone());
-    if extra.intel_rdt.is_some() {
-        base.intel_rdt = extra.intel_rdt.clone();
-    }
-}
-
-fn resolve_cdi_edits(
-    device_ref: &str,
-    configured_dirs: Option<&[String]>,
-) -> Result<CdiContainerEdits> {
-    let Some((kind, name)) = device_ref.split_once('=') else {
-        return Err(NriError::Plugin(format!(
-            "invalid CDI device reference {device_ref:?}, expected <vendor>/<class>=<device>"
-        )));
-    };
-
-    for spec in load_cdi_specs(configured_dirs)? {
-        if spec.kind != kind {
-            continue;
-        }
-        if let Some(device) = spec.devices.iter().find(|device| device.name == name) {
-            let mut edits = spec.container_edits.clone();
-            merge_cdi_edits(&mut edits, &device.container_edits);
-            return Ok(edits);
-        }
-    }
-
-    Err(NriError::Plugin(format!(
-        "CDI device {device_ref} not found in configured CDI specs"
-    )))
 }
 
 fn is_marked_for_removal(key: &str) -> Option<&str> {
@@ -299,75 +98,16 @@ pub fn filter_annotation_adjustments_by_allowlist(
         .collect()
 }
 
-fn effective_blockio_config_path(config_path: Option<&str>) -> Option<PathBuf> {
-    config_path
-        .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var(BLOCKIO_CONFIG_ENV)
-                .ok()
-                .filter(|path| !path.trim().is_empty())
-                .map(PathBuf::from)
-        })
-}
-
 pub fn resolve_blockio_class(
     class_name: &str,
     config_path: Option<&str>,
 ) -> Result<Option<LinuxBlockIo>> {
-    if class_name.trim().is_empty() {
-        return Ok(None);
-    }
-
-    let path = effective_blockio_config_path(config_path).ok_or_else(|| {
-        NriError::Plugin(format!(
-            "blockio class '{}' requested but no blockio config path is configured",
-            class_name
-        ))
-    })?;
-    let content = fs::read_to_string(&path).map_err(|err| {
-        NriError::Plugin(format!(
-            "failed to read blockio config {}: {}",
-            path.display(),
-            err
-        ))
-    })?;
-    let classes = match serde_json::from_str::<BlockIoConfigFile>(&content).map_err(|err| {
-        NriError::Plugin(format!(
-            "failed to parse blockio config {}: {}",
-            path.display(),
-            err
-        ))
-    })? {
-        BlockIoConfigFile::Wrapped(config) => config.classes,
-        BlockIoConfigFile::Flat(classes) => classes,
-    };
-    classes
-        .get(class_name)
-        .cloned()
-        .ok_or_else(|| {
-            NriError::Plugin(format!(
-                "blockio class '{}' not found in {}",
-                class_name,
-                path.display()
-            ))
-        })
-        .map(Some)
+    crate::security::resource_classes::resolve_blockio_class(class_name, config_path)
+        .map_err(|err| NriError::Plugin(err.to_string()))
 }
 
 pub fn resolve_rdt_class(class_name: &str) -> Option<crate::oci::spec::LinuxIntelRdt> {
-    let class_name = class_name.trim();
-    if class_name.is_empty() || class_name == POD_QOS_RDT_CLASS {
-        return None;
-    }
-
-    Some(crate::oci::spec::LinuxIntelRdt {
-        clos_id: Some(class_name.to_string()),
-        l3_cache_schema: None,
-        mem_bw_schema: None,
-        enable_cmt: None,
-        enable_mbm: None,
-    })
+    crate::security::resource_classes::resolve_rdt_class(class_name)
 }
 
 fn validate_adjustment_resources(
@@ -1261,272 +1001,18 @@ fn apply_rlimit_adjustments(spec: &mut Spec, adjustments: &[nri_api::POSIXRlimit
     cleanup_vec(rlimits);
 }
 
-fn apply_cdi_env(spec: &mut Spec, env: &[String]) {
-    if env.is_empty() {
-        return;
-    }
-
-    let entries = &mut ensure_process(spec).env;
-    let current = entries.get_or_insert_with(Vec::new);
-    for rendered in env {
-        let name = env_name(rendered);
-        if let Some(existing) = current.iter_mut().find(|entry| env_name(entry) == name) {
-            *existing = rendered.clone();
-        } else {
-            current.push(rendered.clone());
-        }
-    }
-}
-
-fn apply_cdi_device_nodes(spec: &mut Spec, nodes: &[CdiDeviceNode]) -> Result<()> {
-    if nodes.is_empty() {
-        return Ok(());
-    }
-
-    for node in nodes {
-        if node.path.is_empty() {
-            return Err(NriError::Plugin(
-                "CDI device node path must not be empty".to_string(),
-            ));
-        }
-        let updated = Device {
-            device_type: if node.device_type.is_empty() {
-                "c".to_string()
-            } else {
-                node.device_type.clone()
-            },
-            path: node.path.clone(),
-            major: Some(node.major),
-            minor: Some(node.minor),
-            file_mode: node.file_mode,
-            uid: node.uid,
-            gid: node.gid,
-        };
-        {
-            let devices = &mut ensure_linux(spec).devices;
-            let entries = devices.get_or_insert_with(Vec::new);
-            if let Some(existing) = entries
-                .iter_mut()
-                .find(|device| device.path == updated.path)
-            {
-                *existing = updated;
-            } else {
-                entries.push(updated);
-            }
-        }
-
-        let resource = LinuxDeviceCgroup {
-            allow: true,
-            device_type: Some(if node.device_type.is_empty() {
-                "c".to_string()
-            } else {
-                node.device_type.clone()
-            }),
-            major: Some(node.major),
-            minor: Some(node.minor),
-            access: Some(if node.permissions.is_empty() {
-                "rwm".to_string()
-            } else {
-                node.permissions.clone()
-            }),
-        };
-        {
-            let resources = &mut ensure_linux_resources(spec).devices;
-            let resource_entries = resources.get_or_insert_with(Vec::new);
-            if let Some(existing) = resource_entries.iter_mut().find(|device| {
-                device.device_type == resource.device_type
-                    && device.major == resource.major
-                    && device.minor == resource.minor
-            }) {
-                *existing = resource;
-            } else {
-                resource_entries.push(resource);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn apply_cdi_mounts(spec: &mut Spec, mounts: &[CdiMount]) -> Result<()> {
-    if mounts.is_empty() {
-        return Ok(());
-    }
-
-    let entries = spec.mounts.get_or_insert_with(Vec::new);
-    for mount in mounts {
-        if mount.host_path.is_empty() || mount.container_path.is_empty() {
-            return Err(NriError::Plugin(
-                "CDI mount must set both hostPath and containerPath".to_string(),
-            ));
-        }
-        let updated = Mount {
-            destination: mount.container_path.clone(),
-            source: Some(mount.host_path.clone()),
-            mount_type: (!mount.mount_type.is_empty()).then(|| mount.mount_type.clone()),
-            options: (!mount.options.is_empty()).then(|| mount.options.clone()),
-        };
-        if let Some(existing) = entries
-            .iter_mut()
-            .find(|current| current.destination == updated.destination)
-        {
-            *existing = updated;
-        } else {
-            entries.push(updated);
-        }
-    }
-
-    Ok(())
-}
-
-fn apply_cdi_hooks(spec: &mut Spec, hooks: &[CdiHook]) -> Result<()> {
-    if hooks.is_empty() {
-        return Ok(());
-    }
-
-    let oci_hooks = spec.hooks.get_or_insert(Hooks {
-        prestart: None,
-        create_runtime: None,
-        create_container: None,
-        start_container: None,
-        poststart: None,
-        poststop: None,
-    });
-    for hook in hooks {
-        if hook.path.is_empty() {
-            return Err(NriError::Plugin(
-                "CDI hook path must not be empty".to_string(),
-            ));
-        }
-        let converted = Hook {
-            path: hook.path.clone(),
-            args: (!hook.args.is_empty()).then(|| hook.args.clone()),
-            env: (!hook.env.is_empty()).then(|| hook.env.clone()),
-            timeout: hook.timeout,
-        };
-        match hook.hook_name.as_str() {
-            "prestart" => oci_hooks
-                .prestart
-                .get_or_insert_with(Vec::new)
-                .push(converted),
-            "createRuntime" => oci_hooks
-                .create_runtime
-                .get_or_insert_with(Vec::new)
-                .push(converted),
-            "createContainer" => oci_hooks
-                .create_container
-                .get_or_insert_with(Vec::new)
-                .push(converted),
-            "startContainer" => oci_hooks
-                .start_container
-                .get_or_insert_with(Vec::new)
-                .push(converted),
-            "poststart" => oci_hooks
-                .poststart
-                .get_or_insert_with(Vec::new)
-                .push(converted),
-            "poststop" => oci_hooks
-                .poststop
-                .get_or_insert_with(Vec::new)
-                .push(converted),
-            other => {
-                return Err(NriError::Plugin(format!(
-                    "unsupported CDI hook name {other:?}"
-                )))
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn apply_cdi_intel_rdt(spec: &mut Spec, intel_rdt: &CdiIntelRdt) {
-    ensure_linux(spec).intel_rdt = Some(crate::oci::spec::LinuxIntelRdt {
-        clos_id: (!intel_rdt.clos_id.is_empty()).then(|| intel_rdt.clos_id.clone()),
-        l3_cache_schema: (!intel_rdt.l3_cache_schema.is_empty())
-            .then(|| intel_rdt.l3_cache_schema.clone())
-            .or_else(|| (!intel_rdt.schemata.is_empty()).then(|| intel_rdt.schemata.join(";"))),
-        mem_bw_schema: (!intel_rdt.mem_bw_schema.is_empty())
-            .then(|| intel_rdt.mem_bw_schema.clone()),
-        enable_cmt: Some(intel_rdt.enable_monitoring),
-        enable_mbm: Some(intel_rdt.enable_monitoring),
-    });
-}
-
-fn apply_cdi_additional_gids(spec: &mut Spec, gids: &[u32]) {
-    if gids.is_empty() {
-        return;
-    }
-
-    let user = ensure_process(spec)
-        .user
-        .get_or_insert(crate::oci::spec::User {
-            uid: 0,
-            gid: 0,
-            additional_gids: None,
-            username: None,
-        });
-    let existing = user.additional_gids.get_or_insert_with(Vec::new);
-    let mut seen: HashSet<u32> = existing.iter().copied().collect();
-    for gid in gids {
-        if *gid != 0 && seen.insert(*gid) {
-            existing.push(*gid);
-        }
-    }
-}
-
-fn apply_cdi_net_devices(spec: &mut Spec, devices: &[CdiNetDevice]) -> Result<()> {
-    if devices.is_empty() {
-        return Ok(());
-    }
-
-    let entries = &mut ensure_linux(spec).net_devices;
-    let current = entries.get_or_insert_with(HashMap::new);
-    for device in devices {
-        if device.host_interface_name.is_empty() || device.name.is_empty() {
-            return Err(NriError::Plugin(
-                "CDI net device must set both hostInterfaceName and name".to_string(),
-            ));
-        }
-        current.insert(
-            device.host_interface_name.clone(),
-            crate::oci::spec::LinuxNetDevice {
-                name: device.name.clone(),
-            },
-        );
-    }
-    Ok(())
-}
-
-fn apply_cdi_edits(spec: &mut Spec, edits: &CdiContainerEdits) -> Result<()> {
-    apply_cdi_env(spec, &edits.env);
-    apply_cdi_device_nodes(spec, &edits.device_nodes)?;
-    apply_cdi_mounts(spec, &edits.mounts)?;
-    apply_cdi_hooks(spec, &edits.hooks)?;
-    apply_cdi_net_devices(spec, &edits.net_devices)?;
-    if let Some(intel_rdt) = edits.intel_rdt.as_ref() {
-        apply_cdi_intel_rdt(spec, intel_rdt);
-    }
-    apply_cdi_additional_gids(spec, &edits.additional_gids);
-    Ok(())
-}
-
 fn apply_cdi_device_adjustments(
     spec: &mut Spec,
     devices: &[nri_api::CDIDevice],
     enabled: bool,
     configured_dirs: Option<&[String]>,
 ) -> Result<()> {
-    if !enabled && !devices.is_empty() {
-        return Err(NriError::Plugin(
-            "CDI device adjustments are disabled by configuration".to_string(),
-        ));
-    }
-    for device in devices {
-        let edits = resolve_cdi_edits(&device.name, configured_dirs)?;
-        apply_cdi_edits(spec, &edits)?;
-    }
-    Ok(())
+    let device_names = devices
+        .iter()
+        .map(|device| device.name.clone())
+        .collect::<Vec<_>>();
+    crate::security::cdi::apply_cdi_devices(spec, &device_names, enabled, configured_dirs)
+        .map_err(|err| NriError::Plugin(err.to_string()))
 }
 
 pub fn apply_annotation_adjustments(spec: &mut Spec, adjustments: &HashMap<String, String>) {
