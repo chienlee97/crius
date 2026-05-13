@@ -24,6 +24,8 @@ pub mod shim_rpc;
 pub mod state;
 pub mod storage;
 pub mod streaming;
+#[doc(hidden)]
+pub mod test_support;
 pub mod trace_export;
 pub mod utils;
 pub use crate::proto::nri as nri_proto;
