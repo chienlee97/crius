@@ -1,6 +1,169 @@
 use super::*;
+use crate::state::{RecoveryContainerEntry, RecoveryLedgerSnapshot};
 
 impl RuntimeServiceImpl {
+    fn broken_state(kind: impl Into<String>, details: impl Into<String>) -> StoredBrokenState {
+        StoredBrokenState {
+            kind: kind.into(),
+            details: details.into(),
+            detected_at: Self::now_nanos(),
+        }
+    }
+
+    async fn mark_container_broken(
+        &self,
+        container_id: &str,
+        broken: StoredBrokenState,
+    ) -> Result<(), Status> {
+        let updated_annotations = {
+            let mut containers = self.containers.lock().await;
+            let Some(container) = containers.get_mut(container_id) else {
+                return Ok(());
+            };
+            let mut state = Self::read_internal_state::<StoredContainerState>(
+                &container.annotations,
+                INTERNAL_CONTAINER_STATE_KEY,
+            )
+            .unwrap_or_default();
+            state.broken = Some(broken.clone());
+            Self::insert_internal_state(
+                &mut container.annotations,
+                INTERNAL_CONTAINER_STATE_KEY,
+                &state,
+            )?;
+            container.annotations.clone()
+        };
+
+        if let Err(err) = self
+            .persistence
+            .lock()
+            .await
+            .update_container_annotations(container_id, &updated_annotations)
+        {
+            log::warn!(
+                "Failed to persist broken-state annotations for container {}: {}",
+                container_id,
+                err
+            );
+        }
+
+        {
+            let mut persistence = self.persistence.lock().await;
+            let _ = persistence.storage_mut().append_event(
+                "reconcile_container",
+                container_id,
+                None,
+                Some("broken"),
+                Some(&broken.details),
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn clear_container_broken(&self, container_id: &str) -> Result<(), Status> {
+        let mut should_persist = None;
+        {
+            let mut containers = self.containers.lock().await;
+            if let Some(container) = containers.get_mut(container_id) {
+                if let Some(mut state) = Self::read_internal_state::<StoredContainerState>(
+                    &container.annotations,
+                    INTERNAL_CONTAINER_STATE_KEY,
+                ) {
+                    if state.broken.take().is_some() {
+                        Self::insert_internal_state(
+                            &mut container.annotations,
+                            INTERNAL_CONTAINER_STATE_KEY,
+                            &state,
+                        )?;
+                        should_persist = Some(container.annotations.clone());
+                    }
+                }
+            }
+        }
+        if let Some(annotations) = should_persist {
+            if let Err(err) = self
+                .persistence
+                .lock()
+                .await
+                .update_container_annotations(container_id, &annotations)
+            {
+                log::warn!(
+                    "Failed to clear broken-state annotations for container {}: {}",
+                    container_id,
+                    err
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn mark_pod_broken(&self, pod_id: &str, broken: StoredBrokenState) -> Result<(), Status> {
+        let updated_annotations = {
+            let mut pods = self.pod_sandboxes.lock().await;
+            let Some(pod) = pods.get_mut(pod_id) else {
+                return Ok(());
+            };
+            let mut state =
+                Self::read_internal_state::<StoredPodState>(&pod.annotations, INTERNAL_POD_STATE_KEY)
+                    .unwrap_or_default();
+            state.broken = Some(broken);
+            Self::insert_internal_state(&mut pod.annotations, INTERNAL_POD_STATE_KEY, &state)?;
+            pod.annotations.clone()
+        };
+        if let Err(err) = self
+            .persistence
+            .lock()
+            .await
+            .update_pod_annotations(pod_id, &updated_annotations)
+        {
+            log::warn!(
+                "Failed to persist broken-state annotations for pod {}: {}",
+                pod_id,
+                err
+            );
+        }
+        Ok(())
+    }
+
+    async fn clear_pod_broken(&self, pod_id: &str) -> Result<(), Status> {
+        let mut should_persist = None;
+        {
+            let mut pods = self.pod_sandboxes.lock().await;
+            if let Some(pod) = pods.get_mut(pod_id) {
+                if let Some(mut state) =
+                    Self::read_internal_state::<StoredPodState>(&pod.annotations, INTERNAL_POD_STATE_KEY)
+                {
+                    if state.broken.take().is_some() {
+                        Self::insert_internal_state(&mut pod.annotations, INTERNAL_POD_STATE_KEY, &state)?;
+                        should_persist = Some(pod.annotations.clone());
+                    }
+                }
+            }
+        }
+        if let Some(annotations) = should_persist {
+            if let Err(err) = self
+                .persistence
+                .lock()
+                .await
+                .update_pod_annotations(pod_id, &annotations)
+            {
+                log::warn!(
+                    "Failed to clear broken-state annotations for pod {}: {}",
+                    pod_id,
+                    err
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn load_recovery_ledger_snapshot(&self) -> Result<RecoveryLedgerSnapshot, Status> {
+        let persistence = self.persistence.lock().await;
+        RecoveryLedgerSnapshot::load(&persistence)
+            .map_err(|err| Status::internal(format!("Failed to load recovery ledger snapshot: {}", err)))
+    }
+
     async fn prune_recovered_logical_duplicates(&self) -> Result<(), Status> {
         let pod_snapshots: Vec<crate::proto::runtime::v1::PodSandbox> = {
             let pods = self.pod_sandboxes.lock().await;
@@ -151,131 +314,6 @@ impl RuntimeServiceImpl {
                         );
                     }
                 }
-            }
-        }
-    }
-
-    async fn known_runtime_artifact_ids(&self) -> std::collections::HashSet<String> {
-        let mut known_ids: std::collections::HashSet<String> =
-            self.containers.lock().await.keys().cloned().collect();
-        let known_pause_ids: std::collections::HashSet<String> = self
-            .pod_sandboxes
-            .lock()
-            .await
-            .values()
-            .filter_map(|pod| {
-                Self::read_internal_state::<StoredPodState>(
-                    &pod.annotations,
-                    INTERNAL_POD_STATE_KEY,
-                )
-                .and_then(|state| state.pause_container_id)
-            })
-            .collect();
-        known_ids.extend(known_pause_ids);
-        if let Ok(artifacts) = self.persistence.lock().await.list_runtime_artifacts() {
-            known_ids.extend(artifacts.into_iter().map(|artifact| artifact.owner_id));
-        }
-        known_ids
-    }
-
-    async fn cleanup_orphaned_runtime_bundles(&self) {
-        let known_ids = self.known_runtime_artifact_ids().await;
-        let mut scanned_roots = std::collections::HashSet::new();
-
-        for runtime in self.runtime.all_runtimes() {
-            let runtime_root = runtime.runtime_root().to_path_buf();
-            if !scanned_roots.insert(runtime_root.clone()) {
-                continue;
-            }
-
-            let Ok(entries) = std::fs::read_dir(&runtime_root) else {
-                continue;
-            };
-
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-
-                let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-
-                if known_ids.contains(id) {
-                    continue;
-                }
-
-                if self.runtime.container_has_active_runtime_state(id) {
-                    log::warn!(
-                        "Keeping orphaned runtime bundle {} because container {} still appears active in runtime state",
-                        path.display(),
-                        id
-                    );
-                    continue;
-                }
-
-                if let Err(err) = std::fs::remove_dir_all(&path) {
-                    log::warn!(
-                        "Failed to remove orphaned runtime bundle {}: {}",
-                        path.display(),
-                        err
-                    );
-                } else if let Err(err) = self
-                    .persistence
-                    .lock()
-                    .await
-                    .delete_runtime_artifacts("container", id)
-                {
-                    log::warn!(
-                        "Failed to delete orphaned runtime artifact ledger entries for {}: {}",
-                        id,
-                        err
-                    );
-                }
-            }
-        }
-    }
-
-    async fn cleanup_orphaned_pod_workspaces(&self) {
-        let known_pod_ids: std::collections::HashSet<String> =
-            self.pod_sandboxes.lock().await.keys().cloned().collect();
-        let pod_root = self.config.root_dir.join("pods");
-        let Ok(entries) = std::fs::read_dir(&pod_root) else {
-            return;
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-
-            if known_pod_ids.contains(id) {
-                continue;
-            }
-
-            if let Err(err) = std::fs::remove_dir_all(&path) {
-                log::warn!(
-                    "Failed to remove orphaned pod workspace {}: {}",
-                    path.display(),
-                    err
-                );
-            } else if let Err(err) = self
-                .persistence
-                .lock()
-                .await
-                .delete_runtime_artifacts("pod", id)
-            {
-                log::warn!(
-                    "Failed to delete orphaned pod artifact ledger entries for {}: {}",
-                    id,
-                    err
-                );
             }
         }
     }
@@ -431,18 +469,298 @@ impl RuntimeServiceImpl {
         }
     }
 
-    pub async fn recover_state(&self) -> Result<(), Status> {
-        let (recovered_containers, recovered_pods) = {
-            let persistence = self.persistence.lock().await;
-            (persistence.recover_containers(), persistence.recover_pods())
-        };
+    async fn reconcile_recovered_state_from_ledger(
+        &self,
+        snapshot: &RecoveryLedgerSnapshot,
+    ) -> Result<(), Status> {
+        for RecoveryContainerEntry { record, .. } in &snapshot.containers {
+            let container_id = record.id.as_str();
+            let runtime = record
+                .runtime_handler
+                .as_deref()
+                .and_then(|handler| self.runtime.runtime_for_handler(handler).ok())
+                .or_else(|| self.runtime.runtime_for_container(container_id).ok());
+            let runtime_status = self.runtime_container_status_checked(container_id).await;
 
-        match recovered_containers {
-            Ok(containers) => {
+            let mut broken = None;
+            if let Some(runtime) = runtime.as_ref() {
+                let bundle_path = runtime.bundle_path_for(container_id);
+                if !bundle_path.exists() {
+                    broken = Some(Self::broken_state(
+                        "bundle_missing",
+                        format!("runtime bundle {} is missing", bundle_path.display()),
+                    ));
+                }
+            }
+
+            if broken.is_none() {
+                if let Some(rootfs_artifact) = snapshot.runtime_artifacts.iter().find(|artifact| {
+                    artifact.owner_kind == "container"
+                        && artifact.owner_id == container_id
+                        && artifact.artifact_kind == "rootfs"
+                }) {
+                    let rootfs_path = Path::new(&rootfs_artifact.path);
+                    if !rootfs_path.exists() {
+                        broken = Some(Self::broken_state(
+                            "rootfs_missing",
+                            format!("rootfs artifact {} is missing", rootfs_path.display()),
+                        ));
+                    }
+                }
+            }
+
+            if broken.is_none() {
+                if let Some(shim_record) = snapshot
+                    .shim_processes
+                    .iter()
+                    .find(|record| record.container_id == container_id)
+                {
+                    let shim_pid_live = PathBuf::from("/proc")
+                        .join(shim_record.shim_pid.to_string())
+                        .exists();
+                    match self.runtime.shim_status(container_id) {
+                        Ok(Some(status))
+                            if matches!(
+                                status.state,
+                                crate::shim_rpc::TaskState::Created
+                                    | crate::shim_rpc::TaskState::Running
+                            ) => {}
+                        Ok(None) if shim_pid_live => {}
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            broken = Some(Self::broken_state(
+                                "shim_socket_missing",
+                                format!(
+                                    "shim ledger entry exists for {} but task socket is unavailable",
+                                    container_id
+                                ),
+                            ));
+                        }
+                        Err(err) => {
+                            broken = Some(Self::broken_state(
+                                "shim_reconcile_failed",
+                                format!("failed to query shim live state: {}", err),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if let Some(broken) = broken {
+                self.mark_container_broken(container_id, broken).await?;
+            } else {
+                self.clear_container_broken(container_id).await?;
+            }
+
+            let runtime_state = Self::map_runtime_container_state(runtime_status.clone());
+            let persistence_status = match runtime_status {
+                ContainerStatus::Created => crate::runtime::ContainerStatus::Created,
+                ContainerStatus::Running => crate::runtime::ContainerStatus::Running,
+                ContainerStatus::Stopped(code) => crate::runtime::ContainerStatus::Stopped(code),
+                ContainerStatus::Unknown => crate::runtime::ContainerStatus::Unknown,
+            };
+
+            {
+                let mut containers = self.containers.lock().await;
+                if let Some(container) = containers.get_mut(container_id) {
+                    container.state = runtime_state;
+                }
+            }
+            if let Err(e) = self
+                .persistence
+                .lock()
+                .await
+                .update_container_state(container_id, persistence_status)
+            {
+                log::warn!(
+                    "Failed to reconcile ledger-driven container {} state in database: {}",
+                    container_id,
+                    e
+                );
+            }
+        }
+
+        for pod in &snapshot.pods {
+            let pod_id = pod.id.as_str();
+            let pod_state = Self::read_internal_state::<StoredPodState>(
+                &serde_json::from_str::<HashMap<String, String>>(&pod.annotations)
+                    .unwrap_or_default(),
+                INTERNAL_POD_STATE_KEY,
+            )
+            .unwrap_or_default();
+            let pause_container_id = pod_state.pause_container_id.clone();
+            let has_netns = !pod.netns_path.trim().is_empty() && Path::new(&pod.netns_path).exists();
+
+            if !has_netns {
+                self.mark_pod_broken(
+                    pod_id,
+                    Self::broken_state(
+                        "netns_missing",
+                        format!("pod network namespace {} is missing", pod.netns_path),
+                    ),
+                )
+                .await?;
+            } else {
+                self.clear_pod_broken(pod_id).await?;
+            }
+
+            if let Some(pause_container_id) = pause_container_id {
+                let pause_status = self
+                    .runtime_container_status_checked(&pause_container_id)
+                    .await;
+                let next_state = if matches!(pause_status, ContainerStatus::Running) && has_netns {
+                    "ready"
+                } else {
+                    "notready"
+                };
+                if let Err(err) = self
+                    .persistence
+                    .lock()
+                    .await
+                    .update_pod_state(pod_id, next_state)
+                {
+                    log::warn!(
+                        "Failed to reconcile ledger-driven pod {} state in database: {}",
+                        pod_id,
+                        err
+                    );
+                }
+                {
+                    let mut pods = self.pod_sandboxes.lock().await;
+                    if let Some(pod) = pods.get_mut(pod_id) {
+                        pod.state = if next_state == "ready" {
+                            PodSandboxState::SandboxReady as i32
+                        } else {
+                            PodSandboxState::SandboxNotready as i32
+                        };
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_orphaned_runtime_bundles_from_ledger(
+        &self,
+        snapshot: &RecoveryLedgerSnapshot,
+    ) {
+        let mut known_ids: std::collections::HashSet<String> = snapshot
+            .containers
+            .iter()
+            .map(|entry| entry.record.id.clone())
+            .collect();
+        known_ids.extend(snapshot.pods.iter().map(|pod| pod.id.clone()));
+        known_ids.extend(
+            snapshot
+                .runtime_artifacts
+                .iter()
+                .map(|artifact| artifact.owner_id.clone()),
+        );
+
+        let mut scanned_roots = std::collections::HashSet::new();
+        for runtime in self.runtime.all_runtimes() {
+            let runtime_root = runtime.runtime_root().to_path_buf();
+            if !scanned_roots.insert(runtime_root.clone()) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&runtime_root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if known_ids.contains(id) {
+                    continue;
+                }
+                if self.runtime.container_has_active_runtime_state(id) {
+                    continue;
+                }
+                if let Err(err) = std::fs::remove_dir_all(&path) {
+                    log::warn!(
+                        "Failed to remove orphaned runtime bundle {}: {}",
+                        path.display(),
+                        err
+                    );
+                } else if let Err(err) = self
+                    .persistence
+                    .lock()
+                    .await
+                    .delete_runtime_artifacts("container", id)
+                {
+                    log::warn!(
+                        "Failed to delete orphaned runtime artifact ledger entries for {}: {}",
+                        id,
+                        err
+                    );
+                }
+            }
+        }
+    }
+
+    async fn cleanup_orphaned_pod_workspaces_from_ledger(
+        &self,
+        snapshot: &RecoveryLedgerSnapshot,
+    ) {
+        let known_pod_ids: std::collections::HashSet<String> =
+            snapshot.pods.iter().map(|pod| pod.id.clone()).collect();
+        let pod_root = self.config.root_dir.join("pods");
+        let Ok(entries) = std::fs::read_dir(&pod_root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if known_pod_ids.contains(id) {
+                continue;
+            }
+            if let Err(err) = std::fs::remove_dir_all(&path) {
+                log::warn!(
+                    "Failed to remove orphaned pod workspace {}: {}",
+                    path.display(),
+                    err
+                );
+            } else if let Err(err) = self
+                .persistence
+                .lock()
+                .await
+                .delete_runtime_artifacts("pod", id)
+            {
+                log::warn!(
+                    "Failed to delete orphaned pod artifact ledger entries for {}: {}",
+                    id,
+                    err
+                );
+            }
+        }
+    }
+
+    pub async fn recover_state(&self) -> Result<(), Status> {
+        let snapshot = self.load_recovery_ledger_snapshot().await?;
+
+        {
                 let mut memory_containers = self.containers.lock().await;
-                for (_id, status, record) in containers {
+                for RecoveryContainerEntry { status, record } in snapshot.containers.iter().cloned() {
                     let annotations: HashMap<String, String> =
                         serde_json::from_str(&record.annotations).unwrap_or_default();
+                    if let Some(runtime_handler) = record
+                        .runtime_handler
+                        .as_deref()
+                        .filter(|handler| !handler.trim().is_empty())
+                    {
+                        self.runtime
+                            .remember_recovered_container_handler(&record.id, runtime_handler);
+                    }
                     let container_state = Self::read_internal_state::<StoredContainerState>(
                         &annotations,
                         INTERNAL_CONTAINER_STATE_KEY,
@@ -523,16 +841,11 @@ impl RuntimeServiceImpl {
                     memory_containers.len()
                 );
             }
-            Err(e) => {
-                log::error!("Failed to recover containers: {}", e);
-            }
-        }
 
-        match recovered_pods {
-            Ok(pods) => {
+        {
                 let mut memory_pods = self.pod_sandboxes.lock().await;
                 let mut pod_manager = self.pod_manager.lock().await;
-                for record in pods {
+                for record in snapshot.pods.iter().cloned() {
                     let annotations: HashMap<String, String> =
                         serde_json::from_str(&record.annotations).unwrap_or_default();
                     let pod_state = Self::read_internal_state::<StoredPodState>(
@@ -768,10 +1081,6 @@ impl RuntimeServiceImpl {
                     memory_pods.len()
                 );
             }
-            Err(e) => {
-                log::error!("Failed to recover pod sandboxes: {}", e);
-            }
-        }
 
         let recovered_container_name_keys = {
             let containers = self.containers.lock().await;
@@ -833,7 +1142,7 @@ impl RuntimeServiceImpl {
             }
         }
 
-        self.reconcile_recovered_state().await?;
+        self.reconcile_recovered_state_from_ledger(&snapshot).await?;
         self.ensure_exit_monitors_for_active_containers().await;
         if self.last_startup_clean_shutdown().unwrap_or(false)
             && !self.last_startup_detected_reboot().unwrap_or(false)
@@ -843,8 +1152,10 @@ impl RuntimeServiceImpl {
         } else if !self.config.internal_wipe {
             log::info!("Skipping orphan runtime sweeps because runtime.internal_wipe is disabled");
         } else {
-            self.cleanup_orphaned_runtime_bundles().await;
-            self.cleanup_orphaned_pod_workspaces().await;
+            self.cleanup_orphaned_runtime_bundles_from_ledger(&snapshot)
+                .await;
+            self.cleanup_orphaned_pod_workspaces_from_ledger(&snapshot)
+                .await;
             self.cleanup_orphaned_shim_artifacts().await;
             self.cleanup_orphaned_pause_processes().await;
         }

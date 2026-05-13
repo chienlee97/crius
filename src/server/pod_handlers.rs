@@ -802,6 +802,7 @@ impl RuntimeServiceImpl {
                 overhead_linux_resources: pod_overhead.as_ref().map(StoredLinuxResources::from),
                 linux_resources: stored_effective_pod_linux_resources.clone(),
                 stop_notified: false,
+                broken: None,
             })
             .unwrap_or_else(|| StoredPodState {
                 port_mappings: stored_port_mappings,

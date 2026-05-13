@@ -1847,6 +1847,7 @@ impl RuntimeServiceImpl {
             exit_code: None,
             nri_stop_notified: false,
             nri_remove_notified: false,
+            broken: None,
             linux_resources,
             mounts: config
                 .mounts

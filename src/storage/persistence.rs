@@ -194,6 +194,17 @@ impl PersistenceManager {
         self.storage.delete_container(container_id)
     }
 
+    pub fn update_container_annotations(
+        &mut self,
+        container_id: &str,
+        annotations: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.storage.update_container_annotations(
+            container_id,
+            &serde_json::to_string(annotations).unwrap_or_default(),
+        )
+    }
+
     pub fn update_container_ledger_metadata(
         &mut self,
         container_id: &str,
@@ -248,6 +259,17 @@ impl PersistenceManager {
     /// 删除Pod沙箱
     pub fn delete_pod_sandbox(&mut self, pod_id: &str) -> Result<()> {
         self.storage.delete_pod_sandbox(pod_id)
+    }
+
+    pub fn update_pod_annotations(
+        &mut self,
+        pod_id: &str,
+        annotations: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.storage.update_pod_annotations(
+            pod_id,
+            &serde_json::to_string(annotations).unwrap_or_default(),
+        )
     }
 
     pub fn save_image_record(

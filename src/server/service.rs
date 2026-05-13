@@ -328,6 +328,10 @@ impl RuntimeRegistry {
         }
     }
 
+    pub(super) fn remember_recovered_container_handler(&self, container_id: &str, handler: &str) {
+        self.remember_container_handler(container_id, handler);
+    }
+
     fn forget_container_handler(&self, container_id: &str) {
         if let Ok(mut handlers) = self.container_handlers.lock() {
             handlers.remove(container_id);
@@ -442,6 +446,14 @@ impl RuntimeRegistry {
     pub(super) fn restore_attach_shim(&self, container_id: &str) -> anyhow::Result<()> {
         self.runtime_for_container(container_id)?
             .restore_attach_shim(container_id)
+    }
+
+    pub(super) fn shim_status(
+        &self,
+        container_id: &str,
+    ) -> anyhow::Result<Option<crate::shim_rpc::StatusResponse>> {
+        self.runtime_for_container(container_id)?
+            .shim_status(container_id)
     }
 
     pub(super) fn restore_container_from_checkpoint(

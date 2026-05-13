@@ -5627,6 +5627,135 @@ async fn exec_sync_returns_stdout_and_stderr_when_io_drains_cleanly() {
 }
 
 #[tokio::test]
+async fn exec_sync_prefers_task_shim_rpc_when_socket_is_available() {
+    let (dir, service) = test_service_with_fake_runtime();
+
+    service.containers.lock().await.insert(
+        "container-running".to_string(),
+        test_container("container-running", "pod-1", HashMap::new()),
+    );
+    set_fake_runtime_state(&dir, "container-running", "running");
+
+    let task_socket = dir
+        .path()
+        .join("shims")
+        .join("container-running")
+        .join("task.sock");
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let running_for_thread = running.clone();
+    let socket_for_thread = task_socket.clone();
+    let handle = std::thread::spawn(move || {
+        crate::shim_rpc::server::serve(
+            &socket_for_thread,
+            running_for_thread,
+            Arc::new(TestShimExecSyncHandler),
+        )
+        .unwrap();
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !task_socket.exists() {
+        if std::time::Instant::now() >= deadline {
+            panic!("task shim socket was not created before deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let response = RuntimeService::exec_sync(
+        &service,
+        Request::new(ExecSyncRequest {
+            container_id: "container-running".to_string(),
+            cmd: vec!["echo".to_string(), "from-shim".to_string()],
+            timeout: 0,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    assert_eq!(response.exit_code, 0);
+    assert_eq!(response.stdout, b"shim:echo from-shim");
+    assert_eq!(response.stderr, b"shim-stderr");
+
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = std::os::unix::net::UnixStream::connect(&task_socket);
+    handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn exec_opens_shim_exec_session_when_task_socket_is_available() {
+    let (dir, service) = test_service_with_fake_runtime();
+
+    service
+        .set_streaming_server(crate::streaming::StreamingServer::for_test(
+            "http://127.0.0.1:12345",
+        ))
+        .await;
+
+    service.containers.lock().await.insert(
+        "container-running".to_string(),
+        test_container("container-running", "pod-1", HashMap::new()),
+    );
+    set_fake_runtime_state(&dir, "container-running", "running");
+
+    let task_socket = dir
+        .path()
+        .join("shims")
+        .join("container-running")
+        .join("task.sock");
+    let marker_path = dir.path().join("exec-session.marker");
+    let session_dir = dir.path().join("exec-session");
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let running_for_thread = running.clone();
+    let socket_for_thread = task_socket.clone();
+    let marker_for_thread = marker_path.clone();
+    let session_dir_for_thread = session_dir.clone();
+    let handle = std::thread::spawn(move || {
+        crate::shim_rpc::server::serve(
+            &socket_for_thread,
+            running_for_thread,
+            Arc::new(TestShimExecSessionHandler {
+                marker_path: marker_for_thread,
+                session_dir: session_dir_for_thread,
+            }),
+        )
+        .unwrap();
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !task_socket.exists() {
+        if std::time::Instant::now() >= deadline {
+            panic!("task shim socket was not created before deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let response = RuntimeService::exec(
+        &service,
+        Request::new(ExecRequest {
+            container_id: "container-running".to_string(),
+            cmd: vec!["echo".to_string(), "interactive".to_string()],
+            stdin: true,
+            stdout: true,
+            stderr: false,
+            tty: true,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    assert!(response.url.contains("/exec/"));
+    assert_eq!(fs::read_to_string(&marker_path).unwrap(), "echo interactive");
+    assert!(session_dir.join("io.sock").exists());
+    assert!(session_dir.join("resize.sock").exists());
+
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = std::os::unix::net::UnixStream::connect(&task_socket);
+    handle.join().unwrap();
+}
+
+#[tokio::test]
 async fn exec_sync_returns_deadline_exceeded_when_io_drain_timeout_expires() {
     let dir = tempdir().unwrap();
     let runtime_path = write_fake_runtime_script(dir.path());
@@ -7804,6 +7933,67 @@ struct FakeBackend {
     runtime_root: PathBuf,
 }
 
+struct TestShimExecSyncHandler;
+
+impl crate::shim_rpc::server::ShimRpcHandler for TestShimExecSyncHandler {
+    fn handle_request(
+        &self,
+        request: crate::shim_rpc::ShimRpcRequest,
+    ) -> anyhow::Result<crate::shim_rpc::ShimRpcResponse> {
+        match request {
+            crate::shim_rpc::ShimRpcRequest::Ping => Ok(crate::shim_rpc::ShimRpcResponse::Empty),
+            crate::shim_rpc::ShimRpcRequest::ExecProcess(request) => {
+                Ok(crate::shim_rpc::ShimRpcResponse::ExecProcess(
+                    crate::shim_rpc::ExecProcessResponse {
+                        exit_code: 0,
+                        stdout: format!("shim:{}", request.command.join(" ")).into_bytes(),
+                        stderr: b"shim-stderr".to_vec(),
+                    },
+                ))
+            }
+            other => Err(anyhow::anyhow!(
+                "unexpected shim exec sync test request: {:?}",
+                other
+            )),
+        }
+    }
+}
+
+struct TestShimExecSessionHandler {
+    marker_path: PathBuf,
+    session_dir: PathBuf,
+}
+
+impl crate::shim_rpc::server::ShimRpcHandler for TestShimExecSessionHandler {
+    fn handle_request(
+        &self,
+        request: crate::shim_rpc::ShimRpcRequest,
+    ) -> anyhow::Result<crate::shim_rpc::ShimRpcResponse> {
+        match request {
+            crate::shim_rpc::ShimRpcRequest::Ping => Ok(crate::shim_rpc::ShimRpcResponse::Empty),
+            crate::shim_rpc::ShimRpcRequest::OpenExecSession(request) => {
+                fs::write(&self.marker_path, request.command.join(" ")).unwrap();
+                fs::create_dir_all(&self.session_dir).unwrap();
+                let io_socket_path = self.session_dir.join("io.sock");
+                let resize_socket_path = self.session_dir.join("resize.sock");
+                let _ = std::os::unix::net::UnixListener::bind(&io_socket_path);
+                let _ = std::os::unix::net::UnixListener::bind(&resize_socket_path);
+                Ok(crate::shim_rpc::ShimRpcResponse::OpenExecSession(
+                    crate::shim_rpc::OpenExecSessionResponse {
+                        session_id: "session-1".to_string(),
+                        io_socket_path,
+                        resize_socket_path: Some(resize_socket_path),
+                    },
+                ))
+            }
+            other => Err(anyhow::anyhow!(
+                "unexpected shim exec session test request: {:?}",
+                other
+            )),
+        }
+    }
+}
+
 impl crate::runtime::RuntimeBackend for FakeBackend {
     fn backend_name(&self) -> &str {
         self.name
@@ -7879,6 +8069,13 @@ impl crate::runtime::RuntimeBackend for FakeBackend {
 
     fn restore_attach_shim(&self, _container_id: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn shim_status(
+        &self,
+        _container_id: &str,
+    ) -> anyhow::Result<Option<crate::shim_rpc::StatusResponse>> {
+        Ok(None)
     }
 
     fn restore_container_from_checkpoint(
@@ -15526,6 +15723,209 @@ async fn recover_state_cleans_orphaned_attach_socket_artifacts_from_separate_dir
         !attach_dir.exists(),
         "recover_state should clean orphaned attach socket directories"
     );
+}
+
+#[tokio::test]
+async fn recover_state_recovers_running_container_without_shim_metadata_file_from_ledger() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "recover-ledger-only", "running");
+    fs::create_dir_all(dir.path().join("runtime-root").join("recover-ledger-only")).unwrap();
+
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "recover-ledger-only",
+            "pod-1",
+            crate::runtime::ContainerStatus::Running,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .update_container_ledger_metadata(
+            "recover-ledger-only",
+            Some("runc"),
+            Some("runc"),
+            None,
+        )
+        .unwrap();
+
+    let mut shim_child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .save_shim_process_record(&crate::storage::ShimProcessRecord {
+            container_id: "recover-ledger-only".to_string(),
+            shim_pid: shim_child.id(),
+            work_dir: dir.path().join("shims").display().to_string(),
+            socket_path: dir
+                .path()
+                .join("shims")
+                .join("recover-ledger-only")
+                .join("task.sock")
+                .display()
+                .to_string(),
+            exit_code_file: dir
+                .path()
+                .join("exits")
+                .join("recover-ledger-only")
+                .display()
+                .to_string(),
+            log_file: dir
+                .path()
+                .join("shims")
+                .join("recover-ledger-only")
+                .join("shim.log")
+                .display()
+                .to_string(),
+            bundle_path: dir
+                .path()
+                .join("runtime-root")
+                .join("recover-ledger-only")
+                .display()
+                .to_string(),
+            state: "running".to_string(),
+            last_seen_at: RuntimeServiceImpl::now_nanos(),
+        })
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    let recovered = service
+        .containers
+        .lock()
+        .await
+        .get("recover-ledger-only")
+        .cloned()
+        .unwrap();
+    assert_eq!(recovered.state, ContainerState::ContainerRunning as i32);
+    let internal_state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+        &recovered.annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+    )
+    .unwrap_or_default();
+    assert!(internal_state.broken.is_none());
+
+    let _ = shim_child.kill();
+    let _ = shim_child.wait();
+}
+
+#[tokio::test]
+async fn recover_state_marks_container_broken_when_runtime_bundle_is_missing() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "broken-bundle", "running");
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            metadata_name: Some("broken-bundle".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "broken-bundle",
+            "pod-1",
+            crate::runtime::ContainerStatus::Running,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .update_container_ledger_metadata("broken-bundle", Some("runc"), Some("runc"), None)
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    let recovered = service
+        .containers
+        .lock()
+        .await
+        .get("broken-bundle")
+        .cloned()
+        .unwrap();
+    let internal_state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+        &recovered.annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+    )
+    .unwrap();
+    assert_eq!(
+        internal_state.broken.as_ref().map(|broken| broken.kind.as_str()),
+        Some("bundle_missing")
+    );
+}
+
+#[tokio::test]
+async fn recover_state_keeps_live_orphaned_shim_directories_when_ledger_has_live_process() {
+    let (dir, service) = test_service_with_fake_runtime();
+    let live_shim_dir = dir.path().join("shims").join("orphan-live");
+    let live_attach_dir = dir.path().join("attach").join("orphan-live");
+    let stale_shim_dir = dir.path().join("shims").join("orphan-stale");
+    let stale_attach_dir = dir.path().join("attach").join("orphan-stale");
+    fs::create_dir_all(&live_shim_dir).unwrap();
+    fs::create_dir_all(&live_attach_dir).unwrap();
+    fs::create_dir_all(&stale_shim_dir).unwrap();
+    fs::create_dir_all(&stale_attach_dir).unwrap();
+    fs::write(live_attach_dir.join("attach.sock"), "live").unwrap();
+    fs::write(stale_attach_dir.join("attach.sock"), "stale").unwrap();
+
+    let mut shim_child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .save_shim_process_record(&crate::storage::ShimProcessRecord {
+            container_id: "orphan-live".to_string(),
+            shim_pid: shim_child.id(),
+            work_dir: dir.path().join("shims").display().to_string(),
+            socket_path: live_attach_dir.join("attach.sock").display().to_string(),
+            exit_code_file: dir
+                .path()
+                .join("exits")
+                .join("orphan-live")
+                .display()
+                .to_string(),
+            log_file: live_shim_dir.join("shim.log").display().to_string(),
+            bundle_path: dir.path().join("runtime-root").join("orphan-live").display().to_string(),
+            state: "running".to_string(),
+            last_seen_at: RuntimeServiceImpl::now_nanos(),
+        })
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    assert!(live_shim_dir.exists());
+    assert!(live_attach_dir.exists());
+    assert!(!stale_shim_dir.exists());
+    assert!(!stale_attach_dir.exists());
+
+    let _ = shim_child.kill();
+    let _ = shim_child.wait();
 }
 
 #[tokio::test]

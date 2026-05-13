@@ -278,6 +278,17 @@ impl RuntimeServiceImpl {
                 .and_then(|state| state.pause_container_id)
             })
             .collect();
+        let ledger_shims = self
+            .persistence
+            .lock()
+            .await
+            .list_shim_process_records()
+            .unwrap_or_default();
+        let live_ledger_shims: HashMap<String, u32> = ledger_shims
+            .into_iter()
+            .filter(|record| PathBuf::from("/proc").join(record.shim_pid.to_string()).exists())
+            .map(|record| (record.container_id, record.shim_pid))
+            .collect();
 
         let Ok(entries) = std::fs::read_dir(&self.shim_work_dir) else {
             return;
@@ -296,27 +307,11 @@ impl RuntimeServiceImpl {
             if known_container_ids.contains(id) || known_pause_ids.contains(id) {
                 continue;
             }
-
-            let metadata = std::fs::read(path.join("shim.json"))
-                .ok()
-                .and_then(|raw| serde_json::from_slice::<ShimProcess>(&raw).ok());
-            let live_process = metadata
-                .as_ref()
-                .map(|process| {
-                    PathBuf::from("/proc")
-                        .join(process.shim_pid.to_string())
-                        .exists()
-                })
-                .unwrap_or(false);
-
-            if live_process {
+            if let Some(shim_pid) = live_ledger_shims.get(id) {
                 log::warn!(
                     "Keeping orphaned shim directory {} because shim pid {} still appears live",
                     path.display(),
-                    metadata
-                        .as_ref()
-                        .map(|process| process.shim_pid)
-                        .unwrap_or_default()
+                    shim_pid
                 );
                 continue;
             }
@@ -351,27 +346,11 @@ impl RuntimeServiceImpl {
             if known_container_ids.contains(id) || known_pause_ids.contains(id) {
                 continue;
             }
-
-            let metadata = std::fs::read(self.shim_work_dir.join(id).join("shim.json"))
-                .ok()
-                .and_then(|raw| serde_json::from_slice::<ShimProcess>(&raw).ok());
-            let live_process = metadata
-                .as_ref()
-                .map(|process| {
-                    PathBuf::from("/proc")
-                        .join(process.shim_pid.to_string())
-                        .exists()
-                })
-                .unwrap_or(false);
-
-            if live_process {
+            if let Some(shim_pid) = live_ledger_shims.get(id) {
                 log::warn!(
                     "Keeping orphaned attach socket directory {} because shim pid {} still appears live",
                     path.display(),
-                    metadata
-                        .as_ref()
-                        .map(|process| process.shim_pid)
-                        .unwrap_or_default()
+                    shim_pid
                 );
                 continue;
             }

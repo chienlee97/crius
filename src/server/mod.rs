@@ -61,7 +61,7 @@ use crate::nri::{
 use crate::pod::{PodSandboxConfig, PodSandboxManager};
 use crate::runtime::{
     ContainerConfig, ContainerRuntime, ContainerStatus, DeviceMapping, MountConfig, NamespacePaths,
-    RuncRuntime, SeccompProfile, ShimConfig, ShimProcess,
+    RuncRuntime, SeccompProfile, ShimConfig,
 };
 use crate::streaming::StreamingServer;
 
@@ -659,6 +659,7 @@ struct StoredPodState {
     overhead_linux_resources: Option<StoredLinuxResources>,
     linux_resources: Option<StoredLinuxResources>,
     stop_notified: bool,
+    broken: Option<StoredBrokenState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -697,6 +698,14 @@ struct StoredContainerState {
     exit_code: Option<i32>,
     nri_stop_notified: bool,
     nri_remove_notified: bool,
+    broken: Option<StoredBrokenState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredBrokenState {
+    kind: String,
+    details: String,
+    detected_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
