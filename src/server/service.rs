@@ -1676,6 +1676,15 @@ impl RuntimeServiceImpl {
                 .then(|| config.image_signature_policy_dir.clone()),
             big_files_temporary_dir: (!config.image_big_files_temporary_dir.as_os_str().is_empty())
                 .then(|| config.image_big_files_temporary_dir.clone()),
+            separate_pull_cgroup: config.separate_pull_cgroup.clone(),
+            cgroup_driver: match config.cgroup_driver {
+                Some(CgroupDriver::Systemd) => crate::config::CgroupDriverConfig::Systemd,
+                _ => crate::config::CgroupDriverConfig::Cgroupfs,
+            },
+            rootless: config.rootless.clone(),
+            disable_cgroup: config.disable_cgroup,
+            #[cfg(test)]
+            pull_cgroup_root: None,
         })
         .expect("Failed to initialize image service");
 

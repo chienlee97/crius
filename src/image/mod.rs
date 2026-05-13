@@ -1,6 +1,7 @@
 pub mod content_store;
 pub mod metadata_store;
 pub mod policy;
+pub mod pull_cgroup;
 pub mod snapshotter;
 
 use std::collections::{HashMap, HashSet};
@@ -30,6 +31,10 @@ use crate::proto::runtime::v1::{
 use crate::storage::StorageManager;
 use content_store::{ContentStore, FsContentStore};
 use metadata_store::FilesystemImageMetadataStore;
+pub use pull_cgroup::{
+    validate_pull_cgroup_config, PullCgroupEffectiveConfig, PullCgroupExecutor, PullCgroupMode,
+    PullCgroupScopeRecord,
+};
 
 /// crius镜像
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -79,6 +84,7 @@ pub struct ImageServiceImpl {
     #[cfg(test)]
     test_pull_handler: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<TestPullHandler>>>>,
     reloadable_config: Arc<RwLock<ReloadableImageConfig>>,
+    pull_cgroup: PullCgroupExecutor,
 }
 
 #[derive(Clone)]
@@ -110,6 +116,12 @@ pub struct ImageServiceOptions {
     pub signature_policy: Option<PathBuf>,
     pub signature_policy_dir: Option<PathBuf>,
     pub big_files_temporary_dir: Option<PathBuf>,
+    pub separate_pull_cgroup: String,
+    pub cgroup_driver: crate::config::CgroupDriverConfig,
+    pub rootless: crate::rootless::EffectiveRootlessConfig,
+    pub disable_cgroup: bool,
+    #[cfg(test)]
+    pub pull_cgroup_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +344,14 @@ impl ImageServiceImpl {
 
     pub fn reloadable_config_snapshot(&self) -> ReloadableImageConfig {
         self.current_reloadable_config()
+    }
+
+    pub fn pull_cgroup_effective_config(&self) -> PullCgroupEffectiveConfig {
+        self.pull_cgroup.effective_config()
+    }
+
+    pub fn last_pull_cgroup_scope(&self) -> Option<PullCgroupScopeRecord> {
+        self.pull_cgroup.last_scope()
     }
 
     fn should_retry_pull_status(status: &Status) -> bool {
@@ -1503,7 +1523,28 @@ impl ImageServiceImpl {
             signature_policy,
             signature_policy_dir,
             big_files_temporary_dir,
+            separate_pull_cgroup,
+            cgroup_driver,
+            rootless,
+            disable_cgroup,
+            #[cfg(test)]
+            pull_cgroup_root,
         } = options;
+        #[cfg(not(test))]
+        let pull_cgroup = PullCgroupExecutor::new(
+            separate_pull_cgroup,
+            cgroup_driver,
+            rootless.enabled,
+            disable_cgroup,
+        );
+        #[cfg(test)]
+        let pull_cgroup = PullCgroupExecutor::new_with_root(
+            separate_pull_cgroup,
+            cgroup_driver,
+            rootless.enabled,
+            disable_cgroup,
+            pull_cgroup_root.unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup")),
+        );
         let reloadable_config = ReloadableImageConfig {
             global_auth_file,
             namespaced_auth_dir,
@@ -1553,6 +1594,7 @@ impl ImageServiceImpl {
             #[cfg(test)]
             test_pull_handler: std::sync::Arc::new(std::sync::Mutex::new(None)),
             reloadable_config: Arc::new(RwLock::new(reloadable_config)),
+            pull_cgroup,
         })
     }
 
@@ -2691,6 +2733,15 @@ impl ImageService for ImageServiceImpl {
             .as_ref()
             .and_then(|config| config.metadata.as_ref())
             .map(|metadata| metadata.namespace.clone());
+        let pod_cgroup_parent = req
+            .sandbox_config
+            .as_ref()
+            .and_then(|config| config.linux.as_ref())
+            .map(|linux| linux.cgroup_parent.as_str());
+        let pull_cgroup_target = self
+            .pull_cgroup
+            .target_for_pod(pod_cgroup_parent)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
         self.enforce_signature_policy(&reference, pull_namespace.as_deref())?;
 
         let auth = match req.auth.clone() {
@@ -2755,6 +2806,10 @@ impl ImageService for ImageServiceImpl {
         );
 
         let pull_outcome = Self::execute_pull_with_retries(self.pull_retry_count, || async {
+            let _pull_cgroup_scope = self
+                .pull_cgroup
+                .enter(&pull_cgroup_target)
+                .map_err(|err| Status::failed_precondition(err.to_string()))?;
             #[cfg(test)]
             if let Some(handler) = self.snapshot_test_pull_handler() {
                 return self
@@ -3009,6 +3064,11 @@ mod tests {
             signature_policy: None,
             signature_policy_dir: None,
             big_files_temporary_dir: None,
+            separate_pull_cgroup: String::new(),
+            cgroup_driver: crate::config::CgroupDriverConfig::Cgroupfs,
+            rootless: crate::rootless::EffectiveRootlessConfig::disabled(),
+            disable_cgroup: false,
+            pull_cgroup_root: None,
         })
     }
 
@@ -3058,6 +3118,43 @@ mod tests {
         (dir, service)
     }
 
+    fn test_image_service_with_pull_cgroup(
+        storage_path: &Path,
+        cgroup_root: &Path,
+        separate_pull_cgroup: &str,
+        cgroup_driver: crate::config::CgroupDriverConfig,
+        rootless: crate::rootless::EffectiveRootlessConfig,
+        disable_cgroup: bool,
+    ) -> ImageServiceImpl {
+        ImageServiceImpl::new_with_options(ImageServiceOptions {
+            storage_path: storage_path.to_path_buf(),
+            ledger_db_path: None,
+            storage_driver: "overlay".to_string(),
+            global_auth_file: None,
+            namespaced_auth_dir: None,
+            default_transport: "docker://".to_string(),
+            short_name_mode: "disabled".to_string(),
+            pull_progress_timeout: std::time::Duration::ZERO,
+            max_concurrent_downloads: 3,
+            pull_retry_count: 0,
+            registry_config_dir: None,
+            decryption_keys_path: None,
+            decryption_decoder_path: "ctd-decoder".to_string(),
+            decryption_keyprovider_config: None,
+            additional_artifact_stores: Vec::new(),
+            pinned_image_patterns: Vec::new(),
+            signature_policy: None,
+            signature_policy_dir: None,
+            big_files_temporary_dir: None,
+            separate_pull_cgroup: separate_pull_cgroup.to_string(),
+            cgroup_driver,
+            rootless,
+            disable_cgroup,
+            pull_cgroup_root: Some(cgroup_root.to_path_buf()),
+        })
+        .unwrap()
+    }
+
     #[test]
     fn image_service_rejects_unsupported_storage_driver() {
         let dir = tempdir().unwrap();
@@ -3073,6 +3170,95 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("image.driver must be \"overlay\""));
+    }
+
+    #[tokio::test]
+    async fn pull_image_enters_configured_pull_cgroup_scope() {
+        let dir = tempdir().unwrap();
+        let cgroup_root = dir.path().join("cgroup");
+        let service = test_image_service_with_pull_cgroup(
+            dir.path().join("images").as_path(),
+            &cgroup_root,
+            "kubepods/pod123",
+            crate::config::CgroupDriverConfig::Cgroupfs,
+            crate::rootless::EffectiveRootlessConfig::disabled(),
+            false,
+        );
+        service.set_test_pull_handler(Arc::new(|_| {
+            Ok(TestPullResponse {
+                image_id: "sha256:pull-cgroup".to_string(),
+                size: 12,
+                ..Default::default()
+            })
+        }));
+
+        ImageService::pull_image(
+            &service,
+            Request::new(PullImageRequest {
+                image: Some(ImageSpec {
+                    image: "registry.example.com/ns/image:latest".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(cgroup_root.join("kubepods/pod123/cgroup.procs").exists());
+        let last_scope = service.last_pull_cgroup_scope().unwrap();
+        assert!(last_scope.entered);
+        assert_eq!(last_scope.mode, PullCgroupMode::Path);
+        assert!(last_scope
+            .effective_path
+            .unwrap()
+            .ends_with("kubepods/pod123"));
+    }
+
+    #[tokio::test]
+    async fn pull_image_uses_pod_cgroup_parent_in_pod_mode() {
+        let dir = tempdir().unwrap();
+        let cgroup_root = dir.path().join("cgroup");
+        let service = test_image_service_with_pull_cgroup(
+            dir.path().join("images").as_path(),
+            &cgroup_root,
+            "pod",
+            crate::config::CgroupDriverConfig::Cgroupfs,
+            crate::rootless::EffectiveRootlessConfig::disabled(),
+            false,
+        );
+        service.set_test_pull_handler(Arc::new(|_| {
+            Ok(TestPullResponse {
+                image_id: "sha256:pod-pull-cgroup".to_string(),
+                size: 12,
+                ..Default::default()
+            })
+        }));
+
+        ImageService::pull_image(
+            &service,
+            Request::new(PullImageRequest {
+                image: Some(ImageSpec {
+                    image: "registry.example.com/ns/pod-image:latest".to_string(),
+                    ..Default::default()
+                }),
+                sandbox_config: Some(PodSandboxConfig {
+                    linux: Some(crate::proto::runtime::v1::LinuxPodSandboxConfig {
+                        cgroup_parent: "kubepods/podabc".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(cgroup_root.join("kubepods/podabc/cgroup.procs").exists());
+        let last_scope = service.last_pull_cgroup_scope().unwrap();
+        assert_eq!(last_scope.mode, PullCgroupMode::Pod);
+        assert!(last_scope.entered);
     }
 
     #[test]
@@ -3351,6 +3537,11 @@ mod tests {
             signature_policy: None,
             signature_policy_dir: None,
             big_files_temporary_dir: None,
+            separate_pull_cgroup: String::new(),
+            cgroup_driver: crate::config::CgroupDriverConfig::Cgroupfs,
+            rootless: crate::rootless::EffectiveRootlessConfig::disabled(),
+            disable_cgroup: false,
+            pull_cgroup_root: None,
         })
         .unwrap();
 
@@ -3410,6 +3601,11 @@ mod tests {
             signature_policy: None,
             signature_policy_dir: None,
             big_files_temporary_dir: None,
+            separate_pull_cgroup: String::new(),
+            cgroup_driver: crate::config::CgroupDriverConfig::Cgroupfs,
+            rootless: crate::rootless::EffectiveRootlessConfig::disabled(),
+            disable_cgroup: false,
+            pull_cgroup_root: None,
         })
         .unwrap();
 
@@ -4517,6 +4713,11 @@ server = "https://docker.io"
             signature_policy: None,
             signature_policy_dir: None,
             big_files_temporary_dir: None,
+            separate_pull_cgroup: String::new(),
+            cgroup_driver: crate::config::CgroupDriverConfig::Cgroupfs,
+            rootless: crate::rootless::EffectiveRootlessConfig::disabled(),
+            disable_cgroup: false,
+            pull_cgroup_root: None,
         })
         .unwrap();
 
@@ -4610,6 +4811,11 @@ server = "https://docker.io"
             signature_policy: None,
             signature_policy_dir: None,
             big_files_temporary_dir: None,
+            separate_pull_cgroup: String::new(),
+            cgroup_driver: crate::config::CgroupDriverConfig::Cgroupfs,
+            rootless: crate::rootless::EffectiveRootlessConfig::disabled(),
+            disable_cgroup: false,
+            pull_cgroup_root: None,
         })
         .unwrap();
         service.load_local_images().await.unwrap();
@@ -4670,6 +4876,11 @@ cat
             signature_policy: None,
             signature_policy_dir: None,
             big_files_temporary_dir: None,
+            separate_pull_cgroup: String::new(),
+            cgroup_driver: crate::config::CgroupDriverConfig::Cgroupfs,
+            rootless: crate::rootless::EffectiveRootlessConfig::disabled(),
+            disable_cgroup: false,
+            pull_cgroup_root: None,
         })
         .unwrap();
 

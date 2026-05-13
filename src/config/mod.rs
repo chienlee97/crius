@@ -260,7 +260,7 @@ pub struct RuntimeConfig {
     pub disable_cgroup: bool,
     /// hugetlb controller 缺失时是否容忍并忽略 hugepage limits。
     pub tolerate_missing_hugetlb_controller: bool,
-    /// 镜像拉取使用的独立 cgroup；当前版本仅支持空值，非空表示未实现配置。
+    /// 镜像拉取使用的独立 cgroup；支持空值、`pod` 或指定 cgroup path。
     pub separate_pull_cgroup: String,
     /// 守护进程默认的 UID 映射，格式为 `container:host:size[,..]`。
     pub uid_mappings: String,
@@ -1893,11 +1893,11 @@ impl Config {
                 "runtime.minimum_mappable_gid must be -1 or greater".to_string(),
             ));
         }
-        if !self.runtime.separate_pull_cgroup.trim().is_empty() {
-            return Err(Error::Config(
-                "runtime.separate_pull_cgroup is not supported by crius yet".to_string(),
-            ));
-        }
+        crate::image::validate_pull_cgroup_config(
+            &self.runtime.separate_pull_cgroup,
+            self.runtime.effective_cgroup_driver(),
+        )
+        .map_err(Error::Config)?;
         match self.runtime.exec_cpu_affinity.trim() {
             "" | "first" => {}
             other => {
@@ -4569,16 +4569,27 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_non_empty_separate_pull_cgroup() {
+    fn validate_accepts_supported_separate_pull_cgroup_modes() {
         let mut config = Config::default();
+        config.runtime.cgroup_driver = Some(CgroupDriverConfig::Systemd);
         config.runtime.separate_pull_cgroup = "pod".to_string();
+        config.validate().unwrap();
 
+        config.runtime.separate_pull_cgroup = "kubepods.slice".to_string();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_invalid_systemd_separate_pull_cgroup() {
+        let mut config = Config::default();
+        config.runtime.cgroup_driver = Some(CgroupDriverConfig::Systemd);
+        config.runtime.separate_pull_cgroup = "kubepods/pod123".to_string();
         let err = config
             .validate()
-            .expect_err("non-empty separate pull cgroup must fail");
+            .expect_err("invalid systemd separate pull cgroup must fail");
         assert!(err
             .to_string()
-            .contains("runtime.separate_pull_cgroup is not supported by crius yet"));
+            .contains("runtime.separate_pull_cgroup with systemd"));
     }
 
     #[test]

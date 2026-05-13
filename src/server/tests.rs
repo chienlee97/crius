@@ -7901,6 +7901,9 @@ async fn status_verbose_returns_structured_config() {
     assert_eq!(config["disableCgroup"], false);
     assert_eq!(config["tolerateMissingHugetlbController"], true);
     assert_eq!(config["separatePullCgroup"], "");
+    assert_eq!(config["pullCgroup"]["effective"]["enabled"], false);
+    assert_eq!(config["pullCgroup"]["effective"]["mode"], "disabled");
+    assert!(config["pullCgroup"]["lastScope"].is_null());
     assert_eq!(config["pidsLimit"], -1);
     assert_eq!(config["infraCtrCpuset"], "1");
     assert_eq!(config["sharedCpuset"], "2-3");

@@ -846,6 +846,10 @@ impl RuntimeServiceImpl {
                 "disableCgroup": self.config.disable_cgroup,
                 "tolerateMissingHugetlbController": self.config.tolerate_missing_hugetlb_controller,
                 "separatePullCgroup": self.config.separate_pull_cgroup,
+                "pullCgroup": {
+                    "effective": self.image_service.pull_cgroup_effective_config(),
+                    "lastScope": self.image_service.last_pull_cgroup_scope(),
+                },
                 "pidsLimit": self.config.pids_limit,
                 "infraCtrCpuset": self.config.infra_ctr_cpuset.clone(),
                 "sharedCpuset": self.config.shared_cpuset.clone(),
