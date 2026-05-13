@@ -55,6 +55,9 @@ mod cross_module {
             annotations: "{}".to_string(),
             exit_code: None,
             exit_time: None,
+            runtime_handler: None,
+            runtime_backend: None,
+            snapshot_key: None,
         };
 
         let container2 = ContainerRecord {
@@ -68,6 +71,9 @@ mod cross_module {
             annotations: "{}".to_string(),
             exit_code: None,
             exit_time: None,
+            runtime_handler: None,
+            runtime_backend: None,
+            snapshot_key: None,
         };
 
         storage.save_container(&container1).unwrap();
@@ -119,6 +125,9 @@ mod cross_module {
                 annotations: "{}".to_string(),
                 exit_code: None,
                 exit_time: None,
+                runtime_handler: None,
+                runtime_backend: None,
+                snapshot_key: None,
             };
             storage.save_container(&container).unwrap();
 

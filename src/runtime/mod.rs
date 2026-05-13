@@ -25,7 +25,11 @@ use crate::proto::runtime::v1::{
 };
 use crate::storage::{RuntimeArtifactRecord, StorageManager};
 
+pub mod backend;
+pub mod runc_backend;
 pub mod shim_manager;
+pub use backend::RuntimeBackend;
+pub use runc_backend::RuncBackend;
 pub use shim_manager::{default_shim_work_dir, ShimConfig, ShimManager, ShimProcess};
 
 const INTERNAL_CHECKPOINT_RESTORE_KEY: &str = "io.crius.internal/checkpoint-restore";
@@ -3047,6 +3051,10 @@ impl RuncRuntime {
 
     pub fn set_runtime_config_path(&mut self, runtime_config_path: PathBuf) {
         self.runtime_config_path = runtime_config_path;
+    }
+
+    pub fn cgroup_driver(&self) -> CgroupDriverConfig {
+        self.cgroup_driver
     }
 
     /// 获取容器的config.json路径

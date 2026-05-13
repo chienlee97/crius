@@ -378,7 +378,7 @@ async fn main() -> Result<(), Error> {
             ),
             runtime_path: PathBuf::from(&config.runtime.runtime_path),
             max_container_log_line_size: config.logging.max_container_log_line_size,
-            state_db_path: config.root.join("crius.db").into(),
+            state_db_path: PathBuf::from(&config.root).join("crius.db"),
         },
         streaming: config.api.streaming.clone(),
     };
@@ -1098,6 +1098,7 @@ mod tests {
             runtime_configs: std::collections::HashMap::from([(
                 "runc".to_string(),
                 crius::config::ResolvedRuntimeHandlerConfig {
+                    backend: "runc".to_string(),
                     runtime_path: "/definitely/missing/runc".to_string(),
                     runtime_config_path: String::new(),
                     runtime_root: "/tmp/crius-main-test-runtime-root".to_string(),

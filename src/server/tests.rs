@@ -26,6 +26,7 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
             (
                 "runc".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
+                    backend: "runc".to_string(),
                     runtime_path: "/definitely/missing/runc".to_string(),
                     runtime_config_path: String::new(),
                     runtime_root: "/tmp/crius-test-runtime-root".to_string(),
@@ -45,6 +46,7 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
             (
                 "kata".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
+                    backend: "runc".to_string(),
                     runtime_path: "/definitely/missing/kata-runtime".to_string(),
                     runtime_config_path: String::new(),
                     runtime_root: "/tmp/crius-test-kata-runtime-root".to_string(),
@@ -984,6 +986,7 @@ where
         runtime_configs: HashMap::from([(
             "runc".to_string(),
             crate::config::ResolvedRuntimeHandlerConfig {
+                backend: "runc".to_string(),
                 runtime_path: runtime_path.display().to_string(),
                 runtime_config_path: String::new(),
                 runtime_root: dir.path().join("runtime-root").display().to_string(),
@@ -1214,6 +1217,7 @@ fn test_service_with_fake_runtime_and_nri_and_shim(
         runtime_configs: HashMap::from([(
             "runc".to_string(),
             crate::config::ResolvedRuntimeHandlerConfig {
+                backend: "runc".to_string(),
                 runtime_path: runtime_path.display().to_string(),
                 runtime_config_path: String::new(),
                 runtime_root: dir.path().join("runtime-root").display().to_string(),
@@ -5673,6 +5677,7 @@ async fn exec_sync_uses_runtime_binary_for_non_default_handler() {
         (
             "runc".to_string(),
             crate::config::ResolvedRuntimeHandlerConfig {
+                backend: "runc".to_string(),
                 runtime_path: runc_runtime_path.display().to_string(),
                 runtime_config_path: String::new(),
                 runtime_root: config.runtime_root.display().to_string(),
@@ -5692,6 +5697,7 @@ async fn exec_sync_uses_runtime_binary_for_non_default_handler() {
         (
             "kata".to_string(),
             crate::config::ResolvedRuntimeHandlerConfig {
+                backend: "runc".to_string(),
                 runtime_path: kata_runtime_path.display().to_string(),
                 runtime_config_path: String::new(),
                 runtime_root: dir.path().join("runtime-root-kata").display().to_string(),
@@ -5808,6 +5814,7 @@ esac
     config.runtime_configs.insert(
         "runc".to_string(),
         crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "runc".to_string(),
             runtime_path: runtime_path.display().to_string(),
             runtime_config_path: String::new(),
             runtime_root: config.runtime_root.display().to_string(),
@@ -5916,6 +5923,7 @@ esac
     config.runtime_configs.insert(
         "runc".to_string(),
         crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "runc".to_string(),
             runtime_path: runtime_path.display().to_string(),
             runtime_config_path: String::new(),
             runtime_root: config.runtime_root.display().to_string(),
@@ -6220,6 +6228,7 @@ sleep 1
             runtime_configs: HashMap::from([(
                 "runc".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
+                    backend: "runc".to_string(),
                     runtime_path: runtime_path.display().to_string(),
                     runtime_config_path: String::new(),
                     runtime_root: dir.path().join("runtime-root").display().to_string(),
@@ -6504,6 +6513,7 @@ sleep 1
             runtime_configs: HashMap::from([(
                 "runc".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
+                    backend: "runc".to_string(),
                     runtime_path: runtime_path.display().to_string(),
                     runtime_config_path: String::new(),
                     runtime_root: dir.path().join("runtime-root").display().to_string(),
@@ -6796,6 +6806,7 @@ sleep 1
             runtime_configs: HashMap::from([(
                 "runc".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
+                    backend: "runc".to_string(),
                     runtime_path: runtime_path.display().to_string(),
                     runtime_config_path: String::new(),
                     runtime_root: dir.path().join("runtime-root").display().to_string(),
@@ -7775,16 +7786,201 @@ fn runtime_registry_returns_handler_specific_create_timeout() {
         "runc".to_string(),
         HashMap::from([(
             "runc".to_string(),
-            RuncRuntime::new(
+            Arc::new(crate::runtime::RuncBackend::new(RuncRuntime::new(
                 PathBuf::from("/definitely/missing/runc"),
                 PathBuf::from("/tmp/crius-test-runtime-root"),
-            ),
+            ))) as Arc<dyn crate::runtime::RuntimeBackend>,
         )]),
         HashMap::from([("runc".to_string(), 240), ("kata".to_string(), 600)]),
     );
 
     assert_eq!(runtime.container_create_timeout_for_handler(""), 240);
     assert_eq!(runtime.container_create_timeout_for_handler("kata"), 600);
+}
+
+#[derive(Debug)]
+struct FakeBackend {
+    name: &'static str,
+    runtime_root: PathBuf,
+}
+
+impl crate::runtime::RuntimeBackend for FakeBackend {
+    fn backend_name(&self) -> &str {
+        self.name
+    }
+
+    fn runtime_root(&self) -> &Path {
+        &self.runtime_root
+    }
+
+    fn runtime_path(&self) -> &Path {
+        Path::new("/fake/runtime")
+    }
+
+    fn runtime_config_path(&self) -> &Path {
+        Path::new("/fake/runtime.conf")
+    }
+
+    fn bundle_path_for(&self, container_id: &str) -> PathBuf {
+        self.runtime_root.join(container_id)
+    }
+
+    fn create_container(
+        &self,
+        _container_id: &str,
+        _config: &crate::runtime::ContainerConfig,
+    ) -> anyhow::Result<String> {
+        Ok("fake-created".to_string())
+    }
+
+    fn start_container(&self, _container_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn stop_container(&self, _container_id: &str, _timeout: Option<u32>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn remove_container(&self, _container_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn container_status(
+        &self,
+        _container_id: &str,
+    ) -> anyhow::Result<crate::runtime::ContainerStatus> {
+        Ok(crate::runtime::ContainerStatus::Created)
+    }
+
+    fn reopen_container_log(&self, _container_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn exec_in_container(
+        &self,
+        _container_id: &str,
+        _command: &[String],
+        _tty: bool,
+    ) -> anyhow::Result<i32> {
+        Ok(0)
+    }
+
+    fn update_container_resources(
+        &self,
+        _container_id: &str,
+        _resources: &crate::proto::runtime::v1::LinuxContainerResources,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn is_container_paused(&self, _container_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    fn restore_attach_shim(&self, _container_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn restore_container_from_checkpoint(
+        &self,
+        _container_id: &str,
+        _checkpoint_path: &Path,
+        _work_path: &Path,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn enforce_oom_score_adj_policy(
+        &self,
+        _spec: &mut crate::oci::spec::Spec,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn prepare_rootfs(
+        &self,
+        _container_id: &str,
+        _config: &crate::runtime::ContainerConfig,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn build_spec(
+        &self,
+        _container_id: &str,
+        _config: &crate::runtime::ContainerConfig,
+    ) -> anyhow::Result<crate::oci::spec::Spec> {
+        Ok(crate::oci::spec::Spec::new("1.0.2"))
+    }
+
+    fn write_bundle(
+        &self,
+        _container_id: &str,
+        _rootfs: &Path,
+        _spec: &crate::oci::spec::Spec,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn load_spec(&self, _container_id: &str) -> anyhow::Result<crate::oci::spec::Spec> {
+        Ok(crate::oci::spec::Spec::new("1.0.2"))
+    }
+
+    fn validate_mount_requests(
+        &self,
+        _config: &crate::runtime::ContainerConfig,
+    ) -> std::result::Result<(), crate::runtime::MountSemanticsError> {
+        Ok(())
+    }
+
+    fn pause_container(&self, _container_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn checkpoint_container(
+        &self,
+        _container_id: &str,
+        _location: &Path,
+        _work_path: &Path,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn resume_container(&self, _container_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn container_pid(&self, _container_id: &str) -> anyhow::Result<Option<i32>> {
+        Ok(None)
+    }
+
+    fn probe_runtime_features(&self) -> crate::runtime::RuntimeFeatureProbe {
+        crate::runtime::RuntimeFeatureProbe::default()
+    }
+
+    fn cgroup_driver(&self) -> crate::config::CgroupDriverConfig {
+        crate::config::CgroupDriverConfig::Cgroupfs
+    }
+}
+
+#[test]
+fn runtime_registry_can_store_trait_object_backends() {
+    let runtime = RuntimeRegistry::new(
+        "fake".to_string(),
+        HashMap::from([(
+            "fake".to_string(),
+            Arc::new(FakeBackend {
+                name: "fake",
+                runtime_root: PathBuf::from("/tmp/fake-runtime-root"),
+            }) as Arc<dyn crate::runtime::RuntimeBackend>,
+        )]),
+        HashMap::from([("fake".to_string(), 33)]),
+    );
+
+    let backend = runtime.runtime_for_handler("fake").unwrap();
+    assert_eq!(backend.backend_name(), "fake");
+    assert_eq!(backend.runtime_root(), Path::new("/tmp/fake-runtime-root"));
+    assert_eq!(runtime.container_create_timeout_for_handler("fake"), 33);
 }
 
 #[tokio::test]
@@ -7849,6 +8045,7 @@ exit 0
     config.runtime_configs.insert(
         "runc".to_string(),
         crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "runc".to_string(),
             runtime_path: runtime_path.display().to_string(),
             runtime_config_path: String::new(),
             runtime_root: config.runtime_root.display().to_string(),
@@ -7903,6 +8100,7 @@ exit 0
     config.runtime_configs.insert(
         "runc".to_string(),
         crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "runc".to_string(),
             runtime_path: runtime_path.display().to_string(),
             runtime_config_path: String::new(),
             runtime_root: config.runtime_root.display().to_string(),
@@ -7961,6 +8159,7 @@ async fn status_reports_runtime_not_ready_when_binary_is_not_executable() {
     config.runtime_configs.insert(
         "runc".to_string(),
         crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "runc".to_string(),
             runtime_path: runtime_path.display().to_string(),
             runtime_config_path: String::new(),
             runtime_root: config.runtime_root.display().to_string(),
@@ -9554,7 +9753,10 @@ async fn start_container_fails_when_runtime_keeps_container_in_created_state() {
         "runc".to_string(),
         HashMap::from([(
             "runc".to_string(),
-            RuncRuntime::new(runtime_path.clone(), dir.path().join("runtime-root")),
+            Arc::new(crate::runtime::RuncBackend::new(RuncRuntime::new(
+                runtime_path.clone(),
+                dir.path().join("runtime-root"),
+            ))) as Arc<dyn crate::runtime::RuntimeBackend>,
         )]),
         HashMap::from([("runc".to_string(), 240)]),
     );
@@ -9645,7 +9847,10 @@ async fn start_container_fails_when_runtime_exits_immediately_and_persists_exit_
         "runc".to_string(),
         HashMap::from([(
             "runc".to_string(),
-            RuncRuntime::new(runtime_path.clone(), dir.path().join("runtime-root")),
+            Arc::new(crate::runtime::RuncBackend::new(RuncRuntime::new(
+                runtime_path.clone(),
+                dir.path().join("runtime-root"),
+            ))) as Arc<dyn crate::runtime::RuntimeBackend>,
         )]),
         HashMap::from([("runc".to_string(), 240)]),
     );

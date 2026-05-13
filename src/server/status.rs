@@ -1087,6 +1087,7 @@ impl RuntimeServiceImpl {
                         (
                             handler.clone(),
                             json!({
+                                "backend": config.backend,
                                 "runtimePath": config.runtime_path,
                                 "runtimeConfigPath": config.runtime_config_path,
                                 "runtimeRoot": config.runtime_root,

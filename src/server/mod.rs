@@ -2860,7 +2860,7 @@ impl RuntimeServiceImpl {
     async fn runtime_for_container_request(
         &self,
         container_id: &str,
-    ) -> Result<RuncRuntime, Status> {
+    ) -> Result<Arc<dyn crate::runtime::RuntimeBackend>, Status> {
         let annotations = {
             let containers = self.containers.lock().await;
             containers

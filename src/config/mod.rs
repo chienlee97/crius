@@ -335,6 +335,8 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct RuntimeHandlerConfig {
+    /// 该 handler 绑定的 runtime backend 类型。
+    pub backend: String,
     /// 该 handler 对应的 OCI runtime 二进制路径。
     pub runtime_path: String,
     /// 该 handler 对应的 runtime 特定配置文件路径；为空时继承默认值。
@@ -428,6 +430,7 @@ impl RuntimeWorkloadResources {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRuntimeHandlerConfig {
+    pub backend: String,
     pub runtime_path: String,
     pub runtime_config_path: String,
     pub runtime_root: String,
@@ -447,6 +450,7 @@ pub struct ResolvedRuntimeHandlerConfig {
 impl Default for ResolvedRuntimeHandlerConfig {
     fn default() -> Self {
         Self {
+            backend: "runc".to_string(),
             runtime_path: String::new(),
             runtime_config_path: String::new(),
             runtime_root: String::new(),
@@ -929,6 +933,7 @@ impl RuntimeConfig {
     pub fn resolved_runtimes(&self) -> Result<HashMap<String, ResolvedRuntimeHandlerConfig>> {
         let default_handler = self.runtime_type.trim();
         let default_runtime = ResolvedRuntimeHandlerConfig {
+            backend: "runc".to_string(),
             runtime_path: resolve_platform_runtime_path(
                 self.runtime_path.trim(),
                 &self.platform_runtime_paths,
@@ -973,6 +978,9 @@ impl RuntimeConfig {
                 let mut inherited = default_runtime.clone();
                 if !config.runtime_config_path.trim().is_empty() {
                     inherited.runtime_config_path = config.runtime_config_path.trim().to_string();
+                }
+                if !config.backend.trim().is_empty() {
+                    inherited.backend = config.backend.trim().to_string();
                 }
                 if !config.platform_runtime_paths.is_empty() {
                     inherited.platform_runtime_paths = config.platform_runtime_paths.clone();
@@ -1019,6 +1027,11 @@ impl RuntimeConfig {
             resolved.insert(
                 handler,
                 ResolvedRuntimeHandlerConfig {
+                    backend: if config.backend.trim().is_empty() {
+                        default_runtime.backend.clone()
+                    } else {
+                        config.backend.trim().to_string()
+                    },
                     runtime_path: resolve_platform_runtime_path(
                         config.runtime_path.trim(),
                         &config.platform_runtime_paths,
@@ -2093,6 +2106,10 @@ impl Config {
                     monitor_env,
                 )?;
             }
+            validate_runtime_backend(
+                &format!("runtime.runtimes.{handler}.backend"),
+                &handler_config.backend,
+            )?;
             validate_runtime_snapshotter(
                 &format!("runtime.runtimes.{handler}.snapshotter"),
                 &handler_config.snapshotter,
@@ -2439,6 +2456,16 @@ fn validate_runtime_snapshotter(name: &str, value: &str) -> Result<()> {
     }
     Err(Error::Config(format!(
         "{name} must be empty, \"internal-overlay-untar\", or \"internal-cached-rootfs\", got {trimmed}"
+    )))
+}
+
+fn validate_runtime_backend(name: &str, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "runc" {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "{name} must be empty or \"runc\", got {trimmed}"
     )))
 }
 
@@ -2940,6 +2967,7 @@ mod tests {
                 (
                     "kata".to_string(),
                     RuntimeHandlerConfig {
+                        backend: "runc".to_string(),
                         runtime_path: "/usr/bin/kata-runtime".to_string(),
                         runtime_root: "/run/crius/kata".to_string(),
                         runtime_config_path: String::new(),
@@ -2979,6 +3007,7 @@ mod tests {
         assert_eq!(
             resolved.get("runc"),
             Some(&ResolvedRuntimeHandlerConfig {
+                backend: "runc".to_string(),
                 runtime_path: "/usr/bin/runc".to_string(),
                 runtime_config_path: String::new(),
                 runtime_root: "/run/crius".to_string(),
@@ -2998,6 +3027,7 @@ mod tests {
         assert_eq!(
             resolved.get("kata"),
             Some(&ResolvedRuntimeHandlerConfig {
+                backend: "runc".to_string(),
                 runtime_path: "/usr/bin/kata-runtime".to_string(),
                 runtime_config_path: String::new(),
                 runtime_root: "/run/crius/kata".to_string(),
@@ -3020,6 +3050,7 @@ mod tests {
         assert_eq!(
             resolved.get("crun"),
             Some(&ResolvedRuntimeHandlerConfig {
+                backend: "runc".to_string(),
                 runtime_path: "/usr/bin/runc".to_string(),
                 runtime_config_path: String::new(),
                 runtime_root: "/run/crius".to_string(),

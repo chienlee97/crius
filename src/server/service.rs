@@ -278,7 +278,7 @@ pub struct RuntimeConfig {
 #[derive(Clone)]
 pub struct RuntimeRegistry {
     default_handler: String,
-    runtimes: Arc<HashMap<String, RuncRuntime>>,
+    runtimes: Arc<HashMap<String, Arc<dyn crate::runtime::RuntimeBackend>>>,
     container_create_timeouts: Arc<HashMap<String, u32>>,
     container_handlers: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
@@ -286,7 +286,7 @@ pub struct RuntimeRegistry {
 impl RuntimeRegistry {
     pub(super) fn new(
         default_handler: String,
-        runtimes: HashMap<String, RuncRuntime>,
+        runtimes: HashMap<String, Arc<dyn crate::runtime::RuntimeBackend>>,
         container_create_timeouts: HashMap<String, u32>,
     ) -> Self {
         Self {
@@ -334,7 +334,10 @@ impl RuntimeRegistry {
         }
     }
 
-    pub(super) fn runtime_for_handler(&self, handler: &str) -> anyhow::Result<RuncRuntime> {
+    pub(super) fn runtime_for_handler(
+        &self,
+        handler: &str,
+    ) -> anyhow::Result<Arc<dyn crate::runtime::RuntimeBackend>> {
         let resolved = if handler.trim().is_empty() {
             self.default_handler.as_str()
         } else {
@@ -361,7 +364,7 @@ impl RuntimeRegistry {
     pub(super) fn runtime_for_annotations_map(
         &self,
         annotations: &HashMap<String, String>,
-    ) -> anyhow::Result<RuncRuntime> {
+    ) -> anyhow::Result<Arc<dyn crate::runtime::RuntimeBackend>> {
         let handler = annotations
             .get(CRIO_RUNTIME_HANDLER_ANNOTATION)
             .or_else(|| annotations.get(CONTAINERD_RUNTIME_HANDLER_ANNOTATION))
@@ -371,7 +374,10 @@ impl RuntimeRegistry {
         self.runtime_for_handler(handler)
     }
 
-    pub(super) fn runtime_for_container(&self, container_id: &str) -> anyhow::Result<RuncRuntime> {
+    pub(super) fn runtime_for_container(
+        &self,
+        container_id: &str,
+    ) -> anyhow::Result<Arc<dyn crate::runtime::RuntimeBackend>> {
         if let Ok(handlers) = self.container_handlers.lock() {
             if let Some(handler) = handlers.get(container_id) {
                 return self.runtime_for_handler(handler);
@@ -414,7 +420,7 @@ impl RuntimeRegistry {
             .bundle_path_for(container_id))
     }
 
-    pub(super) fn all_runtimes(&self) -> Vec<RuncRuntime> {
+    pub(super) fn all_runtimes(&self) -> Vec<Arc<dyn crate::runtime::RuntimeBackend>> {
         self.runtimes.values().cloned().collect()
     }
 
@@ -1335,6 +1341,7 @@ impl RuntimeServiceImpl {
         runtime_configs.insert(
             config.runtime.clone(),
             crate::config::ResolvedRuntimeHandlerConfig {
+                backend: "runc".to_string(),
                 runtime_path: config.runtime_path.display().to_string(),
                 runtime_config_path: config.runtime_config_path.display().to_string(),
                 runtime_root: config.runtime_root.display().to_string(),
@@ -1364,7 +1371,7 @@ impl RuntimeServiceImpl {
         let clean_shutdown_file = config.clean_shutdown_file.clone();
         let version_file = config.version_file.clone();
         let version_file_persist = config.version_file_persist.clone();
-        let runtimes = config
+        let runtimes: HashMap<String, Arc<dyn crate::runtime::RuntimeBackend>> = config
             .runtime_configs
             .iter()
             .map(|(handler, runtime_config)| {
@@ -1439,7 +1446,8 @@ impl RuntimeServiceImpl {
                         Some(CgroupDriver::Systemd) => crate::config::CgroupDriverConfig::Systemd,
                         _ => crate::config::CgroupDriverConfig::Cgroupfs,
                     });
-                    runtime
+                    Arc::new(crate::runtime::RuncBackend::new(runtime))
+                        as Arc<dyn crate::runtime::RuntimeBackend>
                 })
             })
             .collect();
