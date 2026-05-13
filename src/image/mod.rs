@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -68,25 +68,17 @@ pub struct ImageServiceImpl {
     storage_driver: String,
     content_store: Arc<FsContentStore>,
     metadata_store: Arc<FilesystemImageMetadataStore>,
-    global_auth_file: Option<PathBuf>,
-    namespaced_auth_dir: Option<PathBuf>,
     default_transport: String,
     short_name_mode: String,
     pull_progress_timeout: std::time::Duration,
     max_concurrent_downloads: usize,
     pull_retry_count: u32,
-    registry_config_dir: Option<PathBuf>,
-    decryption_keys_path: Option<PathBuf>,
-    decryption_decoder_path: String,
-    decryption_keyprovider_config: Option<PathBuf>,
     additional_artifact_stores: Vec<PathBuf>,
-    pinned_image_patterns: Vec<String>,
-    signature_policy: Option<PathBuf>,
-    signature_policy_dir: Option<PathBuf>,
     _big_files_temporary_dir: Option<PathBuf>,
     in_progress_pulls: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     #[cfg(test)]
     test_pull_handler: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<TestPullHandler>>>>,
+    reloadable_config: Arc<RwLock<ReloadableImageConfig>>,
 }
 
 #[derive(Clone)]
@@ -118,6 +110,19 @@ pub struct ImageServiceOptions {
     pub signature_policy: Option<PathBuf>,
     pub signature_policy_dir: Option<PathBuf>,
     pub big_files_temporary_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReloadableImageConfig {
+    pub global_auth_file: Option<PathBuf>,
+    pub namespaced_auth_dir: Option<PathBuf>,
+    pub registry_config_dir: Option<PathBuf>,
+    pub decryption_keys_path: Option<PathBuf>,
+    pub decryption_decoder_path: String,
+    pub decryption_keyprovider_config: Option<PathBuf>,
+    pub pinned_image_patterns: Vec<String>,
+    pub signature_policy: Option<PathBuf>,
+    pub signature_policy_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -311,6 +316,24 @@ const TEST_EMPTY_LAYER_TAR_GZ: &[u8] = &[
 ];
 
 impl ImageServiceImpl {
+    fn current_reloadable_config(&self) -> ReloadableImageConfig {
+        self.reloadable_config
+            .read()
+            .expect("image reloadable config lock poisoned")
+            .clone()
+    }
+
+    pub fn apply_reloadable_config(&self, next: ReloadableImageConfig) {
+        *self
+            .reloadable_config
+            .write()
+            .expect("image reloadable config lock poisoned") = next;
+    }
+
+    pub fn reloadable_config_snapshot(&self) -> ReloadableImageConfig {
+        self.current_reloadable_config()
+    }
+
     fn should_retry_pull_status(status: &Status) -> bool {
         matches!(
             status.code(),
@@ -404,7 +427,8 @@ impl ImageServiceImpl {
         if let Some(source_reference) = meta.source_reference.as_deref() {
             refs.push(source_reference);
         }
-        Self::image_is_pinned_by_patterns(&self.pinned_image_patterns, refs)
+        let reloadable = self.current_reloadable_config();
+        Self::image_is_pinned_by_patterns(&reloadable.pinned_image_patterns, refs)
     }
 
     fn canonicalize_image_reference(reference: &str) -> String {
@@ -776,7 +800,8 @@ impl ImageServiceImpl {
         &self,
         reference: &Reference,
     ) -> Result<Option<RegistryAuth>, Status> {
-        let Some(path) = self.global_auth_file.as_ref() else {
+        let reloadable = self.current_reloadable_config();
+        let Some(path) = reloadable.global_auth_file.as_ref() else {
             return Ok(None);
         };
 
@@ -792,7 +817,8 @@ impl ImageServiceImpl {
     }
 
     fn namespaced_auth_file_path(&self, namespace: &str, reference: &Reference) -> Option<PathBuf> {
-        let root = self.namespaced_auth_dir.as_ref()?;
+        let reloadable = self.current_reloadable_config();
+        let root = reloadable.namespaced_auth_dir.as_ref()?;
         let namespace = namespace.trim();
         if namespace.is_empty() {
             return None;
@@ -821,7 +847,8 @@ impl ImageServiceImpl {
     }
 
     fn registry_hosts_toml_path(&self, registry: &str) -> Option<PathBuf> {
-        let config_dir = self.registry_config_dir.as_ref()?;
+        let reloadable = self.current_reloadable_config();
+        let config_dir = reloadable.registry_config_dir.as_ref()?;
         for alias in Self::registry_auth_aliases(registry) {
             let exact = config_dir.join(&alias).join("hosts.toml");
             if exact.exists() {
@@ -1262,13 +1289,15 @@ impl ImageServiceImpl {
         let namespace = namespace
             .map(str::trim)
             .filter(|namespace| !namespace.is_empty());
-        if let (Some(dir), Some(namespace)) = (self.signature_policy_dir.as_ref(), namespace) {
+        let reloadable = self.current_reloadable_config();
+        if let (Some(dir), Some(namespace)) = (reloadable.signature_policy_dir.as_ref(), namespace)
+        {
             let candidate = dir.join(format!("{namespace}.json"));
             if candidate.exists() {
                 return Some(candidate);
             }
         }
-        self.signature_policy.clone()
+        reloadable.signature_policy
     }
 
     fn enforce_signature_policy(
@@ -1319,6 +1348,7 @@ impl ImageServiceImpl {
 
     fn image_decryption_enabled(&self) -> bool {
         !self
+            .current_reloadable_config()
             .decryption_keys_path
             .as_ref()
             .map(|path| path.as_os_str().is_empty())
@@ -1331,14 +1361,15 @@ impl ImageServiceImpl {
         encrypted_bytes: &[u8],
     ) -> Result<(Vec<u8>, String), Status> {
         let (decrypted_media_type, _) = Self::decrypted_media_type_for(source_media_type)?;
-        let keys_path = self.decryption_keys_path.as_ref().ok_or_else(|| {
+        let reloadable = self.current_reloadable_config();
+        let keys_path = reloadable.decryption_keys_path.as_ref().ok_or_else(|| {
             Status::failed_precondition(
                 "encrypted image layer requires image.decryption_keys_path to be configured",
             )
         })?;
-        let mut command = std::process::Command::new(self.decryption_decoder_path.trim());
+        let mut command = std::process::Command::new(reloadable.decryption_decoder_path.trim());
         command.arg("--decryption-keys-path").arg(keys_path);
-        if let Some(config) = self.decryption_keyprovider_config.as_ref() {
+        if let Some(config) = reloadable.decryption_keyprovider_config.as_ref() {
             command.env("OCICRYPT_KEYPROVIDER_CONFIG", config.as_os_str());
         }
         command.stdin(std::process::Stdio::piped());
@@ -1347,7 +1378,7 @@ impl ImageServiceImpl {
         let mut child = command.spawn().map_err(|err| {
             Status::failed_precondition(format!(
                 "failed to start image decryption decoder {}: {}",
-                self.decryption_decoder_path, err
+                reloadable.decryption_decoder_path, err
             ))
         })?;
         if let Some(stdin) = child.stdin.as_mut() {
@@ -1473,6 +1504,17 @@ impl ImageServiceImpl {
             signature_policy_dir,
             big_files_temporary_dir,
         } = options;
+        let reloadable_config = ReloadableImageConfig {
+            global_auth_file,
+            namespaced_auth_dir,
+            registry_config_dir,
+            decryption_keys_path,
+            decryption_decoder_path,
+            decryption_keyprovider_config,
+            pinned_image_patterns,
+            signature_policy,
+            signature_policy_dir,
+        };
         let storage_driver = storage_driver.trim().to_string();
 
         if storage_driver != "overlay" {
@@ -1500,25 +1542,17 @@ impl ImageServiceImpl {
             storage_driver,
             content_store,
             metadata_store,
-            global_auth_file,
-            namespaced_auth_dir,
             default_transport,
             short_name_mode,
             pull_progress_timeout,
             max_concurrent_downloads,
             pull_retry_count,
-            registry_config_dir,
-            decryption_keys_path,
-            decryption_decoder_path,
-            decryption_keyprovider_config,
             additional_artifact_stores,
-            pinned_image_patterns,
-            signature_policy,
-            signature_policy_dir,
             _big_files_temporary_dir: big_files_temporary_dir,
             in_progress_pulls: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_pull_handler: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            reloadable_config: Arc::new(RwLock::new(reloadable_config)),
         })
     }
 
@@ -1676,6 +1710,7 @@ impl ImageServiceImpl {
             .collect::<Result<Vec<_>, _>>()?;
         let mut pulled_metadata = pulled_metadata;
         pulled_metadata.stored_layers = persisted_layers;
+        let reloadable = self.current_reloadable_config();
 
         self.save_image_metadata(&CriusImage {
             id: image_id.clone(),
@@ -1683,7 +1718,7 @@ impl ImageServiceImpl {
             repo_digests: repo_digests.clone(),
             size: image_size,
             pinned: Self::image_is_pinned_by_patterns(
-                &self.pinned_image_patterns,
+                &reloadable.pinned_image_patterns,
                 [canonical_ref.as_str(), requested_ref.as_str()],
             ),
             pulled_at: Self::now_nanos(),
@@ -1716,7 +1751,7 @@ impl ImageServiceImpl {
             repo_digests,
             size: image_size,
             pinned: Self::image_is_pinned_by_patterns(
-                &self.pinned_image_patterns,
+                &reloadable.pinned_image_patterns,
                 [canonical_ref.as_str(), requested_ref.as_str()],
             ),
             spec: Some(ImageSpec {
@@ -1802,6 +1837,7 @@ impl ImageServiceImpl {
         let Some(existing) = self.load_image_metadata(&image.id) else {
             return Ok(());
         };
+        let reloadable = self.current_reloadable_config();
 
         let mut repo_tags = existing.repo_tags.clone();
         Self::push_unique(&mut repo_tags, canonical_ref);
@@ -1817,7 +1853,7 @@ impl ImageServiceImpl {
             repo_digests: image.repo_digests.clone(),
             size: image.size,
             pinned: Self::image_is_pinned_by_patterns(
-                &self.pinned_image_patterns,
+                &reloadable.pinned_image_patterns,
                 image
                     .repo_tags
                     .iter()
@@ -1851,8 +1887,9 @@ impl ImageServiceImpl {
 
     async fn persist_image_from_proto(&self, image: &Image) -> Result<(), Error> {
         let existing = self.load_image_metadata(&image.id).unwrap_or_default();
+        let reloadable = self.current_reloadable_config();
         let pinned = Self::image_is_pinned_by_patterns(
-            &self.pinned_image_patterns,
+            &reloadable.pinned_image_patterns,
             image
                 .repo_tags
                 .iter()

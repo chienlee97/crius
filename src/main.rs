@@ -391,6 +391,7 @@ async fn main() -> Result<(), Error> {
             state_db_path: PathBuf::from(&config.root).join("crius.db"),
         },
         streaming: config.api.streaming.clone(),
+        config_path: Some(args.config.clone()),
     };
     let listen = config.api.listen.clone();
 
@@ -1257,6 +1258,7 @@ mod tests {
             restrict_oom_score_adj: false,
             enable_unprivileged_ports: false,
             enable_unprivileged_icmp: false,
+            rootless: crius::rootless::EffectiveRootlessConfig::disabled(),
             shim: ShimConfig {
                 shim_path: PathBuf::from("/definitely/missing/crius-shim"),
                 runtime_config_path: PathBuf::new(),
@@ -1278,6 +1280,7 @@ mod tests {
                 state_db_path: PathBuf::from("/tmp/crius-main-test.db"),
             },
             streaming: StreamingConfig::default(),
+            config_path: None,
         }
     }
 

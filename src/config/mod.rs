@@ -1329,10 +1329,7 @@ impl Config {
             "CRIUS_ROOTLESS_SLIRP4NETNS_PATH",
             &mut self.rootless.slirp4netns_path,
         );
-        apply_string_override(
-            "CRIUS_ROOTLESS_PASTA_PATH",
-            &mut self.rootless.pasta_path,
-        );
+        apply_string_override("CRIUS_ROOTLESS_PASTA_PATH", &mut self.rootless.pasta_path);
         if let Ok(value) = std::env::var("CRIUS_ROOTLESS_NETWORK_MODE") {
             self.rootless.network_mode = match value.trim().to_ascii_lowercase().as_str() {
                 "slirp4netns" => crate::rootless::NetworkMode::Slirp4netns,

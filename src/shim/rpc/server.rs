@@ -1,8 +1,8 @@
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -41,12 +41,8 @@ pub fn serve(
         })?;
     }
     cleanup_socket(socket_path);
-    let listener = UnixListener::bind(socket_path).with_context(|| {
-        format!(
-            "failed to bind shim RPC socket {}",
-            socket_path.display()
-        )
-    })?;
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("failed to bind shim RPC socket {}", socket_path.display()))?;
     listener
         .set_nonblocking(true)
         .context("failed to configure shim RPC listener as nonblocking")?;
@@ -161,7 +157,10 @@ mod tests {
         let client = ShimRpcClient::new(temp_dir.path().join("task.sock"), Duration::from_secs(1));
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if matches!(client.request(ShimRpcRequest::Ping), Ok(ShimRpcResponse::Empty)) {
+            if matches!(
+                client.request(ShimRpcRequest::Ping),
+                Ok(ShimRpcResponse::Empty)
+            ) {
                 break;
             }
             if Instant::now() >= deadline {

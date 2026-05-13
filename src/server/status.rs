@@ -478,20 +478,19 @@ impl RuntimeServiceImpl {
     }
 
     pub(super) async fn probe_cni_load_status(&self) -> crate::network::CniLoadStatus {
+        let cni_config = self.current_cni_config();
         let mut cni = match crate::network::CniManager::new(
-            self.config
-                .cni_config
+            cni_config
                 .plugin_dirs()
                 .iter()
                 .map(|dir| dir.display().to_string())
                 .collect(),
-            self.config
-                .cni_config
+            cni_config
                 .config_dirs()
                 .iter()
                 .map(|dir| dir.display().to_string())
                 .collect(),
-            self.config.cni_config.cache_dir().display().to_string(),
+            cni_config.cache_dir().display().to_string(),
         ) {
             Ok(cni) => cni,
             Err(err) => {
@@ -509,13 +508,8 @@ impl RuntimeServiceImpl {
                 };
             }
         };
-        cni.set_max_conf_num(self.config.cni_config.max_conf_num());
-        cni.set_default_network_name(
-            self.config
-                .cni_config
-                .default_network_name()
-                .map(ToOwned::to_owned),
-        );
+        cni.set_max_conf_num(cni_config.max_conf_num());
+        cni.set_default_network_name(cni_config.default_network_name().map(ToOwned::to_owned));
 
         match cni.load_network_configs().await {
             Ok(status) => status,
@@ -783,7 +777,19 @@ impl RuntimeServiceImpl {
         let req = request.into_inner();
         let (runtime_ready, runtime_reason, runtime_message) = self.runtime_readiness();
         let cni_load_status = self.probe_cni_load_status().await;
-        let (network_ready, network_reason, network_message) = cni_load_status.condition();
+        let reload_state = self.current_reload_state();
+        let reloadable_config = self.current_reloadable_config();
+        let (mut network_ready, mut network_reason, mut network_message) =
+            cni_load_status.condition();
+        if let Some(error) = reload_state.last_reload_error.clone() {
+            network_ready = false;
+            network_reason = "ConfigReloadFailed".to_string();
+            network_message = error;
+        } else if let Some(error) = reload_state.last_cni_watch_error.clone() {
+            network_ready = false;
+            network_reason = "NetworkConfigReloadFailed".to_string();
+            network_message = error;
+        }
         let info = if req.verbose {
             let runtime_network_config = self.runtime_network_config.lock().await.clone();
             let payload = json!({
@@ -1200,20 +1206,69 @@ impl RuntimeServiceImpl {
                     "blockioConfigPath": self.nri_config.blockio_config_path,
                 },
                 "reload": {
-                    "strategy": "restart-only",
+                    "strategy": "config-file-watch-and-cni-watch",
                     "signalReload": false,
-                    "configFileWatch": false,
+                    "configFileWatch": reload_state.config_file_watch,
+                    "configFilePath": self.config.config_path.as_ref().map(|path| {
+                        path.display().to_string()
+                    }),
+                    "watcherActive": reload_state.watcher_active,
+                    "cniWatchDirs": reload_state.cni_watch_dirs.clone(),
+                    "reloadableFields": [
+                        "runtime.pause_image",
+                        "image.pinned_images",
+                        "image.registry_config_dir",
+                        "image.global_auth_file",
+                        "image.namespaced_auth_dir",
+                        "image.signature_policy",
+                        "image.signature_policy_dir",
+                        "image.decryption_keys_path",
+                        "image.decryption_decoder_path",
+                        "image.decryption_keyprovider_config",
+                        "security.seccomp_profile",
+                        "security.apparmor_default_profile",
+                        "network.config_dirs",
+                        "network.conf_template",
+                        "network.max_conf_num",
+                        "network.default_network_name",
+                    ],
+                    "current": {
+                        "pauseImage": reloadable_config.pause_image.clone(),
+                        "pinnedImages": reloadable_config.pinned_images.clone(),
+                        "registryConfigDir": reloadable_config.registry_config_dir.display().to_string(),
+                        "globalAuthFile": reloadable_config.global_auth_file.display().to_string(),
+                        "namespacedAuthDir": reloadable_config.namespaced_auth_dir.display().to_string(),
+                        "signaturePolicy": reloadable_config.signature_policy.display().to_string(),
+                        "signaturePolicyDir": reloadable_config.signature_policy_dir.display().to_string(),
+                        "decryptionKeysPath": reloadable_config.decryption_keys_path.display().to_string(),
+                        "decryptionDecoderPath": reloadable_config.decryption_decoder_path.clone(),
+                        "decryptionKeyproviderConfig": reloadable_config
+                            .decryption_keyprovider_config
+                            .display()
+                            .to_string(),
+                        "seccompProfile": reloadable_config.seccomp_profile.display().to_string(),
+                        "apparmorDefaultProfile": reloadable_config.apparmor_default_profile.clone(),
+                        "cniConfigDirs": reloadable_config
+                            .cni_config_dirs
+                            .iter()
+                            .map(|dir| dir.display().to_string())
+                            .collect::<Vec<_>>(),
+                        "cniConfTemplate": reloadable_config
+                            .cni_conf_template
+                            .as_ref()
+                            .map(|path| path.display().to_string()),
+                        "cniMaxConfNum": reloadable_config.cni_max_conf_num,
+                        "cniDefaultNetworkName": reloadable_config.cni_default_network_name.clone(),
+                    },
+                    "lastReloadAtUnixMillis": reload_state.last_reload_at_unix_millis,
+                    "lastReloadSource": reload_state.last_reload_source.clone(),
+                    "lastReloadFields": reload_state.last_reload_fields.clone(),
+                    "lastReloadError": reload_state.last_reload_error.clone(),
+                    "lastCniWatchAtUnixMillis": reload_state.last_cni_watch_at_unix_millis,
+                    "lastCniWatchError": reload_state.last_cni_watch_error.clone(),
                     "runtimeConfigApiOnly": [
                         "UpdateRuntimeConfig.network_config.pod_cidr"
                     ],
-                    "restartRequiredFor": {
-                        "api": true,
-                        "runtime": true,
-                        "image": true,
-                        "network": true,
-                        "logging": true,
-                        "nri": true,
-                    },
                 },
                 "runtimeNetworkConfig": runtime_network_config.as_ref().map(|cfg| {
                     json!({

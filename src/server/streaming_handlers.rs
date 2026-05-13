@@ -140,7 +140,9 @@ impl RuntimeServiceImpl {
             })
             .await
             .map_err(|err| Status::internal(format!("Failed to join shim exec task: {}", err)))?
-            .map_err(|err| Status::internal(format!("Shim exec session request failed: {}", err)))?;
+            .map_err(|err| {
+                Status::internal(format!("Shim exec session request failed: {}", err))
+            })?;
             match response {
                 crate::shim_rpc::ShimRpcResponse::OpenExecSession(response) => {
                     (Some(response.io_socket_path), response.resize_socket_path)
@@ -192,16 +194,15 @@ impl RuntimeServiceImpl {
         let exec_cpu_affinity = self.effective_exec_cpu_affinity(&container_id).await;
         let task_socket_path = self.task_socket_path(&container_id);
         if task_socket_path.exists() {
-            let request = crate::shim_rpc::ShimRpcRequest::ExecProcess(
-                crate::shim_rpc::ExecProcessRequest {
+            let request =
+                crate::shim_rpc::ShimRpcRequest::ExecProcess(crate::shim_rpc::ExecProcessRequest {
                     container_id: container_id.clone(),
                     command: cmd.clone(),
                     tty: false,
                     capture_output: true,
                     timeout_ms: (timeout > 0).then_some(timeout as u64 * 1000),
                     exec_cpu_affinity,
-                },
-            );
+                });
             let task_socket_path_clone = task_socket_path.clone();
             let response = tokio::task::spawn_blocking(move || {
                 crate::shim_rpc::ShimRpcClient::new(
@@ -211,7 +212,9 @@ impl RuntimeServiceImpl {
                 .request(request)
             })
             .await
-            .map_err(|err| Status::internal(format!("Failed to join shim exec_sync task: {}", err)))?
+            .map_err(|err| {
+                Status::internal(format!("Failed to join shim exec_sync task: {}", err))
+            })?
             .map_err(|err| {
                 let message = err.to_string();
                 if message.contains("timed out") {

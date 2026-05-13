@@ -286,7 +286,11 @@ impl RuntimeServiceImpl {
             .unwrap_or_default();
         let live_ledger_shims: HashMap<String, u32> = ledger_shims
             .into_iter()
-            .filter(|record| PathBuf::from("/proc").join(record.shim_pid.to_string()).exists())
+            .filter(|record| {
+                PathBuf::from("/proc")
+                    .join(record.shim_pid.to_string())
+                    .exists()
+            })
             .map(|record| (record.container_id, record.shim_pid))
             .collect();
 

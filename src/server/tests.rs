@@ -222,6 +222,7 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
             state_db_path: PathBuf::from("/tmp/crius-test.db"),
         },
         streaming: crate::streaming::StreamingConfig::default(),
+        config_path: None,
     }
 }
 
@@ -1162,6 +1163,7 @@ where
             state_db_path: dir.path().join("root").join("crius.db"),
         },
         streaming: crate::streaming::StreamingConfig::default(),
+        config_path: None,
     };
     configure(&mut config);
     let nri_config = NriConfig {
@@ -1394,6 +1396,7 @@ fn test_service_with_fake_runtime_and_nri_and_shim(
             state_db_path: dir.path().join("root").join("crius.db"),
         },
         streaming: crate::streaming::StreamingConfig::default(),
+        config_path: None,
     };
     let nri_config = NriConfig {
         enable: true,
@@ -5753,7 +5756,10 @@ async fn exec_opens_shim_exec_session_when_task_socket_is_available() {
     .into_inner();
 
     assert!(response.url.contains("/exec/"));
-    assert_eq!(fs::read_to_string(&marker_path).unwrap(), "echo interactive");
+    assert_eq!(
+        fs::read_to_string(&marker_path).unwrap(),
+        "echo interactive"
+    );
     assert!(session_dir.join("io.sock").exists());
     assert!(session_dir.join("resize.sock").exists());
 
@@ -6532,6 +6538,7 @@ sleep 1
                 state_db_path: dir.path().join("root").join("crius.db"),
             },
             streaming: crate::streaming::StreamingConfig::default(),
+            config_path: None,
             ..test_runtime_config(dir.path().join("root"))
         },
         NriConfig::default(),
@@ -6821,6 +6828,7 @@ sleep 1
                 state_db_path: dir.path().join("root").join("crius.db"),
             },
             streaming: crate::streaming::StreamingConfig::default(),
+            config_path: None,
         },
         NriConfig::default(),
         shim_work_dir.clone(),
@@ -7115,6 +7123,7 @@ sleep 1
                 state_db_path: dir.path().join("root").join("crius.db"),
             },
             streaming: crate::streaming::StreamingConfig::default(),
+            config_path: None,
         },
         NriConfig::default(),
         shim_work_dir.clone(),
@@ -7793,8 +7802,21 @@ async fn status_verbose_returns_structured_config() {
     assert_eq!(config["streaming"]["enableTls"], true);
     assert_eq!(config["streaming"]["tlsCertFile"], "/etc/crius/tls/tls.crt");
     assert_eq!(config["streaming"]["tlsMinVersion"], "VersionTLS13");
-    assert_eq!(config["reload"]["strategy"], "restart-only");
+    assert_eq!(
+        config["reload"]["strategy"],
+        "config-file-watch-and-cni-watch"
+    );
     assert_eq!(config["reload"]["signalReload"], false);
+    assert_eq!(config["reload"]["configFileWatch"], false);
+    assert_eq!(
+        config["reload"]["current"]["pauseImage"],
+        "registry.k8s.io/pause:3.9"
+    );
+    assert!(config["reload"]["reloadableFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "network.conf_template"));
     assert_eq!(
         config["reload"]["runtimeConfigApiOnly"][0],
         "UpdateRuntimeConfig.network_config.pod_cidr"
@@ -7941,6 +7963,165 @@ async fn status_verbose_returns_structured_config() {
         2,
         "expected runtime and network conditions"
     );
+}
+
+#[test]
+fn reloadable_config_diff_reports_changed_fields() {
+    let service = test_service();
+    let mut next = service.current_reloadable_config();
+    next.pause_image = "registry.example/pause:v2".to_string();
+    next.pinned_images = vec!["registry.example/*".to_string()];
+    next.cni_conf_template = Some(PathBuf::from("/etc/crius/cni.template"));
+
+    let changed = service.current_reloadable_config().diff_fields(&next);
+
+    assert!(changed.contains(&"runtime.pause_image".to_string()));
+    assert!(changed.contains(&"image.pinned_images".to_string()));
+    assert!(changed.contains(&"network.conf_template".to_string()));
+}
+
+#[tokio::test]
+async fn apply_reloadable_config_updates_image_security_and_network_state() {
+    let service = test_service();
+    let dir = tempdir().unwrap();
+    let cni_dir = dir.path().join("cni");
+    fs::create_dir_all(&cni_dir).unwrap();
+    let seccomp_profile = dir.path().join("seccomp.json");
+    fs::write(&seccomp_profile, "{}").unwrap();
+
+    let mut next = service.current_reloadable_config();
+    next.pause_image = "registry.example/pause:v2".to_string();
+    next.pinned_images = vec!["registry.example/*".to_string()];
+    next.registry_config_dir = dir.path().join("certs.d");
+    next.global_auth_file = dir.path().join("auth.json");
+    next.namespaced_auth_dir = dir.path().join("auth.d");
+    next.signature_policy = dir.path().join("policy.json");
+    next.signature_policy_dir = dir.path().join("policies");
+    next.decryption_keys_path = dir.path().join("ocicrypt");
+    next.decryption_decoder_path = "/usr/bin/ctd-decoder".to_string();
+    next.decryption_keyprovider_config = dir.path().join("keyprovider.json");
+    next.seccomp_profile = seccomp_profile.clone();
+    next.apparmor_default_profile = "crius-reloaded".to_string();
+    next.cni_config_dirs = vec![cni_dir.clone()];
+    next.cni_max_conf_num = 1;
+    next.cni_default_network_name = Some("reloaded-net".to_string());
+
+    let changed = service
+        .apply_reloadable_config(next.clone(), "test")
+        .await
+        .unwrap();
+
+    assert!(changed.contains(&"runtime.pause_image".to_string()));
+    assert!(changed.contains(&"security.seccomp_profile".to_string()));
+    assert!(changed.contains(&"network.config_dirs".to_string()));
+    assert_eq!(service.current_reloadable_config(), next);
+    let image_config = service.image_service().reloadable_config_snapshot();
+    assert_eq!(
+        image_config.registry_config_dir.as_deref(),
+        Some(dir.path().join("certs.d").as_path())
+    );
+    assert_eq!(
+        image_config.pinned_image_patterns,
+        vec!["registry.example/*".to_string()]
+    );
+    assert_eq!(
+        service.current_reloadable_config().apparmor_default_profile,
+        "crius-reloaded"
+    );
+    match service.effective_seccomp_profile_from_proto(None, "", false) {
+        Some(crate::runtime::SeccompProfile::Localhost(path)) => {
+            assert_eq!(path, seccomp_profile);
+        }
+        other => panic!("expected localhost seccomp profile, got {other:?}"),
+    }
+    let cni_config = service.current_cni_config();
+    assert_eq!(cni_config.config_dirs(), &[cni_dir]);
+    assert_eq!(cni_config.max_conf_num(), 1);
+    assert_eq!(cni_config.default_network_name(), Some("reloaded-net"));
+    assert_eq!(
+        service.current_reload_state().last_reload_source.as_deref(),
+        Some("test")
+    );
+}
+
+#[tokio::test]
+async fn reload_config_file_once_applies_reloadable_subset() {
+    let mut service = test_service();
+    let dir = tempdir().unwrap();
+    let config_path = dir.path().join("crius.toml");
+    let cni_dir = dir.path().join("cni");
+    fs::create_dir_all(&cni_dir).unwrap();
+
+    let mut config = crate::config::Config::default();
+    config.runtime.pause_image = "registry.example/pause:v3".to_string();
+    config.image.pinned_images = vec!["registry.example/static:*".to_string()];
+    config.image.registry_config_dir = dir.path().join("certs").display().to_string();
+    config.security.apparmor_default_profile = "crius-file-reload".to_string();
+    config.network.config_dirs = vec![cni_dir.display().to_string()];
+    config.network.max_conf_num = 2;
+    fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+    service.config.config_path = Some(config_path);
+
+    let changed = service.reload_config_file_once().await.unwrap();
+
+    assert!(changed.contains(&"runtime.pause_image".to_string()));
+    assert!(changed.contains(&"image.pinned_images".to_string()));
+    assert!(changed.contains(&"network.config_dirs".to_string()));
+    let current = service.current_reloadable_config();
+    assert_eq!(current.pause_image, "registry.example/pause:v3");
+    assert_eq!(
+        current.pinned_images,
+        vec!["registry.example/static:*".to_string()]
+    );
+    assert_eq!(current.cni_config_dirs, vec![cni_dir]);
+    assert_eq!(
+        service.current_reload_state().last_reload_source.as_deref(),
+        Some("config-file")
+    );
+}
+
+#[tokio::test]
+async fn reload_cni_watch_once_records_last_error() {
+    let service = test_service();
+    let dir = tempdir().unwrap();
+    let cni_dir = dir.path().join("cni");
+    fs::create_dir_all(&cni_dir).unwrap();
+    fs::write(cni_dir.join("10-broken.conflist"), "{not-json").unwrap();
+
+    let mut next = service.current_reloadable_config();
+    next.cni_config_dirs = vec![cni_dir];
+    service.apply_reloadable_config(next, "test").await.unwrap();
+
+    let status = service.reload_cni_watch_once().await;
+
+    assert!(!status.ready);
+    assert_eq!(status.reason, "CNIConfigInvalid");
+    assert!(service
+        .current_reload_state()
+        .last_cni_watch_error
+        .is_some());
+}
+
+#[tokio::test]
+async fn reload_failure_marks_network_not_ready_condition() {
+    let service = test_service();
+    service.reload_state.lock().unwrap().last_reload_error = Some("reload failed".to_string());
+
+    let response = RuntimeService::status(&service, Request::new(StatusRequest { verbose: false }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let network = response
+        .status
+        .unwrap()
+        .conditions
+        .into_iter()
+        .find(|condition| condition.r#type == "NetworkReady")
+        .unwrap();
+    assert!(!network.status);
+    assert_eq!(network.reason, "ConfigReloadFailed");
+    assert_eq!(network.message, "reload failed");
 }
 
 #[test]
@@ -15783,12 +15964,7 @@ async fn recover_state_recovers_running_container_without_shim_metadata_file_fro
         .persistence
         .lock()
         .await
-        .update_container_ledger_metadata(
-            "recover-ledger-only",
-            Some("runc"),
-            Some("runc"),
-            None,
-        )
+        .update_container_ledger_metadata("recover-ledger-only", Some("runc"), Some("runc"), None)
         .unwrap();
 
     let mut shim_child = std::process::Command::new("sleep")
@@ -15906,7 +16082,10 @@ async fn recover_state_marks_container_broken_when_runtime_bundle_is_missing() {
     )
     .unwrap();
     assert_eq!(
-        internal_state.broken.as_ref().map(|broken| broken.kind.as_str()),
+        internal_state
+            .broken
+            .as_ref()
+            .map(|broken| broken.kind.as_str()),
         Some("bundle_missing")
     );
 }
@@ -15945,7 +16124,12 @@ async fn recover_state_keeps_live_orphaned_shim_directories_when_ledger_has_live
                 .display()
                 .to_string(),
             log_file: live_shim_dir.join("shim.log").display().to_string(),
-            bundle_path: dir.path().join("runtime-root").join("orphan-live").display().to_string(),
+            bundle_path: dir
+                .path()
+                .join("runtime-root")
+                .join("orphan-live")
+                .display()
+                .to_string(),
             state: "running".to_string(),
             last_seen_at: RuntimeServiceImpl::now_nanos(),
         })

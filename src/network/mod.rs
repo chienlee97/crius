@@ -210,6 +210,14 @@ impl CniConfig {
         &self.plugin_dirs
     }
 
+    pub fn set_config_dirs(&mut self, config_dirs: Vec<PathBuf>) {
+        self.config_dirs = config_dirs;
+    }
+
+    pub fn set_plugin_dirs(&mut self, plugin_dirs: Vec<PathBuf>) {
+        self.plugin_dirs = plugin_dirs;
+    }
+
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
     }
@@ -220,6 +228,10 @@ impl CniConfig {
 
     pub fn max_conf_num(&self) -> usize {
         self.max_conf_num
+    }
+
+    pub fn set_max_conf_num(&mut self, max_conf_num: usize) {
+        self.max_conf_num = max_conf_num;
     }
 
     pub fn ip_pref(&self) -> MainIpPreference {
@@ -270,6 +282,10 @@ impl CniConfig {
 
     pub fn default_network_name(&self) -> Option<&str> {
         self.default_network_name.as_deref()
+    }
+
+    pub fn set_default_network_name(&mut self, default_network_name: Option<String>) {
+        self.default_network_name = default_network_name;
     }
 
     pub fn disable_hostport_mapping(&self) -> bool {
@@ -718,10 +734,14 @@ impl DefaultNetworkManager {
         netns: &str,
     ) -> Result<NetworkStatus, NetworkError> {
         let Some(rootless) = self.rootless.as_ref() else {
-            return Err(NetworkError::Other("rootless network config is not enabled".to_string()));
+            return Err(NetworkError::Other(
+                "rootless network config is not enabled".to_string(),
+            ));
         };
         let (program, name) = match rootless.mode {
-            crate::rootless::NetworkMode::Slirp4netns => (&rootless.slirp4netns_path, "slirp4netns"),
+            crate::rootless::NetworkMode::Slirp4netns => {
+                (&rootless.slirp4netns_path, "slirp4netns")
+            }
             crate::rootless::NetworkMode::Pasta => (&rootless.pasta_path, "pasta"),
             crate::rootless::NetworkMode::None => return Ok(self.rootless_network_status("none")),
             crate::rootless::NetworkMode::Rootlesskit => {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::image::{ImageServiceImpl, ImageServiceOptions};
+use crate::image::{ImageServiceImpl, ImageServiceOptions, ReloadableImageConfig};
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
 use std::time::Instant;
 
@@ -84,7 +84,7 @@ pub struct RuntimeServiceImpl {
     pub(super) nri_config: NriConfig,
     pub(super) nri: Arc<dyn NriApi>,
     pub(super) runtime: RuntimeRegistry,
-    pub(super) pod_manager: tokio::sync::Mutex<PodSandboxManager<RuntimeRegistry>>,
+    pub(super) pod_manager: Arc<tokio::sync::Mutex<PodSandboxManager<RuntimeRegistry>>>,
     pub(super) image_service: ImageServiceImpl,
     pub(super) persistence: Arc<Mutex<PersistenceManager>>,
     pub(super) streaming: Arc<Mutex<Option<StreamingServer>>>,
@@ -109,6 +109,8 @@ pub struct RuntimeServiceImpl {
     pub(super) seccomp_notification_tx:
         tokio::sync::mpsc::UnboundedSender<seccomp_notifier::SeccompNotificationEvent>,
     pub(super) runtime_network_config: Arc<Mutex<Option<crate::proto::runtime::v1::NetworkConfig>>>,
+    pub(super) reloadable_config: StdArc<StdMutex<RuntimeReloadableConfig>>,
+    pub(super) reload_state: StdArc<StdMutex<RuntimeReloadState>>,
     pub(super) exit_monitors: Arc<Mutex<HashSet<String>>>,
     pub(super) container_stats_cache:
         Arc<Mutex<HashMap<String, CachedStatsEntry<crate::proto::runtime::v1::ContainerStats>>>>,
@@ -274,6 +276,182 @@ pub struct RuntimeConfig {
     pub rootless: crate::rootless::EffectiveRootlessConfig,
     pub shim: ShimConfig,
     pub streaming: crate::streaming::StreamingConfig,
+    pub config_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeReloadableConfig {
+    pub pause_image: String,
+    pub pinned_images: Vec<String>,
+    pub registry_config_dir: PathBuf,
+    pub global_auth_file: PathBuf,
+    pub namespaced_auth_dir: PathBuf,
+    pub signature_policy: PathBuf,
+    pub signature_policy_dir: PathBuf,
+    pub decryption_keys_path: PathBuf,
+    pub decryption_decoder_path: String,
+    pub decryption_keyprovider_config: PathBuf,
+    pub seccomp_profile: PathBuf,
+    pub apparmor_default_profile: String,
+    pub cni_config_dirs: Vec<PathBuf>,
+    pub cni_conf_template: Option<PathBuf>,
+    pub cni_max_conf_num: usize,
+    pub cni_default_network_name: Option<String>,
+}
+
+impl RuntimeReloadableConfig {
+    pub fn from_runtime_config(config: &RuntimeConfig) -> Self {
+        Self {
+            pause_image: config.pause_image.clone(),
+            pinned_images: config.image_pinned_images.clone(),
+            registry_config_dir: config.image_registry_config_dir.clone(),
+            global_auth_file: config.image_global_auth_file.clone(),
+            namespaced_auth_dir: config.image_namespaced_auth_dir.clone(),
+            signature_policy: config.image_signature_policy.clone(),
+            signature_policy_dir: config.image_signature_policy_dir.clone(),
+            decryption_keys_path: config.image_decryption_keys_path.clone(),
+            decryption_decoder_path: config.image_decryption_decoder_path.clone(),
+            decryption_keyprovider_config: config.image_decryption_keyprovider_config.clone(),
+            seccomp_profile: config.seccomp_profile.clone(),
+            apparmor_default_profile: config.apparmor_default_profile.clone(),
+            cni_config_dirs: config.cni_config.config_dirs().to_vec(),
+            cni_conf_template: config.cni_config.conf_template().map(Path::to_path_buf),
+            cni_max_conf_num: config.cni_config.max_conf_num(),
+            cni_default_network_name: config
+                .cni_config
+                .default_network_name()
+                .map(ToOwned::to_owned),
+        }
+    }
+
+    pub fn diff_fields(&self, next: &Self) -> Vec<String> {
+        let mut changed = Vec::new();
+        if self.pause_image != next.pause_image {
+            changed.push("runtime.pause_image".to_string());
+        }
+        if self.pinned_images != next.pinned_images {
+            changed.push("image.pinned_images".to_string());
+        }
+        if self.registry_config_dir != next.registry_config_dir {
+            changed.push("image.registry_config_dir".to_string());
+        }
+        if self.global_auth_file != next.global_auth_file {
+            changed.push("image.global_auth_file".to_string());
+        }
+        if self.namespaced_auth_dir != next.namespaced_auth_dir {
+            changed.push("image.namespaced_auth_dir".to_string());
+        }
+        if self.signature_policy != next.signature_policy {
+            changed.push("image.signature_policy".to_string());
+        }
+        if self.signature_policy_dir != next.signature_policy_dir {
+            changed.push("image.signature_policy_dir".to_string());
+        }
+        if self.decryption_keys_path != next.decryption_keys_path {
+            changed.push("image.decryption_keys_path".to_string());
+        }
+        if self.decryption_decoder_path != next.decryption_decoder_path {
+            changed.push("image.decryption_decoder_path".to_string());
+        }
+        if self.decryption_keyprovider_config != next.decryption_keyprovider_config {
+            changed.push("image.decryption_keyprovider_config".to_string());
+        }
+        if self.seccomp_profile != next.seccomp_profile {
+            changed.push("security.seccomp_profile".to_string());
+        }
+        if self.apparmor_default_profile != next.apparmor_default_profile {
+            changed.push("security.apparmor_default_profile".to_string());
+        }
+        if self.cni_config_dirs != next.cni_config_dirs {
+            changed.push("network.config_dirs".to_string());
+        }
+        if self.cni_conf_template != next.cni_conf_template {
+            changed.push("network.conf_template".to_string());
+        }
+        if self.cni_max_conf_num != next.cni_max_conf_num {
+            changed.push("network.max_conf_num".to_string());
+        }
+        if self.cni_default_network_name != next.cni_default_network_name {
+            changed.push("network.default_network_name".to_string());
+        }
+        changed
+    }
+
+    pub fn with_cni_config(&self, base: &crate::network::CniConfig) -> crate::network::CniConfig {
+        let mut config = base.clone();
+        config.set_config_dirs(self.cni_config_dirs.clone());
+        config.set_plugin_dirs(base.plugin_dirs().to_vec());
+        config.set_max_conf_num(self.cni_max_conf_num);
+        config.set_default_network_name(self.cni_default_network_name.clone());
+        config.set_conf_template(self.cni_conf_template.clone());
+        config
+    }
+
+    pub fn to_image_reloadable_config(&self) -> ReloadableImageConfig {
+        ReloadableImageConfig {
+            global_auth_file: (!self.global_auth_file.as_os_str().is_empty())
+                .then(|| self.global_auth_file.clone()),
+            namespaced_auth_dir: (!self.namespaced_auth_dir.as_os_str().is_empty())
+                .then(|| self.namespaced_auth_dir.clone()),
+            registry_config_dir: (!self.registry_config_dir.as_os_str().is_empty())
+                .then(|| self.registry_config_dir.clone()),
+            decryption_keys_path: (!self.decryption_keys_path.as_os_str().is_empty())
+                .then(|| self.decryption_keys_path.clone()),
+            decryption_decoder_path: self.decryption_decoder_path.clone(),
+            decryption_keyprovider_config: (!self
+                .decryption_keyprovider_config
+                .as_os_str()
+                .is_empty())
+            .then(|| self.decryption_keyprovider_config.clone()),
+            pinned_image_patterns: self.pinned_images.clone(),
+            signature_policy: (!self.signature_policy.as_os_str().is_empty())
+                .then(|| self.signature_policy.clone()),
+            signature_policy_dir: (!self.signature_policy_dir.as_os_str().is_empty())
+                .then(|| self.signature_policy_dir.clone()),
+        }
+    }
+
+    pub fn from_loaded_config(config: &crate::config::Config) -> Self {
+        Self {
+            pause_image: config.runtime.pause_image.clone(),
+            pinned_images: config.image.pinned_images.clone(),
+            registry_config_dir: PathBuf::from(&config.image.registry_config_dir),
+            global_auth_file: PathBuf::from(&config.image.global_auth_file),
+            namespaced_auth_dir: PathBuf::from(&config.image.namespaced_auth_dir),
+            signature_policy: PathBuf::from(&config.image.signature_policy),
+            signature_policy_dir: PathBuf::from(&config.image.signature_policy_dir),
+            decryption_keys_path: PathBuf::from(&config.image.decryption_keys_path),
+            decryption_decoder_path: config.image.decryption_decoder_path.clone(),
+            decryption_keyprovider_config: PathBuf::from(
+                &config.image.decryption_keyprovider_config,
+            ),
+            seccomp_profile: PathBuf::from(&config.security.seccomp_profile),
+            apparmor_default_profile: config.security.apparmor_default_profile.clone(),
+            cni_config_dirs: config
+                .network
+                .config_dirs
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+            cni_conf_template: (!config.network.conf_template.trim().is_empty())
+                .then(|| PathBuf::from(&config.network.conf_template)),
+            cni_max_conf_num: config.network.max_conf_num,
+            cni_default_network_name: config.network.default_network_name.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RuntimeReloadState {
+    pub last_reload_at_unix_millis: Option<i64>,
+    pub last_reload_source: Option<String>,
+    pub last_reload_fields: Vec<String>,
+    pub last_reload_error: Option<String>,
+    pub watcher_active: bool,
+    pub config_file_watch: bool,
+    pub cni_watch_dirs: Vec<String>,
+    pub last_cni_watch_at_unix_millis: Option<i64>,
+    pub last_cni_watch_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1545,6 +1723,19 @@ impl RuntimeServiceImpl {
                 );
                 None
             });
+        let reloadable_config = StdArc::new(StdMutex::new(
+            RuntimeReloadableConfig::from_runtime_config(&config),
+        ));
+        let reload_state = StdArc::new(StdMutex::new(RuntimeReloadState {
+            config_file_watch: config.config_path.is_some(),
+            cni_watch_dirs: config
+                .cni_config
+                .config_dirs()
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect(),
+            ..Default::default()
+        }));
         let seccomp_notifier_dir = config.runtime_root.join("seccomp-notifier");
         let seccomp_notifiers = StdArc::new(StdMutex::new(HashMap::new()));
         let seccomp_notifier_snapshots = StdArc::new(StdMutex::new(HashMap::<
@@ -1597,7 +1788,7 @@ impl RuntimeServiceImpl {
             });
         }
 
-        Self {
+        let service = Self {
             containers,
             pod_sandboxes,
             container_names,
@@ -1608,7 +1799,7 @@ impl RuntimeServiceImpl {
             nri_config,
             nri,
             runtime,
-            pod_manager: tokio::sync::Mutex::new(pod_manager),
+            pod_manager: Arc::new(tokio::sync::Mutex::new(pod_manager)),
             image_service,
             persistence,
             streaming: Arc::new(Mutex::new(None)),
@@ -1630,11 +1821,15 @@ impl RuntimeServiceImpl {
             seccomp_notifier_snapshots,
             seccomp_notification_tx,
             runtime_network_config: Arc::new(Mutex::new(runtime_network_config)),
+            reloadable_config,
+            reload_state,
             exit_monitors: Arc::new(Mutex::new(HashSet::new())),
             container_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             pod_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             pod_metrics_cache: Arc::new(Mutex::new(HashMap::new())),
-        }
+        };
+        service.spawn_reload_watchers();
+        service
     }
 
     pub async fn initialize_nri(&self) -> Result<(), Status> {
@@ -1662,5 +1857,261 @@ impl RuntimeServiceImpl {
     pub async fn set_streaming_server(&self, streaming_server: StreamingServer) {
         let mut streaming = self.streaming.lock().await;
         *streaming = Some(streaming_server);
+    }
+
+    pub fn current_reloadable_config(&self) -> RuntimeReloadableConfig {
+        self.reloadable_config
+            .lock()
+            .expect("reloadable config lock poisoned")
+            .clone()
+    }
+
+    pub fn current_reload_state(&self) -> RuntimeReloadState {
+        self.reload_state
+            .lock()
+            .expect("reload state lock poisoned")
+            .clone()
+    }
+
+    pub(super) fn current_cni_config(&self) -> crate::network::CniConfig {
+        self.current_reloadable_config()
+            .with_cni_config(&self.config.cni_config)
+    }
+
+    fn update_reload_state(&self, update: impl FnOnce(&mut RuntimeReloadState)) {
+        if let Ok(mut state) = self.reload_state.lock() {
+            update(&mut state);
+        }
+    }
+
+    pub async fn apply_reloadable_config(
+        &self,
+        next: RuntimeReloadableConfig,
+        source: &str,
+    ) -> Result<Vec<String>, Status> {
+        let previous = self.current_reloadable_config();
+        let changed = previous.diff_fields(&next);
+        if changed.is_empty() {
+            self.update_reload_state(|state| {
+                state.last_reload_at_unix_millis = Some(chrono::Utc::now().timestamp_millis());
+                state.last_reload_source = Some(source.to_string());
+                state.last_reload_fields.clear();
+                state.last_reload_error = None;
+            });
+            return Ok(changed);
+        }
+
+        self.image_service
+            .apply_reloadable_config(next.to_image_reloadable_config());
+
+        {
+            let mut pod_manager = self.pod_manager.lock().await;
+            let next_cni = next.with_cni_config(&self.config.cni_config);
+            let runtime_network_config = self.runtime_network_config.lock().await.clone();
+            Self::sync_generated_cni_config(&next_cni, runtime_network_config.as_ref()).map_err(
+                |err| {
+                    Status::invalid_argument(format!(
+                        "Failed to render CNI config template: {}",
+                        err
+                    ))
+                },
+            )?;
+            pod_manager.reload_runtime_network_settings(next.pause_image.clone(), next_cni);
+        }
+
+        if let Ok(mut current) = self.reloadable_config.lock() {
+            *current = next.clone();
+        }
+        self.update_reload_state(|state| {
+            state.last_reload_at_unix_millis = Some(chrono::Utc::now().timestamp_millis());
+            state.last_reload_source = Some(source.to_string());
+            state.last_reload_fields = changed.clone();
+            state.last_reload_error = None;
+            state.cni_watch_dirs = next
+                .cni_config_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect();
+        });
+
+        Ok(changed)
+    }
+
+    pub async fn reload_config_file_once(&self) -> Result<Vec<String>, Status> {
+        let path = self.config.config_path.clone().ok_or_else(|| {
+            Status::failed_precondition("runtime config file path is not configured")
+        })?;
+        let mut config = crate::config::Config::load(&path)
+            .map_err(|err| Status::internal(format!("Failed to load config file: {}", err)))?;
+        config
+            .apply_env_overrides()
+            .map_err(|err| Status::internal(format!("Failed to apply env overrides: {}", err)))?;
+        let next = RuntimeReloadableConfig::from_loaded_config(&config);
+        match self.apply_reloadable_config(next, "config-file").await {
+            Ok(changed) => Ok(changed),
+            Err(status) => {
+                self.update_reload_state(|state| {
+                    state.last_reload_at_unix_millis = Some(chrono::Utc::now().timestamp_millis());
+                    state.last_reload_source = Some("config-file".to_string());
+                    state.last_reload_error = Some(status.message().to_string());
+                });
+                Err(status)
+            }
+        }
+    }
+
+    pub async fn reload_cni_watch_once(&self) -> crate::network::CniLoadStatus {
+        let cni_config = self.current_cni_config();
+        let runtime_network_config = self.runtime_network_config.lock().await.clone();
+        let sync_error =
+            Self::sync_generated_cni_config(&cni_config, runtime_network_config.as_ref())
+                .err()
+                .map(|err| err.to_string());
+        let status = self.probe_cni_load_status().await;
+        self.update_reload_state(|state| {
+            state.last_cni_watch_at_unix_millis = Some(chrono::Utc::now().timestamp_millis());
+            state.last_cni_watch_error = sync_error
+                .clone()
+                .or_else(|| (!status.ready).then(|| status.message.clone()));
+        });
+        status
+    }
+
+    fn config_watch_signature(path: &Path) -> Option<(i64, u64)> {
+        let metadata = std::fs::metadata(path).ok()?;
+        let modified = metadata.modified().ok()?;
+        let modified = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|value| value.as_secs() as i64)?;
+        Some((modified, metadata.len()))
+    }
+
+    fn cni_watch_signature(config: &crate::network::CniConfig) -> Vec<(String, i64, u64)> {
+        let mut entries = Vec::new();
+        for dir in config.config_dirs() {
+            if let Ok(read_dir) = std::fs::read_dir(dir) {
+                for entry in read_dir.flatten() {
+                    let path = entry.path();
+                    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+                        continue;
+                    };
+                    if !matches!(ext, "conf" | "conflist" | "json") {
+                        continue;
+                    }
+                    if let Ok(metadata) = entry.metadata() {
+                        if let Ok(modified) = metadata.modified() {
+                            if let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH)
+                            {
+                                entries.push((
+                                    path.display().to_string(),
+                                    since_epoch.as_secs() as i64,
+                                    metadata.len(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(template) = config.conf_template() {
+            if let Ok(metadata) = std::fs::metadata(template) {
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        entries.push((
+                            template.display().to_string(),
+                            since_epoch.as_secs() as i64,
+                            metadata.len(),
+                        ));
+                    }
+                }
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    fn spawn_reload_watchers(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let config_state = self.reload_state.clone();
+        let config_clone = self.clone_for_background();
+        handle.spawn(async move {
+            if let Ok(mut state) = config_state.lock() {
+                state.watcher_active = true;
+            }
+            let config_path = config_clone.config.config_path.clone();
+            let mut last_config_signature = config_path
+                .as_deref()
+                .and_then(Self::config_watch_signature);
+            let mut last_cni_signature = Self::cni_watch_signature(
+                &config_clone
+                    .current_reloadable_config()
+                    .with_cni_config(&config_clone.config.cni_config),
+            );
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if let Some(path) = config_path.as_deref() {
+                    let current_signature = Self::config_watch_signature(&path);
+                    if current_signature != last_config_signature {
+                        let _ = config_clone.reload_config_file_once().await;
+                        last_config_signature = current_signature;
+                    }
+                }
+                let current_cni_signature = Self::cni_watch_signature(
+                    &config_clone
+                        .current_reloadable_config()
+                        .with_cni_config(&config_clone.config.cni_config),
+                );
+                if current_cni_signature != last_cni_signature {
+                    let _ = config_clone.reload_cni_watch_once().await;
+                    last_cni_signature = current_cni_signature;
+                }
+            }
+        });
+    }
+
+    fn clone_for_background(&self) -> Self {
+        Self {
+            containers: self.containers.clone(),
+            pod_sandboxes: self.pod_sandboxes.clone(),
+            container_names: self.container_names.clone(),
+            pod_names: self.pod_names.clone(),
+            removed_container_ids: self.removed_container_ids.clone(),
+            removed_pod_sandbox_ids: self.removed_pod_sandbox_ids.clone(),
+            config: self.config.clone(),
+            nri_config: self.nri_config.clone(),
+            nri: self.nri.clone(),
+            runtime: self.runtime.clone(),
+            pod_manager: self.pod_manager.clone(),
+            image_service: self.image_service.clone(),
+            persistence: self.persistence.clone(),
+            streaming: self.streaming.clone(),
+            events: self.events.clone(),
+            shim_work_dir: self.shim_work_dir.clone(),
+            attach_socket_dir: self.attach_socket_dir.clone(),
+            container_exits_dir: self.container_exits_dir.clone(),
+            clean_shutdown_file: self.clean_shutdown_file.clone(),
+            last_startup_clean_shutdown: self.last_startup_clean_shutdown.clone(),
+            version_file: self.version_file.clone(),
+            version_file_persist: self.version_file_persist.clone(),
+            last_startup_detected_reboot: self.last_startup_detected_reboot.clone(),
+            last_startup_detected_upgrade: self.last_startup_detected_upgrade.clone(),
+            last_startup_attempted_repair: self.last_startup_attempted_repair.clone(),
+            last_startup_repair_succeeded: self.last_startup_repair_succeeded.clone(),
+            last_irqbalance_restore_status: self.last_irqbalance_restore_status.clone(),
+            seccomp_notifier_dir: self.seccomp_notifier_dir.clone(),
+            seccomp_notifiers: self.seccomp_notifiers.clone(),
+            seccomp_notifier_snapshots: self.seccomp_notifier_snapshots.clone(),
+            seccomp_notification_tx: self.seccomp_notification_tx.clone(),
+            runtime_network_config: self.runtime_network_config.clone(),
+            reloadable_config: self.reloadable_config.clone(),
+            reload_state: self.reload_state.clone(),
+            exit_monitors: self.exit_monitors.clone(),
+            container_stats_cache: self.container_stats_cache.clone(),
+            pod_stats_cache: self.pod_stats_cache.clone(),
+            pod_metrics_cache: self.pod_metrics_cache.clone(),
+        }
     }
 }

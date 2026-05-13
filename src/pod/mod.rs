@@ -228,6 +228,13 @@ impl<R: ContainerRuntime> PodSandboxManager<R, DefaultNetworkManager> {
         manager.namespace_manager = namespace_manager;
         manager
     }
+
+    pub fn reload_runtime_network_settings(&mut self, pause_image: String, cni_config: CniConfig) {
+        self.pause_image = pause_image;
+        self.disable_hostport_mapping = cni_config.disable_hostport_mapping();
+        self.namespace_manager = cni_config.namespace_manager();
+        self.network_manager = DefaultNetworkManager::from_cni_config(cni_config);
+    }
 }
 
 pub(crate) trait PodPortMapper: Send + Sync {

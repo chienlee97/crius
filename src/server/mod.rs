@@ -2083,10 +2083,14 @@ impl RuntimeServiceImpl {
             return Ok(None);
         }
 
+        let default_profile = self
+            .current_reloadable_config()
+            .apparmor_default_profile
+            .clone();
         match requested.as_deref() {
-            None => Ok(Some(self.config.apparmor_default_profile.clone())),
+            None => Ok(Some(default_profile.clone())),
             Some(profile) if profile.eq_ignore_ascii_case("runtime/default") => {
-                Ok(Some(self.config.apparmor_default_profile.clone()))
+                Ok(Some(default_profile))
             }
             Some(profile) if profile.eq_ignore_ascii_case("unconfined") => Ok(None),
             Some(profile) => Ok(Some(profile.to_string())),
@@ -2266,13 +2270,30 @@ impl RuntimeServiceImpl {
         Some(SeccompProfile::Localhost(PathBuf::from(selector)))
     }
 
+    fn expand_runtime_default_seccomp_profile(
+        &self,
+        profile: Option<SeccompProfile>,
+    ) -> Option<SeccompProfile> {
+        match profile {
+            Some(SeccompProfile::RuntimeDefault) => {
+                let path = self.current_reloadable_config().seccomp_profile;
+                if path.as_os_str().is_empty() {
+                    Some(SeccompProfile::RuntimeDefault)
+                } else {
+                    Some(SeccompProfile::Localhost(path))
+                }
+            }
+            other => other,
+        }
+    }
+
     fn effective_seccomp_profile_from_proto(
         &self,
         profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
         deprecated_profile: &str,
         privileged: bool,
     ) -> Option<SeccompProfile> {
-        match Self::seccomp_profile_from_proto(profile, deprecated_profile) {
+        let selected = match Self::seccomp_profile_from_proto(profile, deprecated_profile) {
             Some(SeccompProfile::RuntimeDefault) if privileged => {
                 Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
             }
@@ -2281,7 +2302,8 @@ impl RuntimeServiceImpl {
                 Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
             }
             None => Self::seccomp_profile_from_selector(&self.config.unset_seccomp_profile),
-        }
+        };
+        self.expand_runtime_default_seccomp_profile(selected)
     }
 
     fn stored_seccomp_profile_from_proto(
@@ -2315,17 +2337,23 @@ impl RuntimeServiceImpl {
                         == crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
                             as i32 =>
             {
-                Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
-                    .as_ref()
-                    .map(StoredSecurityProfile::from_runtime_seccomp)
+                self.expand_runtime_default_seccomp_profile(Self::seccomp_profile_from_selector(
+                    &self.config.privileged_seccomp_profile,
+                ))
+                .as_ref()
+                .map(StoredSecurityProfile::from_runtime_seccomp)
             }
             Some(explicit) => Some(explicit),
-            None if privileged => {
-                Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
-                    .as_ref()
-                    .map(StoredSecurityProfile::from_runtime_seccomp)
-            }
-            None => Self::seccomp_profile_from_selector(&self.config.unset_seccomp_profile)
+            None if privileged => self
+                .expand_runtime_default_seccomp_profile(Self::seccomp_profile_from_selector(
+                    &self.config.privileged_seccomp_profile,
+                ))
+                .as_ref()
+                .map(StoredSecurityProfile::from_runtime_seccomp),
+            None => self
+                .expand_runtime_default_seccomp_profile(Self::seccomp_profile_from_selector(
+                    &self.config.unset_seccomp_profile,
+                ))
                 .as_ref()
                 .map(StoredSecurityProfile::from_runtime_seccomp),
         }
@@ -4202,10 +4230,10 @@ impl RuntimeService for RuntimeServiceImpl {
             .and_then(|runtime_config| runtime_config.network_config)
             .filter(|network_config| !network_config.pod_cidr.trim().is_empty());
 
-        Self::sync_generated_cni_config(&self.config.cni_config, next_network_config.as_ref())
-            .map_err(|e| {
-                Status::invalid_argument(format!("Failed to render CNI config template: {}", e))
-            })?;
+        let cni_config = self.current_cni_config();
+        Self::sync_generated_cni_config(&cni_config, next_network_config.as_ref()).map_err(
+            |e| Status::invalid_argument(format!("Failed to render CNI config template: {}", e)),
+        )?;
         Self::persist_runtime_network_config(&self.config.root_dir, next_network_config.as_ref())
             .map_err(|e| Status::internal(format!("Failed to persist runtime config: {}", e)))?;
 

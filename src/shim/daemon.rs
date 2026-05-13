@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::io::{IoConfig, IoManager, JournalConfig, DEFAULT_JOURNALD_SOCKET_PATH};
 use crate::runtime::RuncRuntime;
 use crate::shim_rpc::server::{default_task_socket_path, serve, ShimRpcHandler};
 use crate::shim_rpc::{
@@ -38,7 +39,6 @@ use crate::shim_rpc::{
     UpdateResourcesRequest, WaitProcessRequest, WaitProcessResponse,
 };
 use crate::storage::StorageManager;
-use super::io::{IoConfig, IoManager, JournalConfig, DEFAULT_JOURNALD_SOCKET_PATH};
 
 const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";
 
@@ -302,13 +302,7 @@ impl Daemon {
             return Ok(());
         };
         let mut storage = StorageManager::new(path)?;
-        storage.append_event(
-            "shim_exec",
-            &self.container_id,
-            None,
-            None,
-            Some(details),
-        )
+        storage.append_event("shim_exec", &self.container_id, None, None, Some(details))
     }
 
     fn apply_rootfs_override(&self, rootfs_path: &Path) -> Result<()> {
@@ -391,7 +385,10 @@ impl Daemon {
                     *daemon.container_pid.lock().unwrap() = None;
                     daemon.set_task_state(DaemonTaskState::Stopped);
                     if let Err(err) = daemon.record_exit_code(exit_code) {
-                        warn!("Failed to persist shim exit code for {}: {}", daemon.container_id, err);
+                        warn!(
+                            "Failed to persist shim exit code for {}: {}",
+                            daemon.container_id, err
+                        );
                     }
                 }
                 Err(err) => {
@@ -503,7 +500,10 @@ impl Daemon {
         })?;
         io_manager.start_attach_server()?;
         io_manager.start_resize_server()?;
-        self.record_exec_event(&format!("session-open:{}:{:?}", session_id, request.command))?;
+        self.record_exec_event(&format!(
+            "session-open:{}:{:?}",
+            session_id, request.command
+        ))?;
 
         let result = if request.tty {
             self.serve_tty_exec_session(request, &io_manager)
@@ -544,7 +544,9 @@ impl Daemon {
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
-        let mut child = command.spawn().context("Failed to spawn exec session command")?;
+        let mut child = command
+            .spawn()
+            .context("Failed to spawn exec session command")?;
 
         let stdout_handle = child.stdout.take().map(|stdout| {
             let io_manager = io_manager.clone();
@@ -645,7 +647,8 @@ impl Daemon {
         request: &OpenExecSessionRequest,
         io_manager: &IoManager,
     ) -> Result<()> {
-        let pty = nix::pty::openpty(None, None).context("Failed to allocate PTY for exec session")?;
+        let pty =
+            nix::pty::openpty(None, None).context("Failed to allocate PTY for exec session")?;
         let master = unsafe { File::from_raw_fd(pty.master) };
         let slave = unsafe { File::from_raw_fd(pty.slave) };
         let slave_stdin = slave.try_clone()?;
@@ -654,7 +657,11 @@ impl Daemon {
         let slave_fd = slave_stderr.as_raw_fd();
 
         let mut command = self.runtime_command();
-        command.arg("exec").arg("-i").arg("-t").arg(&request.container_id);
+        command
+            .arg("exec")
+            .arg("-i")
+            .arg("-t")
+            .arg(&request.container_id);
         for arg in &request.command {
             command.arg(arg);
         }
@@ -1245,16 +1252,24 @@ impl Daemon {
     }
 
     fn kill_task_internal(&self, request: &KillTaskRequest) -> Result<()> {
-        let mut args = vec!["kill", request.container_id.as_str(), request.signal.as_str()];
+        let mut args = vec![
+            "kill",
+            request.container_id.as_str(),
+            request.signal.as_str(),
+        ];
         if request.all {
             args.insert(1, "--all");
         }
-        let output = self.runtime_command().args(&args).output().with_context(|| {
-            format!(
-                "Failed to execute runtime kill for container {}",
-                request.container_id
-            )
-        })?;
+        let output = self
+            .runtime_command()
+            .args(&args)
+            .output()
+            .with_context(|| {
+                format!(
+                    "Failed to execute runtime kill for container {}",
+                    request.container_id
+                )
+            })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(anyhow::anyhow!(
@@ -1388,12 +1403,9 @@ impl Daemon {
             None => Vec::new(),
         };
 
-        let exit_code = status.code().unwrap_or_else(|| {
-            status
-                .signal()
-                .map(|signal| 128 + signal)
-                .unwrap_or(1)
-        });
+        let exit_code = status
+            .code()
+            .unwrap_or_else(|| status.signal().map(|signal| 128 + signal).unwrap_or(1));
         self.record_exec_event(&format!("exit:{}:{:?}", exit_code, request.command))?;
         if !status.success() {
             let stderr_message = String::from_utf8_lossy(&stderr).trim().to_string();
@@ -1489,11 +1501,11 @@ impl ShimRpcHandler for Daemon {
             ShimRpcRequest::OpenExecSession(request) => Ok(ShimRpcResponse::OpenExecSession(
                 self.open_exec_session_internal(&request)?,
             )),
-            ShimRpcRequest::WaitProcess(request) => Ok(ShimRpcResponse::WaitProcess(
-                WaitProcessResponse {
+            ShimRpcRequest::WaitProcess(request) => {
+                Ok(ShimRpcResponse::WaitProcess(WaitProcessResponse {
                     exit_code: self.wait_for_exit_code(&request)?,
-                },
-            )),
+                }))
+            }
             ShimRpcRequest::KillTask(request) => {
                 self.kill_task_internal(&request)?;
                 Ok(ShimRpcResponse::Empty)
@@ -1553,9 +1565,9 @@ impl ShimRpcHandler for Daemon {
                 }
                 Ok(ShimRpcResponse::Empty)
             }
-            ShimRpcRequest::ContainerPid(StatusRequest { .. }) => {
-                Ok(ShimRpcResponse::ContainerPid(*self.container_pid.lock().unwrap()))
-            }
+            ShimRpcRequest::ContainerPid(StatusRequest { .. }) => Ok(
+                ShimRpcResponse::ContainerPid(*self.container_pid.lock().unwrap()),
+            ),
         }
     }
 }
