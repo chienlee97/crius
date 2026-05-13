@@ -28,6 +28,10 @@ pub trait RuntimeBackend: Send + Sync {
     ) -> Result<()>;
     fn is_container_paused(&self, container_id: &str) -> Result<bool>;
     fn restore_attach_shim(&self, container_id: &str) -> Result<()>;
+    fn shim_status(
+        &self,
+        container_id: &str,
+    ) -> Result<Option<crate::shim_rpc::StatusResponse>>;
     fn restore_container_from_checkpoint(
         &self,
         container_id: &str,

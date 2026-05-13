@@ -9,12 +9,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use crate::proto::runtime::v1::LinuxContainerResources;
+use crate::shim_rpc::{
+    default_task_socket_path, CheckpointTaskRequest, CreateTaskRequest, DeleteTaskRequest,
+    ExecProcessRequest, KillTaskRequest, PauseTaskRequest, ReopenLogRequest, ResizePtyRequest,
+    ResumeTaskRequest, ShimLinuxResources, ShimRpcClient, ShimRpcRequest, ShimRpcResponse,
+    StartTaskRequest, StatusRequest, StatusResponse, TaskState, UpdateResourcesRequest,
+    WaitProcessRequest, WaitProcessResponse,
+};
 use crate::storage::{ShimProcessRecord, StorageManager};
 
 const DEFAULT_SHIM_WORK_DIR: &str = "/var/run/crius/shims";
 const SHIM_METADATA_FILE: &str = "shim.json";
 const SHIM_PIDFILE_NAME: &str = "shim.pid";
+const SHIM_RPC_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const SHIM_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn default_shim_work_dir() -> PathBuf {
     std::env::var("CRIUS_SHIM_DIR")
@@ -111,6 +122,17 @@ pub struct ShimManager {
     config: ShimConfig,
     /// 正在运行的shim进程
     processes: Arc<Mutex<Vec<ShimProcess>>>,
+}
+
+fn ensure_empty_response(operation: &str, response: ShimRpcResponse) -> Result<()> {
+    match response {
+        ShimRpcResponse::Empty => Ok(()),
+        other => Err(anyhow::anyhow!(
+            "unexpected shim RPC response for {}: {:?}",
+            operation,
+            other
+        )),
+    }
 }
 
 impl ShimManager {
@@ -322,9 +344,60 @@ impl ShimManager {
         self.config.work_dir.join(container_id).join(socket_name)
     }
 
+    pub fn task_socket_path(&self, container_id: &str) -> PathBuf {
+        default_task_socket_path(&self.config.work_dir, container_id)
+    }
+
+    fn rpc_client(&self, container_id: &str) -> ShimRpcClient {
+        ShimRpcClient::new(self.task_socket_path(container_id), SHIM_RPC_TIMEOUT)
+    }
+
+    fn wait_for_rpc_socket(&self, container_id: &str) -> Result<()> {
+        let socket_path = self.task_socket_path(container_id);
+        let deadline = Instant::now() + SHIM_RPC_READY_TIMEOUT;
+        let mut saw_live_process = false;
+        while Instant::now() < deadline {
+            if socket_path.exists() {
+                let client = self.rpc_client(container_id);
+                if matches!(client.request(ShimRpcRequest::Ping), Ok(ShimRpcResponse::Empty)) {
+                    return Ok(());
+                }
+            }
+            saw_live_process |= self
+                .read_shim_pidfile(container_id)?
+                .is_some_and(Self::process_exists);
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        if saw_live_process
+            || self
+                .read_shim_pidfile(container_id)?
+                .is_some_and(Self::process_exists)
+        {
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!(
+            "shim RPC socket {} did not become ready in {:?}",
+            socket_path.display(),
+            SHIM_RPC_READY_TIMEOUT
+        ))
+    }
+
     /// 启动shim进程来管理容器
     pub fn start_shim(&self, container_id: &str, bundle_path: &Path) -> Result<ShimProcess> {
         info!("Starting shim for container {}", container_id);
+
+        if let Some(existing) = self
+            .list_shims()
+            .into_iter()
+            .find(|process| process.container_id == container_id)
+        {
+            if Self::process_exists(existing.shim_pid) {
+                self.wait_for_rpc_socket(container_id)?;
+                return Ok(existing);
+            }
+        }
 
         // 创建shim工作目录
         let shim_dir = self.config.work_dir.join(container_id);
@@ -346,6 +419,8 @@ impl ShimManager {
             .arg(bundle_path)
             .arg("--runtime")
             .arg(&self.config.runtime_path)
+            .arg("--work-dir")
+            .arg(&self.config.work_dir)
             .arg("--exit-code-file")
             .arg(&exit_code_file)
             .arg("--attach-socket-dir")
@@ -354,6 +429,10 @@ impl ShimManager {
             .arg(self.config.io_uid.to_string())
             .arg("--io-gid")
             .arg(self.config.io_gid.to_string());
+
+        if !self.config.state_db_path.as_os_str().is_empty() {
+            cmd.arg("--state-db-path").arg(&self.config.state_db_path);
+        }
 
         if !self.config.runtime_config_path.as_os_str().is_empty() {
             cmd.arg("--runtime-config-path")
@@ -430,6 +509,7 @@ impl ShimManager {
         processes.push(process.clone());
         drop(processes);
         self.persist_process_metadata(&process)?;
+        self.wait_for_rpc_socket(container_id)?;
 
         Ok(process)
     }
@@ -445,9 +525,240 @@ impl ShimManager {
         Self::read_exit_code_file(&self.exit_code_file_path(container_id))
     }
 
+    pub fn create_task(&self, container_id: &str, bundle_path: &Path, rootfs_path: &Path) -> Result<()> {
+        self.start_shim(container_id, bundle_path)?;
+        if !self.task_socket_path(container_id).exists() {
+            return Ok(());
+        }
+        let response = self.rpc_client(container_id).request(ShimRpcRequest::CreateTask(
+            CreateTaskRequest {
+                container_id: container_id.to_string(),
+                rootfs_path: rootfs_path.to_path_buf(),
+            },
+        ))?;
+        ensure_empty_response("create_task", response)
+    }
+
+    pub fn start_task(&self, container_id: &str, bundle_path: &Path) -> Result<()> {
+        self.start_shim(container_id, bundle_path)?;
+        if !self.task_socket_path(container_id).exists() {
+            return Ok(());
+        }
+        let response = self.rpc_client(container_id).request(ShimRpcRequest::StartTask(
+            StartTaskRequest {
+                container_id: container_id.to_string(),
+            },
+        ))?;
+        ensure_empty_response("start_task", response)
+    }
+
+    pub fn exec_process(
+        &self,
+        container_id: &str,
+        command: &[String],
+        tty: bool,
+        exec_cpu_affinity: Option<usize>,
+    ) -> Result<i32> {
+        match self.rpc_client(container_id).request(ShimRpcRequest::ExecProcess(
+            ExecProcessRequest {
+                container_id: container_id.to_string(),
+                command: command.to_vec(),
+                tty,
+                capture_output: false,
+                timeout_ms: None,
+                exec_cpu_affinity,
+            },
+        ))? {
+            ShimRpcResponse::ExecProcess(response) => Ok(response.exit_code),
+            other => Err(anyhow::anyhow!(
+                "unexpected shim RPC response for exec_process: {:?}",
+                other
+            )),
+        }
+    }
+
+    pub fn exec_sync_process(
+        &self,
+        container_id: &str,
+        command: &[String],
+        tty: bool,
+        timeout: Option<Duration>,
+        exec_cpu_affinity: Option<usize>,
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        match self.rpc_client(container_id).request(ShimRpcRequest::ExecProcess(
+            ExecProcessRequest {
+                container_id: container_id.to_string(),
+                command: command.to_vec(),
+                tty,
+                capture_output: true,
+                timeout_ms: timeout.map(|value| value.as_millis() as u64),
+                exec_cpu_affinity,
+            },
+        ))? {
+            ShimRpcResponse::ExecProcess(response) => {
+                Ok((response.exit_code, response.stdout, response.stderr))
+            }
+            other => Err(anyhow::anyhow!(
+                "unexpected shim RPC response for exec_sync_process: {:?}",
+                other
+            )),
+        }
+    }
+
+    pub fn wait_task(&self, container_id: &str, timeout: Option<Duration>) -> Result<Option<i32>> {
+        if !self.task_socket_path(container_id).exists() {
+            return self.get_exit_code(container_id);
+        }
+        match self.rpc_client(container_id).request(ShimRpcRequest::WaitProcess(
+            WaitProcessRequest {
+                container_id: container_id.to_string(),
+                timeout_ms: timeout.map(|value| value.as_millis() as u64),
+            },
+        ))? {
+            ShimRpcResponse::WaitProcess(WaitProcessResponse { exit_code }) => Ok(exit_code),
+            other => Err(anyhow::anyhow!(
+                "unexpected shim RPC response for wait_task: {:?}",
+                other
+            )),
+        }
+    }
+
+    pub fn kill_task(&self, container_id: &str, signal: &str, all: bool) -> Result<()> {
+        let response = self.rpc_client(container_id).request(ShimRpcRequest::KillTask(
+            KillTaskRequest {
+                container_id: container_id.to_string(),
+                signal: signal.to_string(),
+                all,
+            },
+        ))?;
+        ensure_empty_response("kill_task", response)
+    }
+
+    pub fn delete_task(&self, container_id: &str) -> Result<()> {
+        if !self.task_socket_path(container_id).exists() {
+            return Ok(());
+        }
+        let response = self.rpc_client(container_id).request(ShimRpcRequest::DeleteTask(
+            DeleteTaskRequest {
+                container_id: container_id.to_string(),
+            },
+        ))?;
+        ensure_empty_response("delete_task", response)
+    }
+
+    pub fn update_resources(
+        &self,
+        container_id: &str,
+        resources: &LinuxContainerResources,
+    ) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::UpdateResources(UpdateResourcesRequest {
+                container_id: container_id.to_string(),
+                resources: ShimLinuxResources::from(resources),
+            }))?;
+        ensure_empty_response("update_resources", response)
+    }
+
+    pub fn checkpoint_task(
+        &self,
+        container_id: &str,
+        image_path: &Path,
+        work_path: &Path,
+    ) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::CheckpointTask(CheckpointTaskRequest {
+                container_id: container_id.to_string(),
+                image_path: image_path.to_path_buf(),
+                work_path: work_path.to_path_buf(),
+            }))?;
+        ensure_empty_response("checkpoint_task", response)
+    }
+
+    pub fn reopen_log(&self, container_id: &str) -> Result<()> {
+        if !self.task_socket_path(container_id).exists() {
+            return Ok(());
+        }
+        let response = self.rpc_client(container_id).request(ShimRpcRequest::ReopenLog(
+            ReopenLogRequest {
+                container_id: container_id.to_string(),
+            },
+        ))?;
+        ensure_empty_response("reopen_log", response)
+    }
+
+    pub fn resize_pty(&self, container_id: &str, width: u16, height: u16) -> Result<()> {
+        let response = self.rpc_client(container_id).request(ShimRpcRequest::ResizePty(
+            ResizePtyRequest {
+                container_id: container_id.to_string(),
+                width,
+                height,
+            },
+        ))?;
+        ensure_empty_response("resize_pty", response)
+    }
+
+    pub fn status(&self, container_id: &str) -> Result<StatusResponse> {
+        if !self.task_socket_path(container_id).exists() {
+            return Ok(StatusResponse {
+                state: if self.get_exit_code(container_id)?.is_some() {
+                    TaskState::Stopped
+                } else if self.is_shim_running(container_id) {
+                    TaskState::Running
+                } else {
+                    TaskState::Init
+                },
+                pid: None,
+                exit_code: self.get_exit_code(container_id)?,
+            });
+        }
+        match self.rpc_client(container_id).request(ShimRpcRequest::Status(StatusRequest {
+            container_id: container_id.to_string(),
+        }))? {
+            ShimRpcResponse::Status(response) => Ok(response),
+            other => Err(anyhow::anyhow!(
+                "unexpected shim RPC response for status: {:?}",
+                other
+            )),
+        }
+    }
+
+    pub fn pause_task(&self, container_id: &str) -> Result<()> {
+        let response = self.rpc_client(container_id).request(ShimRpcRequest::PauseTask(
+            PauseTaskRequest {
+                container_id: container_id.to_string(),
+            },
+        ))?;
+        ensure_empty_response("pause_task", response)
+    }
+
+    pub fn resume_task(&self, container_id: &str) -> Result<()> {
+        let response = self.rpc_client(container_id).request(ShimRpcRequest::ResumeTask(
+            ResumeTaskRequest {
+                container_id: container_id.to_string(),
+            },
+        ))?;
+        ensure_empty_response("resume_task", response)
+    }
+
+    pub fn container_pid(&self, container_id: &str) -> Result<Option<i32>> {
+        match self.rpc_client(container_id).request(ShimRpcRequest::ContainerPid(StatusRequest {
+            container_id: container_id.to_string(),
+        }))? {
+            ShimRpcResponse::ContainerPid(pid) => Ok(pid),
+            other => Err(anyhow::anyhow!(
+                "unexpected shim RPC response for container_pid: {:?}",
+                other
+            )),
+        }
+    }
+
     /// 停止shim进程
     pub fn stop_shim(&self, container_id: &str) -> Result<()> {
         info!("Stopping shim for container {}", container_id);
+
+        let _ = self.delete_task(container_id);
 
         let mut processes = self.processes.lock().unwrap();
         let removed = processes

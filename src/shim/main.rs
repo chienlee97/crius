@@ -38,6 +38,10 @@ struct Args {
     #[clap(long)]
     monitor_cgroup: Option<String>,
 
+    /// Shim work directory root
+    #[clap(long)]
+    work_dir: Option<PathBuf>,
+
     /// Debug mode
     #[clap(short, long)]
     debug: bool,
@@ -85,6 +89,10 @@ struct Args {
     /// Maximum CRI container log line size in bytes
     #[clap(long, default_value_t = 4096)]
     max_container_log_line_size: usize,
+
+    /// Optional unified state ledger path
+    #[clap(long)]
+    state_db_path: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -124,6 +132,10 @@ fn main() -> Result<()> {
         DaemonOptions {
             runtime_config_path: args.runtime_config_path.unwrap_or_default(),
             monitor_cgroup: args.monitor_cgroup.unwrap_or_default(),
+            work_dir: args
+                .work_dir
+                .unwrap_or_else(|| PathBuf::from("/var/run/crius/shims")),
+            state_db_path: args.state_db_path,
             exit_code_file: args.exit_code_file,
             attach_socket_dir: args.attach_socket_dir,
             io_uid: args.io_uid,

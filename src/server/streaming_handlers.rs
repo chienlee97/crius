@@ -90,6 +90,10 @@ impl RuntimeServiceImpl {
             .join("attach.sock")
     }
 
+    pub(super) fn task_socket_path(&self, container_id: &str) -> PathBuf {
+        crate::shim_rpc::default_task_socket_path(&self.shim_work_dir, container_id)
+    }
+
     pub(super) async fn exec(
         &self,
         request: Request<ExecRequest>,
@@ -113,6 +117,44 @@ impl RuntimeServiceImpl {
             .map(|config| config.stream_websockets)
             .unwrap_or(false);
         let exec_cpu_affinity = self.effective_exec_cpu_affinity(&req.container_id).await;
+        let task_socket_path = self.task_socket_path(&req.container_id);
+        let (exec_io_socket_path, exec_resize_socket_path) = if task_socket_path.exists() {
+            let request = crate::shim_rpc::ShimRpcRequest::OpenExecSession(
+                crate::shim_rpc::OpenExecSessionRequest {
+                    container_id: req.container_id.clone(),
+                    command: req.cmd.clone(),
+                    tty: req.tty,
+                    stdin: req.stdin,
+                    stdout: req.stdout,
+                    stderr: req.stderr,
+                    exec_cpu_affinity,
+                },
+            );
+            let task_socket_path_clone = task_socket_path.clone();
+            let response = tokio::task::spawn_blocking(move || {
+                crate::shim_rpc::ShimRpcClient::new(
+                    task_socket_path_clone,
+                    std::time::Duration::from_secs(5),
+                )
+                .request(request)
+            })
+            .await
+            .map_err(|err| Status::internal(format!("Failed to join shim exec task: {}", err)))?
+            .map_err(|err| Status::internal(format!("Shim exec session request failed: {}", err)))?;
+            match response {
+                crate::shim_rpc::ShimRpcResponse::OpenExecSession(response) => {
+                    (Some(response.io_socket_path), response.resize_socket_path)
+                }
+                other => {
+                    return Err(Status::internal(format!(
+                        "unexpected shim exec session response for container {}: {:?}",
+                        req.container_id, other
+                    )));
+                }
+            }
+        } else {
+            (None, None)
+        };
         let streaming = self.get_streaming_server().await?;
         let response = streaming
             .get_exec(
@@ -120,6 +162,8 @@ impl RuntimeServiceImpl {
                 runtime_path,
                 runtime_config_path,
                 exec_cpu_affinity,
+                exec_io_socket_path,
+                exec_resize_socket_path,
                 websocket_enabled,
             )
             .await?;
@@ -145,9 +189,53 @@ impl RuntimeServiceImpl {
             .await?;
 
         let runtime = self.runtime_for_container_request(&container_id).await?;
+        let exec_cpu_affinity = self.effective_exec_cpu_affinity(&container_id).await;
+        let task_socket_path = self.task_socket_path(&container_id);
+        if task_socket_path.exists() {
+            let request = crate::shim_rpc::ShimRpcRequest::ExecProcess(
+                crate::shim_rpc::ExecProcessRequest {
+                    container_id: container_id.clone(),
+                    command: cmd.clone(),
+                    tty: false,
+                    capture_output: true,
+                    timeout_ms: (timeout > 0).then_some(timeout as u64 * 1000),
+                    exec_cpu_affinity,
+                },
+            );
+            let task_socket_path_clone = task_socket_path.clone();
+            let response = tokio::task::spawn_blocking(move || {
+                crate::shim_rpc::ShimRpcClient::new(
+                    task_socket_path_clone,
+                    std::time::Duration::from_secs(5),
+                )
+                .request(request)
+            })
+            .await
+            .map_err(|err| Status::internal(format!("Failed to join shim exec_sync task: {}", err)))?
+            .map_err(|err| {
+                let message = err.to_string();
+                if message.contains("timed out") {
+                    Status::deadline_exceeded(message)
+                } else {
+                    Status::internal(format!("Shim exec_sync failed: {}", message))
+                }
+            })?;
+
+            if let crate::shim_rpc::ShimRpcResponse::ExecProcess(response) = response {
+                return Ok(Response::new(ExecSyncResponse {
+                    stdout: response.stdout,
+                    stderr: response.stderr,
+                    exit_code: response.exit_code as i32,
+                }));
+            }
+            return Err(Status::internal(format!(
+                "unexpected shim exec_sync response for container {}",
+                container_id
+            )));
+        }
+
         let runtime_path = runtime.runtime_path().to_path_buf();
         let runtime_config_path = runtime.runtime_config_path().to_path_buf();
-        let exec_cpu_affinity = self.effective_exec_cpu_affinity(&container_id).await;
         let mut command = TokioCommand::new(&runtime_path);
         if !runtime_config_path.as_os_str().is_empty() {
             command.arg("--config").arg(&runtime_config_path);

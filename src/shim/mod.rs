@@ -7,5 +7,9 @@ pub mod io;
 pub mod process;
 pub mod subreaper;
 
+pub mod rpc {
+    pub use crate::shim_rpc::*;
+}
+
 pub use daemon::{Daemon, DaemonOptions};
 pub use io::{IoConfig, IoManager};

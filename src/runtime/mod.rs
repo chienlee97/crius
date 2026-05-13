@@ -5,9 +5,7 @@ use nix::sys::stat::{major, makedev, minor, mknod, stat, Mode, SFlag};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::os::unix::net::UnixStream as StdUnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -2592,6 +2590,9 @@ impl RuncRuntime {
         image_path: &Path,
         work_path: &Path,
     ) -> Result<()> {
+        if let Some(ref shim_manager) = self.shim_manager {
+            return shim_manager.checkpoint_task(container_id, image_path, work_path);
+        }
         std::fs::create_dir_all(image_path).with_context(|| {
             format!(
                 "Failed to create checkpoint image directory {}",
@@ -2626,6 +2627,9 @@ impl RuncRuntime {
     }
 
     pub fn pause_container(&self, container_id: &str) -> Result<()> {
+        if let Some(ref shim_manager) = self.shim_manager {
+            return shim_manager.pause_task(container_id);
+        }
         match self.get_runc_state(container_id)? {
             Some(state) if state.status == "paused" => Ok(()),
             Some(state) if state.status == "running" => self.runc_exec(&["pause", container_id]),
@@ -2639,6 +2643,9 @@ impl RuncRuntime {
     }
 
     pub fn resume_container(&self, container_id: &str) -> Result<()> {
+        if let Some(ref shim_manager) = self.shim_manager {
+            return shim_manager.resume_task(container_id);
+        }
         match self.get_runc_state(container_id)? {
             Some(state) if state.status == "running" => Ok(()),
             Some(state) if state.status == "paused" => self.runc_exec(&["resume", container_id]),
@@ -2719,9 +2726,30 @@ impl RuncRuntime {
         }
 
         shim_manager
-            .start_shim(container_id, &bundle_path)
+            .create_task(
+                container_id,
+                &bundle_path,
+                &self
+                    .rootfs_cleanup_target_from_bundle(container_id)
+                    .unwrap_or_else(|| bundle_path.join("rootfs")),
+            )
             .context("failed to restore shim for attach recovery")?;
         Ok(())
+    }
+
+    pub fn shim_status(
+        &self,
+        container_id: &str,
+    ) -> Result<Option<crate::shim_rpc::StatusResponse>> {
+        let Some(shim_manager) = self.shim_manager.as_ref() else {
+            return Ok(None);
+        };
+        if !shim_manager.task_socket_path(container_id).exists()
+            && !shim_manager.is_shim_running(container_id)
+        {
+            return Ok(None);
+        }
+        shim_manager.status(container_id).map(Some)
     }
 
     pub fn new(runtime_path: PathBuf, root: PathBuf) -> Self {
@@ -3594,6 +3622,9 @@ impl RuncRuntime {
 
     /// 获取容器 init 进程 PID
     pub fn container_pid(&self, container_id: &str) -> Result<Option<i32>> {
+        if let Some(ref shim_manager) = self.shim_manager {
+            return shim_manager.container_pid(container_id);
+        }
         match self.get_runc_state(container_id)? {
             Some(state) if state.pid > 0 => Ok(Some(state.pid)),
             _ => Ok(None),
@@ -3601,7 +3632,7 @@ impl RuncRuntime {
     }
 
     /// 将 CRI LinuxContainerResources 转换为 ResourceLimits
-    fn cri_to_limits(resources: &LinuxContainerResources) -> ResourceLimits {
+    pub(crate) fn cri_to_limits(resources: &LinuxContainerResources) -> ResourceLimits {
         ResourceLimits {
             cpu: Some(CpuLimit {
                 shares: (resources.cpu_shares > 0).then_some(resources.cpu_shares as u64),
@@ -3635,57 +3666,7 @@ impl RuncRuntime {
             .shim_manager
             .as_ref()
             .context("container log reopen requires shim-enabled runtime")?;
-        let socket_path = shim_manager.shim_socket_path(container_id, "reopen.sock");
-        if !socket_path.exists() {
-            return Err(LogReopenError::MissingSocket {
-                container_id: container_id.to_string(),
-                socket_path,
-            }
-            .into());
-        }
-        let mut stream = StdUnixStream::connect(&socket_path).with_context(|| {
-            format!(
-                "Failed to connect reopen log socket {}",
-                socket_path.display()
-            )
-        })?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-            .with_context(|| {
-                format!(
-                    "Failed to configure reopen log socket timeout {}",
-                    socket_path.display()
-                )
-            })?;
-        let mut response = String::new();
-        stream.read_to_string(&mut response).with_context(|| {
-            format!(
-                "Failed to read reopen log response from {}",
-                socket_path.display()
-            )
-        })?;
-
-        let response = response.trim();
-        if response == "OK" {
-            Ok(())
-        } else if response.is_empty() {
-            Err(anyhow::anyhow!(
-                "reopen log socket {} closed without acknowledgement",
-                socket_path.display()
-            ))
-        } else if let Some(reason) = response.strip_prefix("ERR ") {
-            Err(anyhow::anyhow!(
-                "shim failed to reopen log file for {}: {}",
-                container_id,
-                reason
-            ))
-        } else {
-            Err(anyhow::anyhow!(
-                "unexpected reopen log response from {}: {}",
-                socket_path.display(),
-                response
-            ))
-        }
+        shim_manager.reopen_log(container_id)
     }
 
     fn rootfs_cleanup_target(&self, container_id: &str) -> Option<PathBuf> {
@@ -3741,6 +3722,10 @@ impl ContainerRuntime for RuncRuntime {
 
         // 延迟到start阶段再调用runc，避免create阶段阻塞导致CRI超时。
         info!("Container {} bundle prepared successfully", container_id);
+        if let Some(ref shim_manager) = self.shim_manager {
+            let bundle_path = self.bundle_path(container_id);
+            shim_manager.create_task(container_id, &bundle_path, &config.rootfs)?;
+        }
         Ok(container_id.to_string())
     }
 
@@ -3752,11 +3737,8 @@ impl ContainerRuntime for RuncRuntime {
         // 如果启用了shim，使用shim启动
         if let Some(ref shim_manager) = self.shim_manager {
             let bundle_path = self.bundle_path(container_id);
-            let _process = shim_manager.start_shim(container_id, &bundle_path)?;
-            info!(
-                "Container {} started via shim (PID: {})",
-                container_id, _process.shim_pid
-            );
+            shim_manager.start_task(container_id, &bundle_path)?;
+            info!("Container {} started via shim task RPC", container_id);
         } else {
             match state {
                 None => {
@@ -3816,7 +3798,11 @@ impl ContainerRuntime for RuncRuntime {
         }
 
         let timeout_secs = timeout.unwrap_or(self.container_stop_timeout_secs);
-        self.runc_exec(&["kill", container_id, "TERM"])?;
+        if let Some(ref shim_manager) = self.shim_manager {
+            shim_manager.kill_task(container_id, "TERM", true)?;
+        } else {
+            self.runc_exec(&["kill", container_id, "TERM"])?;
+        }
 
         let graceful_deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
@@ -3846,7 +3832,12 @@ impl ContainerRuntime for RuncRuntime {
                 ));
             }
 
-            if let Err(err) = self.runc_exec(&["kill", container_id, "KILL"]) {
+            let kill_result = if let Some(ref shim_manager) = self.shim_manager {
+                shim_manager.kill_task(container_id, "KILL", true)
+            } else {
+                self.runc_exec(&["kill", container_id, "KILL"])
+            };
+            if let Err(err) = kill_result {
                 match self.get_runc_state(container_id)? {
                     None => break,
                     Some(state) if state.status == "stopped" => break,
@@ -3877,15 +3868,19 @@ impl ContainerRuntime for RuncRuntime {
         let _ = self.stop_container(container_id, None);
 
         // 删除容器
-        let output = self.run_command_output(&["delete", container_id])?;
+        if let Some(ref shim_manager) = self.shim_manager {
+            let _ = shim_manager.delete_task(container_id);
+        } else {
+            let output = self.run_command_output(&["delete", container_id])?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // 检查是否已经是"container does not exist"错误
-            if stderr.contains("does not exist") {
-                info!("Container {} does not exist", container_id);
-            } else {
-                return Err(anyhow::anyhow!("Failed to delete container: {}", stderr));
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // 检查是否已经是"container does not exist"错误
+                if stderr.contains("does not exist") {
+                    info!("Container {} does not exist", container_id);
+                } else {
+                    return Err(anyhow::anyhow!("Failed to delete container: {}", stderr));
+                }
             }
         }
 
@@ -3930,14 +3925,17 @@ impl ContainerRuntime for RuncRuntime {
     fn container_status(&self, container_id: &str) -> Result<ContainerStatus> {
         // 如果启用了shim，检查shim是否还在运行
         if let Some(ref shim_manager) = self.shim_manager {
-            // 检查是否有退出码
-            if let Ok(Some(exit_code)) = shim_manager.get_exit_code(container_id) {
-                return Ok(ContainerStatus::Stopped(exit_code));
-            }
-
-            // 检查shim是否还在运行
-            if shim_manager.is_shim_running(container_id) {
-                return Ok(ContainerStatus::Running);
+            if let Ok(status) = shim_manager.status(container_id) {
+                match status.state {
+                    crate::shim_rpc::TaskState::Created => return Ok(ContainerStatus::Created),
+                    crate::shim_rpc::TaskState::Running => return Ok(ContainerStatus::Running),
+                    crate::shim_rpc::TaskState::Stopped => {
+                        return Ok(ContainerStatus::Stopped(
+                            status.exit_code.unwrap_or_default(),
+                        ));
+                    }
+                    crate::shim_rpc::TaskState::Deleted | crate::shim_rpc::TaskState::Init => {}
+                }
             }
         }
 
@@ -3961,6 +3959,24 @@ impl ContainerRuntime for RuncRuntime {
     }
 
     fn exec_in_container(&self, container_id: &str, command: &[String], tty: bool) -> Result<i32> {
+        if let Some(ref shim_manager) = self.shim_manager {
+            let affinity_cpu = if self.exec_cpu_affinity == "first" {
+                self.load_bundle_config_value(container_id)
+                    .ok()
+                    .and_then(|config| {
+                        config
+                            .get("linux")
+                            .and_then(|linux| linux.get("resources"))
+                            .and_then(|resources| resources.get("cpu"))
+                            .and_then(|cpu| cpu.get("cpus"))
+                            .and_then(|cpus| cpus.as_str())
+                            .and_then(Self::first_cpu_from_cpuset)
+                    })
+            } else {
+                None
+            };
+            return shim_manager.exec_process(container_id, command, tty, affinity_cpu);
+        }
         info!(
             "Executing command in container {}: {:?}",
             container_id, command
@@ -4021,6 +4037,9 @@ impl ContainerRuntime for RuncRuntime {
         container_id: &str,
         resources: &LinuxContainerResources,
     ) -> Result<()> {
+        if let Some(ref shim_manager) = self.shim_manager {
+            return shim_manager.update_resources(container_id, resources);
+        }
         if self.disable_cgroup {
             return Err(anyhow::anyhow!(
                 "cgroup support is disabled; container resource updates are unavailable"

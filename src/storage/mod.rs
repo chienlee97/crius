@@ -542,6 +542,20 @@ impl StorageManager {
         Ok(())
     }
 
+    pub fn update_container_annotations(
+        &mut self,
+        container_id: &str,
+        annotations: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE containers SET annotations = ?2 WHERE id = ?1",
+                (container_id, annotations),
+            )
+            .context("Failed to update container annotations")?;
+        Ok(())
+    }
+
     /// 保存Pod沙箱记录
     pub fn save_pod_sandbox(&mut self, record: &PodSandboxRecord) -> Result<()> {
         self.conn.execute(
@@ -669,6 +683,16 @@ impl StorageManager {
             "Pod sandbox {} and its containers deleted from database",
             pod_id
         );
+        Ok(())
+    }
+
+    pub fn update_pod_annotations(&mut self, pod_id: &str, annotations: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE pod_sandboxes SET annotations = ?2 WHERE id = ?1",
+                (pod_id, annotations),
+            )
+            .context("Failed to update pod sandbox annotations")?;
         Ok(())
     }
 
@@ -1047,6 +1071,32 @@ impl StorageManager {
             )
             .context("Failed to record state event")?;
 
+        Ok(())
+    }
+
+    pub fn append_event(
+        &mut self,
+        entity_type: &str,
+        entity_id: &str,
+        old_state: Option<&str>,
+        new_state: Option<&str>,
+        details: Option<&str>,
+    ) -> Result<()> {
+        let timestamp = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO events (entity_type, entity_id, old_state, new_state, timestamp, details)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (
+                    entity_type,
+                    entity_id,
+                    old_state.unwrap_or(""),
+                    new_state.unwrap_or(""),
+                    timestamp,
+                    details,
+                ),
+            )
+            .context("Failed to append state event")?;
         Ok(())
     }
 

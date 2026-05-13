@@ -93,6 +93,10 @@ impl RuntimeBackend for RuncBackend {
         self.inner.restore_attach_shim(container_id)
     }
 
+    fn shim_status(&self, container_id: &str) -> Result<Option<crate::shim_rpc::StatusResponse>> {
+        self.inner.shim_status(container_id)
+    }
+
     fn restore_container_from_checkpoint(
         &self,
         container_id: &str,

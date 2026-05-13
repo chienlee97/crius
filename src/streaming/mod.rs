@@ -426,6 +426,8 @@ struct ExecRequestContext {
     runtime_path: PathBuf,
     runtime_config_path: PathBuf,
     exec_cpu_affinity: Option<usize>,
+    exec_io_socket_path: Option<PathBuf>,
+    exec_resize_socket_path: Option<PathBuf>,
     websocket_enabled: bool,
 }
 
@@ -579,6 +581,8 @@ impl StreamingServer {
         runtime_path: PathBuf,
         runtime_config_path: PathBuf,
         exec_cpu_affinity: Option<usize>,
+        exec_io_socket_path: Option<PathBuf>,
+        exec_resize_socket_path: Option<PathBuf>,
         websocket_enabled: bool,
     ) -> Result<ExecResponse, tonic::Status> {
         Self::validate_exec_request(req)?;
@@ -588,6 +592,8 @@ impl StreamingServer {
                 runtime_path,
                 runtime_config_path,
                 exec_cpu_affinity,
+                exec_io_socket_path,
+                exec_resize_socket_path,
                 websocket_enabled,
             }))
             .await;
@@ -784,6 +790,8 @@ async fn handle_request(
                 runtime_path,
                 runtime_config_path,
                 exec_cpu_affinity,
+                exec_io_socket_path,
+                exec_resize_socket_path,
                 websocket_enabled,
             } = exec_ctx;
             if is_websocket_upgrade_request(&req) {
@@ -809,6 +817,8 @@ async fn handle_request(
                         runtime_path,
                         runtime_config_path,
                         exec_cpu_affinity,
+                        exec_io_socket_path,
+                        exec_resize_socket_path,
                         protocol,
                     )
                     .await
@@ -841,6 +851,8 @@ async fn handle_request(
                     runtime_path,
                     runtime_config_path,
                     exec_cpu_affinity,
+                    exec_io_socket_path,
+                    exec_resize_socket_path,
                     protocol,
                 )
                 .await
@@ -2183,8 +2195,21 @@ async fn serve_exec_spdy(
     runtime_path: PathBuf,
     runtime_config_path: PathBuf,
     exec_cpu_affinity: Option<usize>,
+    exec_io_socket_path: Option<PathBuf>,
+    exec_resize_socket_path: Option<PathBuf>,
     _protocol: &'static str,
 ) -> anyhow::Result<()> {
+    if let Some(exec_io_socket_path) = exec_io_socket_path {
+        return serve_exec_spdy_via_shim(
+            on_upgrade,
+            req,
+            exec_io_socket_path,
+            exec_resize_socket_path,
+            _protocol,
+        )
+        .await;
+    }
+
     let upgraded = on_upgrade.await?;
     let (read_half, write_half) = tokio::io::split(upgraded);
     let writer = Arc::new(Mutex::new(spdy::AsyncSpdyWriter::new(write_half)));
@@ -2663,8 +2688,21 @@ async fn serve_exec_websocket(
     runtime_path: PathBuf,
     runtime_config_path: PathBuf,
     exec_cpu_affinity: Option<usize>,
+    exec_io_socket_path: Option<PathBuf>,
+    exec_resize_socket_path: Option<PathBuf>,
     _protocol: &'static str,
 ) -> anyhow::Result<()> {
+    if let Some(exec_io_socket_path) = exec_io_socket_path {
+        return serve_exec_websocket_via_shim(
+            on_upgrade,
+            req,
+            exec_io_socket_path,
+            exec_resize_socket_path,
+            _protocol,
+        )
+        .await;
+    }
+
     let upgraded = on_upgrade.await?;
     let (mut reader, writer) = tokio::io::split(upgraded);
     let writer = Arc::new(Mutex::new(writer));
@@ -3657,6 +3695,437 @@ async fn serve_portforward_websocket(
     Ok(())
 }
 
+async fn serve_exec_spdy_via_shim(
+    on_upgrade: hyper::upgrade::OnUpgrade,
+    req: ExecRequest,
+    exec_io_socket_path: PathBuf,
+    exec_resize_socket_path: Option<PathBuf>,
+    _protocol: &'static str,
+) -> anyhow::Result<()> {
+    let upgraded = on_upgrade.await?;
+    let (read_half, write_half) = tokio::io::split(upgraded);
+    let writer = Arc::new(Mutex::new(spdy::AsyncSpdyWriter::new(write_half)));
+    let mut reader = read_half;
+
+    let expected_roles = expected_exec_roles(&req);
+    let mut header_decompressor = spdy::HeaderDecompressor::new();
+    let mut stdin_stream = None;
+    let mut stdout_stream = None;
+    let mut stderr_stream = None;
+    let mut error_stream = None;
+    let mut resize_stream = None;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while [error_stream, stdin_stream, stdout_stream, stderr_stream]
+        .into_iter()
+        .flatten()
+        .count()
+        < expected_roles.len()
+    {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = tokio::time::timeout(remaining, spdy::read_frame_async(&mut reader)).await??;
+        match frame {
+            spdy::Frame::SynStream(frame) => {
+                let headers =
+                    spdy::decode_header_block(&frame.header_block, &mut header_decompressor)?;
+                let stream_type = spdy::header_value(&headers, "streamtype")
+                    .ok_or_else(|| anyhow::anyhow!("exec stream is missing streamtype header"))?;
+                let role = match stream_type {
+                    "error" => ExecStreamRole::Error,
+                    "stdin" => ExecStreamRole::Stdin,
+                    "stdout" => ExecStreamRole::Stdout,
+                    "stderr" => ExecStreamRole::Stderr,
+                    "resize" => ExecStreamRole::Resize,
+                    other => return Err(anyhow::anyhow!("unsupported exec streamtype {}", other)),
+                };
+
+                if role != ExecStreamRole::Resize && !expected_roles.contains(&role) {
+                    return Err(anyhow::anyhow!(
+                        "unexpected exec stream {:?} for request",
+                        role
+                    ));
+                }
+                if role == ExecStreamRole::Resize && !req.tty {
+                    return Err(anyhow::anyhow!("exec resize stream requires tty mode"));
+                }
+
+                match role {
+                    ExecStreamRole::Error if error_stream.is_none() => {
+                        error_stream = Some(frame.stream_id)
+                    }
+                    ExecStreamRole::Stdin if stdin_stream.is_none() => {
+                        stdin_stream = Some(frame.stream_id)
+                    }
+                    ExecStreamRole::Stdout if stdout_stream.is_none() => {
+                        stdout_stream = Some(frame.stream_id)
+                    }
+                    ExecStreamRole::Stderr if stderr_stream.is_none() => {
+                        stderr_stream = Some(frame.stream_id)
+                    }
+                    ExecStreamRole::Resize if resize_stream.is_none() => {
+                        resize_stream = Some(frame.stream_id)
+                    }
+                    _ => {
+                        return Err(anyhow::anyhow!("duplicate exec stream {:?} received", role));
+                    }
+                }
+
+                writer
+                    .lock()
+                    .await
+                    .write_syn_reply(frame.stream_id, &[], false)
+                    .await?;
+            }
+            spdy::Frame::Ping(frame) => {
+                writer.lock().await.write_ping(frame.id).await?;
+            }
+            _ => {}
+        }
+    }
+
+    let shim = match UnixStream::connect(&exec_io_socket_path).await {
+        Ok(shim) => shim,
+        Err(e) => {
+            let message = format!(
+                "failed to connect exec session socket {}: {}",
+                exec_io_socket_path.display(),
+                e
+            );
+            write_error_stream(&writer, error_stream, &message).await?;
+            if let Some(stream_id) = error_stream {
+                let mut writer = writer.lock().await;
+                writer.write_data(stream_id, &[], true).await?;
+                writer.write_goaway(stream_id).await?;
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!(message));
+        }
+    };
+    let (mut shim_read, shim_write) = shim.into_split();
+    let shim_write = Arc::new(Mutex::new(shim_write));
+
+    let mut resize_socket = if req.tty && resize_stream.is_some() {
+        match exec_resize_socket_path.as_ref() {
+            Some(path) => match UnixStream::connect(path).await {
+                Ok(stream) => Some(stream),
+                Err(e) => {
+                    let message = format!(
+                        "failed to connect exec resize socket {}: {}",
+                        path.display(),
+                        e
+                    );
+                    write_error_stream(&writer, error_stream, &message).await?;
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let writer_for_output = writer.clone();
+    let error_stream_for_output = error_stream;
+    let stdout_stream_for_output = stdout_stream;
+    let stderr_stream_for_output = stderr_stream;
+    tokio::spawn(async move {
+        let mut decoder = AttachOutputDecoder::default();
+        let mut buffer = [0u8; 8192];
+        loop {
+            match shim_read.read(&mut buffer).await {
+                Ok(0) => {
+                    if let Some(stream_id) = stdout_stream_for_output {
+                        let _ = writer_for_output
+                            .lock()
+                            .await
+                            .write_data(stream_id, &[], true)
+                            .await;
+                    }
+                    if let Some(stream_id) = stderr_stream_for_output {
+                        let _ = writer_for_output
+                            .lock()
+                            .await
+                            .write_data(stream_id, &[], true)
+                            .await;
+                    }
+                    if let Some(stream_id) = error_stream_for_output {
+                        let _ = writer_for_output
+                            .lock()
+                            .await
+                            .write_data(stream_id, &[], true)
+                            .await;
+                    }
+                    if let Err(e) = decoder.finish() {
+                        log::debug!("Exec output decoder finished with trailing data: {}", e);
+                    }
+                    if let Some(stream_id) = stdout_stream_for_output
+                        .or(stderr_stream_for_output)
+                        .or(error_stream_for_output)
+                    {
+                        let _ = writer_for_output.lock().await.write_goaway(stream_id).await;
+                    }
+                    break;
+                }
+                Ok(n) => match decoder.push(&buffer[..n]) {
+                    Ok(frames) => {
+                        for frame in frames {
+                            let target_stream = match frame.pipe {
+                                ATTACH_PIPE_STDOUT => stdout_stream_for_output,
+                                ATTACH_PIPE_STDERR => {
+                                    stderr_stream_for_output.or(stdout_stream_for_output)
+                                }
+                                _ => None,
+                            };
+                            if let Some(stream_id) = target_stream {
+                                if writer_for_output
+                                    .lock()
+                                    .await
+                                    .write_data(stream_id, &frame.payload, false)
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("Exec output decoder stopped: {}", e);
+                        if let Some(stream_id) = error_stream_for_output {
+                            let _ = writer_for_output
+                                .lock()
+                                .await
+                                .write_data(stream_id, e.to_string().as_bytes(), false)
+                                .await;
+                        }
+                        break;
+                    }
+                },
+                Err(e) => {
+                    log::debug!("Exec output pump stopped: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut header_decompressor = header_decompressor;
+    loop {
+        match spdy::read_frame_async(&mut reader).await {
+            Ok(spdy::Frame::Data(frame)) => {
+                if Some(frame.stream_id) == resize_stream {
+                    if frame.data.is_empty() {
+                        continue;
+                    }
+                    if resize_socket.is_none() && req.tty {
+                        if let Some(path) = exec_resize_socket_path.as_ref() {
+                            match UnixStream::connect(path).await {
+                                Ok(stream) => resize_socket = Some(stream),
+                                Err(e) => {
+                                    write_error_stream(
+                                        &writer,
+                                        error_stream,
+                                        &format!(
+                                            "failed to connect exec resize socket {}: {}",
+                                            path.display(),
+                                            e
+                                        ),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(socket) = resize_socket.as_mut() {
+                        socket.write_all(&frame.data).await?;
+                        if !frame.data.ends_with(b"\n") {
+                            socket.write_all(b"\n").await?;
+                        }
+                    }
+                } else if Some(frame.stream_id) == stdin_stream {
+                    let mut shim_write = shim_write.lock().await;
+                    if !frame.data.is_empty() {
+                        shim_write.write_all(&frame.data).await?;
+                    }
+                    if frame.flags & 0x01 != 0 {
+                        let _ = shim_write.shutdown().await;
+                    }
+                }
+            }
+            Ok(spdy::Frame::SynStream(frame)) => {
+                let headers =
+                    spdy::decode_header_block(&frame.header_block, &mut header_decompressor)?;
+                let stream_type = spdy::header_value(&headers, "streamtype")
+                    .ok_or_else(|| anyhow::anyhow!("exec stream is missing streamtype header"))?;
+                if stream_type != "resize" || !req.tty {
+                    return Err(anyhow::anyhow!(
+                        "unexpected exec streamtype {} after session start",
+                        stream_type
+                    ));
+                }
+                if resize_stream.replace(frame.stream_id).is_some() {
+                    return Err(anyhow::anyhow!("duplicate exec resize stream received"));
+                }
+                writer
+                    .lock()
+                    .await
+                    .write_syn_reply(frame.stream_id, &[], false)
+                    .await?;
+            }
+            Ok(spdy::Frame::Ping(frame)) => {
+                writer.lock().await.write_ping(frame.id).await?;
+            }
+            Ok(spdy::Frame::GoAway(_)) => break,
+            Ok(_) => {}
+            Err(e) => {
+                log::debug!("Exec input loop stopped: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn serve_exec_websocket_via_shim(
+    on_upgrade: hyper::upgrade::OnUpgrade,
+    req: ExecRequest,
+    exec_io_socket_path: PathBuf,
+    exec_resize_socket_path: Option<PathBuf>,
+    _protocol: &'static str,
+) -> anyhow::Result<()> {
+    let upgraded = on_upgrade.await?;
+    let (mut reader, writer) = tokio::io::split(upgraded);
+    let writer = Arc::new(Mutex::new(writer));
+
+    let shim = UnixStream::connect(&exec_io_socket_path)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to connect exec session socket {}: {}",
+                exec_io_socket_path.display(),
+                e
+            )
+        })?;
+    let (mut shim_read, shim_write) = shim.into_split();
+    let shim_write = Arc::new(Mutex::new(shim_write));
+
+    let mut resize_socket = if req.tty {
+        match exec_resize_socket_path.as_ref() {
+            Some(path) => UnixStream::connect(path).await.ok(),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let writer_for_output = writer.clone();
+    let stdout_enabled = req.stdout;
+    let stderr_enabled = req.stderr;
+    let tty = req.tty;
+    tokio::spawn(async move {
+        let mut decoder = AttachOutputDecoder::default();
+        let mut buffer = [0u8; 8192];
+        loop {
+            match shim_read.read(&mut buffer).await {
+                Ok(0) => {
+                    let _ =
+                        write_websocket_frame(&mut *writer_for_output.lock().await, 0x8, &[]).await;
+                    if let Err(e) = decoder.finish() {
+                        log::debug!("Exec websocket decoder finished with trailing data: {}", e);
+                    }
+                    break;
+                }
+                Ok(n) => match decoder.push(&buffer[..n]) {
+                    Ok(frames) => {
+                        for frame in frames {
+                            let channel = match frame.pipe {
+                                ATTACH_PIPE_STDOUT => Some(WS_CHANNEL_STDOUT),
+                                ATTACH_PIPE_STDERR if stderr_enabled && !tty => {
+                                    Some(WS_CHANNEL_STDERR)
+                                }
+                                ATTACH_PIPE_STDERR if stdout_enabled => Some(WS_CHANNEL_STDOUT),
+                                _ => None,
+                            };
+                            if let Some(channel) = channel {
+                                if write_websocket_channel_frame(
+                                    &writer_for_output,
+                                    channel,
+                                    &frame.payload,
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = write_websocket_channel_frame(
+                            &writer_for_output,
+                            WS_CHANNEL_ERROR,
+                            e.to_string().as_bytes(),
+                        )
+                        .await;
+                        break;
+                    }
+                },
+                Err(e) => {
+                    log::debug!("Exec websocket output pump stopped: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    loop {
+        let Some(frame) = read_websocket_frame(&mut reader).await? else {
+            break;
+        };
+        match frame.opcode {
+            0x8 => break,
+            0x9 => {
+                write_websocket_frame(&mut *writer.lock().await, 0xA, &frame.payload).await?;
+            }
+            0x1 | 0x2 => {
+                if frame.payload.is_empty() {
+                    continue;
+                }
+                let channel = frame.payload[0];
+                let payload = &frame.payload[1..];
+                match channel {
+                    WS_CHANNEL_STDIN => {
+                        if !payload.is_empty() {
+                            shim_write.lock().await.write_all(payload).await?;
+                        }
+                    }
+                    WS_CHANNEL_RESIZE if req.tty => {
+                        if resize_socket.is_none() {
+                            if let Some(path) = exec_resize_socket_path.as_ref() {
+                                resize_socket = UnixStream::connect(path).await.ok();
+                            }
+                        }
+                        if let Some(socket) = resize_socket.as_mut() {
+                            socket.write_all(payload).await?;
+                            if !payload.ends_with(b"\n") {
+                                socket.write_all(b"\n").await?;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let _ = shim_write.lock().await.shutdown().await;
+    write_websocket_frame(&mut *writer.lock().await, 0x8, &[]).await?;
+    Ok(())
+}
+
 async fn serve_attach_log_spdy(
     on_upgrade: hyper::upgrade::OnUpgrade,
     ctx: AttachLogRequestContext,
@@ -4138,6 +4607,8 @@ dB0HtnAja5pmq6N9Ck79+g==
                 PathBuf::from("/bin/false"),
                 PathBuf::new(),
                 None,
+                None,
+                None,
                 true,
             )
             .await
@@ -4213,6 +4684,8 @@ dB0HtnAja5pmq6N9Ck79+g==
                 runtime_path: PathBuf::from("/bin/false"),
                 runtime_config_path: PathBuf::new(),
                 exec_cpu_affinity: None,
+                exec_io_socket_path: None,
+                exec_resize_socket_path: None,
                 websocket_enabled: true,
             }))
             .await;
@@ -4247,6 +4720,8 @@ dB0HtnAja5pmq6N9Ck79+g==
                 runtime_path: PathBuf::from("/bin/false"),
                 runtime_config_path: PathBuf::new(),
                 exec_cpu_affinity: None,
+                exec_io_socket_path: None,
+                exec_resize_socket_path: None,
                 websocket_enabled: true,
             }))
             .await;
@@ -4297,6 +4772,8 @@ dB0HtnAja5pmq6N9Ck79+g==
                 runtime_path: PathBuf::from("/bin/false"),
                 runtime_config_path: PathBuf::new(),
                 exec_cpu_affinity: None,
+                exec_io_socket_path: None,
+                exec_resize_socket_path: None,
                 websocket_enabled: false,
             }))
             .await;
@@ -4688,6 +5165,8 @@ dB0HtnAja5pmq6N9Ck79+g==
                 runtime_path: PathBuf::from("/bin/false"),
                 runtime_config_path: PathBuf::new(),
                 exec_cpu_affinity: None,
+                exec_io_socket_path: None,
+                exec_resize_socket_path: None,
                 websocket_enabled: true,
             }))
             .await;
@@ -4729,6 +5208,8 @@ dB0HtnAja5pmq6N9Ck79+g==
                     runtime_path: PathBuf::from("/bin/false"),
                     runtime_config_path: PathBuf::new(),
                     exec_cpu_affinity: None,
+                    exec_io_socket_path: None,
+                    exec_resize_socket_path: None,
                     websocket_enabled: true,
                 }),
                 Duration::from_secs(6),
