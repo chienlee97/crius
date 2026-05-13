@@ -975,6 +975,26 @@ impl RuntimeServiceImpl {
                 "restrictOomScoreAdj": self.config.restrict_oom_score_adj,
                 "enableUnprivilegedPorts": self.config.enable_unprivileged_ports,
                 "enableUnprivilegedIcmp": self.config.enable_unprivileged_icmp,
+                "rootless": {
+                    "enabled": self.config.rootless.enabled,
+                    "currentUid": self.config.rootless.current_uid,
+                    "currentGid": self.config.rootless.current_gid,
+                    "inUserNamespace": self.config.rootless.in_user_namespace,
+                    "xdgRuntimeDir": self.config.rootless.xdg_runtime_dir.display().to_string(),
+                    "xdgDataHome": self.config.rootless.xdg_data_home.display().to_string(),
+                    "storageRoot": self.config.rootless.storage_root.display().to_string(),
+                    "runtimeRoot": self.config.rootless.runtime_root.display().to_string(),
+                    "netnsDir": self.config.rootless.netns_dir.display().to_string(),
+                    "networkMode": self.config.rootless.network_mode.as_str(),
+                    "useFuseOverlayfs": self.config.rootless.use_fuse_overlayfs,
+                    "disableCgroup": self.config.rootless.disable_cgroup,
+                    "tolerateMissingHugetlbController": self
+                        .config
+                        .rootless
+                        .tolerate_missing_hugetlb_controller,
+                    "slirp4netnsPath": self.config.rootless.slirp4netns_path.display().to_string(),
+                    "pastaPath": self.config.rootless.pasta_path.display().to_string(),
+                },
                 "cniMaxConfNum": self.config.cni_config.max_conf_num(),
                 "cniConfTemplate": self
                     .config

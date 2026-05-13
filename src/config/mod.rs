@@ -61,6 +61,9 @@ pub struct Config {
 
     /// NRI 配置。
     pub nri: NriConfig,
+
+    /// Rootless 配置。
+    pub rootless: crate::rootless::RootlessConfig,
 }
 
 /// CRI API 配置。
@@ -896,6 +899,7 @@ impl Default for Config {
             metrics: MetricsConfig::default(),
             tracing: TracingConfig::default(),
             nri: NriConfig::default(),
+            rootless: crate::rootless::RootlessConfig::default(),
         };
         config.normalize_runtime_settings();
         config
@@ -1210,6 +1214,21 @@ impl Config {
 
     /// 在 file/env/CLI 覆盖后收口派生路径和默认语义。
     pub fn normalize_derived_settings(&mut self) {
+        if self.rootless.enabled {
+            if let Ok(effective) = crate::rootless::EffectiveRootlessConfig::resolve(&self.rootless)
+            {
+                rewrite_default_string(
+                    &mut self.root,
+                    &[DEFAULT_PERSISTENT_ROOT_DIR],
+                    effective.xdg_data_home.join("crius").display().to_string(),
+                );
+                rewrite_default_string(
+                    &mut self.runtime.root,
+                    &[DEFAULT_RUNTIME_STATE_DIR],
+                    effective.runtime_root.display().to_string(),
+                );
+            }
+        }
         self.normalize_runtime_settings();
         self.api.listen_aliases = self
             .api
@@ -1223,6 +1242,28 @@ impl Config {
                 }
                 acc
             });
+        if self.rootless.enabled {
+            if let Ok(effective) = crate::rootless::EffectiveRootlessConfig::resolve(&self.rootless)
+            {
+                let default_image_root = ImageConfig::default().root;
+                rewrite_default_string(
+                    &mut self.image.root,
+                    &[default_image_root.as_str()],
+                    effective.storage_root.display().to_string(),
+                );
+                let default_log_dir = LoggingConfig::default().dir;
+                rewrite_default_string(
+                    &mut self.logging.dir,
+                    &[default_log_dir.as_str()],
+                    effective
+                        .xdg_data_home
+                        .join("crius")
+                        .join("logs")
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
     }
 
     /// 应用环境变量覆盖。
@@ -1262,6 +1303,50 @@ impl Config {
             "CRIUS_STREAM_ENABLE_TLS",
             &mut self.api.streaming.enable_tls,
         )?;
+        apply_bool_override("CRIUS_ROOTLESS", &mut self.rootless.enabled)?;
+        apply_string_override(
+            "CRIUS_ROOTLESS_XDG_RUNTIME_DIR",
+            &mut self.rootless.xdg_runtime_dir,
+        );
+        apply_string_override(
+            "CRIUS_ROOTLESS_XDG_DATA_HOME",
+            &mut self.rootless.xdg_data_home,
+        );
+        apply_string_override(
+            "CRIUS_ROOTLESS_STORAGE_ROOT",
+            &mut self.rootless.storage_root,
+        );
+        apply_string_override(
+            "CRIUS_ROOTLESS_RUNTIME_ROOT",
+            &mut self.rootless.runtime_root,
+        );
+        apply_string_override("CRIUS_ROOTLESS_NETNS_DIR", &mut self.rootless.netns_dir);
+        apply_bool_override(
+            "CRIUS_ROOTLESS_USE_FUSE_OVERLAYFS",
+            &mut self.rootless.use_fuse_overlayfs,
+        )?;
+        apply_string_override(
+            "CRIUS_ROOTLESS_SLIRP4NETNS_PATH",
+            &mut self.rootless.slirp4netns_path,
+        );
+        apply_string_override(
+            "CRIUS_ROOTLESS_PASTA_PATH",
+            &mut self.rootless.pasta_path,
+        );
+        if let Ok(value) = std::env::var("CRIUS_ROOTLESS_NETWORK_MODE") {
+            self.rootless.network_mode = match value.trim().to_ascii_lowercase().as_str() {
+                "slirp4netns" => crate::rootless::NetworkMode::Slirp4netns,
+                "pasta" => crate::rootless::NetworkMode::Pasta,
+                "rootlesskit" => crate::rootless::NetworkMode::Rootlesskit,
+                "none" => crate::rootless::NetworkMode::None,
+                other => {
+                    return Err(Error::Config(format!(
+                        "unsupported CRIUS_ROOTLESS_NETWORK_MODE {}",
+                        other
+                    )))
+                }
+            };
+        }
         apply_string_override(
             "CRIUS_STREAM_TLS_CERT",
             &mut self.api.streaming.tls_cert_file,
@@ -1677,6 +1762,14 @@ impl Config {
     /// 启动期统一配置校验。
     pub fn validate(&self) -> Result<()> {
         ensure_non_empty("root", &self.root)?;
+        if self.rootless.enabled {
+            let effective = crate::rootless::EffectiveRootlessConfig::resolve(&self.rootless)?;
+            if effective.network_mode == crate::rootless::NetworkMode::Rootlesskit {
+                return Err(Error::Config(
+                    "rootless.network_mode=rootlesskit is not implemented".to_string(),
+                ));
+            }
+        }
         ensure_non_empty("api.listen", &self.api.listen)?;
         validate_listen_address(&self.api.listen, self.api.allow_tcp_service)?;
         for alias in &self.api.listen_aliases {
@@ -3892,6 +3985,21 @@ mod tests {
         assert!(config.runtime.restrict_oom_score_adj);
         assert!(config.runtime.enable_unprivileged_ports);
         assert!(config.runtime.enable_unprivileged_icmp);
+    }
+
+    #[test]
+    fn rootless_config_rewrites_default_paths_to_xdg_layout() {
+        let mut config = Config::default();
+        config.rootless.enabled = true;
+        config.rootless.xdg_runtime_dir = "/run/user/1000".to_string();
+        config.rootless.xdg_data_home = "/home/test/.local/share".to_string();
+
+        config.normalize_derived_settings();
+
+        assert_eq!(config.root, "/home/test/.local/share/crius");
+        assert_eq!(config.runtime.root, "/run/user/1000/crius");
+        assert_eq!(config.image.root, "/home/test/.local/share/crius/storage");
+        assert_eq!(config.logging.dir, "/home/test/.local/share/crius/logs");
     }
 
     #[test]

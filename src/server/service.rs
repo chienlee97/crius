@@ -271,6 +271,7 @@ pub struct RuntimeConfig {
     pub restrict_oom_score_adj: bool,
     pub enable_unprivileged_ports: bool,
     pub enable_unprivileged_icmp: bool,
+    pub rootless: crate::rootless::EffectiveRootlessConfig,
     pub shim: ShimConfig,
     pub streaming: crate::streaming::StreamingConfig,
 }
@@ -1450,6 +1451,7 @@ impl RuntimeServiceImpl {
                     runtime.set_restrict_oom_score_adj(config.restrict_oom_score_adj);
                     runtime.set_bind_mount_prefix(config.bind_mount_prefix.clone());
                     runtime.set_disable_cgroup(config.disable_cgroup);
+                    runtime.set_rootless(config.rootless.clone());
                     runtime.set_default_seccomp_profile_path(config.seccomp_profile.clone());
                     runtime.set_exec_cpu_affinity(config.exec_cpu_affinity.clone());
                     runtime.set_no_pivot(config.no_pivot);

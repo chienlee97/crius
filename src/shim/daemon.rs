@@ -767,7 +767,12 @@ impl Daemon {
         if !self.runtime_config_path.as_os_str().is_empty() {
             cmd.arg("--config").arg(&self.runtime_config_path);
         }
-        cmd.env("XDG_RUNTIME_DIR", "/run/user/0");
+        let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/run/user/0"));
+        if !xdg_runtime_dir.as_os_str().is_empty() {
+            cmd.env("XDG_RUNTIME_DIR", xdg_runtime_dir);
+        }
         cmd
     }
 

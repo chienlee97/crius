@@ -493,6 +493,7 @@ pub struct RuncRuntime {
     restrict_oom_score_adj: bool,
     bind_mount_prefix: PathBuf,
     disable_cgroup: bool,
+    rootless: crate::rootless::EffectiveRootlessConfig,
     default_seccomp_profile_path: Option<PathBuf>,
     exec_cpu_affinity: String,
     no_pivot: bool,
@@ -2786,6 +2787,7 @@ impl RuncRuntime {
             restrict_oom_score_adj: false,
             bind_mount_prefix: PathBuf::new(),
             disable_cgroup: false,
+            rootless: crate::rootless::EffectiveRootlessConfig::disabled(),
             default_seccomp_profile_path: None,
             exec_cpu_affinity: String::new(),
             no_pivot: false,
@@ -2845,6 +2847,7 @@ impl RuncRuntime {
             restrict_oom_score_adj: false,
             bind_mount_prefix: PathBuf::new(),
             disable_cgroup: false,
+            rootless: crate::rootless::EffectiveRootlessConfig::disabled(),
             default_seccomp_profile_path: None,
             exec_cpu_affinity: String::new(),
             no_pivot,
@@ -2957,6 +2960,11 @@ impl RuncRuntime {
 
     pub fn set_disable_cgroup(&mut self, disable_cgroup: bool) {
         self.disable_cgroup = disable_cgroup;
+    }
+
+    pub fn set_rootless(&mut self, rootless: crate::rootless::EffectiveRootlessConfig) {
+        self.disable_cgroup = self.disable_cgroup || rootless.disable_cgroup;
+        self.rootless = rootless;
     }
 
     pub fn set_default_seccomp_profile_path(&mut self, path: PathBuf) {
@@ -3098,8 +3106,21 @@ impl RuncRuntime {
         if !self.runtime_config_path.as_os_str().is_empty() {
             cmd.arg("--config").arg(&self.runtime_config_path);
         }
-        cmd.env("XDG_RUNTIME_DIR", "/run/user/0");
+        let xdg_runtime_dir = self.effective_xdg_runtime_dir();
+        if !xdg_runtime_dir.as_os_str().is_empty() {
+            cmd.env("XDG_RUNTIME_DIR", xdg_runtime_dir);
+        }
         cmd
+    }
+
+    fn effective_xdg_runtime_dir(&self) -> PathBuf {
+        if self.rootless.enabled {
+            self.rootless.xdg_runtime_dir.clone()
+        } else {
+            std::env::var("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/run/user/0"))
+        }
     }
 
     /// 执行runc命令并返回输出（仅用于需要解析stdout的查询类命令）
@@ -4082,6 +4103,33 @@ mod tests {
             RuncRuntime::new(PathBuf::from("runc"), temp_dir.path().join("containers"));
         runtime.set_restrict_oom_score_adj(restrict);
         (runtime, temp_dir)
+    }
+
+    #[test]
+    fn runtime_uses_rootless_xdg_runtime_dir_when_enabled() {
+        let (mut runtime, _dir) = create_test_runtime();
+        runtime.set_rootless(crate::rootless::EffectiveRootlessConfig {
+            enabled: true,
+            current_uid: 1000,
+            current_gid: 1000,
+            in_user_namespace: true,
+            xdg_runtime_dir: PathBuf::from("/run/user/1000"),
+            xdg_data_home: PathBuf::from("/home/test/.local/share"),
+            storage_root: PathBuf::from("/home/test/.local/share/crius/storage"),
+            runtime_root: PathBuf::from("/run/user/1000/crius"),
+            netns_dir: PathBuf::from("/run/user/1000/crius/netns"),
+            use_fuse_overlayfs: true,
+            network_mode: crate::rootless::NetworkMode::None,
+            slirp4netns_path: PathBuf::from("slirp4netns"),
+            pasta_path: PathBuf::from("pasta"),
+            disable_cgroup: true,
+            tolerate_missing_hugetlb_controller: true,
+        });
+
+        assert_eq!(
+            runtime.effective_xdg_runtime_dir(),
+            PathBuf::from("/run/user/1000")
+        );
     }
 
     fn write_arg_capture_runtime_script(dir: &Path, args_path: &Path) -> PathBuf {

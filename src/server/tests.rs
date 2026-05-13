@@ -17,6 +17,10 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 
+fn disabled_rootless() -> crate::rootless::EffectiveRootlessConfig {
+    crate::rootless::EffectiveRootlessConfig::disabled()
+}
+
 fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
     RuntimeConfig {
         root_dir,
@@ -196,6 +200,7 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
         restrict_oom_score_adj: false,
         enable_unprivileged_ports: false,
         enable_unprivileged_icmp: false,
+        rootless: disabled_rootless(),
         shim: ShimConfig {
             shim_path: PathBuf::from("/definitely/missing/crius-shim"),
             runtime_config_path: PathBuf::new(),
@@ -1135,6 +1140,7 @@ where
         restrict_oom_score_adj: false,
         enable_unprivileged_ports: false,
         enable_unprivileged_icmp: false,
+        rootless: disabled_rootless(),
         shim: ShimConfig {
             shim_path: shim_path_override.unwrap_or(default_test_shim_path),
             runtime_config_path: PathBuf::new(),
@@ -1366,6 +1372,7 @@ fn test_service_with_fake_runtime_and_nri_and_shim(
         restrict_oom_score_adj: false,
         enable_unprivileged_ports: false,
         enable_unprivileged_icmp: false,
+        rootless: disabled_rootless(),
         shim: ShimConfig {
             shim_path: shim_path_override.unwrap_or(default_test_shim_path),
             runtime_config_path: PathBuf::new(),
@@ -6503,6 +6510,7 @@ sleep 1
             restrict_oom_score_adj: false,
             enable_unprivileged_ports: false,
             enable_unprivileged_icmp: false,
+            rootless: disabled_rootless(),
             shim: ShimConfig {
                 shim_path: fake_shim_path.clone(),
                 runtime_config_path: PathBuf::new(),
@@ -6791,6 +6799,7 @@ sleep 1
             restrict_oom_score_adj: false,
             enable_unprivileged_ports: false,
             enable_unprivileged_icmp: false,
+            rootless: disabled_rootless(),
             shim: ShimConfig {
                 shim_path: fake_shim_path.clone(),
                 runtime_config_path: PathBuf::new(),
@@ -7084,6 +7093,7 @@ sleep 1
             restrict_oom_score_adj: false,
             enable_unprivileged_ports: false,
             enable_unprivileged_icmp: false,
+            rootless: disabled_rootless(),
             shim: ShimConfig {
                 shim_path: fake_shim_path.clone(),
                 runtime_config_path: PathBuf::new(),
@@ -7590,6 +7600,23 @@ async fn status_verbose_returns_structured_config() {
         .config
         .cni_config
         .set_handler_max_conf_num("kata", 2);
+    service.config.rootless = crate::rootless::EffectiveRootlessConfig {
+        enabled: true,
+        current_uid: 1000,
+        current_gid: 1000,
+        in_user_namespace: true,
+        xdg_runtime_dir: PathBuf::from("/run/user/1000"),
+        xdg_data_home: PathBuf::from("/home/test/.local/share"),
+        storage_root: PathBuf::from("/home/test/.local/share/crius/storage"),
+        runtime_root: PathBuf::from("/run/user/1000/crius"),
+        netns_dir: PathBuf::from("/run/user/1000/crius/netns"),
+        use_fuse_overlayfs: true,
+        network_mode: crate::rootless::NetworkMode::Pasta,
+        slirp4netns_path: PathBuf::from("/usr/bin/slirp4netns"),
+        pasta_path: PathBuf::from("/usr/bin/pasta"),
+        disable_cgroup: true,
+        tolerate_missing_hugetlb_controller: true,
+    };
     let response = RuntimeService::status(&service, Request::new(StatusRequest { verbose: true }))
         .await
         .unwrap()
@@ -7613,6 +7640,13 @@ async fn status_verbose_returns_structured_config() {
     assert_eq!(config["imageMaxConcurrentDownloads"], 5);
     assert_eq!(config["imagePullRetryCount"], 2);
     assert_eq!(config["imageRegistryConfigDir"], "/etc/containerd/certs.d");
+    assert_eq!(config["rootless"]["enabled"], true);
+    assert_eq!(config["rootless"]["networkMode"], "pasta");
+    assert_eq!(config["rootless"]["xdgRuntimeDir"], "/run/user/1000");
+    assert_eq!(
+        config["rootless"]["storageRoot"],
+        "/home/test/.local/share/crius/storage"
+    );
     assert_eq!(config["imageStorageOptions"], serde_json::json!([]));
     assert_eq!(config["imageVolumes"], "bind");
     assert_eq!(

@@ -37,6 +37,20 @@ pub struct RootlessConfig {
     pub use_fuse_overlayfs: bool,
     /// 网络模式（slirp4netns/pasta/none）
     pub network_mode: NetworkMode,
+    /// 显式覆盖 XDG_RUNTIME_DIR；为空时自动推导。
+    pub xdg_runtime_dir: String,
+    /// 显式覆盖 XDG_DATA_HOME；为空时自动推导。
+    pub xdg_data_home: String,
+    /// 显式覆盖 rootless 存储根目录；为空时使用 XDG_DATA_HOME 下的 `crius/storage`。
+    pub storage_root: String,
+    /// 显式覆盖 rootless runtime state 根目录；为空时使用 XDG_RUNTIME_DIR 下的 `crius`。
+    pub runtime_root: String,
+    /// 显式覆盖 rootless netns 目录；为空时使用 runtime state 下的 `netns`。
+    pub netns_dir: String,
+    /// slirp4netns 二进制路径或命令名。
+    pub slirp4netns_path: String,
+    /// pasta 二进制路径或命令名。
+    pub pasta_path: String,
 }
 
 /// ID映射
@@ -51,7 +65,7 @@ pub struct IdMapping {
 }
 
 /// 网络模式
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NetworkMode {
     /// 使用slirp4netns
     Slirp4netns,
@@ -61,6 +75,17 @@ pub enum NetworkMode {
     Rootlesskit,
     /// 无网络
     None,
+}
+
+impl NetworkMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Slirp4netns => "slirp4netns",
+            Self::Pasta => "pasta",
+            Self::Rootlesskit => "rootlesskit",
+            Self::None => "none",
+        }
+    }
 }
 
 impl Default for RootlessConfig {
@@ -76,6 +101,13 @@ impl Default for RootlessConfig {
             auto_configure_subids: true,
             use_fuse_overlayfs: true,
             network_mode: NetworkMode::Slirp4netns,
+            xdg_runtime_dir: String::new(),
+            xdg_data_home: String::new(),
+            storage_root: String::new(),
+            runtime_root: String::new(),
+            netns_dir: String::new(),
+            slirp4netns_path: "slirp4netns".to_string(),
+            pasta_path: "pasta".to_string(),
         }
     }
 }
@@ -139,6 +171,105 @@ impl RootlessConfig {
     pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
         self.network_mode = mode;
         self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EffectiveRootlessConfig {
+    pub enabled: bool,
+    pub current_uid: u32,
+    pub current_gid: u32,
+    pub in_user_namespace: bool,
+    pub xdg_runtime_dir: PathBuf,
+    pub xdg_data_home: PathBuf,
+    pub storage_root: PathBuf,
+    pub runtime_root: PathBuf,
+    pub netns_dir: PathBuf,
+    pub use_fuse_overlayfs: bool,
+    pub network_mode: NetworkMode,
+    pub slirp4netns_path: PathBuf,
+    pub pasta_path: PathBuf,
+    pub disable_cgroup: bool,
+    pub tolerate_missing_hugetlb_controller: bool,
+}
+
+impl EffectiveRootlessConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            current_uid: RootlessManager::current_uid(),
+            current_gid: RootlessManager::current_gid(),
+            in_user_namespace: is_in_new_user_namespace(),
+            xdg_runtime_dir: PathBuf::new(),
+            xdg_data_home: PathBuf::new(),
+            storage_root: PathBuf::new(),
+            runtime_root: PathBuf::new(),
+            netns_dir: PathBuf::new(),
+            use_fuse_overlayfs: false,
+            network_mode: NetworkMode::None,
+            slirp4netns_path: PathBuf::from("slirp4netns"),
+            pasta_path: PathBuf::from("pasta"),
+            disable_cgroup: false,
+            tolerate_missing_hugetlb_controller: false,
+        }
+    }
+
+    pub fn resolve(config: &RootlessConfig) -> Result<Self> {
+        let current_uid = RootlessManager::current_uid();
+        let current_gid = RootlessManager::current_gid();
+        if !config.enabled {
+            return Ok(Self::disabled());
+        }
+
+        let xdg_runtime_dir = if !config.xdg_runtime_dir.trim().is_empty() {
+            PathBuf::from(config.xdg_runtime_dir.trim())
+        } else if let Ok(value) = std::env::var("XDG_RUNTIME_DIR") {
+            PathBuf::from(value)
+        } else {
+            PathBuf::from(format!("/run/user/{current_uid}"))
+        };
+        let xdg_data_home = if !config.xdg_data_home.trim().is_empty() {
+            PathBuf::from(config.xdg_data_home.trim())
+        } else if let Ok(value) = std::env::var("XDG_DATA_HOME") {
+            PathBuf::from(value)
+        } else {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+                .join(".local")
+                .join("share")
+        };
+        let runtime_root = if !config.runtime_root.trim().is_empty() {
+            PathBuf::from(config.runtime_root.trim())
+        } else {
+            xdg_runtime_dir.join("crius")
+        };
+        let storage_root = if !config.storage_root.trim().is_empty() {
+            PathBuf::from(config.storage_root.trim())
+        } else {
+            xdg_data_home.join("crius").join("storage")
+        };
+        let netns_dir = if !config.netns_dir.trim().is_empty() {
+            PathBuf::from(config.netns_dir.trim())
+        } else {
+            runtime_root.join("netns")
+        };
+
+        Ok(Self {
+            enabled: true,
+            current_uid,
+            current_gid,
+            in_user_namespace: is_in_new_user_namespace(),
+            xdg_runtime_dir,
+            xdg_data_home,
+            storage_root,
+            runtime_root,
+            netns_dir,
+            use_fuse_overlayfs: config.use_fuse_overlayfs,
+            network_mode: config.network_mode.clone(),
+            slirp4netns_path: PathBuf::from(config.slirp4netns_path.trim()),
+            pasta_path: PathBuf::from(config.pasta_path.trim()),
+            disable_cgroup: true,
+            tolerate_missing_hugetlb_controller: true,
+        })
     }
 }
 
@@ -566,5 +697,34 @@ mod tests {
         let config = RootlessConfig::new().with_network_mode(NetworkMode::Slirp4netns);
 
         assert_eq!(config.network_mode, NetworkMode::Slirp4netns);
+    }
+
+    #[test]
+    fn effective_rootless_config_uses_xdg_layout_by_default() {
+        let config = RootlessConfig {
+            enabled: true,
+            xdg_runtime_dir: "/tmp/crius-rootless-runtime".to_string(),
+            xdg_data_home: "/tmp/crius-rootless-data".to_string(),
+            ..RootlessConfig::default()
+        };
+
+        let effective = EffectiveRootlessConfig::resolve(&config).unwrap();
+        assert!(effective.enabled);
+        assert_eq!(
+            effective.runtime_root,
+            PathBuf::from("/tmp/crius-rootless-runtime").join("crius")
+        );
+        assert_eq!(
+            effective.storage_root,
+            PathBuf::from("/tmp/crius-rootless-data")
+                .join("crius")
+                .join("storage")
+        );
+        assert_eq!(
+            effective.netns_dir,
+            PathBuf::from("/tmp/crius-rootless-runtime")
+                .join("crius")
+                .join("netns")
+        );
     }
 }

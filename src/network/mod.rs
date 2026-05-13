@@ -2,6 +2,7 @@
 //!
 //! 提供容器网络功能，包括网络命名空间管理、CNI 接口等。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
@@ -42,6 +43,15 @@ pub struct CniConfig {
     netns_mount_dir: PathBuf,
     netns_mounts_under_state_dir: bool,
     namespace_helper_path: Option<PathBuf>,
+    rootless: Option<RootlessNetworkConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootlessNetworkConfig {
+    enabled: bool,
+    mode: crate::rootless::NetworkMode,
+    slirp4netns_path: PathBuf,
+    pasta_path: PathBuf,
 }
 
 impl Default for CniConfig {
@@ -68,6 +78,7 @@ impl Default for CniConfig {
             netns_mount_dir: PathBuf::from("/var/run/netns"),
             netns_mounts_under_state_dir: false,
             namespace_helper_path: None,
+            rootless: None,
         }
     }
 }
@@ -101,6 +112,7 @@ impl CniConfig {
             netns_mount_dir: PathBuf::from("/var/run/netns"),
             netns_mounts_under_state_dir: false,
             namespace_helper_path: None,
+            rootless: None,
         }
     }
 
@@ -186,6 +198,7 @@ impl CniConfig {
                 })
                 .unwrap_or(defaults.netns_mounts_under_state_dir),
             namespace_helper_path: None,
+            rootless: None,
         }
     }
 
@@ -285,6 +298,24 @@ impl CniConfig {
 
     pub fn set_namespace_helper_path(&mut self, helper_path: Option<PathBuf>) {
         self.namespace_helper_path = helper_path.filter(|path| !path.as_os_str().is_empty());
+    }
+
+    pub fn set_rootless_config(
+        &mut self,
+        rootless: Option<crate::rootless::EffectiveRootlessConfig>,
+    ) {
+        self.rootless = rootless.and_then(|effective| {
+            effective.enabled.then(|| RootlessNetworkConfig {
+                enabled: true,
+                mode: effective.network_mode,
+                slirp4netns_path: effective.slirp4netns_path,
+                pasta_path: effective.pasta_path,
+            })
+        });
+    }
+
+    pub fn rootless_config(&self) -> Option<&RootlessNetworkConfig> {
+        self.rootless.as_ref()
     }
 
     pub fn netns_path(&self, ns_name_or_path: &str) -> PathBuf {
@@ -566,6 +597,8 @@ pub struct DefaultNetworkManager {
     cni_runtime_handler_max_conf_nums: std::collections::HashMap<String, usize>,
     cni_default_network_name: Option<String>,
     namespace_manager: NamespaceManager,
+    rootless: Option<RootlessNetworkConfig>,
+    rootless_processes: std::sync::Arc<std::sync::Mutex<HashMap<String, u32>>>,
 }
 
 impl DefaultNetworkManager {
@@ -649,6 +682,8 @@ impl DefaultNetworkManager {
             cni_runtime_handler_max_conf_nums: cni.runtime_handler_max_conf_nums.clone(),
             cni_default_network_name: cni.default_network_name().map(ToOwned::to_owned),
             namespace_manager: NamespaceManager::new(cni.netns_mount_dir().to_path_buf()),
+            rootless: cni.rootless.clone(),
+            rootless_processes: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -666,13 +701,89 @@ impl DefaultNetworkManager {
             .copied()
             .unwrap_or(self.cni_max_conf_num)
     }
+
+    fn rootless_network_status(&self, name: &str) -> NetworkStatus {
+        NetworkStatus {
+            name: name.to_string(),
+            ip: None,
+            mac: None,
+            interfaces: Vec::new(),
+            raw_result: None,
+        }
+    }
+
+    fn start_rootless_network_helper(
+        &self,
+        pod_id: &str,
+        netns: &str,
+    ) -> Result<NetworkStatus, NetworkError> {
+        let Some(rootless) = self.rootless.as_ref() else {
+            return Err(NetworkError::Other("rootless network config is not enabled".to_string()));
+        };
+        let (program, name) = match rootless.mode {
+            crate::rootless::NetworkMode::Slirp4netns => (&rootless.slirp4netns_path, "slirp4netns"),
+            crate::rootless::NetworkMode::Pasta => (&rootless.pasta_path, "pasta"),
+            crate::rootless::NetworkMode::None => return Ok(self.rootless_network_status("none")),
+            crate::rootless::NetworkMode::Rootlesskit => {
+                return Err(NetworkError::Other(
+                    "rootlesskit network mode is not implemented".to_string(),
+                ))
+            }
+        };
+        let mut command = StdCommand::new(program);
+        match rootless.mode {
+            crate::rootless::NetworkMode::Slirp4netns => {
+                command.args([
+                    "--netns-type=path",
+                    "--disable-host-loopback",
+                    netns,
+                    "tap0",
+                ]);
+            }
+            crate::rootless::NetworkMode::Pasta => {
+                command.args(["--netns", netns, "--config-net", "--quiet"]);
+            }
+            crate::rootless::NetworkMode::None | crate::rootless::NetworkMode::Rootlesskit => {}
+        }
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::null());
+        let child = command.spawn().map_err(|err| {
+            NetworkError::Other(format!(
+                "failed to start rootless network helper {} for {}: {}",
+                program.display(),
+                pod_id,
+                err
+            ))
+        })?;
+        if let Ok(mut processes) = self.rootless_processes.lock() {
+            processes.insert(pod_id.to_string(), child.id());
+        }
+        Ok(self.rootless_network_status(name))
+    }
+
+    fn stop_rootless_network_helper(&self, pod_id: &str) {
+        let pid = self
+            .rootless_processes
+            .lock()
+            .ok()
+            .and_then(|mut processes| processes.remove(pod_id));
+        if let Some(pid) = pid {
+            #[cfg(unix)]
+            {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl NetworkManager for DefaultNetworkManager {
     async fn init(&self) -> Result<(), NetworkError> {
         // 创建缓存目录
-        if !Path::new(&self.cni_cache_dir).exists() {
+        if self.rootless.is_none() && !Path::new(&self.cni_cache_dir).exists() {
             tokio::fs::create_dir_all(&self.cni_cache_dir).await?;
         }
         tokio::fs::create_dir_all(self.namespace_manager.mount_dir()).await?;
@@ -700,6 +811,10 @@ impl NetworkManager for DefaultNetworkManager {
         pod_cidr: Option<&str>,
     ) -> Result<NetworkStatus, NetworkError> {
         self.ensure_loopback_up(netns).await?;
+
+        if self.rootless.is_some() {
+            return self.start_rootless_network_helper(pod_id, netns);
+        }
 
         let mut cni = CniManager::new(
             self.cni_plugin_dirs.clone(),
@@ -729,6 +844,10 @@ impl NetworkManager for DefaultNetworkManager {
         pod_uid: &str,
         runtime_handler: &str,
     ) -> Result<(), NetworkError> {
+        if self.rootless.is_some() {
+            self.stop_rootless_network_helper(pod_id);
+            return Ok(());
+        }
         let mut cni = CniManager::new(
             self.cni_plugin_dirs.clone(),
             self.effective_cni_config_dirs(runtime_handler),
@@ -780,6 +899,34 @@ mod tests {
 
         assert_eq!(manager.effective_cni_max_conf_num("kata"), 2);
         assert_eq!(manager.effective_cni_max_conf_num("runc"), 0);
+    }
+
+    #[test]
+    fn default_network_manager_supports_rootless_none_mode() {
+        let mut cni = CniConfig::default();
+        cni.set_rootless_config(Some(crate::rootless::EffectiveRootlessConfig {
+            enabled: true,
+            current_uid: 1000,
+            current_gid: 1000,
+            in_user_namespace: false,
+            xdg_runtime_dir: PathBuf::from("/tmp/rootless-runtime"),
+            xdg_data_home: PathBuf::from("/tmp/rootless-data"),
+            storage_root: PathBuf::from("/tmp/rootless-data/crius/storage"),
+            runtime_root: PathBuf::from("/tmp/rootless-runtime/crius"),
+            netns_dir: PathBuf::from("/tmp/rootless-runtime/crius/netns"),
+            use_fuse_overlayfs: true,
+            network_mode: crate::rootless::NetworkMode::None,
+            slirp4netns_path: PathBuf::from("slirp4netns"),
+            pasta_path: PathBuf::from("pasta"),
+            disable_cgroup: true,
+            tolerate_missing_hugetlb_controller: true,
+        }));
+        let manager = DefaultNetworkManager::from_cni_config(cni);
+        let status = manager
+            .start_rootless_network_helper("pod-1", "/tmp/nonexistent-netns")
+            .unwrap();
+        assert_eq!(status.name, "none");
+        assert!(status.ip.is_none());
     }
 
     #[tokio::test]
