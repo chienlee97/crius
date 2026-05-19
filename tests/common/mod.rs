@@ -1,8 +1,10 @@
-//! Shared fake implementations for unit and integration tests.
+//! Shared fake implementations for integration tests.
 //!
 //! These helpers are intentionally small and deterministic. They provide common
 //! stand-ins for runtime, image storage and shim RPC boundaries without requiring
 //! runc, a real rootfs or a long-running shim process.
+
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,14 +13,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::config::CgroupDriverConfig;
-use crate::image::content_store::{BlobHandle, BlobInfo, ContentStore, FsContentStore};
-use crate::image::snapshotter::{PreparedSnapshot, SnapshotUsage, Snapshotter};
-use crate::oci::spec::Spec;
-use crate::runtime::{
+use crius::config::CgroupDriverConfig;
+use crius::image::content_store::{BlobHandle, BlobInfo, ContentStore, FsContentStore};
+use crius::image::snapshotter::{PreparedSnapshot, SnapshotUsage, Snapshotter};
+use crius::oci::spec::Spec;
+use crius::runtime::{
     ContainerConfig, ContainerStatus, MountSemanticsError, RuntimeBackend, RuntimeFeatureProbe,
 };
-use crate::shim_rpc::{
+use crius::shim_rpc::{
     server::{serve, ShimRpcHandler},
     ShimRpcClient, ShimRpcRequest, ShimRpcResponse, TaskState,
 };
@@ -111,7 +113,7 @@ impl RuntimeBackend for FakeRuntimeBackend {
     fn update_container_resources(
         &self,
         _container_id: &str,
-        _resources: &crate::proto::runtime::v1::LinuxContainerResources,
+        _resources: &crius::proto::runtime::v1::LinuxContainerResources,
     ) -> Result<()> {
         Ok(())
     }
@@ -124,7 +126,7 @@ impl RuntimeBackend for FakeRuntimeBackend {
         Ok(())
     }
 
-    fn shim_status(&self, _container_id: &str) -> Result<Option<crate::shim_rpc::StatusResponse>> {
+    fn shim_status(&self, _container_id: &str) -> Result<Option<crius::shim_rpc::StatusResponse>> {
         Ok(None)
     }
 
@@ -346,7 +348,7 @@ impl ShimRpcHandler for PingShimHandler {
         match request {
             ShimRpcRequest::Ping => Ok(ShimRpcResponse::Empty),
             ShimRpcRequest::Status(_) => {
-                Ok(ShimRpcResponse::Status(crate::shim_rpc::StatusResponse {
+                Ok(ShimRpcResponse::Status(crius::shim_rpc::StatusResponse {
                     state: TaskState::Running,
                     pid: Some(1),
                     exit_code: None,
@@ -357,51 +359,5 @@ impl ShimRpcHandler for PingShimHandler {
                 other
             )),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::image::content_store::ContentStore;
-    use crate::image::snapshotter::Snapshotter;
-
-    #[test]
-    fn fake_runtime_backend_reports_configured_status() {
-        let backend = FakeRuntimeBackend::new("/tmp/fake").with_status(ContainerStatus::Running);
-        assert_eq!(backend.backend_name(), "fake");
-        assert!(matches!(
-            backend.container_status("container").unwrap(),
-            ContainerStatus::Running
-        ));
-    }
-
-    #[test]
-    fn fake_content_store_round_trips_blobs() {
-        let store = FakeContentStore::new().unwrap();
-        let digest = FsContentStore::compute_digest(b"hello");
-        store
-            .put_blob(&digest, "application/octet-stream", b"hello")
-            .unwrap();
-        assert_eq!(store.stat_blob(&digest).unwrap().size, 5);
-    }
-
-    #[test]
-    fn fake_snapshotter_returns_prepared_snapshot() {
-        let snapshotter = FakeSnapshotter::new("/tmp/snapshots");
-        let prepared = snapshotter
-            .prepare("key", "image:latest", Path::new("/tmp/rootfs"))
-            .unwrap();
-        assert_eq!(prepared.key, "key");
-        assert_eq!(prepared.image_id, "image:latest");
-    }
-
-    #[test]
-    fn fake_shim_rpc_server_handles_ping() {
-        let dir = tempfile::tempdir().unwrap();
-        let server =
-            FakeShimRpcServer::start(dir.path().join("task.sock"), Arc::new(PingShimHandler))
-                .unwrap();
-        server.wait_until_ready(Duration::from_secs(2)).unwrap();
     }
 }

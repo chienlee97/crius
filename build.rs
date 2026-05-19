@@ -9,13 +9,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .out_dir("src/proto")
+        .out_dir(&out_dir)
         .compile_with_config(
             config,
             &["proto/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto"],
             &["proto"],
         )?;
-    let _ = std::fs::copy(descriptor_path, "src/proto/file_descriptor_set.bin");
 
     std::fs::create_dir_all(&nri_out_dir)?;
     ttrpc_codegen::Codegen::new()
