@@ -745,6 +745,14 @@ impl RuntimeServiceImpl {
             let resource_class_support = crate::security::resource_classes::feature_support(Some(
                 &self.nri_config.blockio_config_path,
             ));
+            let extended_health_conditions = self.internal_services.health.extended_conditions(
+                &self.config.image_root,
+                &self.config.image_root.join("snapshots"),
+                &self.shim_work_dir,
+                self.last_startup_attempted_repair(),
+                self.last_startup_repair_succeeded(),
+                true,
+            );
             let payload = json!({
                 "runtimeName": self.cri_runtime_name(),
                 "runtimeVersion": self.cri_runtime_version(),
@@ -1156,6 +1164,7 @@ impl RuntimeServiceImpl {
                     "health": {
                         "runtime": runtime_condition.clone(),
                         "network": network_condition.clone(),
+                        "conditions": extended_health_conditions,
                         "watchers": self.internal_services.health.watcher_status(
                             reload_state.watcher_active,
                             reload_state.last_reload_error.as_deref(),

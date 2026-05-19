@@ -706,6 +706,18 @@ async fn status_verbose_returns_structured_config() {
     );
     assert!(config["internalServices"]["health"]["runtime"]["ready"].is_boolean());
     assert!(config["internalServices"]["health"]["network"]["ready"].is_boolean());
+    let health_conditions = config["internalServices"]["health"]["conditions"]
+        .as_array()
+        .unwrap();
+    for condition_type in ["ImageReady", "SnapshotReady", "ShimReady", "RecoveryReady"] {
+        let condition = health_conditions
+            .iter()
+            .find(|condition| condition["type"] == condition_type)
+            .unwrap_or_else(|| panic!("missing {condition_type} condition"));
+        assert!(condition["ready"].is_boolean());
+        assert!(condition["reason"].is_string());
+        assert!(condition["message"].is_string());
+    }
     assert!(config["internalServices"]["events"]["subscriberCount"]
         .as_u64()
         .is_some());

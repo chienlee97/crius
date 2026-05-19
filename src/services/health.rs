@@ -13,6 +13,36 @@ pub struct HealthCondition {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InternalHealthCondition {
+    #[serde(rename = "type")]
+    pub condition_type: String,
+    pub ready: bool,
+    pub reason: String,
+    pub message: String,
+}
+
+impl InternalHealthCondition {
+    fn ready(condition_type: &str, reason: &str, message: String) -> Self {
+        Self {
+            condition_type: condition_type.to_string(),
+            ready: true,
+            reason: reason.to_string(),
+            message,
+        }
+    }
+
+    fn not_ready(condition_type: &str, reason: &str, message: String) -> Self {
+        Self {
+            condition_type: condition_type.to_string(),
+            ready: false,
+            reason: reason.to_string(),
+            message,
+        }
+    }
+}
+
 impl HealthCondition {
     pub fn runtime_condition(&self) -> RuntimeCondition {
         RuntimeCondition {
@@ -128,6 +158,164 @@ impl HealthService {
             "shimReconnectSupported": shim_reconnect_supported,
         })
     }
+
+    pub fn image_condition(&self, image_root: &Path) -> InternalHealthCondition {
+        self.directory_condition(
+            "ImageReady",
+            image_root,
+            DirectoryConditionReasons {
+                ready: "ImageStoreReady",
+                missing: "ImageStoreMissing",
+                invalid: "ImageStoreInvalid",
+                read_only: "ImageStoreReadOnly",
+                label: "image store",
+            },
+        )
+    }
+
+    pub fn snapshot_condition(&self, snapshot_root: &Path) -> InternalHealthCondition {
+        self.directory_condition(
+            "SnapshotReady",
+            snapshot_root,
+            DirectoryConditionReasons {
+                ready: "SnapshotRootReady",
+                missing: "SnapshotRootMissing",
+                invalid: "SnapshotRootInvalid",
+                read_only: "SnapshotRootReadOnly",
+                label: "snapshot root",
+            },
+        )
+    }
+
+    pub fn shim_condition(
+        &self,
+        shim_work_dir: &Path,
+        reconnect_supported: bool,
+    ) -> InternalHealthCondition {
+        if !reconnect_supported {
+            return InternalHealthCondition::not_ready(
+                "ShimReady",
+                "ShimReconnectUnsupported",
+                "shim reconnect support is disabled".to_string(),
+            );
+        }
+
+        self.directory_condition(
+            "ShimReady",
+            shim_work_dir,
+            DirectoryConditionReasons {
+                ready: "ShimWorkDirReady",
+                missing: "ShimWorkDirMissing",
+                invalid: "ShimWorkDirInvalid",
+                read_only: "ShimWorkDirReadOnly",
+                label: "shim work directory",
+            },
+        )
+    }
+
+    pub fn recovery_condition(
+        &self,
+        attempted_repair: Option<bool>,
+        repair_succeeded: Option<bool>,
+    ) -> InternalHealthCondition {
+        match (attempted_repair, repair_succeeded) {
+            (Some(true), Some(false)) => InternalHealthCondition::not_ready(
+                "RecoveryReady",
+                "RecoveryRepairFailed",
+                "startup persistence repair was attempted and failed".to_string(),
+            ),
+            (Some(true), Some(true)) => InternalHealthCondition::ready(
+                "RecoveryReady",
+                "RecoveryRepairSucceeded",
+                "startup persistence repair completed successfully".to_string(),
+            ),
+            (Some(false), _) => InternalHealthCondition::ready(
+                "RecoveryReady",
+                "RecoveryRepairNotNeeded",
+                "startup recovery did not require persistence repair".to_string(),
+            ),
+            (None, _) => InternalHealthCondition::ready(
+                "RecoveryReady",
+                "RecoveryStatusUnavailable",
+                "startup recovery status has not been recorded".to_string(),
+            ),
+            (Some(true), None) => InternalHealthCondition::ready(
+                "RecoveryReady",
+                "RecoveryRepairInProgress",
+                "startup persistence repair has not recorded a final result".to_string(),
+            ),
+        }
+    }
+
+    pub fn extended_conditions(
+        &self,
+        image_root: &Path,
+        snapshot_root: &Path,
+        shim_work_dir: &Path,
+        attempted_repair: Option<bool>,
+        repair_succeeded: Option<bool>,
+        shim_reconnect_supported: bool,
+    ) -> Vec<InternalHealthCondition> {
+        vec![
+            self.image_condition(image_root),
+            self.snapshot_condition(snapshot_root),
+            self.shim_condition(shim_work_dir, shim_reconnect_supported),
+            self.recovery_condition(attempted_repair, repair_succeeded),
+        ]
+    }
+
+    fn directory_condition(
+        &self,
+        condition_type: &str,
+        path: &Path,
+        reasons: DirectoryConditionReasons,
+    ) -> InternalHealthCondition {
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                return InternalHealthCondition::not_ready(
+                    condition_type,
+                    reasons.missing,
+                    format!("{} does not exist at {}", reasons.label, path.display()),
+                );
+            }
+        };
+
+        if !metadata.is_dir() {
+            return InternalHealthCondition::not_ready(
+                condition_type,
+                reasons.invalid,
+                format!("{} is not a directory: {}", reasons.label, path.display()),
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o222 == 0 {
+                return InternalHealthCondition::not_ready(
+                    condition_type,
+                    reasons.read_only,
+                    format!("{} is not writable: {}", reasons.label, path.display()),
+                );
+            }
+        }
+
+        InternalHealthCondition::ready(
+            condition_type,
+            reasons.ready,
+            format!("{} is available at {}", reasons.label, path.display()),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirectoryConditionReasons {
+    ready: &'static str,
+    missing: &'static str,
+    invalid: &'static str,
+    read_only: &'static str,
+    label: &'static str,
 }
 
 #[cfg(test)]
@@ -183,5 +371,73 @@ mod tests {
         let condition = service.runtime_condition_for_path(&path, Some("runtime 1.0".to_string()));
         assert!(condition.ready);
         assert_eq!(condition.reason, "RuntimeIsReady");
+    }
+
+    #[test]
+    fn extended_conditions_report_subsystem_readiness() {
+        let service = HealthService;
+        let dir = tempdir().unwrap();
+        let image_root = dir.path().join("images");
+        let snapshot_root = image_root.join("snapshots");
+        let shim_work_dir = dir.path().join("shims");
+        std::fs::create_dir_all(&snapshot_root).unwrap();
+        std::fs::create_dir_all(&shim_work_dir).unwrap();
+
+        let conditions = service.extended_conditions(
+            &image_root,
+            &snapshot_root,
+            &shim_work_dir,
+            Some(false),
+            None,
+            true,
+        );
+
+        assert_eq!(conditions.len(), 4);
+        assert!(conditions.iter().all(|condition| condition.ready));
+        assert!(conditions
+            .iter()
+            .any(|condition| condition.condition_type == "ImageReady"));
+        assert!(conditions
+            .iter()
+            .any(|condition| condition.condition_type == "SnapshotReady"));
+        assert!(conditions
+            .iter()
+            .any(|condition| condition.condition_type == "ShimReady"));
+        assert!(conditions
+            .iter()
+            .any(|condition| condition.condition_type == "RecoveryReady"));
+    }
+
+    #[test]
+    fn extended_conditions_report_missing_snapshot_root_and_recovery_failure() {
+        let service = HealthService;
+        let dir = tempdir().unwrap();
+        let image_root = dir.path().join("images");
+        let shim_work_dir = dir.path().join("shims");
+        std::fs::create_dir_all(&image_root).unwrap();
+        std::fs::create_dir_all(&shim_work_dir).unwrap();
+
+        let conditions = service.extended_conditions(
+            &image_root,
+            &image_root.join("snapshots"),
+            &shim_work_dir,
+            Some(true),
+            Some(false),
+            true,
+        );
+
+        let snapshot = conditions
+            .iter()
+            .find(|condition| condition.condition_type == "SnapshotReady")
+            .unwrap();
+        assert!(!snapshot.ready);
+        assert_eq!(snapshot.reason, "SnapshotRootMissing");
+
+        let recovery = conditions
+            .iter()
+            .find(|condition| condition.condition_type == "RecoveryReady")
+            .unwrap();
+        assert!(!recovery.ready);
+        assert_eq!(recovery.reason, "RecoveryRepairFailed");
     }
 }
