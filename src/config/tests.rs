@@ -26,6 +26,7 @@ fn resolved_runtimes_merge_default_and_handler_specific_entries() {
                 "kata".to_string(),
                 RuntimeHandlerConfig {
                     backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
                     runtime_path: "/usr/bin/kata-runtime".to_string(),
                     runtime_root: "/run/crius/kata".to_string(),
                     runtime_config_path: String::new(),
@@ -66,6 +67,7 @@ fn resolved_runtimes_merge_default_and_handler_specific_entries() {
         resolved.get("runc"),
         Some(&ResolvedRuntimeHandlerConfig {
             backend: "runc".to_string(),
+            backend_options: HashMap::new(),
             runtime_path: "/usr/bin/runc".to_string(),
             runtime_config_path: String::new(),
             runtime_root: "/run/crius".to_string(),
@@ -86,6 +88,7 @@ fn resolved_runtimes_merge_default_and_handler_specific_entries() {
         resolved.get("kata"),
         Some(&ResolvedRuntimeHandlerConfig {
             backend: "runc".to_string(),
+            backend_options: HashMap::new(),
             runtime_path: "/usr/bin/kata-runtime".to_string(),
             runtime_config_path: String::new(),
             runtime_root: "/run/crius/kata".to_string(),
@@ -109,6 +112,7 @@ fn resolved_runtimes_merge_default_and_handler_specific_entries() {
         resolved.get("crun"),
         Some(&ResolvedRuntimeHandlerConfig {
             backend: "runc".to_string(),
+            backend_options: HashMap::new(),
             runtime_path: "/usr/bin/runc".to_string(),
             runtime_config_path: String::new(),
             runtime_root: "/run/crius".to_string(),
@@ -409,6 +413,73 @@ fn runtime_handler_config_accepts_runtime_config_path() {
         config.runtime.runtimes["kata"].runtime_config_path,
         runtime_config_path.display().to_string()
     );
+}
+
+#[test]
+fn runtime_handler_config_accepts_backend_options() {
+    let config: Config = toml::from_str(
+        r#"
+            root = "/var/lib/crius"
+
+            [runtime]
+            runtime_type = "runc"
+            runtime_path = "/usr/bin/runc"
+            root = "/run/crius"
+            handlers = ["runc", "kata"]
+
+            [runtime.runtimes.kata]
+            backend = "kata"
+            runtime_path = "/usr/bin/kata-runtime"
+            runtime_root = "/run/crius/kata"
+
+            [runtime.runtimes.kata.backend_options]
+            sandbox_cgroup_only = "true"
+            sandbox_type = "podsandbox"
+            "#,
+    )
+    .expect("handler backend_options should deserialize");
+
+    assert_eq!(
+        config.runtime.runtimes["kata"]
+            .backend_options
+            .get("sandbox_type")
+            .map(String::as_str),
+        Some("podsandbox")
+    );
+
+    let resolved = config.runtime.resolved_runtimes().unwrap();
+    assert_eq!(
+        resolved["kata"]
+            .backend_options
+            .get("sandbox_cgroup_only")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[test]
+fn validate_rejects_unknown_runc_backend_option() {
+    let mut config = Config::default();
+    config.runtime.handlers = vec!["kata".to_string()];
+    config.runtime.runtimes.insert(
+        "kata".to_string(),
+        RuntimeHandlerConfig {
+            backend: "runc".to_string(),
+            inherit_default_runtime: true,
+            backend_options: HashMap::from([(
+                "sandbox_type".to_string(),
+                "podsandbox".to_string(),
+            )]),
+            ..Default::default()
+        },
+    );
+
+    let err = config
+        .validate()
+        .expect_err("unknown runc backend option must fail validation");
+    assert!(err.to_string().contains(
+        "runtime.runtimes.kata.backend_options: unsupported runc backend option sandbox_type"
+    ));
 }
 
 #[test]

@@ -41,6 +41,7 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
                 "runc".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
                     backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
                     runtime_path: "/definitely/missing/runc".to_string(),
                     runtime_config_path: String::new(),
                     runtime_root: "/tmp/crius-test-runtime-root".to_string(),
@@ -61,6 +62,7 @@ fn test_runtime_config(root_dir: PathBuf) -> RuntimeConfig {
                 "kata".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
                     backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
                     runtime_path: "/definitely/missing/kata-runtime".to_string(),
                     runtime_config_path: String::new(),
                     runtime_root: "/tmp/crius-test-kata-runtime-root".to_string(),
@@ -1234,6 +1236,7 @@ where
             "runc".to_string(),
             crate::config::ResolvedRuntimeHandlerConfig {
                 backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
                 runtime_path: runtime_path.display().to_string(),
                 runtime_config_path: String::new(),
                 runtime_root: dir.path().join("runtime-root").display().to_string(),
@@ -1467,6 +1470,7 @@ fn test_service_with_fake_runtime_and_nri_and_shim(
             "runc".to_string(),
             crate::config::ResolvedRuntimeHandlerConfig {
                 backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
                 runtime_path: runtime_path.display().to_string(),
                 runtime_config_path: String::new(),
                 runtime_root: dir.path().join("runtime-root").display().to_string(),

@@ -1110,6 +1110,7 @@ mod tests {
                 "runc".to_string(),
                 crius::config::ResolvedRuntimeHandlerConfig {
                     backend: "runc".to_string(),
+                    backend_options: std::collections::HashMap::new(),
                     runtime_path: "/definitely/missing/runc".to_string(),
                     runtime_config_path: String::new(),
                     runtime_root: "/tmp/crius-main-test-runtime-root".to_string(),

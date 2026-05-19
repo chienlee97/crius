@@ -243,6 +243,40 @@ pub(super) fn parse_main_ip_preference(raw: &str) -> std::result::Result<MainIpP
     }
 }
 
+pub(super) fn validate_runtime_backend_options(
+    field_name: &str,
+    backend: &str,
+    options: &HashMap<String, String>,
+) -> Result<()> {
+    if options.iter().any(|(key, _value)| key.trim().is_empty()) {
+        return Err(Error::Config(format!(
+            "{field_name}: backend option keys must not be empty"
+        )));
+    }
+
+    match backend.trim() {
+        "" | "runc" => {
+            const RUNC_OPTIONS: &[&str] = &[
+                "no_pivot",
+                "no_new_keyring",
+                "systemd_cgroup",
+                "rootless",
+                "criu_path",
+            ];
+            for key in options.keys() {
+                if !RUNC_OPTIONS.iter().any(|allowed| allowed == key) {
+                    return Err(Error::Config(format!(
+                        "{field_name}: unsupported runc backend option {key}"
+                    )));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
 pub(super) fn validate_included_pod_metrics(values: &[String]) -> Result<()> {
     const ALL: &str = "all";
     const AVAILABLE: &[&str] = &["cpu", "memory", "network", "process", "disk"];

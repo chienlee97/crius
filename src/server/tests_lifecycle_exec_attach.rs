@@ -333,6 +333,7 @@ async fn exec_sync_uses_runtime_binary_for_non_default_handler() {
             "runc".to_string(),
             crate::config::ResolvedRuntimeHandlerConfig {
                 backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
                 runtime_path: runc_runtime_path.display().to_string(),
                 runtime_config_path: String::new(),
                 runtime_root: config.runtime_root.display().to_string(),
@@ -353,6 +354,7 @@ async fn exec_sync_uses_runtime_binary_for_non_default_handler() {
             "kata".to_string(),
             crate::config::ResolvedRuntimeHandlerConfig {
                 backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
                 runtime_path: kata_runtime_path.display().to_string(),
                 runtime_config_path: String::new(),
                 runtime_root: dir.path().join("runtime-root-kata").display().to_string(),
@@ -466,6 +468,7 @@ esac
         "runc".to_string(),
         crate::config::ResolvedRuntimeHandlerConfig {
             backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
             runtime_path: runtime_path.display().to_string(),
             runtime_config_path: String::new(),
             runtime_root: config.runtime_root.display().to_string(),
@@ -582,6 +585,7 @@ esac
         "runc".to_string(),
         crate::config::ResolvedRuntimeHandlerConfig {
             backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
             runtime_path: runtime_path.display().to_string(),
             runtime_config_path: String::new(),
             runtime_root: config.runtime_root.display().to_string(),
@@ -894,6 +898,7 @@ sleep 1
                 "runc".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
                     backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
                     runtime_path: runtime_path.display().to_string(),
                     runtime_config_path: String::new(),
                     runtime_root: dir.path().join("runtime-root").display().to_string(),
@@ -1181,6 +1186,7 @@ sleep 1
                 "runc".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
                     backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
                     runtime_path: runtime_path.display().to_string(),
                     runtime_config_path: String::new(),
                     runtime_root: dir.path().join("runtime-root").display().to_string(),
@@ -1476,6 +1482,7 @@ sleep 1
                 "runc".to_string(),
                 crate::config::ResolvedRuntimeHandlerConfig {
                     backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
                     runtime_path: runtime_path.display().to_string(),
                     runtime_config_path: String::new(),
                     runtime_root: dir.path().join("runtime-root").display().to_string(),

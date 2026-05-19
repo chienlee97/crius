@@ -24,6 +24,7 @@ impl IntrospectionService {
                         handler.clone(),
                         json!({
                             "backend": handler_config.backend,
+                            "backendOptions": handler_config.backend_options,
                             "runtimePath": handler_config.runtime_path,
                             "runtimeRoot": handler_config.runtime_root,
                             "snapshotter": handler_config.snapshotter,

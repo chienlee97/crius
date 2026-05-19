@@ -344,6 +344,8 @@ pub struct RuntimeConfig {
 pub struct RuntimeHandlerConfig {
     /// 该 handler 绑定的 runtime backend 类型。
     pub backend: String,
+    /// 该 handler 传递给 backend 的差异化配置项。
+    pub backend_options: HashMap<String, String>,
     /// 该 handler 对应的 OCI runtime 二进制路径。
     pub runtime_path: String,
     /// 该 handler 对应的 runtime 特定配置文件路径；为空时继承默认值。
@@ -438,6 +440,7 @@ impl RuntimeWorkloadResources {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRuntimeHandlerConfig {
     pub backend: String,
+    pub backend_options: HashMap<String, String>,
     pub runtime_path: String,
     pub runtime_config_path: String,
     pub runtime_root: String,
@@ -458,6 +461,7 @@ impl Default for ResolvedRuntimeHandlerConfig {
     fn default() -> Self {
         Self {
             backend: "runc".to_string(),
+            backend_options: HashMap::new(),
             runtime_path: String::new(),
             runtime_config_path: String::new(),
             runtime_root: String::new(),
@@ -942,6 +946,7 @@ impl RuntimeConfig {
         let default_handler = self.runtime_type.trim();
         let default_runtime = ResolvedRuntimeHandlerConfig {
             backend: "runc".to_string(),
+            backend_options: HashMap::new(),
             runtime_path: resolve_platform_runtime_path(
                 self.runtime_path.trim(),
                 &self.platform_runtime_paths,
@@ -990,6 +995,7 @@ impl RuntimeConfig {
                 if !config.backend.trim().is_empty() {
                     inherited.backend = config.backend.trim().to_string();
                 }
+                inherited.backend_options = config.backend_options.clone();
                 if !config.platform_runtime_paths.is_empty() {
                     inherited.platform_runtime_paths = config.platform_runtime_paths.clone();
                     inherited.runtime_path = resolve_platform_runtime_path(
@@ -1040,6 +1046,7 @@ impl RuntimeConfig {
                     } else {
                         config.backend.trim().to_string()
                     },
+                    backend_options: config.backend_options.clone(),
                     runtime_path: resolve_platform_runtime_path(
                         config.runtime_path.trim(),
                         &config.platform_runtime_paths,
@@ -2199,6 +2206,11 @@ impl Config {
             validate_runtime_backend(
                 &format!("runtime.runtimes.{handler}.backend"),
                 &handler_config.backend,
+            )?;
+            validate_runtime_backend_options(
+                &format!("runtime.runtimes.{handler}.backend_options"),
+                &handler_config.backend,
+                &handler_config.backend_options,
             )?;
             validate_runtime_snapshotter(
                 &format!("runtime.runtimes.{handler}.snapshotter"),

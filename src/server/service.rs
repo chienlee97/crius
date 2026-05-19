@@ -1530,6 +1530,7 @@ impl RuntimeServiceImpl {
             config.runtime.clone(),
             crate::config::ResolvedRuntimeHandlerConfig {
                 backend: "runc".to_string(),
+                backend_options: HashMap::new(),
                 runtime_path: config.runtime_path.display().to_string(),
                 runtime_config_path: config.runtime_config_path.display().to_string(),
                 runtime_root: config.runtime_root.display().to_string(),

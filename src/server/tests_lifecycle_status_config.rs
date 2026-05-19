@@ -331,6 +331,15 @@ async fn status_verbose_returns_structured_config() {
         .runtime_configs
         .get_mut("kata")
         .unwrap()
+        .backend_options = HashMap::from([
+        ("sandbox_type".to_string(), "podsandbox".to_string()),
+        ("sandbox_cgroup_only".to_string(), "true".to_string()),
+    ]);
+    service
+        .config
+        .runtime_configs
+        .get_mut("kata")
+        .unwrap()
         .stream_websockets = true;
     service
         .config
@@ -540,6 +549,14 @@ async fn status_verbose_returns_structured_config() {
     assert_eq!(
         config["runtimeHandlerConfigs"]["kata"]["monitorCgroup"],
         "system.slice"
+    );
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["backendOptions"]["sandbox_type"],
+        "podsandbox"
+    );
+    assert_eq!(
+        config["runtimeHandlerConfigs"]["kata"]["backendOptions"]["sandbox_cgroup_only"],
+        "true"
     );
     assert_eq!(
         config["runtimeHandlerConfigs"]["kata"]["streamWebsockets"],
@@ -1298,6 +1315,7 @@ exit 0
         "runc".to_string(),
         crate::config::ResolvedRuntimeHandlerConfig {
             backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
             runtime_path: runtime_path.display().to_string(),
             runtime_config_path: String::new(),
             runtime_root: config.runtime_root.display().to_string(),
@@ -1353,6 +1371,7 @@ exit 0
         "runc".to_string(),
         crate::config::ResolvedRuntimeHandlerConfig {
             backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
             runtime_path: runtime_path.display().to_string(),
             runtime_config_path: String::new(),
             runtime_root: config.runtime_root.display().to_string(),
@@ -1412,6 +1431,7 @@ async fn status_reports_runtime_not_ready_when_binary_is_not_executable() {
         "runc".to_string(),
         crate::config::ResolvedRuntimeHandlerConfig {
             backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
             runtime_path: runtime_path.display().to_string(),
             runtime_config_path: String::new(),
             runtime_root: config.runtime_root.display().to_string(),
