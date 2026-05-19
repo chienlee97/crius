@@ -1335,6 +1335,56 @@ async fn pull_persists_layers_into_content_store_and_metadata() {
 }
 
 #[tokio::test]
+async fn pull_image_does_not_materialize_container_rootfs() {
+    let (dir, service) = test_image_service_in_tempdir();
+    service.set_test_pull_handler(Arc::new(|_| {
+        Ok(TestPullResponse {
+            image_id: "sha256:pull-only".to_string(),
+            size: TEST_EMPTY_LAYER_TAR_GZ.len() as u64,
+            ..Default::default()
+        })
+    }));
+
+    ImageService::pull_image(
+        &service,
+        Request::new(PullImageRequest {
+            image: Some(ImageSpec {
+                image: "repo/pull-only:latest".to_string(),
+                user_specified_image: "repo/pull-only:latest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let meta = service
+        .load_image_metadata("sha256:pull-only")
+        .expect("expected pull metadata");
+    assert_eq!(meta.stored_layers.len(), 1);
+    assert!(dir.path().join(&meta.stored_layers[0].path).exists());
+    assert!(dir
+        .path()
+        .join("images")
+        .join("sha256:pull-only")
+        .join("metadata.json")
+        .exists());
+    assert!(
+        !dir.path().join("snapshots").exists(),
+        "pull must not create snapshot/rootfs storage"
+    );
+    assert!(
+        !dir.path()
+            .join("images")
+            .join("sha256:pull-only")
+            .join("rootfs")
+            .exists(),
+        "pull metadata directory must not contain a rootfs"
+    );
+}
+
+#[tokio::test]
 async fn remove_image_reports_in_use_when_container_references_it() {
     let (dir, service) = test_image_service_in_tempdir();
     insert_image(
