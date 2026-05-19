@@ -370,6 +370,7 @@ impl StorageManager {
             .execute(
                 "CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL DEFAULT 'container',
                 entity_type TEXT NOT NULL,
                 entity_id TEXT NOT NULL,
                 old_state TEXT,
@@ -380,6 +381,8 @@ impl StorageManager {
                 [],
             )
             .context("Failed to create events table")?;
+        self.ensure_event_type_column()?;
+        self.migrate_state_events_to_events()?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_image_refs_image_id ON image_refs(image_id)",
             [],
@@ -414,6 +417,79 @@ impl StorageManager {
         )?;
 
         debug!("Database tables initialized");
+        Ok(())
+    }
+
+    fn ensure_event_type_column(&mut self) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(events)")
+            .context("Failed to inspect events table")?;
+        let has_event_type = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to read events table columns")?
+            .iter()
+            .any(|column| column == "event_type");
+        drop(stmt);
+
+        if !has_event_type {
+            self.conn
+                .execute(
+                    "ALTER TABLE events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'container'",
+                    [],
+                )
+                .context("Failed to add event_type column to events")?;
+            self.conn
+                .execute(
+                    "UPDATE events
+                     SET event_type = CASE
+                       WHEN entity_type = 'pod' THEN 'pod'
+                       WHEN entity_type = 'shim_task' THEN 'task'
+                       WHEN entity_type = 'shim_exec' THEN 'shim'
+                       WHEN entity_type LIKE 'reconcile%' THEN 'reconcile'
+                       ELSE 'container'
+                     END",
+                    [],
+                )
+                .context("Failed to backfill events.event_type")?;
+        }
+
+        Ok(())
+    }
+
+    fn migrate_state_events_to_events(&mut self) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO events
+                 (event_type, entity_type, entity_id, old_state, new_state, timestamp, details)
+                 SELECT
+                   CASE
+                     WHEN se.entity_type = 'pod' THEN 'pod'
+                     WHEN se.entity_type = 'shim_task' THEN 'task'
+                     WHEN se.entity_type = 'shim_exec' THEN 'shim'
+                     WHEN se.entity_type LIKE 'reconcile%' THEN 'reconcile'
+                     ELSE 'container'
+                   END,
+                   se.entity_type,
+                   se.entity_id,
+                   se.old_state,
+                   se.new_state,
+                   se.timestamp,
+                   se.details
+                 FROM state_events se
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM events e
+                   WHERE e.entity_type = se.entity_type
+                     AND e.entity_id = se.entity_id
+                     AND IFNULL(e.old_state, '') = IFNULL(se.old_state, '')
+                     AND IFNULL(e.new_state, '') = IFNULL(se.new_state, '')
+                     AND e.timestamp = se.timestamp
+                     AND IFNULL(e.details, '') = IFNULL(se.details, '')
+                 )",
+                [],
+            )
+            .context("Failed to migrate state_events into events")?;
         Ok(())
     }
 
@@ -1257,23 +1333,25 @@ impl StorageManager {
         old_state: Option<&str>,
         new_state: Option<&str>,
     ) -> Result<()> {
-        let timestamp = chrono::Utc::now().timestamp();
+        let event_type = Self::ledger_event_type(entity_type);
+        self.append_typed_event(
+            event_type,
+            entity_type,
+            entity_id,
+            old_state,
+            new_state,
+            None,
+        )
+    }
 
-        self.conn
-            .execute(
-                "INSERT INTO events (entity_type, entity_id, old_state, new_state, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-                [
-                    entity_type,
-                    entity_id,
-                    old_state.unwrap_or(""),
-                    new_state.unwrap_or(""),
-                    &timestamp.to_string(),
-                ],
-            )
-            .context("Failed to record state event")?;
-
-        Ok(())
+    fn ledger_event_type(entity_type: &str) -> &'static str {
+        match entity_type {
+            "pod" => "pod",
+            "shim_task" => "task",
+            "shim_exec" => "shim",
+            value if value.starts_with("reconcile") => "reconcile",
+            _ => "container",
+        }
     }
 
     pub fn append_event(
@@ -1284,19 +1362,41 @@ impl StorageManager {
         new_state: Option<&str>,
         details: Option<&str>,
     ) -> Result<()> {
+        let event_type = Self::ledger_event_type(entity_type);
+        self.append_typed_event(
+            event_type,
+            entity_type,
+            entity_id,
+            old_state,
+            new_state,
+            details,
+        )
+    }
+
+    pub fn append_typed_event(
+        &mut self,
+        event_type: &str,
+        entity_type: &str,
+        entity_id: &str,
+        old_state: Option<&str>,
+        new_state: Option<&str>,
+        details: Option<&str>,
+    ) -> Result<()> {
         let timestamp = chrono::Utc::now().timestamp();
         self.conn
             .execute(
-                "INSERT INTO events (entity_type, entity_id, old_state, new_state, timestamp, details)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                (
+                "INSERT INTO events
+                 (event_type, entity_type, entity_id, old_state, new_state, timestamp, details)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    event_type,
                     entity_type,
                     entity_id,
                     old_state.unwrap_or(""),
                     new_state.unwrap_or(""),
                     timestamp,
                     details,
-                ),
+                ],
             )
             .context("Failed to append state event")?;
         Ok(())
@@ -1305,7 +1405,7 @@ impl StorageManager {
     /// 获取最近的实体状态事件
     pub fn get_recent_events(&self, entity_type: &str, since: i64) -> Result<Vec<StateEvent>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, entity_type, entity_id, old_state, new_state, timestamp, details
+            "SELECT id, event_type, entity_type, entity_id, old_state, new_state, timestamp, details
              FROM events
              WHERE entity_type = ?1 AND timestamp >= ?2
              ORDER BY timestamp DESC",
@@ -1315,12 +1415,13 @@ impl StorageManager {
             .query_map([entity_type, &since.to_string()], |row| {
                 Ok(StateEvent {
                     id: row.get(0)?,
-                    entity_type: row.get(1)?,
-                    entity_id: row.get(2)?,
-                    old_state: row.get(3)?,
-                    new_state: row.get(4)?,
-                    timestamp: row.get(5)?,
-                    details: row.get(6)?,
+                    event_type: row.get(1)?,
+                    entity_type: row.get(2)?,
+                    entity_id: row.get(3)?,
+                    old_state: row.get(4)?,
+                    new_state: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    details: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -1342,6 +1443,7 @@ impl StorageManager {
 #[derive(Debug, Clone)]
 pub struct StateEvent {
     pub id: i64,
+    pub event_type: String,
     pub entity_type: String,
     pub entity_id: String,
     pub old_state: String,
@@ -1413,6 +1515,84 @@ mod tests {
         manager.delete_container("container-1").unwrap();
         let deleted = manager.get_container("container-1").unwrap();
         assert!(deleted.is_none());
+    }
+
+    #[test]
+    fn container_state_changes_write_single_typed_event_table() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let mut manager = StorageManager::new(&db_path).unwrap();
+
+        manager
+            .save_container(&ContainerRecord {
+                id: "container-events".to_string(),
+                pod_id: "pod-1".to_string(),
+                state: "created".to_string(),
+                image: "test:latest".to_string(),
+                command: "sleep 60".to_string(),
+                created_at: 1,
+                labels: "{}".to_string(),
+                annotations: "{}".to_string(),
+                exit_code: None,
+                exit_time: None,
+                runtime_handler: None,
+                runtime_backend: None,
+                snapshot_key: None,
+            })
+            .unwrap();
+        manager
+            .update_container_state("container-events", "running", None)
+            .unwrap();
+
+        let events = manager.get_recent_events("container", 0).unwrap();
+        let running_events = events
+            .iter()
+            .filter(|event| {
+                event.entity_id == "container-events"
+                    && event.event_type == "container"
+                    && event.old_state == "created"
+                    && event.new_state == "running"
+            })
+            .count();
+        assert_eq!(running_events, 1);
+
+        let legacy_count: i64 = manager
+            .conn
+            .query_row("SELECT COUNT(*) FROM state_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(legacy_count, 0);
+    }
+
+    #[test]
+    fn legacy_state_events_are_migrated_to_unified_events_once() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let manager = StorageManager::new(&db_path).unwrap();
+        manager
+            .conn
+            .execute(
+                "INSERT INTO state_events
+                 (entity_type, entity_id, old_state, new_state, timestamp, details)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params!["pod", "pod-events", "notready", "ready", 1234_i64, "legacy"],
+            )
+            .unwrap();
+        manager.close().unwrap();
+
+        let manager = StorageManager::new(&db_path).unwrap();
+        let events = manager.get_recent_events("pod", 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "pod");
+        assert_eq!(events[0].entity_id, "pod-events");
+        assert_eq!(events[0].details.as_deref(), Some("legacy"));
+        manager.close().unwrap();
+
+        let manager = StorageManager::new(&db_path).unwrap();
+        let event_count: i64 = manager
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 1);
     }
 
     #[test]
