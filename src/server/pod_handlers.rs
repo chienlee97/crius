@@ -907,6 +907,7 @@ impl RuntimeServiceImpl {
             owner_id: pod_id.clone(),
             artifact_kind: "workspace".to_string(),
             path: pod_root_dir_for_persist.display().to_string(),
+            state: "active".to_string(),
             runtime_handler: Some(current_pod.runtime_handler.clone().trim().to_string())
                 .filter(|value| !value.is_empty()),
             runtime_root: None,
@@ -917,6 +918,7 @@ impl RuntimeServiceImpl {
                 owner_id: pod_id.clone(),
                 artifact_kind: "netns".to_string(),
                 path: netns_path.clone(),
+                state: "active".to_string(),
                 runtime_handler: Some(current_pod.runtime_handler.clone().trim().to_string())
                     .filter(|value| !value.is_empty()),
                 runtime_root: None,

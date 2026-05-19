@@ -133,6 +133,7 @@ pub struct RuntimeArtifactRecord {
     pub owner_id: String,
     pub artifact_kind: String,
     pub path: String,
+    pub state: String,
     pub runtime_handler: Option<String>,
     pub runtime_root: Option<String>,
 }
@@ -341,6 +342,7 @@ impl StorageManager {
                 owner_id TEXT NOT NULL,
                 artifact_kind TEXT NOT NULL,
                 path TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',
                 runtime_handler TEXT,
                 runtime_root TEXT,
                 PRIMARY KEY(owner_kind, owner_id, artifact_kind, path)
@@ -348,6 +350,7 @@ impl StorageManager {
                 [],
             )
             .context("Failed to create runtime_artifacts table")?;
+        self.ensure_runtime_artifact_state_column()?;
 
         self.conn
             .execute(
@@ -453,6 +456,31 @@ impl StorageManager {
                     [],
                 )
                 .context("Failed to backfill events.event_type")?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_runtime_artifact_state_column(&mut self) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(runtime_artifacts)")
+            .context("Failed to inspect runtime_artifacts table")?;
+        let has_state = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to read runtime_artifacts table columns")?
+            .iter()
+            .any(|column| column == "state");
+        drop(stmt);
+
+        if !has_state {
+            self.conn
+                .execute(
+                    "ALTER TABLE runtime_artifacts ADD COLUMN state TEXT NOT NULL DEFAULT 'active'",
+                    [],
+                )
+                .context("Failed to add state column to runtime_artifacts")?;
         }
 
         Ok(())
@@ -1159,6 +1187,16 @@ impl StorageManager {
         Ok(())
     }
 
+    pub fn update_snapshot_state(&mut self, key: &str, state: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE snapshots SET state = ?2 WHERE key = ?1",
+                rusqlite::params![key, state],
+            )
+            .context("Failed to update snapshot state")?;
+        Ok(())
+    }
+
     pub fn list_snapshots(&self) -> Result<Vec<SnapshotRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT key, image_id, owner_kind, owner_id, state, mountpoint FROM snapshots",
@@ -1202,13 +1240,14 @@ impl StorageManager {
             self.conn
                 .execute(
                     "INSERT OR REPLACE INTO runtime_artifacts
-                 (owner_kind, owner_id, artifact_kind, path, runtime_handler, runtime_root)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (owner_kind, owner_id, artifact_kind, path, state, runtime_handler, runtime_root)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     rusqlite::params![
                         &record.owner_kind,
                         &record.owner_id,
                         &record.artifact_kind,
                         &record.path,
+                        &record.state,
                         record.runtime_handler.as_deref(),
                         record.runtime_root.as_deref(),
                     ],
@@ -1220,7 +1259,7 @@ impl StorageManager {
 
     pub fn list_runtime_artifacts(&self) -> Result<Vec<RuntimeArtifactRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT owner_kind, owner_id, artifact_kind, path, runtime_handler, runtime_root
+            "SELECT owner_kind, owner_id, artifact_kind, path, state, runtime_handler, runtime_root
              FROM runtime_artifacts",
         )?;
         let records = stmt
@@ -1230,13 +1269,33 @@ impl StorageManager {
                     owner_id: row.get(1)?,
                     artifact_kind: row.get(2)?,
                     path: row.get(3)?,
-                    runtime_handler: row.get(4)?,
-                    runtime_root: row.get(5)?,
+                    state: row.get(4)?,
+                    runtime_handler: row.get(5)?,
+                    runtime_root: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to list runtime artifacts")?;
         Ok(records)
+    }
+
+    pub fn update_runtime_artifact_state(
+        &mut self,
+        owner_kind: &str,
+        owner_id: &str,
+        artifact_kind: &str,
+        path: &str,
+        state: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runtime_artifacts
+                 SET state = ?5
+                 WHERE owner_kind = ?1 AND owner_id = ?2 AND artifact_kind = ?3 AND path = ?4",
+                rusqlite::params![owner_kind, owner_id, artifact_kind, path, state],
+            )
+            .context("Failed to update runtime artifact state")?;
+        Ok(())
     }
 
     pub fn delete_runtime_artifacts(&mut self, owner_kind: &str, owner_id: &str) -> Result<()> {
@@ -1266,6 +1325,16 @@ impl StorageManager {
                 record.last_seen_at,
             ],
         ).context("Failed to save shim process")?;
+        Ok(())
+    }
+
+    pub fn update_shim_process_state(&mut self, container_id: &str, state: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE shim_processes SET state = ?2, last_seen_at = ?3 WHERE container_id = ?1",
+                rusqlite::params![container_id, state, chrono::Utc::now().timestamp()],
+            )
+            .context("Failed to update shim process state")?;
         Ok(())
     }
 
@@ -1726,6 +1795,7 @@ mod tests {
                     owner_id: "container-1".to_string(),
                     artifact_kind: "bundle".to_string(),
                     path: "/tmp/bundle".to_string(),
+                    state: "active".to_string(),
                     runtime_handler: Some("runc".to_string()),
                     runtime_root: Some("/run/crius".to_string()),
                 }],

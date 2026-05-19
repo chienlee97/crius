@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::fmt;
 
 use crate::runtime::ContainerStatus;
 use crate::storage::persistence::PersistenceManager;
@@ -6,6 +7,183 @@ use crate::storage::{
     ContainerRecord, ImageRecord, ImageRefRecord, PodSandboxRecord, RuntimeArtifactRecord,
     ShimProcessRecord, SnapshotRecord, StateEvent,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotLedgerState {
+    Preparing,
+    Prepared,
+    Mounted,
+    Committed,
+    Removing,
+    Deleted,
+    Broken,
+}
+
+impl SnapshotLedgerState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Prepared => "prepared",
+            Self::Mounted => "mounted",
+            Self::Committed => "committed",
+            Self::Removing => "removing",
+            Self::Deleted => "deleted",
+            Self::Broken => "broken",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "preparing" => Ok(Self::Preparing),
+            "prepared" => Ok(Self::Prepared),
+            "mounted" => Ok(Self::Mounted),
+            "committed" => Ok(Self::Committed),
+            "removing" => Ok(Self::Removing),
+            "deleted" => Ok(Self::Deleted),
+            "broken" => Ok(Self::Broken),
+            other => anyhow::bail!("invalid snapshot ledger state: {other}"),
+        }
+    }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        self == next
+            || matches!(
+                (self, next),
+                (
+                    Self::Preparing,
+                    Self::Prepared | Self::Removing | Self::Broken
+                ) | (
+                    Self::Prepared,
+                    Self::Mounted | Self::Committed | Self::Removing | Self::Broken
+                ) | (
+                    Self::Mounted,
+                    Self::Committed | Self::Removing | Self::Broken
+                ) | (Self::Committed, Self::Removing | Self::Broken)
+                    | (Self::Removing, Self::Deleted | Self::Broken)
+                    | (Self::Broken, Self::Removing | Self::Deleted)
+            )
+    }
+}
+
+impl fmt::Display for SnapshotLedgerState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeArtifactLedgerState {
+    Planned,
+    Created,
+    Active,
+    Stale,
+    Deleted,
+    Broken,
+}
+
+impl RuntimeArtifactLedgerState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Created => "created",
+            Self::Active => "active",
+            Self::Stale => "stale",
+            Self::Deleted => "deleted",
+            Self::Broken => "broken",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "planned" => Ok(Self::Planned),
+            "created" => Ok(Self::Created),
+            "active" => Ok(Self::Active),
+            "stale" => Ok(Self::Stale),
+            "deleted" => Ok(Self::Deleted),
+            "broken" => Ok(Self::Broken),
+            other => anyhow::bail!("invalid runtime artifact ledger state: {other}"),
+        }
+    }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        self == next
+            || matches!(
+                (self, next),
+                (Self::Planned, Self::Created | Self::Deleted | Self::Broken)
+                    | (
+                        Self::Created,
+                        Self::Active | Self::Stale | Self::Deleted | Self::Broken
+                    )
+                    | (Self::Active, Self::Stale | Self::Deleted | Self::Broken)
+                    | (Self::Stale, Self::Active | Self::Deleted | Self::Broken)
+                    | (Self::Broken, Self::Stale | Self::Deleted)
+            )
+    }
+}
+
+impl fmt::Display for RuntimeArtifactLedgerState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShimLedgerState {
+    Starting,
+    Running,
+    Exited,
+    Dead,
+    Broken,
+    Degraded,
+}
+
+impl ShimLedgerState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Exited => "exited",
+            Self::Dead => "dead",
+            Self::Broken => "broken",
+            Self::Degraded => "degraded",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "planned" | "starting" => Ok(Self::Starting),
+            "running" => Ok(Self::Running),
+            "exited" => Ok(Self::Exited),
+            "dead" => Ok(Self::Dead),
+            "broken" => Ok(Self::Broken),
+            "degraded" => Ok(Self::Degraded),
+            other => anyhow::bail!("invalid shim ledger state: {other}"),
+        }
+    }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        self == next
+            || matches!(
+                (self, next),
+                (
+                    Self::Starting,
+                    Self::Running | Self::Exited | Self::Dead | Self::Broken
+                ) | (
+                    Self::Running,
+                    Self::Exited | Self::Dead | Self::Broken | Self::Degraded
+                ) | (Self::Exited, Self::Dead | Self::Broken)
+                    | (Self::Dead, Self::Starting | Self::Broken)
+                    | (Self::Broken, Self::Starting | Self::Dead)
+                    | (Self::Degraded, Self::Running | Self::Dead | Self::Broken)
+            )
+    }
+}
+
+impl fmt::Display for ShimLedgerState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RecoveryContainerEntry {
@@ -143,7 +321,28 @@ impl<'a> StateLedgerWriter<'a> {
     }
 
     pub fn save_snapshot(&mut self, record: &SnapshotRecord) -> Result<()> {
+        SnapshotLedgerState::parse(&record.state)?;
         self.persistence.save_snapshot_record(record)
+    }
+
+    pub fn transition_snapshot_state(
+        &mut self,
+        key: &str,
+        next: SnapshotLedgerState,
+    ) -> Result<()> {
+        let record = self
+            .persistence
+            .list_snapshot_records()?
+            .into_iter()
+            .find(|record| record.key == key)
+            .ok_or_else(|| anyhow::anyhow!("snapshot {key} not found"))?;
+        let current = SnapshotLedgerState::parse(&record.state)?;
+        if !current.can_transition_to(next) {
+            anyhow::bail!("invalid snapshot state transition: {current} -> {next}");
+        }
+        self.persistence
+            .storage_mut()
+            .update_snapshot_state(key, next.as_str())
     }
 
     pub fn delete_snapshot(&mut self, key: &str) -> Result<()> {
@@ -156,8 +355,43 @@ impl<'a> StateLedgerWriter<'a> {
         owner_id: &str,
         records: &[RuntimeArtifactRecord],
     ) -> Result<()> {
+        for record in records {
+            RuntimeArtifactLedgerState::parse(&record.state)?;
+        }
         self.persistence
             .replace_runtime_artifacts(owner_kind, owner_id, records)
+    }
+
+    pub fn transition_runtime_artifact_state(
+        &mut self,
+        owner_kind: &str,
+        owner_id: &str,
+        artifact_kind: &str,
+        path: &str,
+        next: RuntimeArtifactLedgerState,
+    ) -> Result<()> {
+        let record = self
+            .persistence
+            .list_runtime_artifacts()?
+            .into_iter()
+            .find(|record| {
+                record.owner_kind == owner_kind
+                    && record.owner_id == owner_id
+                    && record.artifact_kind == artifact_kind
+                    && record.path == path
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runtime artifact {owner_kind}/{owner_id}/{artifact_kind} at {path} not found"
+                )
+            })?;
+        let current = RuntimeArtifactLedgerState::parse(&record.state)?;
+        if !current.can_transition_to(next) {
+            anyhow::bail!("invalid runtime artifact state transition: {current} -> {next}");
+        }
+        self.persistence
+            .storage_mut()
+            .update_runtime_artifact_state(owner_kind, owner_id, artifact_kind, path, next.as_str())
     }
 
     pub fn delete_runtime_artifacts(&mut self, owner_kind: &str, owner_id: &str) -> Result<()> {
@@ -166,7 +400,26 @@ impl<'a> StateLedgerWriter<'a> {
     }
 
     pub fn save_shim_process(&mut self, record: &ShimProcessRecord) -> Result<()> {
+        ShimLedgerState::parse(&record.state)?;
         self.persistence.save_shim_process_record(record)
+    }
+
+    pub fn transition_shim_state(
+        &mut self,
+        container_id: &str,
+        next: ShimLedgerState,
+    ) -> Result<()> {
+        let record = self
+            .persistence
+            .get_shim_process_record(container_id)?
+            .ok_or_else(|| anyhow::anyhow!("shim process {container_id} not found"))?;
+        let current = ShimLedgerState::parse(&record.state)?;
+        if !current.can_transition_to(next) {
+            anyhow::bail!("invalid shim state transition: {current} -> {next}");
+        }
+        self.persistence
+            .storage_mut()
+            .update_shim_process_state(container_id, next.as_str())
     }
 
     pub fn delete_shim_process(&mut self, container_id: &str) -> Result<()> {
@@ -282,6 +535,7 @@ mod tests {
                 owner_id: container.id.clone(),
                 artifact_kind: "bundle".to_string(),
                 path: "/run/crius/container-a/bundle".to_string(),
+                state: RuntimeArtifactLedgerState::Active.as_str().to_string(),
                 runtime_handler: Some("runc".to_string()),
                 runtime_root: Some("/run/runc".to_string()),
             },
@@ -290,6 +544,7 @@ mod tests {
                 owner_id: pod.id.clone(),
                 artifact_kind: "netns".to_string(),
                 path: pod.netns_path.clone(),
+                state: RuntimeArtifactLedgerState::Active.as_str().to_string(),
                 runtime_handler: None,
                 runtime_root: None,
             },
@@ -373,5 +628,148 @@ mod tests {
         let events = ledger.recent_events("container", 0).unwrap();
         assert!(events.iter().any(|event| event.entity_id == "container-a"
             && event.details.as_deref() == Some("state-ledger-test")));
+    }
+
+    #[test]
+    fn ledger_state_transitions_are_validated() {
+        let temp_dir = tempdir().unwrap();
+        let mut persistence = PersistenceManager::new(PersistenceConfig {
+            db_path: temp_dir.path().join("states.db"),
+            enable_recovery: true,
+            auto_save_interval: 30,
+        })
+        .unwrap();
+
+        let artifact_path = "/run/crius/container-state/bundle";
+        {
+            let mut ledger = StateLedgerWriter::new(&mut persistence);
+            ledger
+                .save_snapshot(&SnapshotRecord {
+                    key: "snapshot-state".to_string(),
+                    image_id: "sha256:image".to_string(),
+                    owner_kind: "container".to_string(),
+                    owner_id: "container-state".to_string(),
+                    state: SnapshotLedgerState::Prepared.as_str().to_string(),
+                    mountpoint: "/run/crius/snapshots/snapshot-state".to_string(),
+                })
+                .unwrap();
+            ledger
+                .replace_runtime_artifacts(
+                    "container",
+                    "container-state",
+                    &[RuntimeArtifactRecord {
+                        owner_kind: "container".to_string(),
+                        owner_id: "container-state".to_string(),
+                        artifact_kind: "bundle".to_string(),
+                        path: artifact_path.to_string(),
+                        state: RuntimeArtifactLedgerState::Active.as_str().to_string(),
+                        runtime_handler: Some("runc".to_string()),
+                        runtime_root: Some("/run/runc".to_string()),
+                    }],
+                )
+                .unwrap();
+            ledger
+                .save_shim_process(&ShimProcessRecord {
+                    container_id: "container-state".to_string(),
+                    shim_pid: 123,
+                    work_dir: "/run/crius/shims".to_string(),
+                    socket_path: "/run/crius/shims/container-state/task.sock".to_string(),
+                    exit_code_file: "/run/crius/exits/container-state".to_string(),
+                    log_file: "/run/crius/shims/container-state/shim.log".to_string(),
+                    bundle_path: artifact_path.to_string(),
+                    state: ShimLedgerState::Running.as_str().to_string(),
+                    last_seen_at: 1,
+                })
+                .unwrap();
+
+            ledger
+                .transition_snapshot_state("snapshot-state", SnapshotLedgerState::Mounted)
+                .unwrap();
+            assert!(ledger
+                .transition_snapshot_state("snapshot-state", SnapshotLedgerState::Prepared)
+                .is_err());
+
+            ledger
+                .transition_runtime_artifact_state(
+                    "container",
+                    "container-state",
+                    "bundle",
+                    artifact_path,
+                    RuntimeArtifactLedgerState::Stale,
+                )
+                .unwrap();
+            assert!(ledger
+                .transition_runtime_artifact_state(
+                    "container",
+                    "container-state",
+                    "bundle",
+                    artifact_path,
+                    RuntimeArtifactLedgerState::Planned,
+                )
+                .is_err());
+
+            ledger
+                .transition_shim_state("container-state", ShimLedgerState::Dead)
+                .unwrap();
+            assert!(ledger
+                .transition_shim_state("container-state", ShimLedgerState::Exited)
+                .is_err());
+        }
+
+        let snapshot = StateLedger::new(&persistence).recovery_snapshot().unwrap();
+        assert_eq!(snapshot.snapshots[0].state, "mounted");
+        assert_eq!(snapshot.runtime_artifacts[0].state, "stale");
+        assert_eq!(snapshot.shim_processes[0].state, "dead");
+    }
+
+    #[test]
+    fn ledger_writer_rejects_unknown_object_states() {
+        let temp_dir = tempdir().unwrap();
+        let mut persistence = PersistenceManager::new(PersistenceConfig {
+            db_path: temp_dir.path().join("invalid-states.db"),
+            enable_recovery: true,
+            auto_save_interval: 30,
+        })
+        .unwrap();
+        let mut ledger = StateLedgerWriter::new(&mut persistence);
+
+        assert!(ledger
+            .save_snapshot(&SnapshotRecord {
+                key: "bad-snapshot".to_string(),
+                image_id: "sha256:image".to_string(),
+                owner_kind: "container".to_string(),
+                owner_id: "container-state".to_string(),
+                state: "half-mounted".to_string(),
+                mountpoint: "/run/crius/snapshots/bad-snapshot".to_string(),
+            })
+            .is_err());
+        assert!(ledger
+            .replace_runtime_artifacts(
+                "container",
+                "container-state",
+                &[RuntimeArtifactRecord {
+                    owner_kind: "container".to_string(),
+                    owner_id: "container-state".to_string(),
+                    artifact_kind: "bundle".to_string(),
+                    path: "/run/crius/container-state/bundle".to_string(),
+                    state: "warm".to_string(),
+                    runtime_handler: None,
+                    runtime_root: None,
+                }],
+            )
+            .is_err());
+        assert!(ledger
+            .save_shim_process(&ShimProcessRecord {
+                container_id: "container-state".to_string(),
+                shim_pid: 123,
+                work_dir: "/run/crius/shims".to_string(),
+                socket_path: "/run/crius/shims/container-state/task.sock".to_string(),
+                exit_code_file: "/run/crius/exits/container-state".to_string(),
+                log_file: "/run/crius/shims/container-state/shim.log".to_string(),
+                bundle_path: "/run/crius/container-state/bundle".to_string(),
+                state: "awake".to_string(),
+                last_seen_at: 1,
+            })
+            .is_err());
     }
 }
