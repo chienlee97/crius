@@ -161,12 +161,14 @@ impl RuntimeServiceImpl {
         let response = streaming
             .get_exec(
                 &req,
-                runtime_path,
-                runtime_config_path,
-                exec_cpu_affinity,
-                exec_io_socket_path,
-                exec_resize_socket_path,
-                websocket_enabled,
+                crate::streaming::ExecStreamOptions {
+                    runtime_path,
+                    runtime_config_path,
+                    exec_cpu_affinity,
+                    exec_io_socket_path,
+                    exec_resize_socket_path,
+                    websocket_enabled,
+                },
             )
             .await?;
         Ok(Response::new(response))
@@ -201,6 +203,8 @@ impl RuntimeServiceImpl {
                     tty: false,
                     capture_output: true,
                     timeout_ms: (timeout > 0).then_some(timeout as u64 * 1000),
+                    io_drain_timeout_ms: (!self.config.exec_sync_io_drain_timeout.is_zero())
+                        .then_some(self.config.exec_sync_io_drain_timeout.as_millis() as u64),
                     exec_cpu_affinity,
                 });
             let task_socket_path_clone = task_socket_path.clone();
@@ -228,7 +232,7 @@ impl RuntimeServiceImpl {
                 return Ok(Response::new(ExecSyncResponse {
                     stdout: response.stdout,
                     stderr: response.stderr,
-                    exit_code: response.exit_code as i32,
+                    exit_code: response.exit_code,
                 }));
             }
             return Err(Status::internal(format!(
@@ -446,10 +450,17 @@ impl RuntimeServiceImpl {
                     .filter(|path| !path.is_empty())
             };
 
-            if !req.stdin && log_path.is_some() {
+            if !req.stdin {
+                let Some(log_path) = log_path else {
+                    return Err(Status::failed_precondition(format!(
+                        "attach is not available for container {}: attach socket {} is missing and no interactive recovery path is available",
+                        req.container_id,
+                        attach_socket_path.display()
+                    )));
+                };
                 let streaming = self.get_streaming_server().await?;
                 let response = streaming
-                    .get_attach_log(&req, PathBuf::from(log_path.unwrap()), websocket_enabled)
+                    .get_attach_log(&req, PathBuf::from(log_path), websocket_enabled)
                     .await?;
                 return Ok(Response::new(response));
             }

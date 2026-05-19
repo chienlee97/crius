@@ -34,8 +34,8 @@ use crate::shim_rpc::server::{default_task_socket_path, serve, ShimRpcHandler};
 use crate::shim_rpc::{
     CheckpointTaskRequest, CreateTaskRequest, DeleteTaskRequest, ExecProcessRequest,
     ExecProcessResponse, KillTaskRequest, OpenExecSessionRequest, OpenExecSessionResponse,
-    PauseTaskRequest, ReopenLogRequest, ResizePtyRequest, ResumeTaskRequest, ShimRpcRequest,
-    ShimRpcResponse, StartTaskRequest, StatusRequest, StatusResponse, TaskState,
+    PauseTaskRequest, ReopenLogRequest, ResizePtyRequest, RestoreTaskRequest, ResumeTaskRequest,
+    ShimRpcRequest, ShimRpcResponse, StartTaskRequest, StatusRequest, StatusResponse, TaskState,
     UpdateResourcesRequest, WaitProcessRequest, WaitProcessResponse,
 };
 use crate::storage::StorageManager;
@@ -74,6 +74,7 @@ enum DaemonTaskState {
     Init,
     Created,
     Running,
+    Paused,
     Stopped,
     Deleted,
 }
@@ -91,6 +92,7 @@ impl DaemonTaskState {
             Self::Init => TaskState::Init,
             Self::Created => TaskState::Created,
             Self::Running => TaskState::Running,
+            Self::Paused => TaskState::Paused,
             Self::Stopped => TaskState::Stopped,
             Self::Deleted => TaskState::Deleted,
         }
@@ -101,6 +103,7 @@ impl DaemonTaskState {
             Self::Init => "init",
             Self::Created => "created",
             Self::Running => "running",
+            Self::Paused => "paused",
             Self::Stopped => "stopped",
             Self::Deleted => "deleted",
         }
@@ -341,7 +344,7 @@ impl Daemon {
     fn spawn_task_runner(&self) -> Result<()> {
         let state = *self.task_state.lock().unwrap();
         match state {
-            DaemonTaskState::Running => return Ok(()),
+            DaemonTaskState::Running | DaemonTaskState::Paused => return Ok(()),
             DaemonTaskState::Deleted => {
                 return Err(anyhow::anyhow!(
                     "cannot start deleted task {}",
@@ -946,22 +949,20 @@ impl Daemon {
             None
         };
 
-        let mut create_args = vec!["create", "--bundle", self.bundle.to_str().unwrap()];
+        let mut create_cmd = self.runtime_command();
+        create_cmd.arg("create").arg("--bundle").arg(&self.bundle);
         if self.no_pivot {
-            create_args.push("--no-pivot");
+            create_cmd.arg("--no-pivot");
         }
         if self.no_new_keyring {
-            create_args.push("--no-new-keyring");
+            create_cmd.arg("--no-new-keyring");
         }
         if tty {
-            create_args.push("--console-socket");
-            create_args.push(console_socket_path.to_str().unwrap());
+            create_cmd.arg("--console-socket").arg(&console_socket_path);
         }
-        create_args.push(&self.container_id);
+        create_cmd.arg(&self.container_id);
 
-        let output = self
-            .runtime_command()
-            .args(&create_args)
+        let output = create_cmd
             .output()
             .context("Failed to execute runc create")?;
 
@@ -1016,15 +1017,14 @@ impl Daemon {
             .unwrap_or_default();
 
         let mut cmd = self.runtime_command();
-        let mut run_args = vec!["run", "--bundle", self.bundle.to_str().unwrap()];
+        cmd.arg("run").arg("--bundle").arg(&self.bundle);
         if self.no_pivot {
-            run_args.push("--no-pivot");
+            cmd.arg("--no-pivot");
         }
         if self.no_new_keyring {
-            run_args.push("--no-new-keyring");
+            cmd.arg("--no-new-keyring");
         }
-        run_args.push(&self.container_id);
-        cmd.args(&run_args);
+        cmd.arg(&self.container_id);
 
         if container_state.stdin {
             cmd.stdin(std::process::Stdio::piped());
@@ -1283,7 +1283,10 @@ impl Daemon {
 
     fn delete_task_internal(&self, request: &DeleteTaskRequest) -> Result<()> {
         self.running.store(false, Ordering::SeqCst);
-        if matches!(*self.task_state.lock().unwrap(), DaemonTaskState::Running) {
+        if matches!(
+            *self.task_state.lock().unwrap(),
+            DaemonTaskState::Running | DaemonTaskState::Paused
+        ) {
             let _ = self.kill_task_internal(&KillTaskRequest {
                 container_id: request.container_id.clone(),
                 signal: "KILL".to_string(),
@@ -1352,16 +1355,20 @@ impl Daemon {
 
         let mut child = cmd.spawn().context("Failed to execute runtime exec")?;
         let stdout_task = child.stdout.take().map(|mut stdout| {
+            let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let mut buf = Vec::new();
-                std::io::Read::read_to_end(&mut stdout, &mut buf).map(|_| buf)
-            })
+                let _ = tx.send(std::io::Read::read_to_end(&mut stdout, &mut buf).map(|_| buf));
+            });
+            rx
         });
         let stderr_task = child.stderr.take().map(|mut stderr| {
+            let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let mut buf = Vec::new();
-                std::io::Read::read_to_end(&mut stderr, &mut buf).map(|_| buf)
-            })
+                let _ = tx.send(std::io::Read::read_to_end(&mut stderr, &mut buf).map(|_| buf));
+            });
+            rx
         });
 
         let deadline = request
@@ -1378,8 +1385,6 @@ impl Daemon {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait().context("Failed to wait for killed exec")?;
-                    let _ = stdout_task.map(|task| task.join());
-                    let _ = stderr_task.map(|task| task.join());
                     return Err(anyhow::anyhow!(
                         "exec timed out after {}ms in container {}",
                         request.timeout_ms.unwrap_or_default(),
@@ -1390,18 +1395,11 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(10));
         };
 
-        let stdout = match stdout_task {
-            Some(task) => task
-                .join()
-                .map_err(|_| anyhow::anyhow!("failed to join stdout reader for exec"))??,
-            None => Vec::new(),
-        };
-        let stderr = match stderr_task {
-            Some(task) => task
-                .join()
-                .map_err(|_| anyhow::anyhow!("failed to join stderr reader for exec"))??,
-            None => Vec::new(),
-        };
+        let drain_deadline = request
+            .io_drain_timeout_ms
+            .map(|timeout| Instant::now() + Duration::from_millis(timeout));
+        let stdout = wait_exec_reader(stdout_task, drain_deadline, "stdout")?;
+        let stderr = wait_exec_reader(stderr_task, drain_deadline, "stderr")?;
 
         let exit_code = status
             .code()
@@ -1476,6 +1474,46 @@ impl Daemon {
         checkpoint_args.clear();
         Ok(())
     }
+
+    fn restore_task_internal(&self, request: &RestoreTaskRequest) -> Result<()> {
+        self.setup_io_once()?;
+        std::fs::create_dir_all(&request.work_path).with_context(|| {
+            format!(
+                "Failed to create restore work directory {}",
+                request.work_path.display()
+            )
+        })?;
+        let mut command = self.runtime_command();
+        command
+            .arg("restore")
+            .arg("-d")
+            .arg("--image-path")
+            .arg(&request.image_path)
+            .arg("--work-path")
+            .arg(&request.work_path)
+            .arg("--bundle")
+            .arg(&request.bundle_path);
+        if !request.criu_path.as_os_str().is_empty() {
+            command.arg("--criu").arg(&request.criu_path);
+        }
+        if request.no_pivot {
+            command.arg("--no-pivot");
+        }
+        command.arg(&request.container_id);
+        let output = command
+            .output()
+            .context("Failed to execute runtime restore")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(anyhow::anyhow!(
+                "failed to restore container {}: {}",
+                request.container_id,
+                stderr
+            ));
+        }
+        self.set_task_state(DaemonTaskState::Running);
+        Ok(())
+    }
 }
 
 impl ShimRpcHandler for Daemon {
@@ -1522,6 +1560,10 @@ impl ShimRpcHandler for Daemon {
                 self.checkpoint_task_internal(&request)?;
                 Ok(ShimRpcResponse::Empty)
             }
+            ShimRpcRequest::RestoreTask(request) => {
+                self.restore_task_internal(&request)?;
+                Ok(ShimRpcResponse::Empty)
+            }
             ShimRpcRequest::ReopenLog(ReopenLogRequest { .. }) => {
                 self.io_manager.reopen_log_file()?;
                 Ok(ShimRpcResponse::Empty)
@@ -1547,6 +1589,7 @@ impl ShimRpcHandler for Daemon {
                         stderr
                     ));
                 }
+                self.set_task_state(DaemonTaskState::Paused);
                 Ok(ShimRpcResponse::Empty)
             }
             ShimRpcRequest::ResumeTask(ResumeTaskRequest { container_id }) => {
@@ -1563,12 +1606,40 @@ impl ShimRpcHandler for Daemon {
                         stderr
                     ));
                 }
+                self.set_task_state(DaemonTaskState::Running);
                 Ok(ShimRpcResponse::Empty)
             }
             ShimRpcRequest::ContainerPid(StatusRequest { .. }) => Ok(
                 ShimRpcResponse::ContainerPid(*self.container_pid.lock().unwrap()),
             ),
         }
+    }
+}
+
+fn wait_exec_reader(
+    reader: Option<std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
+    deadline: Option<Instant>,
+    stream_name: &str,
+) -> Result<Vec<u8>> {
+    let Some(reader) = reader else {
+        return Ok(Vec::new());
+    };
+
+    match deadline {
+        Some(deadline) => {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(anyhow::anyhow!("exec {} drain timed out", stream_name));
+            }
+            reader
+                .recv_timeout(deadline.saturating_duration_since(now))
+                .map_err(|_| anyhow::anyhow!("exec {} drain timed out", stream_name))?
+                .context("failed to read exec output")
+        }
+        None => reader
+            .recv()
+            .map_err(|_| anyhow::anyhow!("failed to join {} reader for exec", stream_name))?
+            .context("failed to read exec output"),
     }
 }
 
@@ -1612,394 +1683,4 @@ fn move_pid_to_cgroup(pid: u32, target: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    use std::os::unix::fs::PermissionsExt;
-    use tempfile::tempdir;
-
-    fn parse_cri_log_lines(contents: &str) -> Vec<(String, String, String, String)> {
-        contents
-            .lines()
-            .map(|line| {
-                let mut parts = line.splitn(4, ' ');
-                (
-                    parts.next().unwrap_or_default().to_string(),
-                    parts.next().unwrap_or_default().to_string(),
-                    parts.next().unwrap_or_default().to_string(),
-                    parts.next().unwrap_or_default().to_string(),
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn test_non_terminal_container_stdio_capture() {
-        let temp_dir = tempdir().unwrap();
-        let bundle_dir = temp_dir.path().join("bundle");
-        fs::create_dir_all(&bundle_dir).unwrap();
-
-        let log_path = temp_dir.path().join("logs").join("container.log");
-        let internal_state = json!({
-            "log_path": log_path.to_string_lossy(),
-            "tty": false,
-            "stdin": false,
-            "stdin_once": false,
-        });
-        let config = json!({
-            "process": {
-                "terminal": false
-            },
-            "annotations": {
-                INTERNAL_CONTAINER_STATE_KEY: internal_state.to_string()
-            }
-        });
-        fs::write(
-            bundle_dir.join("config.json"),
-            serde_json::to_vec(&config).unwrap(),
-        )
-        .unwrap();
-
-        let runtime_path = temp_dir.path().join("fake-runtime.sh");
-        fs::write(
-            &runtime_path,
-            r#"#!/bin/sh
-set -eu
-
-cmd="$1"
-shift || true
-
-case "$cmd" in
-  run)
-    echo "stdout:hello"
-    echo "stderr:world" >&2
-    ;;
-  delete)
-    exit 0
-    ;;
-  *)
-    exit 1
-    ;;
-esac
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let exit_code_file = temp_dir.path().join("shim").join("exit_code");
-        fs::create_dir_all(exit_code_file.parent().unwrap()).unwrap();
-        let mut daemon = Daemon::new(
-            "test-container".to_string(),
-            bundle_dir,
-            runtime_path,
-            DaemonOptions {
-                runtime_config_path: PathBuf::new(),
-                monitor_cgroup: String::new(),
-                work_dir: temp_dir.path().join("shim"),
-                state_db_path: None,
-                exit_code_file: Some(exit_code_file),
-                attach_socket_dir: None,
-                io_uid: 0,
-                io_gid: 0,
-                max_container_log_line_size: 4096,
-                log_to_journald: false,
-                no_sync_log: false,
-                no_pivot: false,
-                no_new_keyring: false,
-                systemd_cgroup: false,
-            },
-        );
-
-        daemon
-            .io_manager
-            .configure(IoConfig {
-                stdout: Some(log_path.clone()),
-                terminal: false,
-                ..Default::default()
-            })
-            .unwrap();
-
-        let exit_code = daemon.run_non_terminal_container().unwrap();
-        assert_eq!(exit_code, 0);
-
-        let log_content = fs::read_to_string(&log_path).unwrap();
-        let records = parse_cri_log_lines(&log_content);
-        assert_eq!(records.len(), 2);
-        for record in &records {
-            assert!(chrono::DateTime::parse_from_rfc3339(&record.0).is_ok());
-            assert_eq!(record.2, "F");
-        }
-        assert!(records
-            .iter()
-            .any(|record| record.1 == "stdout" && record.3 == "stdout:hello"));
-        assert!(records
-            .iter()
-            .any(|record| record.1 == "stderr" && record.3 == "stderr:world"));
-    }
-
-    #[test]
-    fn test_non_terminal_container_passes_no_pivot_when_enabled() {
-        let temp_dir = tempdir().unwrap();
-        let bundle_dir = temp_dir.path().join("bundle");
-        fs::create_dir_all(&bundle_dir).unwrap();
-
-        let log_path = temp_dir.path().join("logs").join("container.log");
-        let args_path = temp_dir.path().join("runtime.args");
-        let internal_state = json!({
-            "log_path": log_path.to_string_lossy(),
-            "tty": false,
-            "stdin": false,
-            "stdin_once": false,
-        });
-        let config = json!({
-            "process": {
-                "terminal": false
-            },
-            "annotations": {
-                INTERNAL_CONTAINER_STATE_KEY: internal_state.to_string()
-            }
-        });
-        fs::write(
-            bundle_dir.join("config.json"),
-            serde_json::to_vec(&config).unwrap(),
-        )
-        .unwrap();
-
-        let runtime_path = temp_dir.path().join("fake-runtime.sh");
-        fs::write(
-            &runtime_path,
-            format!(
-                r#"#!/bin/sh
-set -eu
-
-cmd="$1"
-shift || true
-
-case "$cmd" in
-  run)
-    printf '%s\n' "$@" > "{}"
-    exit 0
-    ;;
-  delete)
-    exit 0
-    ;;
-  *)
-    exit 1
-    ;;
-esac
-"#,
-                args_path.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let exit_code_file = temp_dir.path().join("shim").join("exit_code");
-        fs::create_dir_all(exit_code_file.parent().unwrap()).unwrap();
-        let mut daemon = Daemon::new(
-            "test-container".to_string(),
-            bundle_dir,
-            runtime_path,
-            DaemonOptions {
-                runtime_config_path: PathBuf::new(),
-                monitor_cgroup: String::new(),
-                work_dir: temp_dir.path().join("shim"),
-                state_db_path: None,
-                exit_code_file: Some(exit_code_file),
-                attach_socket_dir: None,
-                io_uid: 0,
-                io_gid: 0,
-                max_container_log_line_size: 4096,
-                log_to_journald: false,
-                no_sync_log: false,
-                no_pivot: true,
-                no_new_keyring: false,
-                systemd_cgroup: false,
-            },
-        );
-
-        daemon
-            .io_manager
-            .configure(IoConfig {
-                stdout: Some(log_path),
-                terminal: false,
-                ..Default::default()
-            })
-            .unwrap();
-
-        daemon.run_non_terminal_container().unwrap();
-
-        let args = fs::read_to_string(&args_path).unwrap();
-        assert!(args.lines().any(|line| line == "--no-pivot"));
-    }
-
-    #[test]
-    fn test_non_terminal_container_passes_no_new_keyring_when_enabled() {
-        let temp_dir = tempdir().unwrap();
-        let bundle_dir = temp_dir.path().join("bundle");
-        fs::create_dir_all(&bundle_dir).unwrap();
-
-        let log_path = temp_dir.path().join("logs").join("container.log");
-        let args_path = temp_dir.path().join("runtime.args");
-        let internal_state = json!({
-            "log_path": log_path.to_string_lossy(),
-            "tty": false,
-            "stdin": false,
-            "stdin_once": false,
-        });
-        let config = json!({
-            "process": {
-                "terminal": false
-            },
-            "annotations": {
-                INTERNAL_CONTAINER_STATE_KEY: internal_state.to_string()
-            }
-        });
-        fs::write(
-            bundle_dir.join("config.json"),
-            serde_json::to_vec(&config).unwrap(),
-        )
-        .unwrap();
-
-        let runtime_path = temp_dir.path().join("fake-runtime.sh");
-        fs::write(
-            &runtime_path,
-            format!(
-                r#"#!/bin/sh
-set -eu
-
-cmd="$1"
-shift || true
-
-case "$cmd" in
-  run)
-    printf '%s\n' "$@" > "{}"
-    exit 0
-    ;;
-  delete)
-    exit 0
-    ;;
-  *)
-    exit 1
-    ;;
-esac
-"#,
-                args_path.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let exit_code_file = temp_dir.path().join("shim").join("exit_code");
-        fs::create_dir_all(exit_code_file.parent().unwrap()).unwrap();
-        let mut daemon = Daemon::new(
-            "test-container".to_string(),
-            bundle_dir,
-            runtime_path,
-            DaemonOptions {
-                runtime_config_path: PathBuf::new(),
-                monitor_cgroup: String::new(),
-                work_dir: temp_dir.path().join("shim"),
-                state_db_path: None,
-                exit_code_file: Some(exit_code_file),
-                attach_socket_dir: None,
-                io_uid: 0,
-                io_gid: 0,
-                max_container_log_line_size: 4096,
-                log_to_journald: false,
-                no_sync_log: false,
-                no_pivot: false,
-                no_new_keyring: true,
-                systemd_cgroup: false,
-            },
-        );
-
-        daemon
-            .io_manager
-            .configure(IoConfig {
-                stdout: Some(log_path),
-                terminal: false,
-                ..Default::default()
-            })
-            .unwrap();
-
-        daemon.run_non_terminal_container().unwrap();
-
-        let args = fs::read_to_string(&args_path).unwrap();
-        assert!(args.lines().any(|line| line == "--no-new-keyring"));
-    }
-
-    #[test]
-    fn test_setup_io_places_reopen_socket_under_attach_socket_dir() {
-        let temp_dir = tempdir().unwrap();
-        let bundle_dir = temp_dir.path().join("bundle");
-        fs::create_dir_all(&bundle_dir).unwrap();
-
-        let log_path = temp_dir.path().join("logs").join("container.log");
-        let internal_state = json!({
-            "log_path": log_path.to_string_lossy(),
-            "tty": false,
-            "stdin": false,
-            "stdin_once": false,
-        });
-        let config = json!({
-            "process": {
-                "terminal": false
-            },
-            "annotations": {
-                INTERNAL_CONTAINER_STATE_KEY: internal_state.to_string()
-            }
-        });
-        fs::write(
-            bundle_dir.join("config.json"),
-            serde_json::to_vec(&config).unwrap(),
-        )
-        .unwrap();
-
-        let runtime_path = temp_dir.path().join("fake-runtime.sh");
-        fs::write(
-            &runtime_path,
-            r#"#!/bin/sh
-set -eu
-exit 0
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let exit_code_file = temp_dir.path().join("exits").join("container-1");
-        fs::create_dir_all(exit_code_file.parent().unwrap()).unwrap();
-        let attach_socket_dir = temp_dir.path().join("attach");
-        let mut daemon = Daemon::new(
-            "container-1".to_string(),
-            bundle_dir,
-            runtime_path,
-            DaemonOptions {
-                runtime_config_path: PathBuf::new(),
-                monitor_cgroup: String::new(),
-                work_dir: temp_dir.path().join("shim"),
-                state_db_path: None,
-                exit_code_file: Some(exit_code_file.clone()),
-                attach_socket_dir: Some(attach_socket_dir.clone()),
-                io_uid: 0,
-                io_gid: 0,
-                max_container_log_line_size: 4096,
-                log_to_journald: false,
-                no_sync_log: false,
-                no_pivot: false,
-                no_new_keyring: false,
-                systemd_cgroup: false,
-            },
-        );
-
-        daemon.setup_io().unwrap();
-
-        let expected = attach_socket_dir.join("container-1").join("reopen.sock");
-        let unexpected = exit_code_file.parent().unwrap().join("reopen.sock");
-        assert!(expected.exists());
-        assert!(!unexpected.exists());
-
-        daemon.io_manager.shutdown().unwrap();
-        daemon.cleanup_attach_socket_directory();
-    }
-}
+mod tests;

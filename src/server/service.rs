@@ -1060,9 +1060,7 @@ impl RuntimeServiceImpl {
         // Match CRI-O's behavior: the sandbox decides whether workload
         // containers must run in host namespaces, even if the container
         // request omitted namespace options or left them at proto defaults.
-        if sandbox.network == NamespaceMode::Node as i32 {
-            effective.network = sandbox.network;
-        } else if requested_missing {
+        if sandbox.network == NamespaceMode::Node as i32 || requested_missing {
             effective.network = sandbox.network;
         }
 
@@ -1074,9 +1072,7 @@ impl RuntimeServiceImpl {
             effective.target_id = sandbox.target_id.clone();
         }
 
-        if sandbox.ipc == NamespaceMode::Node as i32 {
-            effective.ipc = sandbox.ipc;
-        } else if requested_missing {
+        if sandbox.ipc == NamespaceMode::Node as i32 || requested_missing {
             effective.ipc = sandbox.ipc;
         }
 
@@ -2067,7 +2063,7 @@ impl RuntimeServiceImpl {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 if let Some(path) = config_path.as_deref() {
-                    let current_signature = Self::config_watch_signature(&path);
+                    let current_signature = Self::config_watch_signature(path);
                     if current_signature != last_config_signature {
                         let _ = config_clone.reload_config_file_once().await;
                         last_config_signature = current_signature;

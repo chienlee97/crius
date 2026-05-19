@@ -545,20 +545,15 @@ impl RuntimeServiceImpl {
                 None => crate::runtime::ContainerStatus::Unknown,
             },
         };
-        let persistence = self.persistence.clone();
-        let container_id_owned = container_id.to_string();
-        tokio::spawn(async move {
-            let mut persistence = persistence.lock().await;
-            if let Err(err) =
-                persistence.update_container_state(&container_id_owned, persistence_status)
-            {
-                log::error!(
-                    "Failed to update container {} state in database: {}",
-                    container_id_owned,
-                    err
-                );
-            }
-        });
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = persistence.update_container_state(container_id, persistence_status) {
+            log::error!(
+                "Failed to update container {} state in database: {}",
+                container_id,
+                err
+            );
+        }
+        drop(persistence);
 
         Ok(updated_container)
     }
@@ -721,14 +716,42 @@ impl RuntimeServiceImpl {
             return Ok(updated_container);
         }
 
+        let reserved_nri_stop = needs_nri_stop && !stop_notified;
+        if reserved_nri_stop {
+            let reservation = self
+                .mutate_container_internal_state(actual_container_id, |state| {
+                    state.nri_stop_notified = true;
+                })
+                .await;
+            if let Err(err) = reservation {
+                log::warn!(
+                    "Failed to reserve NRI stop notification for {}: {}",
+                    actual_container_id,
+                    err
+                );
+            }
+        }
+
         let runtime = self.runtime.clone();
         let actual_container_id_owned = actual_container_id.to_string();
-        tokio::task::spawn_blocking(move || {
+        let stop_result = tokio::task::spawn_blocking(move || {
             runtime.stop_container(&actual_container_id_owned, Some(timeout))
         })
         .await
-        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-        .map_err(|e| Status::internal(format!("Failed to stop container: {}", e)))?;
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))
+        .and_then(|result| {
+            result.map_err(|e| Status::internal(format!("Failed to stop container: {}", e)))
+        });
+        if let Err(status) = stop_result {
+            if reserved_nri_stop {
+                let _ = self
+                    .mutate_container_internal_state(actual_container_id, |state| {
+                        state.nri_stop_notified = false;
+                    })
+                    .await;
+            }
+            return Err(status);
+        }
 
         let final_runtime_status = {
             let runtime = self.runtime.clone();
@@ -742,7 +765,7 @@ impl RuntimeServiceImpl {
             .finalize_container_stop_state(actual_container_id, final_runtime_status)
             .await?;
 
-        if needs_nri_stop && !stop_notified {
+        if reserved_nri_stop {
             let current_annotations = updated_container
                 .as_ref()
                 .map(|container| container.annotations.clone())
@@ -839,23 +862,17 @@ impl RuntimeServiceImpl {
         self.remove_seccomp_notifier(actual_container_id);
         self.release_container_name(actual_container_id);
 
-        let persistence = self.persistence.clone();
-        let container_id_for_delete = actual_container_id.to_string();
-        tokio::spawn(async move {
-            let mut persistence = persistence.lock().await;
-            if let Err(err) = persistence.delete_container(&container_id_for_delete) {
-                log::error!(
-                    "Failed to delete container {} from database: {}",
-                    container_id_for_delete,
-                    err
-                );
-            } else {
-                log::info!(
-                    "Container {} removed from database",
-                    container_id_for_delete
-                );
-            }
-        });
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = persistence.delete_container(actual_container_id) {
+            log::error!(
+                "Failed to delete container {} from database: {}",
+                actual_container_id,
+                err
+            );
+        } else {
+            log::info!("Container {} removed from database", actual_container_id);
+        }
+        drop(persistence);
 
         Ok(deleted_container)
     }
@@ -2157,10 +2174,7 @@ impl RuntimeServiceImpl {
             id: created_id.clone(),
             pod_sandbox_id: pod_sandbox_id.clone(),
             state: ContainerState::ContainerCreated as i32,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as i64,
+            created_at: Self::now_nanos(),
             labels: config.labels.clone(),
             metadata: config.metadata.clone(),
             annotations: stored_annotations.clone(),
@@ -2182,82 +2196,59 @@ impl RuntimeServiceImpl {
         );
         drop(containers);
 
-        let persistence = self.persistence.clone();
-        let containers = self.containers.clone();
-        let removed_container_ids = self.removed_container_ids.clone();
-        let created_id_for_persist = created_id.clone();
-        let pod_sandbox_id_for_persist = pod_sandbox_id.clone();
-        let container_image_ref_for_persist = container_image_ref.clone();
-        let command_for_persist = container_config.command.clone();
-        let runtime_handler_for_persist = runtime_handler.to_string();
-        tokio::spawn(async move {
-            if removed_container_ids
-                .lock()
-                .ok()
-                .map(|removed| removed.contains(&created_id_for_persist))
-                .unwrap_or(false)
-            {
-                return;
+        let state = match container.state {
+            x if x == ContainerState::ContainerCreated as i32 => {
+                crate::runtime::ContainerStatus::Created
             }
-
-            let Some(current_container) = ({
-                let containers = containers.lock().await;
-                containers.get(&created_id_for_persist).cloned()
-            }) else {
-                return;
-            };
-
-            let state = match current_container.state {
-                x if x == ContainerState::ContainerCreated as i32 => {
-                    crate::runtime::ContainerStatus::Created
-                }
-                x if x == ContainerState::ContainerRunning as i32 => {
-                    crate::runtime::ContainerStatus::Running
-                }
-                x if x == ContainerState::ContainerExited as i32 => {
-                    let exit_code =
-                        RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
-                            &current_container.annotations,
-                            INTERNAL_CONTAINER_STATE_KEY,
-                        )
-                        .and_then(|state| state.exit_code)
-                        .unwrap_or_default();
-                    crate::runtime::ContainerStatus::Stopped(exit_code)
-                }
-                _ => crate::runtime::ContainerStatus::Unknown,
-            };
-
-            let mut persistence = persistence.lock().await;
+            x if x == ContainerState::ContainerRunning as i32 => {
+                crate::runtime::ContainerStatus::Running
+            }
+            x if x == ContainerState::ContainerExited as i32 => {
+                let exit_code = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+                    &container.annotations,
+                    INTERNAL_CONTAINER_STATE_KEY,
+                )
+                .and_then(|state| state.exit_code)
+                .unwrap_or_default();
+                crate::runtime::ContainerStatus::Stopped(exit_code)
+            }
+            _ => crate::runtime::ContainerStatus::Unknown,
+        };
+        {
+            let mut persistence = self.persistence.lock().await;
             if let Err(err) = persistence.save_container(
-                &created_id_for_persist,
-                &pod_sandbox_id_for_persist,
+                &created_id,
+                &pod_sandbox_id,
                 state,
-                &container_image_ref_for_persist,
-                &command_for_persist,
-                &current_container.labels,
-                &current_container.annotations,
+                &container_image_ref,
+                &container_config.command,
+                &container.labels,
+                &container.annotations,
             ) {
-                log::error!(
+                drop(persistence);
+                self.rollback_failed_container_create(&created_id, nri_event)
+                    .await;
+                return Err(Status::internal(format!(
                     "Failed to persist container {}: {}",
-                    created_id_for_persist,
-                    err
-                );
-            } else {
-                if let Err(err) = persistence.update_container_ledger_metadata(
-                    &created_id_for_persist,
-                    Some(&runtime_handler_for_persist),
-                    Some("runc"),
-                    Some(&created_id_for_persist),
-                ) {
-                    log::error!(
-                        "Failed to persist ledger metadata for container {}: {}",
-                        created_id_for_persist,
-                        err
-                    );
-                }
-                log::info!("Container {} persisted to database", created_id_for_persist);
+                    created_id, err
+                )));
             }
-        });
+            if let Err(err) = persistence.update_container_ledger_metadata(
+                &created_id,
+                Some(runtime_handler),
+                Some("runc"),
+                Some(&created_id),
+            ) {
+                drop(persistence);
+                self.rollback_failed_container_create(&created_id, nri_event)
+                    .await;
+                return Err(Status::internal(format!(
+                    "Failed to persist ledger metadata for container {}: {}",
+                    created_id, err
+                )));
+            }
+        }
+        log::info!("Container {} persisted to database", created_id);
         if let Err(err) = self.nri.post_create_container(nri_event.clone()).await {
             log::warn!("NRI PostCreateContainer failed for {}: {}", created_id, err);
         }
@@ -2513,8 +2504,6 @@ impl RuntimeServiceImpl {
             self.persist_bundle_annotations(&actual_container_id, &container.annotations)?;
         }
 
-        let persistence = self.persistence.clone();
-        let actual_container_id_for_persist = actual_container_id.clone();
         let persistence_state = match observed_state {
             x if x == ContainerState::ContainerRunning as i32 => {
                 crate::runtime::ContainerStatus::Running
@@ -2527,18 +2516,18 @@ impl RuntimeServiceImpl {
             }
             _ => crate::runtime::ContainerStatus::Unknown,
         };
-        tokio::spawn(async move {
-            let mut persistence = persistence.lock().await;
-            if let Err(err) = persistence
-                .update_container_state(&actual_container_id_for_persist, persistence_state)
+        {
+            let mut persistence = self.persistence.lock().await;
+            if let Err(err) =
+                persistence.update_container_state(&actual_container_id, persistence_state)
             {
                 log::error!(
                     "Failed to update container {} state in database: {}",
-                    actual_container_id_for_persist,
+                    actual_container_id,
                     err
                 );
             }
-        });
+        }
         if checkpoint_restore.is_some() {
             let updated_annotations = {
                 let mut containers = self.containers.lock().await;

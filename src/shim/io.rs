@@ -814,8 +814,8 @@ impl IoManager {
     pub fn setup_stdio_pipes(&self) -> Result<(Option<File>, Option<File>, Option<File>)> {
         // 创建管道用于与容器通信
         // stdin
-        let stdin = if self.config.stdin.is_some() {
-            let file = File::open(self.config.stdin.as_ref().unwrap())?;
+        let stdin = if let Some(stdin) = &self.config.stdin {
+            let file = File::open(stdin)?;
             Some(file)
         } else {
             None

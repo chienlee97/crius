@@ -532,6 +532,7 @@ impl RuntimeServiceImpl {
                                 status.state,
                                 crate::shim_rpc::TaskState::Created
                                     | crate::shim_rpc::TaskState::Running
+                                    | crate::shim_rpc::TaskState::Paused
                             ) => {}
                         Ok(None) if shim_pid_live => {}
                         Ok(Some(_)) => {}
@@ -568,18 +569,49 @@ impl RuntimeServiceImpl {
                 ContainerStatus::Unknown => crate::runtime::ContainerStatus::Unknown,
             };
 
-            {
+            let updated_annotations = {
                 let mut containers = self.containers.lock().await;
                 if let Some(container) = containers.get_mut(container_id) {
                     container.state = runtime_state;
+                    if let Some(mut state) = Self::read_internal_state::<StoredContainerState>(
+                        &container.annotations,
+                        INTERNAL_CONTAINER_STATE_KEY,
+                    ) {
+                        match &persistence_status {
+                            crate::runtime::ContainerStatus::Running => {
+                                state.started_at.get_or_insert(Self::now_nanos());
+                                state.finished_at = None;
+                                state.exit_code = None;
+                            }
+                            crate::runtime::ContainerStatus::Stopped(code) => {
+                                state.finished_at.get_or_insert(Self::now_nanos());
+                                state.exit_code = Some(*code);
+                            }
+                            _ => {}
+                        }
+                        Self::insert_internal_state(
+                            &mut container.annotations,
+                            INTERNAL_CONTAINER_STATE_KEY,
+                            &state,
+                        )?;
+                    }
+                    Some(container.annotations.clone())
+                } else {
+                    None
+                }
+            };
+            let mut persistence = self.persistence.lock().await;
+            if let Some(annotations) = updated_annotations {
+                if let Err(e) = persistence.update_container_annotations(container_id, &annotations)
+                {
+                    log::warn!(
+                        "Failed to persist ledger-driven annotations for container {}: {}",
+                        container_id,
+                        e
+                    );
                 }
             }
-            if let Err(e) = self
-                .persistence
-                .lock()
-                .await
-                .update_container_state(container_id, persistence_status)
-            {
+            if let Err(e) = persistence.update_container_state(container_id, persistence_status) {
                 log::warn!(
                     "Failed to reconcile ledger-driven container {} state in database: {}",
                     container_id,
@@ -617,10 +649,10 @@ impl RuntimeServiceImpl {
                 let pause_status = self
                     .runtime_container_status_checked(&pause_container_id)
                     .await;
-                let next_state = if matches!(pause_status, ContainerStatus::Running) && has_netns {
-                    "ready"
-                } else {
-                    "notready"
+                let next_state = match pause_status {
+                    ContainerStatus::Running if has_netns => "ready",
+                    ContainerStatus::Unknown if has_netns => pod.state.as_str(),
+                    _ => "notready",
                 };
                 if let Err(err) = self
                     .persistence
