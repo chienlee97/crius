@@ -1571,7 +1571,10 @@ impl ImageServiceImpl {
         }
 
         let images = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let content_store = Arc::new(FsContentStore::new(&storage_path)?);
+        let content_store = Arc::new(FsContentStore::new_with_ledger(
+            &storage_path,
+            ledger_db_path.clone(),
+        )?);
         let metadata_store = Arc::new(FilesystemImageMetadataStore::new(
             &storage_path,
             additional_artifact_stores.clone(),

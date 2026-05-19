@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::storage::{ContentBlobRecord, StorageManager};
+
 pub trait ContentStore: Send + Sync {
     fn put_blob(&self, digest: &str, media_type: &str, bytes: &[u8]) -> Result<BlobInfo>;
     fn get_blob(&self, digest: &str) -> Result<BlobHandle>;
@@ -30,6 +32,7 @@ pub struct BlobHandle {
 #[derive(Debug, Clone)]
 pub struct FsContentStore {
     root: PathBuf,
+    ledger_db_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,10 +45,20 @@ struct BlobMeta {
 
 impl FsContentStore {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+        Self::new_with_ledger(root, None)
+    }
+
+    pub fn new_with_ledger(
+        root: impl AsRef<Path>,
+        ledger_db_path: Option<PathBuf>,
+    ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(root.join("blobs").join("sha256"))
             .with_context(|| format!("failed to create content store root {}", root.display()))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            ledger_db_path,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -96,6 +109,55 @@ impl FsContentStore {
         }
         std::fs::write(&path, serde_json::to_vec_pretty(&meta)?)
             .with_context(|| format!("failed to write blob metadata {}", path.display()))?;
+        Ok(())
+    }
+
+    fn storage(&self) -> Result<Option<StorageManager>> {
+        self.ledger_db_path
+            .as_ref()
+            .map(StorageManager::new)
+            .transpose()
+    }
+
+    fn save_ledger_info(&self, info: &BlobInfo) -> Result<()> {
+        let Some(mut storage) = self.storage()? else {
+            return Ok(());
+        };
+        let now = chrono::Utc::now().timestamp();
+        let created_at = storage
+            .get_content_blob(&info.digest)?
+            .map(|record| record.created_at)
+            .unwrap_or(now);
+        storage.save_content_blob(&ContentBlobRecord {
+            digest: info.digest.clone(),
+            media_type: info.media_type.clone(),
+            size: info.size,
+            relative_path: info.relative_path.display().to_string(),
+            created_at,
+            last_used_at: now,
+        })
+    }
+
+    fn read_ledger_info(&self, digest: &str) -> Result<Option<BlobInfo>> {
+        let Some(mut storage) = self.storage()? else {
+            return Ok(None);
+        };
+        let Some(record) = storage.get_content_blob(digest)? else {
+            return Ok(None);
+        };
+        storage.touch_content_blob(digest, chrono::Utc::now().timestamp())?;
+        Ok(Some(BlobInfo {
+            digest: record.digest,
+            media_type: record.media_type,
+            size: record.size,
+            relative_path: PathBuf::from(record.relative_path),
+        }))
+    }
+
+    fn delete_ledger_info(&self, digest: &str) -> Result<()> {
+        if let Some(mut storage) = self.storage()? {
+            storage.delete_content_blob(digest)?;
+        }
         Ok(())
     }
 
@@ -151,6 +213,7 @@ impl ContentStore for FsContentStore {
             size,
             relative_path: Self::relative_blob_path_for_digest(&digest),
         };
+        self.save_ledger_info(&info)?;
         self.write_meta(&info)?;
         Ok(info)
     }
@@ -175,10 +238,14 @@ impl ContentStore for FsContentStore {
                 format!("failed to delete blob metadata {}", meta_path.display())
             })?;
         }
+        self.delete_ledger_info(digest)?;
         Ok(())
     }
 
     fn stat_blob(&self, digest: &str) -> Result<BlobInfo> {
+        if let Some(info) = self.read_ledger_info(digest)? {
+            return Ok(info);
+        }
         match self.read_meta(digest) {
             Ok(info) => Ok(info),
             Err(_) => {
@@ -254,5 +321,28 @@ mod tests {
         let (all_bytes, all_inodes) = collect_path_usage(dir.path()).unwrap();
         assert!(all_bytes >= bytes);
         assert!(all_inodes >= inodes);
+    }
+
+    #[test]
+    fn ledger_metadata_is_primary_when_meta_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("crius.db");
+        let store = FsContentStore::new_with_ledger(dir.path(), Some(db_path.clone())).unwrap();
+        let info = store
+            .put_blob("", "application/vnd.oci.image.config.v1+json", b"{}")
+            .unwrap();
+
+        std::fs::remove_file(store.meta_path_for_digest(&info.digest)).unwrap();
+
+        let stat = store.stat_blob(&info.digest).unwrap();
+        assert_eq!(stat.media_type, "application/vnd.oci.image.config.v1+json");
+        assert_eq!(stat.size, 2);
+
+        let storage = crate::storage::StorageManager::new(&db_path).unwrap();
+        assert!(storage.get_content_blob(&info.digest).unwrap().is_some());
+
+        store.delete_blob(&info.digest).unwrap();
+        let storage = crate::storage::StorageManager::new(&db_path).unwrap();
+        assert!(storage.get_content_blob(&info.digest).unwrap().is_none());
     }
 }

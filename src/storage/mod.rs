@@ -86,6 +86,17 @@ pub struct ImageRefRecord {
     pub ref_kind: String,
 }
 
+/// 内容 blob 记录
+#[derive(Debug, Clone)]
+pub struct ContentBlobRecord {
+    pub digest: String,
+    pub media_type: String,
+    pub size: u64,
+    pub relative_path: String,
+    pub created_at: i64,
+    pub last_used_at: i64,
+}
+
 /// 快照记录
 #[derive(Debug, Clone)]
 pub struct SnapshotRecord {
@@ -253,6 +264,20 @@ impl StorageManager {
 
         self.conn
             .execute(
+                "CREATE TABLE IF NOT EXISTS content_blobs (
+                digest TEXT PRIMARY KEY,
+                media_type TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                relative_path TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL
+            )",
+                [],
+            )
+            .context("Failed to create content_blobs table")?;
+
+        self.conn
+            .execute(
                 "CREATE TABLE IF NOT EXISTS image_refs (
                 reference TEXT NOT NULL,
                 image_id TEXT NOT NULL,
@@ -326,6 +351,10 @@ impl StorageManager {
             .context("Failed to create events table")?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_image_refs_image_id ON image_refs(image_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_blobs_last_used ON content_blobs(last_used_at)",
             [],
         )?;
         self.conn.execute(
@@ -862,6 +891,69 @@ impl StorageManager {
         self.conn
             .execute("DELETE FROM images WHERE id = ?1", [image_id])
             .context("Failed to delete image")?;
+        Ok(())
+    }
+
+    pub fn save_content_blob(&mut self, record: &ContentBlobRecord) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO content_blobs
+                 (digest, media_type, size, relative_path, created_at, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(digest) DO UPDATE SET
+                   media_type = excluded.media_type,
+                   size = excluded.size,
+                   relative_path = excluded.relative_path,
+                   last_used_at = excluded.last_used_at",
+                rusqlite::params![
+                    &record.digest,
+                    &record.media_type,
+                    record.size as i64,
+                    &record.relative_path,
+                    record.created_at,
+                    record.last_used_at,
+                ],
+            )
+            .context("Failed to save content blob")?;
+        Ok(())
+    }
+
+    pub fn get_content_blob(&self, digest: &str) -> Result<Option<ContentBlobRecord>> {
+        self.conn
+            .query_row(
+                "SELECT digest, media_type, size, relative_path, created_at, last_used_at
+                 FROM content_blobs WHERE digest = ?1",
+                [digest],
+                |row| {
+                    let size: i64 = row.get(2)?;
+                    Ok(ContentBlobRecord {
+                        digest: row.get(0)?,
+                        media_type: row.get(1)?,
+                        size: size.max(0) as u64,
+                        relative_path: row.get(3)?,
+                        created_at: row.get(4)?,
+                        last_used_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .context("Failed to get content blob")
+    }
+
+    pub fn touch_content_blob(&mut self, digest: &str, last_used_at: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE content_blobs SET last_used_at = ?2 WHERE digest = ?1",
+                rusqlite::params![digest, last_used_at],
+            )
+            .context("Failed to touch content blob")?;
+        Ok(())
+    }
+
+    pub fn delete_content_blob(&mut self, digest: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM content_blobs WHERE digest = ?1", [digest])
+            .context("Failed to delete content blob")?;
         Ok(())
     }
 

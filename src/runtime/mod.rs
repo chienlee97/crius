@@ -2380,7 +2380,10 @@ impl RuncRuntime {
                 Vec::new(),
                 self.state_db_path.clone(),
             ),
-            crate::image::content_store::FsContentStore::new(&self.image_storage_root)?,
+            crate::image::content_store::FsContentStore::new_with_ledger(
+                &self.image_storage_root,
+                self.state_db_path.clone(),
+            )?,
             self.state_db_path.clone(),
         );
         snapshotter.prepare(container_id, image_ref, rootfs_dir)?;
