@@ -16,7 +16,43 @@ pub enum SnapshotMode {
 
 pub trait Snapshotter: Send + Sync {
     fn prepare(&self, key: &str, image_ref: &str, destination: &Path) -> Result<PreparedSnapshot>;
+    fn mount(&self, key: &str) -> Result<MountView>;
+    fn commit(&self, key: &str) -> Result<SnapshotInfo>;
+    fn remove(&self, key: &str) -> Result<()>;
+    fn usage_for(&self, key: &str) -> Result<SnapshotUsage>;
     fn usage(&self) -> Result<SnapshotUsage>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotState {
+    Prepared,
+    Mounted,
+    Committed,
+    Deleted,
+    Broken,
+}
+
+impl SnapshotState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Mounted => "mounted",
+            Self::Committed => "committed",
+            Self::Deleted => "deleted",
+            Self::Broken => "broken",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "prepared" => Self::Prepared,
+            "mounted" => Self::Mounted,
+            "committed" => Self::Committed,
+            "deleted" => Self::Deleted,
+            "broken" => Self::Broken,
+            _ => Self::Broken,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +60,21 @@ pub struct PreparedSnapshot {
     pub key: String,
     pub image_id: String,
     pub rootfs_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountView {
+    pub key: String,
+    pub mountpoint: PathBuf,
+    pub readonly: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotInfo {
+    pub key: String,
+    pub image_id: String,
+    pub state: SnapshotState,
+    pub mountpoint: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -167,6 +218,36 @@ impl FilesystemSnapshotter {
         }
         Ok(())
     }
+
+    fn storage(&self) -> Result<StorageManager> {
+        let db_path = self
+            .ledger_db_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("snapshot ledger is not configured"))?;
+        StorageManager::new(db_path)
+    }
+
+    fn snapshot_record(&self, key: &str) -> Result<SnapshotRecord> {
+        self.storage()?
+            .list_snapshots()?
+            .into_iter()
+            .find(|record| record.key == key)
+            .ok_or_else(|| anyhow::anyhow!("snapshot {key} not found"))
+    }
+
+    fn save_snapshot_state(&self, mut record: SnapshotRecord, state: SnapshotState) -> Result<()> {
+        record.state = state.as_str().to_string();
+        self.storage()?.save_snapshot(&record)
+    }
+
+    fn info_from_record(record: SnapshotRecord) -> SnapshotInfo {
+        SnapshotInfo {
+            key: record.key,
+            image_id: record.image_id,
+            state: SnapshotState::from_str(&record.state),
+            mountpoint: PathBuf::from(record.mountpoint),
+        }
+    }
 }
 
 impl Snapshotter for FilesystemSnapshotter {
@@ -191,7 +272,7 @@ impl Snapshotter for FilesystemSnapshotter {
                 image_id: metadata.id.clone(),
                 owner_kind: "container".to_string(),
                 owner_id: key.to_string(),
-                state: "prepared".to_string(),
+                state: SnapshotState::Prepared.as_str().to_string(),
                 mountpoint: destination.display().to_string(),
             })?;
         }
@@ -199,6 +280,53 @@ impl Snapshotter for FilesystemSnapshotter {
             key: key.to_string(),
             image_id: metadata.id,
             rootfs_path: destination.to_path_buf(),
+        })
+    }
+
+    fn mount(&self, key: &str) -> Result<MountView> {
+        let record = self.snapshot_record(key)?;
+        let mountpoint = PathBuf::from(&record.mountpoint);
+        if !mountpoint.exists() {
+            self.save_snapshot_state(record, SnapshotState::Broken)?;
+            return Err(anyhow::anyhow!(
+                "snapshot {key} mountpoint does not exist: {}",
+                mountpoint.display()
+            ));
+        }
+        self.save_snapshot_state(record, SnapshotState::Mounted)?;
+        Ok(MountView {
+            key: key.to_string(),
+            mountpoint,
+            readonly: false,
+        })
+    }
+
+    fn commit(&self, key: &str) -> Result<SnapshotInfo> {
+        let record = self.snapshot_record(key)?;
+        self.save_snapshot_state(record.clone(), SnapshotState::Committed)?;
+        Ok(Self::info_from_record(SnapshotRecord {
+            state: SnapshotState::Committed.as_str().to_string(),
+            ..record
+        }))
+    }
+
+    fn remove(&self, key: &str) -> Result<()> {
+        let record = self.snapshot_record(key)?;
+        let mountpoint = PathBuf::from(&record.mountpoint);
+        if mountpoint.exists() {
+            std::fs::remove_dir_all(&mountpoint)
+                .with_context(|| format!("failed to remove snapshot {}", mountpoint.display()))?;
+        }
+        self.storage()?.delete_snapshot(key)
+    }
+
+    fn usage_for(&self, key: &str) -> Result<SnapshotUsage> {
+        let record = self.snapshot_record(key)?;
+        let (used_bytes, inodes_used) =
+            crate::image::content_store::collect_path_usage(Path::new(&record.mountpoint))?;
+        Ok(SnapshotUsage {
+            used_bytes,
+            inodes_used,
         })
     }
 
@@ -240,7 +368,7 @@ fn unpack_layer_with_tar(layer_file: &Path, rootfs_dir: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilesystemSnapshotter, SnapshotMode, Snapshotter};
+    use super::{FilesystemSnapshotter, SnapshotMode, SnapshotState, Snapshotter};
     use crate::image::content_store::{ContentStore, FsContentStore};
     use crate::image::metadata_store::FilesystemImageMetadataStore;
     use crate::image::{CriusImage, StoredLayerMeta};
@@ -300,9 +428,30 @@ mod tests {
             std::fs::read_to_string(rootfs.join("etc/hello")).unwrap(),
             "world"
         );
+
+        let mount = snapshotter.mount("container-1").unwrap();
+        assert_eq!(mount.key, "container-1");
+        assert_eq!(mount.mountpoint, rootfs);
+        assert!(!mount.readonly);
+
+        let usage = snapshotter.usage_for("container-1").unwrap();
+        assert!(usage.used_bytes > 0);
+        assert!(usage.inodes_used > 0);
+
+        let info = snapshotter.commit("container-1").unwrap();
+        assert_eq!(info.key, "container-1");
+        assert_eq!(info.image_id, "sha256:test");
+        assert_eq!(info.state, SnapshotState::Committed);
+
         let storage = crate::storage::StorageManager::new(db_path).unwrap();
         let snapshots = storage.list_snapshots().unwrap();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].owner_id, "container-1");
+        assert_eq!(snapshots[0].state, SnapshotState::Committed.as_str());
+
+        snapshotter.remove("container-1").unwrap();
+        assert!(!mount.mountpoint.exists());
+        let storage = crate::storage::StorageManager::new(dir.path().join("crius.db")).unwrap();
+        assert!(storage.list_snapshots().unwrap().is_empty());
     }
 }

@@ -6,16 +6,19 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crius::config::CgroupDriverConfig;
 use crius::image::content_store::{BlobHandle, BlobInfo, ContentStore, FsContentStore};
-use crius::image::snapshotter::{PreparedSnapshot, SnapshotUsage, Snapshotter};
+use crius::image::snapshotter::{
+    MountView, PreparedSnapshot, SnapshotInfo, SnapshotState, SnapshotUsage, Snapshotter,
+};
 use crius::oci::spec::Spec;
 use crius::runtime::{
     ContainerConfig, ContainerStatus, MountSemanticsError, RuntimeBackend, RuntimeFeatureProbe,
@@ -239,6 +242,7 @@ impl ContentStore for FakeContentStore {
 pub struct FakeSnapshotter {
     root: PathBuf,
     usage: SnapshotUsage,
+    snapshots: Arc<Mutex<HashMap<String, SnapshotInfo>>>,
 }
 
 impl FakeSnapshotter {
@@ -246,6 +250,7 @@ impl FakeSnapshotter {
         Self {
             root: root.into(),
             usage: SnapshotUsage::default(),
+            snapshots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -266,11 +271,76 @@ impl Snapshotter for FakeSnapshotter {
         } else {
             destination.to_path_buf()
         };
-        Ok(PreparedSnapshot {
+        let prepared = PreparedSnapshot {
             key: key.to_string(),
             image_id: image_ref.to_string(),
-            rootfs_path,
+            rootfs_path: rootfs_path.clone(),
+        };
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake snapshotter state lock poisoned"))?;
+        snapshots.insert(
+            key.to_string(),
+            SnapshotInfo {
+                key: key.to_string(),
+                image_id: image_ref.to_string(),
+                state: SnapshotState::Prepared,
+                mountpoint: rootfs_path,
+            },
+        );
+        Ok(prepared)
+    }
+
+    fn mount(&self, key: &str) -> Result<MountView> {
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake snapshotter state lock poisoned"))?;
+        let snapshot = snapshots
+            .get_mut(key)
+            .with_context(|| format!("snapshot {key} not found"))?;
+        snapshot.state = SnapshotState::Mounted;
+        Ok(MountView {
+            key: key.to_string(),
+            mountpoint: snapshot.mountpoint.clone(),
+            readonly: false,
         })
+    }
+
+    fn commit(&self, key: &str) -> Result<SnapshotInfo> {
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake snapshotter state lock poisoned"))?;
+        let snapshot = snapshots
+            .get_mut(key)
+            .with_context(|| format!("snapshot {key} not found"))?;
+        snapshot.state = SnapshotState::Committed;
+        Ok(snapshot.clone())
+    }
+
+    fn remove(&self, key: &str) -> Result<()> {
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake snapshotter state lock poisoned"))?;
+        snapshots
+            .remove(key)
+            .map(|_| ())
+            .with_context(|| format!("snapshot {key} not found"))
+    }
+
+    fn usage_for(&self, key: &str) -> Result<SnapshotUsage> {
+        let snapshots = self
+            .snapshots
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake snapshotter state lock poisoned"))?;
+        if snapshots.contains_key(key) {
+            Ok(self.usage.clone())
+        } else {
+            Err(anyhow::anyhow!("snapshot {key} not found"))
+        }
     }
 
     fn usage(&self) -> Result<SnapshotUsage> {
