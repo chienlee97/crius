@@ -1766,6 +1766,24 @@ async fn recover_state_cleans_orphaned_runtime_bundles_but_keeps_recovered_ones(
             &HashMap::new(),
         )
         .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .replace_runtime_artifacts(
+            "container",
+            "orphan-bundle",
+            &[crate::storage::RuntimeArtifactRecord {
+                owner_kind: "container".to_string(),
+                owner_id: "orphan-bundle".to_string(),
+                artifact_kind: "bundle".to_string(),
+                path: orphan_bundle.display().to_string(),
+                state: "active".to_string(),
+                runtime_handler: Some("runc".to_string()),
+                runtime_root: Some(dir.path().join("runtime-root").display().to_string()),
+            }],
+        )
+        .unwrap();
 
     service.recover_state().await.unwrap();
 
@@ -1781,6 +1799,25 @@ async fn recover_state_cleans_orphaned_runtime_bundles_but_keeps_recovered_ones(
         live_orphan_bundle.exists(),
         "recover_state should not delete live runtime bundles that still have runtime state"
     );
+    {
+        let persistence = service.persistence.lock().await;
+        assert!(
+            !persistence
+                .list_runtime_artifacts()
+                .unwrap()
+                .iter()
+                .any(|artifact| artifact.owner_id == "orphan-bundle"),
+            "orphan cleanup should delete ledger artifacts with no container owner"
+        );
+        assert!(persistence
+            .storage()
+            .get_recent_events("orphan_cleanup", 0)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "reconcile"
+                && event.entity_id == "orphan-bundle"
+                && event.new_state == "pending"));
+    }
 }
 
 #[tokio::test]
@@ -1828,6 +1865,24 @@ async fn recover_state_cleans_orphaned_pod_workspaces_but_keeps_recovered_ones()
             None,
         )
         .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .replace_runtime_artifacts(
+            "pod",
+            "orphan-pod",
+            &[crate::storage::RuntimeArtifactRecord {
+                owner_kind: "pod".to_string(),
+                owner_id: "orphan-pod".to_string(),
+                artifact_kind: "workspace".to_string(),
+                path: orphan_workspace.display().to_string(),
+                state: "active".to_string(),
+                runtime_handler: None,
+                runtime_root: None,
+            }],
+        )
+        .unwrap();
 
     service.recover_state().await.unwrap();
 
@@ -1839,5 +1894,23 @@ async fn recover_state_cleans_orphaned_pod_workspaces_but_keeps_recovered_ones()
         !orphan_workspace.exists(),
         "recover_state should clean orphaned pod workspaces"
     );
+    {
+        let persistence = service.persistence.lock().await;
+        assert!(
+            !persistence
+                .list_runtime_artifacts()
+                .unwrap()
+                .iter()
+                .any(|artifact| artifact.owner_id == "orphan-pod"),
+            "orphan cleanup should delete pod artifact ledger entries with no pod owner"
+        );
+        assert!(persistence
+            .storage()
+            .get_recent_events("orphan_cleanup", 0)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "reconcile"
+                && event.entity_id == "orphan-pod"
+                && event.new_state == "pending"));
+    }
 }
-

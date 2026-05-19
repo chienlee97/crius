@@ -692,12 +692,6 @@ impl RuntimeServiceImpl {
             .map(|entry| entry.record.id.clone())
             .collect();
         known_ids.extend(snapshot.pods.iter().map(|pod| pod.id.clone()));
-        known_ids.extend(
-            snapshot
-                .runtime_artifacts
-                .iter()
-                .map(|artifact| artifact.owner_id.clone()),
-        );
 
         let mut scanned_roots = std::collections::HashSet::new();
         for runtime in self.runtime.all_runtimes() {
@@ -722,6 +716,8 @@ impl RuntimeServiceImpl {
                 if self.runtime.container_has_active_runtime_state(id) {
                     continue;
                 }
+                self.record_orphan_cleanup_event("container", id, &path)
+                    .await;
                 if let Err(err) = std::fs::remove_dir_all(&path) {
                     log::warn!(
                         "Failed to remove orphaned runtime bundle {}: {}",
@@ -762,6 +758,7 @@ impl RuntimeServiceImpl {
             if known_pod_ids.contains(id) {
                 continue;
             }
+            self.record_orphan_cleanup_event("pod", id, &path).await;
             if let Err(err) = std::fs::remove_dir_all(&path) {
                 log::warn!(
                     "Failed to remove orphaned pod workspace {}: {}",
@@ -780,6 +777,34 @@ impl RuntimeServiceImpl {
                     err
                 );
             }
+        }
+    }
+
+    async fn record_orphan_cleanup_event(&self, owner_kind: &str, owner_id: &str, path: &Path) {
+        let details = format!(
+            "pending cleanup for orphaned {owner_kind} artifact at {}",
+            path.display()
+        );
+        if let Err(err) = self
+            .persistence
+            .lock()
+            .await
+            .storage_mut()
+            .append_typed_event(
+                "reconcile",
+                "orphan_cleanup",
+                owner_id,
+                None,
+                Some("pending"),
+                Some(&details),
+            )
+        {
+            log::warn!(
+                "Failed to record orphan cleanup event for {} {}: {}",
+                owner_kind,
+                owner_id,
+                err
+            );
         }
     }
 
