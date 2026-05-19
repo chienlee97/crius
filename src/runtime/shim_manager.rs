@@ -164,10 +164,11 @@ impl ShimManager {
     }
 
     fn metadata_path(&self, container_id: &str) -> PathBuf {
-        self.config
-            .work_dir
-            .join(container_id)
-            .join(SHIM_METADATA_FILE)
+        Self::metadata_path_for(&self.config, container_id)
+    }
+
+    fn metadata_path_for(config: &ShimConfig, container_id: &str) -> PathBuf {
+        config.work_dir.join(container_id).join(SHIM_METADATA_FILE)
     }
 
     pub fn pidfile_path(&self, container_id: &str) -> PathBuf {
@@ -178,30 +179,57 @@ impl ShimManager {
         PathBuf::from("/proc").join(pid.to_string()).exists()
     }
 
-    fn persist_process_metadata(&self, process: &ShimProcess) -> Result<()> {
+    fn persist_shim_ledger_state(
+        &self,
+        container_id: &str,
+        shim_pid: u32,
+        exit_code_file: &Path,
+        log_file: &Path,
+        socket_path: &Path,
+        bundle_path: &Path,
+        state: &str,
+    ) -> Result<()> {
         if let Some(mut storage) = self.ledger_storage()? {
             storage.save_shim_process(&ShimProcessRecord {
-                container_id: process.container_id.clone(),
-                shim_pid: process.shim_pid,
+                container_id: container_id.to_string(),
+                shim_pid,
                 work_dir: self.config.work_dir.display().to_string(),
-                socket_path: process.socket_path.display().to_string(),
-                exit_code_file: process.exit_code_file.display().to_string(),
-                log_file: process.log_file.display().to_string(),
-                bundle_path: process.bundle_path.display().to_string(),
-                state: "running".to_string(),
+                socket_path: socket_path.display().to_string(),
+                exit_code_file: exit_code_file.display().to_string(),
+                log_file: log_file.display().to_string(),
+                bundle_path: bundle_path.display().to_string(),
+                state: state.to_string(),
                 last_seen_at: chrono::Utc::now().timestamp(),
             })?;
         }
-        let metadata_path = self.metadata_path(&process.container_id);
-        if let Some(parent) = metadata_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&metadata_path, serde_json::to_vec_pretty(process)?)?;
         Ok(())
     }
 
-    fn persist_pidfile(&self, container_id: &str, shim_pid: u32) -> Result<()> {
-        Self::persist_pidfile_for(&self.config, container_id, shim_pid)
+    fn persist_process_metadata(&self, process: &ShimProcess) {
+        let metadata_path = self.metadata_path(&process.container_id);
+        if let Err(err) = (|| -> Result<()> {
+            if let Some(parent) = metadata_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&metadata_path, serde_json::to_vec_pretty(process)?)?;
+            Ok(())
+        })() {
+            log::warn!(
+                "Failed to write diagnostic shim metadata {}: {}",
+                metadata_path.display(),
+                err
+            );
+        }
+    }
+
+    fn persist_pidfile(&self, container_id: &str, shim_pid: u32) {
+        if let Err(err) = Self::persist_pidfile_for(&self.config, container_id, shim_pid) {
+            log::warn!(
+                "Failed to write diagnostic shim pidfile for {}: {}",
+                container_id,
+                err
+            );
+        }
     }
 
     fn persist_pidfile_for(config: &ShimConfig, container_id: &str, shim_pid: u32) -> Result<()> {
@@ -247,21 +275,48 @@ impl ShimManager {
 
     fn restore_processes_from_disk(config: &ShimConfig) -> Vec<ShimProcess> {
         if !config.state_db_path.as_os_str().is_empty() {
-            if let Ok(storage) = StorageManager::new(&config.state_db_path) {
+            if let Ok(mut storage) = StorageManager::new(&config.state_db_path) {
                 if let Ok(records) = storage.list_shim_processes() {
                     let restored = records
                         .into_iter()
-                        .filter(|record| {
-                            Self::process_exists(record.shim_pid)
-                                || Path::new(&record.exit_code_file).exists()
-                        })
-                        .map(|record| ShimProcess {
-                            container_id: record.container_id,
-                            shim_pid: record.shim_pid,
-                            exit_code_file: PathBuf::from(record.exit_code_file),
-                            log_file: PathBuf::from(record.log_file),
-                            socket_path: PathBuf::from(record.socket_path),
-                            bundle_path: PathBuf::from(record.bundle_path),
+                        .filter_map(|mut record| {
+                            let live_or_exited = Self::process_exists(record.shim_pid)
+                                || Path::new(&record.exit_code_file).exists();
+                            if !live_or_exited {
+                                return None;
+                            }
+
+                            let metadata_path =
+                                Self::metadata_path_for(config, &record.container_id);
+                            let pidfile_path = Self::pidfile_path_for(config, &record.container_id);
+                            if !metadata_path.exists() || !pidfile_path.exists() {
+                                let previous_state = record.state.clone();
+                                record.state = "degraded".to_string();
+                                record.last_seen_at = chrono::Utc::now().timestamp();
+                                let _ = storage.save_shim_process(&record);
+                                let details = format!(
+                                    "diagnostic shim files missing: metadata={}, pidfile={}",
+                                    metadata_path.exists(),
+                                    pidfile_path.exists()
+                                );
+                                let _ = storage.append_typed_event(
+                                    "shim",
+                                    "shim_process",
+                                    &record.container_id,
+                                    Some(&previous_state),
+                                    Some("degraded"),
+                                    Some(&details),
+                                );
+                            }
+
+                            Some(ShimProcess {
+                                container_id: record.container_id,
+                                shim_pid: record.shim_pid,
+                                exit_code_file: PathBuf::from(record.exit_code_file),
+                                log_file: PathBuf::from(record.log_file),
+                                socket_path: PathBuf::from(record.socket_path),
+                                bundle_path: PathBuf::from(record.bundle_path),
+                            })
                         })
                         .collect::<Vec<_>>();
                     if !restored.is_empty() {
@@ -402,6 +457,16 @@ impl ShimManager {
         let log_file = shim_dir.join("shim.log");
         let socket_path = attach_dir.join("attach.sock");
 
+        self.persist_shim_ledger_state(
+            container_id,
+            0,
+            &exit_code_file,
+            &log_file,
+            &socket_path,
+            bundle_path,
+            "planned",
+        )?;
+
         // 构建shim命令
         let mut cmd = Command::new(&self.config.shim_path);
         cmd.arg("--id")
@@ -473,7 +538,16 @@ impl ShimManager {
             .context("Failed to start shim process")?;
 
         let shim_pid = child.id();
-        self.persist_pidfile(container_id, shim_pid)?;
+        self.persist_shim_ledger_state(
+            container_id,
+            shim_pid,
+            &exit_code_file,
+            &log_file,
+            &socket_path,
+            bundle_path,
+            "starting",
+        )?;
+        self.persist_pidfile(container_id, shim_pid);
 
         // 在后台等待shim进程（避免僵尸进程）
         std::thread::spawn(move || {
@@ -499,8 +573,17 @@ impl ShimManager {
         processes.retain(|existing| existing.container_id != container_id);
         processes.push(process.clone());
         drop(processes);
-        self.persist_process_metadata(&process)?;
+        self.persist_process_metadata(&process);
         self.wait_for_rpc_socket(container_id)?;
+        self.persist_shim_ledger_state(
+            container_id,
+            shim_pid,
+            &process.exit_code_file,
+            &process.log_file,
+            &process.socket_path,
+            &process.bundle_path,
+            "running",
+        )?;
 
         Ok(process)
     }

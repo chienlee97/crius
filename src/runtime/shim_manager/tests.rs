@@ -201,12 +201,61 @@ fn test_shim_manager_restores_live_metadata_from_ledger() {
         work_dir: temp_dir.path().join("shims"),
         attach_socket_dir: temp_dir.path().join("attach"),
         container_exits_dir: temp_dir.path().join("exits"),
-        state_db_path: db_path,
+        state_db_path: db_path.clone(),
         ..Default::default()
     });
     let shims = manager.list_shims();
     assert_eq!(shims.len(), 1);
     assert_eq!(shims[0].container_id, "container-ledger");
+
+    let storage = StorageManager::new(&db_path).unwrap();
+    let record = storage
+        .get_shim_process("container-ledger")
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.state, "degraded");
+    assert!(storage
+        .get_recent_events("shim_process", 0)
+        .unwrap()
+        .iter()
+        .any(|event| event.event_type == "shim"
+            && event.entity_id == "container-ledger"
+            && event.new_state == "degraded"));
+}
+
+#[test]
+fn test_start_shim_treats_pidfile_as_diagnostic_cache() {
+    let temp_dir = tempdir().unwrap();
+    let shim_path = write_ping_shim(temp_dir.path(), None);
+    let db_path = temp_dir.path().join("crius.db");
+    let work_dir = temp_dir.path().join("shims");
+    let container_dir = work_dir.join("container-1");
+    fs::create_dir_all(&container_dir).unwrap();
+    fs::create_dir(container_dir.join(SHIM_PIDFILE_NAME)).unwrap();
+
+    let manager = ShimManager::new(ShimConfig {
+        shim_path,
+        work_dir,
+        attach_socket_dir: temp_dir.path().join("attach"),
+        container_exits_dir: temp_dir.path().join("exits"),
+        runtime_path: PathBuf::from("/bin/false"),
+        state_db_path: db_path.clone(),
+        ..Default::default()
+    });
+    let bundle = temp_dir.path().join("bundle");
+    fs::create_dir_all(&bundle).unwrap();
+
+    let process = manager.start_shim("container-1", &bundle).unwrap();
+    let storage = StorageManager::new(&db_path).unwrap();
+    let record = storage
+        .get_shim_process("container-1")
+        .unwrap()
+        .expect("shim ledger record");
+    assert_eq!(record.shim_pid, process.shim_pid);
+    assert_eq!(record.state, "running");
+    assert!(manager.pidfile_path("container-1").is_dir());
+
+    manager.stop_shim("container-1").unwrap();
 }
 
 #[test]
