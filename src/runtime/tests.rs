@@ -1867,6 +1867,12 @@ fn test_probe_runtime_features_reports_idmap_and_rro_support() {
     assert!(features.available);
     assert!(features.idmap_mounts);
     assert!(features.recursive_read_only_mounts);
+    assert!(features.checkpoint_restore);
+    assert!(features.exec_tty);
+    assert!(features.cgroup);
+    assert!(!features.rootless);
+    assert!(!features.shim_rpc);
+    assert!(!features.reopen_log);
     assert_eq!(features.mount_options, vec!["ro", "rro"]);
     assert_eq!(features.oci_version_min.as_deref(), Some("1.0.0"));
     assert_eq!(features.oci_version_max.as_deref(), Some("1.2.0"));
@@ -1882,6 +1888,26 @@ fn test_probe_runtime_features_reports_invalid_document() {
     let features = runtime.probe_runtime_features();
     assert!(!features.available);
     assert!(features.error.is_some());
+}
+
+#[test]
+fn test_probe_runtime_features_reflects_disabled_cgroup_config() {
+    let temp_dir = tempdir().unwrap();
+    let runtime_path = write_runtime_features_script(
+        temp_dir.path(),
+        r#"{
+  "ociVersionMin": "1.0.0",
+  "ociVersionMax": "1.2.0",
+  "mountOptions": []
+}"#,
+        0,
+    );
+    let mut runtime = RuncRuntime::new(runtime_path, temp_dir.path().join("containers"));
+    runtime.set_disable_cgroup(true);
+
+    let features = runtime.probe_runtime_features();
+    assert!(features.available);
+    assert!(!features.cgroup);
 }
 
 #[test]

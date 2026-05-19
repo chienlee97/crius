@@ -534,6 +534,22 @@ async fn status_verbose_returns_structured_config() {
             .is_boolean()
     );
     assert!(
+        config["runtimeHandlerConfigs"]["kata"]["runtimeDetectedFeatures"]["checkpointRestore"]
+            .is_boolean()
+    );
+    assert!(
+        config["runtimeHandlerConfigs"]["kata"]["runtimeDetectedFeatures"]["execTty"].is_boolean()
+    );
+    assert!(
+        config["runtimeHandlerConfigs"]["kata"]["runtimeDetectedFeatures"]["cgroup"].is_boolean()
+    );
+    assert!(
+        config["runtimeHandlerConfigs"]["kata"]["runtimeDetectedFeatures"]["rootless"].is_boolean()
+    );
+    assert!(
+        config["runtimeHandlerConfigs"]["kata"]["runtimeDetectedFeatures"]["shimRpc"].is_boolean()
+    );
+    assert!(
         config["runtimeHandlerConfigs"]["kata"]["runtimeDetectedFeatures"]
             ["recursiveReadOnlyMounts"]
             .is_boolean()
