@@ -21,6 +21,7 @@ fn test_image_service_result_with_options(
         storage_path: storage_path.to_path_buf(),
         ledger_db_path: None,
         storage_driver: storage_driver.to_string(),
+        storage_options: Vec::new(),
         global_auth_file: global_auth_file.map(Path::to_path_buf),
         namespaced_auth_dir: namespaced_auth_dir.map(Path::to_path_buf),
         default_transport: "docker://".to_string(),
@@ -103,6 +104,7 @@ fn test_image_service_with_pull_cgroup(
         storage_path: storage_path.to_path_buf(),
         ledger_db_path: None,
         storage_driver: "overlay".to_string(),
+        storage_options: Vec::new(),
         global_auth_file: None,
         namespaced_auth_dir: None,
         default_transport: "docker://".to_string(),
@@ -143,6 +145,49 @@ fn image_service_rejects_unsupported_storage_driver() {
         Err(err) => err,
     };
     assert!(err.to_string().contains("image.driver must be \"overlay\""));
+}
+
+#[test]
+fn image_service_accepts_supported_overlay_storage_options() {
+    let dir = tempdir().unwrap();
+    let service = ImageServiceImpl::new_with_options(ImageServiceOptions {
+        storage_path: dir.path().to_path_buf(),
+        ledger_db_path: None,
+        storage_driver: "overlay".to_string(),
+        storage_options: vec![
+            "overlay.mount_program=/usr/bin/fuse-overlayfs".to_string(),
+            "overlay.ignore_chown_errors=true".to_string(),
+        ],
+        global_auth_file: None,
+        namespaced_auth_dir: None,
+        default_transport: "docker://".to_string(),
+        short_name_mode: "disabled".to_string(),
+        pull_progress_timeout: std::time::Duration::ZERO,
+        max_concurrent_downloads: 3,
+        pull_retry_count: 0,
+        registry_config_dir: None,
+        decryption_keys_path: None,
+        decryption_decoder_path: "ctd-decoder".to_string(),
+        decryption_keyprovider_config: None,
+        additional_artifact_stores: Vec::new(),
+        pinned_image_patterns: Vec::new(),
+        signature_policy: None,
+        signature_policy_dir: None,
+        big_files_temporary_dir: None,
+        separate_pull_cgroup: String::new(),
+        cgroup_driver: crate::config::CgroupDriverConfig::Cgroupfs,
+        rootless: crate::rootless::EffectiveRootlessConfig::disabled(),
+        disable_cgroup: false,
+        pull_cgroup_root: None,
+    })
+    .unwrap();
+
+    assert_eq!(service.storage_options.len(), 2);
+    assert_eq!(
+        service.parsed_storage_options.mount_program.as_deref(),
+        Some(Path::new("/usr/bin/fuse-overlayfs"))
+    );
+    assert!(service.parsed_storage_options.ignore_chown_errors);
 }
 
 #[tokio::test]
@@ -494,6 +539,7 @@ fn short_name_mode_enforcing_rejects_unqualified_pull_reference() {
         storage_path: dir.path().to_path_buf(),
         ledger_db_path: None,
         storage_driver: "overlay".to_string(),
+        storage_options: Vec::new(),
         global_auth_file: None,
         namespaced_auth_dir: None,
         default_transport: "docker://".to_string(),
@@ -558,6 +604,7 @@ async fn pull_progress_timeout_cancels_stalled_response_body() {
         storage_path: dir.path().to_path_buf(),
         ledger_db_path: None,
         storage_driver: "overlay".to_string(),
+        storage_options: Vec::new(),
         global_auth_file: None,
         namespaced_auth_dir: None,
         default_transport: "docker://".to_string(),
@@ -1719,6 +1766,7 @@ async fn load_local_images_includes_additional_artifact_stores() {
         storage_path: dir.path().join("storage"),
         ledger_db_path: None,
         storage_driver: "overlay".to_string(),
+        storage_options: Vec::new(),
         global_auth_file: None,
         namespaced_auth_dir: None,
         default_transport: "docker://".to_string(),
@@ -1816,6 +1864,7 @@ async fn remove_image_rejects_artifact_from_additional_store() {
         storage_path: dir.path().join("storage"),
         ledger_db_path: None,
         storage_driver: "overlay".to_string(),
+        storage_options: Vec::new(),
         global_auth_file: None,
         namespaced_auth_dir: None,
         default_transport: "docker://".to_string(),
@@ -1881,6 +1930,7 @@ cat
         storage_path: dir.path().join("storage"),
         ledger_db_path: None,
         storage_driver: "overlay".to_string(),
+        storage_options: Vec::new(),
         global_auth_file: None,
         namespaced_auth_dir: None,
         default_transport: "docker://".to_string(),

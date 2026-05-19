@@ -39,6 +39,8 @@ impl IntrospectionService {
             "contentStore": {
                 "root": config.image_root.display().to_string(),
                 "driver": config.image_driver,
+                "storageOptions": config.image_storage_options,
+                "effectiveOptions": effective_overlay_storage_options(&config.image_storage_options),
                 "additionalArtifactStores": config
                     .image_additional_artifact_stores
                     .iter()
@@ -173,6 +175,30 @@ impl IntrospectionService {
             },
         })
     }
+}
+
+fn effective_overlay_storage_options(options: &[String]) -> Value {
+    let mut mount_program = None;
+    let mut ignore_chown_errors = false;
+    for option in options {
+        let Some((key, value)) = option.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "overlay.mount_program" => mount_program = Some(value.trim().to_string()),
+            "overlay.ignore_chown_errors" => {
+                ignore_chown_errors = matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                );
+            }
+            _ => {}
+        }
+    }
+    json!({
+        "mountProgram": mount_program,
+        "ignoreChownErrors": ignore_chown_errors,
+    })
 }
 
 #[cfg(test)]

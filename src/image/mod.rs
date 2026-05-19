@@ -72,6 +72,8 @@ pub struct ImageServiceImpl {
     images: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Image>>>,
     storage_path: PathBuf,
     storage_driver: String,
+    storage_options: Vec<String>,
+    parsed_storage_options: OverlayImageStorageOptions,
     content_store: Arc<FsContentStore>,
     metadata_store: Arc<FilesystemImageMetadataStore>,
     default_transport: String,
@@ -101,6 +103,7 @@ pub struct ImageServiceOptions {
     pub storage_path: PathBuf,
     pub ledger_db_path: Option<PathBuf>,
     pub storage_driver: String,
+    pub storage_options: Vec<String>,
     pub global_auth_file: Option<PathBuf>,
     pub namespaced_auth_dir: Option<PathBuf>,
     pub default_transport: String,
@@ -123,6 +126,92 @@ pub struct ImageServiceOptions {
     pub disable_cgroup: bool,
     #[cfg(test)]
     pub pull_cgroup_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayImageStorageOptions {
+    pub mount_program: Option<PathBuf>,
+    pub ignore_chown_errors: bool,
+}
+
+impl OverlayImageStorageOptions {
+    fn parse(storage_driver: &str, options: &[String]) -> Result<Self, Error> {
+        if storage_driver != "overlay" && !options.is_empty() {
+            return Err(Error::Config(format!(
+                "image.storage_options is not supported for image.driver {storage_driver}"
+            )));
+        }
+
+        let mut parsed = Self::default();
+        let mut seen = HashSet::new();
+        for option in options {
+            let (key, value) = parse_storage_option(option)?;
+            if !seen.insert(key.clone()) {
+                return Err(Error::Config(format!(
+                    "image.storage_options contains duplicate key {key}"
+                )));
+            }
+            match key.as_str() {
+                "overlay.mount_program" => {
+                    if !Path::new(&value).is_absolute() {
+                        return Err(Error::Config(format!(
+                            "image.storage_options overlay.mount_program must be an absolute path, got {value}"
+                        )));
+                    }
+                    parsed.mount_program = Some(PathBuf::from(value));
+                }
+                "overlay.ignore_chown_errors" => {
+                    parsed.ignore_chown_errors =
+                        parse_storage_option_bool(&value).map_err(|err| {
+                            Error::Config(format!(
+                                "image.storage_options overlay.ignore_chown_errors: {err}"
+                            ))
+                        })?;
+                }
+                other => {
+                    return Err(Error::Config(format!(
+                        "unsupported image.storage_options key {other}; supported overlay keys are overlay.mount_program and overlay.ignore_chown_errors"
+                    )));
+                }
+            }
+        }
+
+        Ok(parsed)
+    }
+}
+
+fn parse_storage_option(option: &str) -> Result<(String, String), Error> {
+    let trimmed = option.trim();
+    let (key, value) = trimmed
+        .split_once('=')
+        .or_else(|| trimmed.split_once(char::is_whitespace))
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "image.storage_options entry {option:?}: expected key=value format"
+            ))
+        })?;
+    let key = key.trim();
+    let value = value.trim();
+    if key.is_empty() {
+        return Err(Error::Config(format!(
+            "image.storage_options entry {option:?}: key must not be empty"
+        )));
+    }
+    if value.is_empty() {
+        return Err(Error::Config(format!(
+            "image.storage_options entry {option:?}: value must not be empty"
+        )));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+fn parse_storage_option_bool(value: &str) -> std::result::Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!("invalid boolean value {other}")),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1198,6 +1287,8 @@ impl ImageServiceImpl {
         metadata_store: &FilesystemImageMetadataStore,
         content_store: &FsContentStore,
         storage_driver: &str,
+        storage_options: &[String],
+        parsed_storage_options: &OverlayImageStorageOptions,
     ) -> Result<HashMap<String, String>, Status> {
         let stored = metadata_store.load_by_id(&image.id);
         let image_dir = stored
@@ -1275,6 +1366,8 @@ impl ImageServiceImpl {
                 .unwrap_or_default(),
             "storagePath": image_dir.display().to_string(),
             "storageDriver": storage_driver,
+            "storageOptions": storage_options,
+            "effectiveStorageOptions": parsed_storage_options,
             "layers": layer_files,
             "snapshotStats": {
                 "metadataBytes": metadata_bytes,
@@ -1508,6 +1601,7 @@ impl ImageServiceImpl {
             storage_path,
             ledger_db_path,
             storage_driver,
+            storage_options,
             global_auth_file,
             namespaced_auth_dir,
             default_transport,
@@ -1565,6 +1659,8 @@ impl ImageServiceImpl {
                 storage_driver
             )));
         }
+        let parsed_storage_options =
+            OverlayImageStorageOptions::parse(&storage_driver, &storage_options)?;
 
         if !storage_path.exists() {
             std::fs::create_dir_all(&storage_path).context("Failed to create storage directory")?;
@@ -1585,6 +1681,8 @@ impl ImageServiceImpl {
             images,
             storage_path,
             storage_driver,
+            storage_options,
+            parsed_storage_options,
             content_store,
             metadata_store,
             default_transport,
@@ -2698,6 +2796,8 @@ impl ImageService for ImageServiceImpl {
                             &self.metadata_store,
                             &self.content_store,
                             &self.storage_driver,
+                            &self.storage_options,
+                            &self.parsed_storage_options,
                         )?
                     } else {
                         HashMap::new()

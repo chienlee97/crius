@@ -274,7 +274,10 @@ async fn status_verbose_returns_structured_config() {
     service.config.image_max_concurrent_downloads = 5;
     service.config.image_pull_retry_count = 2;
     service.config.image_registry_config_dir = PathBuf::from("/etc/containerd/certs.d");
-    service.config.image_storage_options = Vec::new();
+    service.config.image_storage_options = vec![
+        "overlay.mount_program=/usr/bin/fuse-overlayfs".to_string(),
+        "overlay.ignore_chown_errors=true".to_string(),
+    ];
     service.config.image_volumes = "bind".to_string();
     service.config.image_pinned_images = vec![
         "busybox*".to_string(),
@@ -421,7 +424,13 @@ async fn status_verbose_returns_structured_config() {
         config["rootless"]["storageRoot"],
         "/home/test/.local/share/crius/storage"
     );
-    assert_eq!(config["imageStorageOptions"], serde_json::json!([]));
+    assert_eq!(
+        config["imageStorageOptions"],
+        serde_json::json!([
+            "overlay.mount_program=/usr/bin/fuse-overlayfs",
+            "overlay.ignore_chown_errors=true"
+        ])
+    );
     assert_eq!(config["imageVolumes"], "bind");
     assert_eq!(
         config["pinnedImages"],
@@ -436,6 +445,14 @@ async fn status_verbose_returns_structured_config() {
     assert_eq!(
         config["imageSnapshotModel"]["snapshotter"],
         "internal-overlay-untar"
+    );
+    assert_eq!(config["imageSnapshotModel"]["storageDriver"], "overlay");
+    assert_eq!(
+        config["imageSnapshotModel"]["storageOptions"],
+        serde_json::json!([
+            "overlay.mount_program=/usr/bin/fuse-overlayfs",
+            "overlay.ignore_chown_errors=true"
+        ])
     );
     assert_eq!(
         config["imageSnapshotModel"]["externalSnapshotterSupported"],
@@ -631,6 +648,24 @@ async fn status_verbose_returns_structured_config() {
     assert_eq!(
         config["internalServices"]["introspection"]["snapshotBackend"]["snapshotter"]["default"],
         "internal-overlay-untar"
+    );
+    assert_eq!(
+        config["internalServices"]["introspection"]["snapshotBackend"]["contentStore"]
+            ["storageOptions"],
+        serde_json::json!([
+            "overlay.mount_program=/usr/bin/fuse-overlayfs",
+            "overlay.ignore_chown_errors=true"
+        ])
+    );
+    assert_eq!(
+        config["internalServices"]["introspection"]["snapshotBackend"]["contentStore"]
+            ["effectiveOptions"]["mountProgram"],
+        "/usr/bin/fuse-overlayfs"
+    );
+    assert_eq!(
+        config["internalServices"]["introspection"]["snapshotBackend"]["contentStore"]
+            ["effectiveOptions"]["ignoreChownErrors"],
+        true
     );
     assert_eq!(
         config["internalServices"]["introspection"]["rootless"]["networkMode"],

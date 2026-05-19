@@ -567,6 +567,48 @@ pub(super) fn parse_sysctl_assignment(
     Ok((key.to_string(), raw_value.to_string()))
 }
 
+pub(super) fn validate_image_storage_options(driver: &str, options: &[String]) -> Result<()> {
+    let driver = driver.trim();
+    let mut seen = HashSet::new();
+    for option in options {
+        let (key, value) = parse_sysctl_assignment(option).map_err(|err| {
+            Error::Config(format!("image.storage_options entry {option:?}: {err}"))
+        })?;
+        if !seen.insert(key.clone()) {
+            return Err(Error::Config(format!(
+                "image.storage_options contains duplicate key {key}"
+            )));
+        }
+        match (driver, key.as_str()) {
+            ("overlay", "overlay.mount_program") => {
+                if !Path::new(&value).is_absolute() {
+                    return Err(Error::Config(format!(
+                        "image.storage_options overlay.mount_program must be an absolute path, got {value}"
+                    )));
+                }
+            }
+            ("overlay", "overlay.ignore_chown_errors") => {
+                parse_bool(&value).map_err(|err| {
+                    Error::Config(format!(
+                        "image.storage_options overlay.ignore_chown_errors: {err}"
+                    ))
+                })?;
+            }
+            ("overlay", other) => {
+                return Err(Error::Config(format!(
+                    "unsupported image.storage_options key {other}; supported overlay keys are overlay.mount_program and overlay.ignore_chown_errors"
+                )));
+            }
+            (other_driver, _) => {
+                return Err(Error::Config(format!(
+                    "image.storage_options is not supported for image.driver {other_driver}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn parse_ulimit_assignment(
     value: &str,
 ) -> std::result::Result<crate::oci::spec::Rlimit, String> {

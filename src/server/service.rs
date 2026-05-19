@@ -1646,6 +1646,7 @@ impl RuntimeServiceImpl {
             storage_path: config.image_root.clone(),
             ledger_db_path: Some(config.root_dir.join("crius.db")),
             storage_driver: config.image_driver.clone(),
+            storage_options: config.image_storage_options.clone(),
             global_auth_file: (!config.image_global_auth_file.as_os_str().is_empty())
                 .then(|| config.image_global_auth_file.clone()),
             namespaced_auth_dir: (!config.image_namespaced_auth_dir.as_os_str().is_empty())

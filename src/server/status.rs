@@ -891,6 +891,8 @@ impl RuntimeServiceImpl {
                 },
                 "imageSnapshotModel": {
                     "snapshotter": "internal-overlay-untar",
+                    "storageDriver": self.config.image_driver.clone(),
+                    "storageOptions": self.config.image_storage_options.clone(),
                     "externalSnapshotterSupported": false,
                     "runtimeSnapshotterOverrideSupported": true,
                     "snapshotAnnotationPassthrough": false,

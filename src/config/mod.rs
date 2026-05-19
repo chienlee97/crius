@@ -2083,11 +2083,7 @@ impl Config {
                 "image.signature_policy_dir must be an absolute path when set".to_string(),
             ));
         }
-        if !self.image.storage_options.is_empty() {
-            return Err(Error::Config(
-                "image.storage_options is not supported by crius yet; overlay image storage uses fixed backend parameters".to_string(),
-            ));
-        }
+        validate_image_storage_options(&self.image.driver, &self.image.storage_options)?;
         match self.image.image_volumes.trim() {
             "mkdir" | "bind" | "ignore" => {}
             other => {

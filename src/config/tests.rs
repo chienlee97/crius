@@ -1103,17 +1103,27 @@ fn validate_rejects_relative_image_registry_config_dir() {
 }
 
 #[test]
-fn validate_rejects_non_empty_image_storage_options() {
+fn validate_accepts_supported_image_storage_options() {
     let mut config = Config::default();
-    config.image.storage_options =
-        vec!["overlay.mount_program=/usr/bin/fuse-overlayfs".to_string()];
+    config.image.storage_options = vec![
+        "overlay.mount_program=/usr/bin/fuse-overlayfs".to_string(),
+        "overlay.ignore_chown_errors=true".to_string(),
+    ];
+
+    config.validate().unwrap();
+}
+
+#[test]
+fn validate_rejects_unsupported_image_storage_option() {
+    let mut config = Config::default();
+    config.image.storage_options = vec!["overlay.mountopt=nodev".to_string()];
 
     let err = config
         .validate()
-        .expect_err("non-empty image storage options must fail validation");
+        .expect_err("unsupported image storage option must fail validation");
     assert!(err
         .to_string()
-        .contains("image.storage_options is not supported by crius yet"));
+        .contains("unsupported image.storage_options key overlay.mountopt"));
 }
 
 #[test]
