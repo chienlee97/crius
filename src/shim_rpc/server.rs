@@ -7,21 +7,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use log::{debug, error};
-use serde::{Deserialize, Serialize};
 
 use super::proto::{ShimRpcRequest, ShimRpcResponse};
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RpcEnvelope<T> {
-    payload: T,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RpcResultEnvelope {
-    ok: bool,
-    payload: Option<ShimRpcResponse>,
-    error: Option<String>,
-}
+use super::wire::{RpcEnvelope, RpcResultEnvelope};
 
 pub trait ShimRpcHandler: Send + Sync + 'static {
     fn handle_request(&self, request: ShimRpcRequest) -> Result<ShimRpcResponse>;
@@ -76,19 +64,11 @@ fn handle_stream(mut stream: UnixStream, handler: &dyn ShimRpcHandler) -> Result
     let envelope: RpcEnvelope<ShimRpcRequest> =
         serde_json::from_slice(&request).context("failed to decode shim RPC request")?;
 
-    let response = match handler.handle_request(envelope.payload) {
-        Ok(payload) => RpcResultEnvelope {
-            ok: true,
-            payload: Some(payload),
-            error: None,
-        },
+    let response = match handler.handle_request(envelope.into_payload()) {
+        Ok(payload) => RpcResultEnvelope::success(payload),
         Err(err) => {
             debug!("shim RPC request returned an error: {}", err);
-            RpcResultEnvelope {
-                ok: false,
-                payload: None,
-                error: Some(err.to_string()),
-            }
+            RpcResultEnvelope::failure(err.to_string())
         }
     };
 

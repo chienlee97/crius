@@ -8,6 +8,7 @@ pub enum TaskState {
     Init,
     Created,
     Running,
+    Paused,
     Stopped,
     Deleted,
 }
@@ -30,6 +31,7 @@ pub struct ExecProcessRequest {
     pub tty: bool,
     pub capture_output: bool,
     pub timeout_ms: Option<u64>,
+    pub io_drain_timeout_ms: Option<u64>,
     pub exec_cpu_affinity: Option<usize>,
 }
 
@@ -139,6 +141,16 @@ pub struct CheckpointTaskRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreTaskRequest {
+    pub container_id: String,
+    pub image_path: PathBuf,
+    pub work_path: PathBuf,
+    pub bundle_path: PathBuf,
+    pub criu_path: PathBuf,
+    pub no_pivot: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReopenLogRequest {
     pub container_id: String,
 }
@@ -185,6 +197,7 @@ pub enum ShimRpcRequest {
     DeleteTask(DeleteTaskRequest),
     UpdateResources(UpdateResourcesRequest),
     CheckpointTask(CheckpointTaskRequest),
+    RestoreTask(RestoreTaskRequest),
     ReopenLog(ReopenLogRequest),
     ResizePty(ResizePtyRequest),
     Status(StatusRequest),

@@ -4,26 +4,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 
 use super::proto::{ShimRpcRequest, ShimRpcResponse};
+use super::wire::{RpcEnvelope, RpcResultEnvelope};
 
 #[derive(Debug, Clone)]
 pub struct ShimRpcClient {
     socket_path: PathBuf,
     timeout: Duration,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RpcEnvelope<T> {
-    payload: T,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RpcResultEnvelope {
-    ok: bool,
-    payload: Option<ShimRpcResponse>,
-    error: Option<String>,
 }
 
 impl ShimRpcClient {
@@ -52,7 +40,7 @@ impl ShimRpcClient {
             .set_write_timeout(Some(self.timeout))
             .context("failed to configure shim RPC write timeout")?;
 
-        let request = serde_json::to_vec(&RpcEnvelope { payload })
+        let request = serde_json::to_vec(&RpcEnvelope::new(payload))
             .context("failed to encode shim RPC request")?;
         stream
             .write_all(&request)
@@ -67,17 +55,6 @@ impl ShimRpcClient {
             .context("failed to read shim RPC response")?;
         let envelope: RpcResultEnvelope =
             serde_json::from_slice(&response).context("failed to decode shim RPC response")?;
-        if envelope.ok {
-            envelope
-                .payload
-                .ok_or_else(|| anyhow::anyhow!("shim RPC response was missing a payload"))
-        } else {
-            Err(anyhow::anyhow!(
-                "{}",
-                envelope
-                    .error
-                    .unwrap_or_else(|| "shim RPC request failed".to_string())
-            ))
-        }
+        envelope.into_result()
     }
 }

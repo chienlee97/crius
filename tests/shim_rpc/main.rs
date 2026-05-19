@@ -2,7 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crius::shim_rpc::{ShimRpcRequest, ShimRpcResponse};
-use crius::test_support::{FakeShimRpcServer, PingShimHandler};
+
+#[path = "../common/mod.rs"]
+mod common;
+use common::{FakeShimRpcServer, PingShimHandler};
 
 #[test]
 fn fake_shim_rpc_server_supports_ping_roundtrip() {
