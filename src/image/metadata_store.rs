@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use super::{CriusImage, Image, ImageMeta};
-use crate::storage::{ImageRecord, ImageRefRecord, StorageManager};
+use crate::storage::{ContentBlobRefRecord, ImageRecord, ImageRefRecord, StorageManager};
 
 #[derive(Debug, Clone)]
 pub struct StoredImageRecord {
@@ -68,6 +68,7 @@ impl FilesystemImageMetadataStore {
             let mut storage = StorageManager::new(db_path)?;
             storage.save_image(&image_to_record(image, self.image_record_dir(image)))?;
             storage.replace_image_refs(&image.id, &image_to_refs(image))?;
+            storage.replace_content_blob_refs("image", &image.id, &image_to_blob_refs(image))?;
         }
         let record_dir = self.image_record_dir(image);
         std::fs::create_dir_all(&record_dir)
@@ -287,6 +288,30 @@ fn image_to_refs(image: &CriusImage) -> Vec<ImageRefRecord> {
     refs
 }
 
+fn image_to_blob_refs(image: &CriusImage) -> Vec<ContentBlobRefRecord> {
+    let layer_refs = image
+        .stored_layers
+        .iter()
+        .filter(|layer| !layer.digest.trim().is_empty())
+        .map(|layer| ContentBlobRefRecord {
+            owner_kind: "image".to_string(),
+            owner_id: image.id.clone(),
+            digest: layer.digest.clone(),
+            ref_kind: "layer".to_string(),
+        });
+    let artifact_refs = image
+        .artifact_blobs
+        .iter()
+        .filter(|blob| !blob.digest.trim().is_empty())
+        .map(|blob| ContentBlobRefRecord {
+            owner_kind: "image".to_string(),
+            owner_id: image.id.clone(),
+            digest: blob.digest.clone(),
+            ref_kind: "artifact".to_string(),
+        });
+    layer_refs.chain(artifact_refs).collect()
+}
+
 fn meta_from_record(record: &ImageRecord, refs: Option<Vec<ImageRefRecord>>) -> ImageMeta {
     let refs = refs.unwrap_or_default();
     let repo_tags = refs
@@ -356,7 +381,7 @@ fn image_from_meta(meta: &ImageMeta) -> Image {
 #[cfg(test)]
 mod tests {
     use super::FilesystemImageMetadataStore;
-    use crate::image::CriusImage;
+    use crate::image::{ArtifactBlobMeta, CriusImage, StoredLayerMeta};
 
     #[test]
     fn saves_and_loads_metadata_records() {
@@ -377,7 +402,8 @@ mod tests {
     fn saves_and_loads_metadata_records_via_ledger() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("crius.db");
-        let store = FilesystemImageMetadataStore::new(dir.path(), Vec::new(), Some(db_path));
+        let store =
+            FilesystemImageMetadataStore::new(dir.path(), Vec::new(), Some(db_path.clone()));
         let image = CriusImage {
             id: "sha256:test-ledger".to_string(),
             repo_tags: vec!["busybox:ledger".to_string()],
@@ -391,5 +417,54 @@ mod tests {
             loaded.meta.repo_digests,
             vec!["docker.io/library/busybox@sha256:test-ledger"]
         );
+    }
+
+    #[test]
+    fn saves_image_blob_refs_via_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("crius.db");
+        let store =
+            FilesystemImageMetadataStore::new(dir.path(), Vec::new(), Some(db_path.clone()));
+        let image = CriusImage {
+            id: "sha256:image-with-blobs".to_string(),
+            stored_layers: vec![StoredLayerMeta {
+                digest: "sha256:layer".to_string(),
+                path: "blobs/sha256/la/yer".to_string(),
+                media_type: "application/vnd.oci.image.layer.v1.tar".to_string(),
+                source_media_type: "application/vnd.oci.image.layer.v1.tar".to_string(),
+                encrypted: false,
+            }],
+            artifact_blobs: vec![ArtifactBlobMeta {
+                digest: "sha256:artifact".to_string(),
+                media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+                path: "blobs/sha256/ar/tifact".to_string(),
+                size: 42,
+                annotations: Default::default(),
+            }],
+            ..Default::default()
+        };
+
+        store.save(&image).unwrap();
+
+        let storage = crate::storage::StorageManager::new(&db_path).unwrap();
+        let refs = storage
+            .list_content_blob_refs(Some("image"), Some("sha256:image-with-blobs"))
+            .unwrap();
+        assert_eq!(refs.len(), 2);
+        assert!(refs
+            .iter()
+            .any(|record| record.digest == "sha256:layer" && record.ref_kind == "layer"));
+        assert!(refs
+            .iter()
+            .any(|record| record.digest == "sha256:artifact" && record.ref_kind == "artifact"));
+
+        store
+            .delete_by_id("sha256:image-with-blobs", false)
+            .unwrap();
+        let storage = crate::storage::StorageManager::new(&db_path).unwrap();
+        assert!(storage
+            .list_content_blob_refs(Some("image"), Some("sha256:image-with-blobs"))
+            .unwrap()
+            .is_empty());
     }
 }

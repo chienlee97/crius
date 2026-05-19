@@ -17,6 +17,15 @@ pub struct StorageManager {
     db_path: std::path::PathBuf,
 }
 
+fn content_blob_ref_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContentBlobRefRecord> {
+    Ok(ContentBlobRefRecord {
+        owner_kind: row.get(0)?,
+        owner_id: row.get(1)?,
+        digest: row.get(2)?,
+        ref_kind: row.get(3)?,
+    })
+}
+
 /// 容器记录
 #[derive(Debug, Clone)]
 pub struct ContainerRecord {
@@ -95,6 +104,15 @@ pub struct ContentBlobRecord {
     pub relative_path: String,
     pub created_at: i64,
     pub last_used_at: i64,
+}
+
+/// 内容 blob 引用记录
+#[derive(Debug, Clone)]
+pub struct ContentBlobRefRecord {
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub digest: String,
+    pub ref_kind: String,
 }
 
 /// 快照记录
@@ -278,6 +296,19 @@ impl StorageManager {
 
         self.conn
             .execute(
+                "CREATE TABLE IF NOT EXISTS content_blob_refs (
+                owner_kind TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                ref_kind TEXT NOT NULL,
+                PRIMARY KEY(owner_kind, owner_id, digest, ref_kind)
+            )",
+                [],
+            )
+            .context("Failed to create content_blob_refs table")?;
+
+        self.conn
+            .execute(
                 "CREATE TABLE IF NOT EXISTS image_refs (
                 reference TEXT NOT NULL,
                 image_id TEXT NOT NULL,
@@ -355,6 +386,10 @@ impl StorageManager {
         )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_content_blobs_last_used ON content_blobs(last_used_at)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_blob_refs_digest ON content_blob_refs(digest)",
             [],
         )?;
         self.conn.execute(
@@ -886,6 +921,12 @@ impl StorageManager {
 
     pub fn delete_image(&mut self, image_id: &str) -> Result<()> {
         self.conn
+            .execute(
+                "DELETE FROM content_blob_refs WHERE owner_kind = 'image' AND owner_id = ?1",
+                [image_id],
+            )
+            .context("Failed to delete image content blob refs")?;
+        self.conn
             .execute("DELETE FROM image_refs WHERE image_id = ?1", [image_id])
             .context("Failed to delete image refs")?;
         self.conn
@@ -952,9 +993,78 @@ impl StorageManager {
 
     pub fn delete_content_blob(&mut self, digest: &str) -> Result<()> {
         self.conn
+            .execute("DELETE FROM content_blob_refs WHERE digest = ?1", [digest])
+            .context("Failed to delete content blob refs")?;
+        self.conn
             .execute("DELETE FROM content_blobs WHERE digest = ?1", [digest])
             .context("Failed to delete content blob")?;
         Ok(())
+    }
+
+    pub fn replace_content_blob_refs(
+        &mut self,
+        owner_kind: &str,
+        owner_id: &str,
+        records: &[ContentBlobRefRecord],
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM content_blob_refs WHERE owner_kind = ?1 AND owner_id = ?2",
+                [owner_kind, owner_id],
+            )
+            .context("Failed to delete content blob refs")?;
+        for record in records {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO content_blob_refs
+                     (owner_kind, owner_id, digest, ref_kind)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        &record.owner_kind,
+                        &record.owner_id,
+                        &record.digest,
+                        &record.ref_kind,
+                    ],
+                )
+                .context("Failed to save content blob ref")?;
+        }
+        Ok(())
+    }
+
+    pub fn list_content_blob_refs(
+        &self,
+        owner_kind: Option<&str>,
+        owner_id: Option<&str>,
+    ) -> Result<Vec<ContentBlobRefRecord>> {
+        let mut sql =
+            "SELECT owner_kind, owner_id, digest, ref_kind FROM content_blob_refs".to_string();
+        let records = match (owner_kind, owner_id) {
+            (Some(kind), Some(id)) => {
+                sql.push_str(" WHERE owner_kind = ?1 AND owner_id = ?2");
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(rusqlite::params![kind, id], content_blob_ref_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            (Some(kind), None) => {
+                sql.push_str(" WHERE owner_kind = ?1");
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map([kind], content_blob_ref_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            (None, Some(id)) => {
+                sql.push_str(" WHERE owner_id = ?1");
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map([id], content_blob_ref_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            (None, None) => {
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map([], content_blob_ref_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        Ok(records)
     }
 
     pub fn save_snapshot(&mut self, record: &SnapshotRecord) -> Result<()> {
