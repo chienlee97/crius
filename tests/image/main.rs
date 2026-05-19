@@ -1,6 +1,9 @@
 use crius::image::content_store::{ContentStore, FsContentStore};
 use crius::image::snapshotter::{SnapshotUsage, Snapshotter};
-use crius::test_support::{FakeContentStore, FakeSnapshotter};
+
+#[path = "../common/mod.rs"]
+mod common;
+use common::{FakeContentStore, FakeSnapshotter};
 
 #[test]
 fn fake_content_store_round_trips_blob_metadata() {
@@ -16,10 +19,12 @@ fn fake_content_store_round_trips_blob_metadata() {
 
 #[test]
 fn fake_snapshotter_reports_configured_usage() {
-    let snapshotter = FakeSnapshotter::new("/tmp/snapshots").with_usage(SnapshotUsage {
-        used_bytes: 10,
-        inodes_used: 2,
-    });
+    let dir = tempfile::tempdir().unwrap();
+    let snapshotter =
+        FakeSnapshotter::new(dir.path().join("snapshots")).with_usage(SnapshotUsage {
+            used_bytes: 10,
+            inodes_used: 2,
+        });
 
     assert_eq!(snapshotter.usage().unwrap().used_bytes, 10);
     assert_eq!(snapshotter.usage().unwrap().inodes_used, 2);

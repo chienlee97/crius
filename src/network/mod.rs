@@ -321,7 +321,7 @@ impl CniConfig {
         rootless: Option<crate::rootless::EffectiveRootlessConfig>,
     ) {
         self.rootless = rootless.and_then(|effective| {
-            effective.enabled.then(|| RootlessNetworkConfig {
+            effective.enabled.then_some(RootlessNetworkConfig {
                 enabled: true,
                 mode: effective.network_mode,
                 slirp4netns_path: effective.slirp4netns_path,
@@ -565,6 +565,17 @@ fn current_thread_netns_path() -> String {
 }
 
 /// 网络管理器接口
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkSetupRequest<'a> {
+    pub pod_id: &'a str,
+    pub netns: &'a str,
+    pub pod_name: &'a str,
+    pub pod_namespace: &'a str,
+    pub pod_uid: &'a str,
+    pub runtime_handler: &'a str,
+    pub pod_cidr: Option<&'a str>,
+}
+
 #[async_trait]
 pub trait NetworkManager: Send + Sync + 'static {
     /// 初始化网络
@@ -579,13 +590,7 @@ pub trait NetworkManager: Send + Sync + 'static {
     /// 设置 Pod 网络
     async fn setup_pod_network(
         &self,
-        pod_id: &str,
-        netns: &str,
-        pod_name: &str,
-        pod_namespace: &str,
-        pod_uid: &str,
-        runtime_handler: &str,
-        pod_cidr: Option<&str>,
+        request: NetworkSetupRequest<'_>,
     ) -> Result<NetworkStatus, NetworkError>;
 
     /// 清理 Pod 网络
@@ -822,27 +827,21 @@ impl NetworkManager for DefaultNetworkManager {
 
     async fn setup_pod_network(
         &self,
-        pod_id: &str,
-        netns: &str,
-        pod_name: &str,
-        pod_namespace: &str,
-        pod_uid: &str,
-        runtime_handler: &str,
-        pod_cidr: Option<&str>,
+        request: NetworkSetupRequest<'_>,
     ) -> Result<NetworkStatus, NetworkError> {
-        self.ensure_loopback_up(netns).await?;
+        self.ensure_loopback_up(request.netns).await?;
 
         if self.rootless.is_some() {
-            return self.start_rootless_network_helper(pod_id, netns);
+            return self.start_rootless_network_helper(request.pod_id, request.netns);
         }
 
         let mut cni = CniManager::new(
             self.cni_plugin_dirs.clone(),
-            self.effective_cni_config_dirs(runtime_handler),
+            self.effective_cni_config_dirs(request.runtime_handler),
             self.cni_cache_dir.clone(),
         )
         .map_err(|e| NetworkError::Other(e.to_string()))?;
-        cni.set_max_conf_num(self.effective_cni_max_conf_num(runtime_handler));
+        cni.set_max_conf_num(self.effective_cni_max_conf_num(request.runtime_handler));
         cni.set_ip_pref(self.cni_ip_pref);
         cni.set_default_network_name(self.cni_default_network_name.clone());
         cni.set_teardown_timeout(self.cni_teardown_timeout);
@@ -850,9 +849,16 @@ impl NetworkManager for DefaultNetworkManager {
             .await
             .map_err(|e| NetworkError::Other(e.to_string()))?;
 
-        cni.setup_pod_network(pod_id, netns, pod_name, pod_namespace, pod_uid, pod_cidr)
-            .await
-            .map_err(|e| NetworkError::Other(e.to_string()))
+        cni.setup_pod_network(
+            request.pod_id,
+            request.netns,
+            request.pod_name,
+            request.pod_namespace,
+            request.pod_uid,
+            request.pod_cidr,
+        )
+        .await
+        .map_err(|e| NetworkError::Other(e.to_string()))
     }
 
     async fn teardown_pod_network(
