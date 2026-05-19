@@ -1252,6 +1252,53 @@ fn runtime_registry_can_store_trait_object_backends() {
     assert_eq!(runtime.container_create_timeout_for_handler("fake"), 33);
 }
 
+#[test]
+fn runtime_service_can_use_injected_fake_backend_for_handler() {
+    let dir = tempdir().unwrap();
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime = "fake".to_string();
+    config.runtime_handlers = vec!["fake".to_string()];
+    config.runtime_configs = HashMap::from([(
+        "fake".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "fake".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: "/fake/runtime".to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: dir.path().join("fake-runtime-root").display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/fake/shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 77,
+            snapshotter: "internal-overlay-untar".to_string(),
+        },
+    )]);
+    let service = RuntimeServiceImpl::new_with_runtime_backends(
+        config,
+        HashMap::from([(
+            "fake".to_string(),
+            Arc::new(FakeBackend {
+                name: "fake",
+                runtime_root: dir.path().join("fake-runtime-root"),
+            }) as Arc<dyn crate::runtime::RuntimeBackend>,
+        )]),
+    );
+
+    let backend = service.runtime.runtime_for_handler("fake").unwrap();
+    assert_eq!(backend.backend_name(), "fake");
+    assert_eq!(
+        backend.container_status("container-1").unwrap(),
+        crate::runtime::ContainerStatus::Created
+    );
+    assert_eq!(service.runtime.container_create_timeout_for_handler("fake"), 77);
+}
+
 #[tokio::test]
 async fn run_container_create_phase_until_returns_deadline_exceeded() {
     let service = test_service();

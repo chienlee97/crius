@@ -1484,6 +1484,20 @@ impl RuntimeServiceImpl {
         Self::new_with_shim_work_dir(config, nri_config, shim_work_dir)
     }
 
+    pub fn new_with_runtime_backends(
+        config: RuntimeConfig,
+        runtimes: HashMap<String, Arc<dyn crate::runtime::RuntimeBackend>>,
+    ) -> Self {
+        let shim_work_dir = config.shim.work_dir.clone();
+        Self::new_with_shim_work_dir_and_nri_and_runtime_backends(
+            config,
+            NriConfig::default(),
+            shim_work_dir,
+            None,
+            Some(runtimes),
+        )
+    }
+
     pub fn new_with_nri_api(
         config: RuntimeConfig,
         nri_config: NriConfig,
@@ -1507,6 +1521,22 @@ impl RuntimeServiceImpl {
         shim_work_dir: PathBuf,
         injected_nri: Option<Arc<dyn NriApi>>,
     ) -> Self {
+        Self::new_with_shim_work_dir_and_nri_and_runtime_backends(
+            config,
+            nri_config,
+            shim_work_dir,
+            injected_nri,
+            None,
+        )
+    }
+
+    fn new_with_shim_work_dir_and_nri_and_runtime_backends(
+        config: RuntimeConfig,
+        nri_config: NriConfig,
+        shim_work_dir: PathBuf,
+        injected_nri: Option<Arc<dyn NriApi>>,
+        injected_runtimes: Option<HashMap<String, Arc<dyn crate::runtime::RuntimeBackend>>>,
+    ) -> Self {
         let nri_manager_config = NriManagerConfig::from(nri_config.clone());
         let containers = Arc::new(Mutex::new(HashMap::new()));
         let pod_sandboxes = Arc::new(Mutex::new(HashMap::new()));
@@ -1526,9 +1556,9 @@ impl RuntimeServiceImpl {
         }
         config.runtime_handlers = handlers;
         let mut runtime_configs = config.runtime_configs.clone();
-        runtime_configs.insert(
-            config.runtime.clone(),
-            crate::config::ResolvedRuntimeHandlerConfig {
+        runtime_configs
+            .entry(config.runtime.clone())
+            .or_insert_with(|| crate::config::ResolvedRuntimeHandlerConfig {
                 backend: "runc".to_string(),
                 backend_options: HashMap::new(),
                 runtime_path: config.runtime_path.display().to_string(),
@@ -1545,8 +1575,7 @@ impl RuntimeServiceImpl {
                 privileged_without_host_devices_all_devices_allowed: false,
                 container_create_timeout: 240,
                 snapshotter: "internal-overlay-untar".to_string(),
-            },
-        );
+            });
         config.runtime_configs = runtime_configs;
         let container_create_timeouts = config
             .runtime_configs
@@ -1560,87 +1589,103 @@ impl RuntimeServiceImpl {
         let clean_shutdown_file = config.clean_shutdown_file.clone();
         let version_file = config.version_file.clone();
         let version_file_persist = config.version_file_persist.clone();
-        let runtimes: HashMap<String, Arc<dyn crate::runtime::RuntimeBackend>> = config
-            .runtime_configs
-            .iter()
-            .map(|(handler, runtime_config)| {
-                let mut shim_config = config.shim.clone();
-                shim_config.work_dir = resolved_shim_work_dir.clone();
-                shim_config.attach_socket_dir = config.attach_socket_dir.clone();
-                shim_config.container_exits_dir = config.container_exits_dir.clone();
-                shim_config.shim_path = PathBuf::from(&runtime_config.monitor_path);
-                shim_config.runtime_config_path =
-                    PathBuf::from(runtime_config.runtime_config_path.as_str());
-                shim_config.monitor_cgroup = runtime_config.monitor_cgroup.clone();
-                shim_config.io_uid = config.io_uid;
-                shim_config.io_gid = config.io_gid;
-                shim_config.runtime_path = PathBuf::from(&runtime_config.runtime_path);
-                shim_config.monitor_env = runtime_config.monitor_env.clone();
-                shim_config.no_sync_log = config.no_sync_log;
-                shim_config.no_new_keyring = config.no_new_keyring;
-                shim_config.systemd_cgroup = config.cgroup_driver == Some(CgroupDriver::Systemd);
-                (handler.clone(), {
-                    let mut runtime = RuncRuntime::with_shim_and_image_storage(
-                        PathBuf::from(&runtime_config.runtime_path),
-                        PathBuf::from(&runtime_config.runtime_root),
-                        config.image_root.clone(),
-                        shim_config,
-                    );
-                    runtime.set_default_env(config.default_env.clone());
-                    runtime.set_default_capabilities(config.default_capabilities.clone());
-                    runtime.set_default_sysctls(config.default_sysctls.clone());
-                    runtime.set_default_ulimits(config.default_ulimits.clone());
-                    runtime.set_allowed_devices(config.allowed_devices.clone());
-                    runtime.set_additional_devices(config.additional_devices.clone());
-                    runtime.set_device_ownership_from_security_context(
-                        config.device_ownership_from_security_context,
-                    );
-                    runtime.set_privileged_without_host_devices(
-                        runtime_config.privileged_without_host_devices,
-                    );
-                    runtime.set_privileged_without_host_devices_all_devices_allowed(
-                        runtime_config.privileged_without_host_devices_all_devices_allowed,
-                    );
-                    runtime.set_add_inheritable_capabilities(config.add_inheritable_capabilities);
-                    runtime.set_base_runtime_spec(config.base_runtime_spec.clone());
-                    runtime.set_default_mounts_file(config.default_mounts_file.clone());
-                    runtime.set_hooks_dirs(config.hooks_dir.clone());
-                    runtime.set_absent_mount_sources_to_reject(
-                        config.absent_mount_sources_to_reject.clone(),
-                    );
-                    runtime.set_image_volumes_mode(crate::runtime::ImageVolumesMode::from_config(
-                        &config.image_volumes,
-                    ));
-                    runtime.set_rootfs_snapshotter(crate::runtime::RootfsSnapshotter::from_config(
-                        runtime_config.snapshotter.as_str(),
-                    ));
-                    runtime.set_disable_proc_mount(config.disable_proc_mount);
-                    runtime.set_timezone(config.timezone.clone());
-                    runtime.set_runtime_config_path(PathBuf::from(
-                        runtime_config.runtime_config_path.as_str(),
-                    ));
-                    runtime
-                        .set_container_create_timeout_secs(runtime_config.container_create_timeout);
-                    runtime.set_container_stop_timeout_secs(config.container_stop_timeout);
-                    runtime.set_state_db_path(config.root_dir.join("crius.db"));
-                    runtime.set_criu_path(config.criu_path.clone());
-                    runtime.set_restrict_oom_score_adj(config.restrict_oom_score_adj);
-                    runtime.set_bind_mount_prefix(config.bind_mount_prefix.clone());
-                    runtime.set_disable_cgroup(config.disable_cgroup);
-                    runtime.set_rootless(config.rootless.clone());
-                    runtime.set_default_seccomp_profile_path(config.seccomp_profile.clone());
-                    runtime.set_exec_cpu_affinity(config.exec_cpu_affinity.clone());
-                    runtime.set_no_pivot(config.no_pivot);
-                    runtime.set_no_new_keyring(config.no_new_keyring);
-                    runtime.set_cgroup_driver(match config.cgroup_driver {
-                        Some(CgroupDriver::Systemd) => crate::config::CgroupDriverConfig::Systemd,
-                        _ => crate::config::CgroupDriverConfig::Cgroupfs,
-                    });
-                    Arc::new(crate::runtime::RuncBackend::new(runtime))
-                        as Arc<dyn crate::runtime::RuntimeBackend>
-                })
-            })
-            .collect();
+        let runtimes: HashMap<String, Arc<dyn crate::runtime::RuntimeBackend>> =
+            if let Some(runtimes) = injected_runtimes {
+                runtimes
+            } else {
+                config
+                    .runtime_configs
+                    .iter()
+                    .map(|(handler, runtime_config)| {
+                        let mut shim_config = config.shim.clone();
+                        shim_config.work_dir = resolved_shim_work_dir.clone();
+                        shim_config.attach_socket_dir = config.attach_socket_dir.clone();
+                        shim_config.container_exits_dir = config.container_exits_dir.clone();
+                        shim_config.shim_path = PathBuf::from(&runtime_config.monitor_path);
+                        shim_config.runtime_config_path =
+                            PathBuf::from(runtime_config.runtime_config_path.as_str());
+                        shim_config.monitor_cgroup = runtime_config.monitor_cgroup.clone();
+                        shim_config.io_uid = config.io_uid;
+                        shim_config.io_gid = config.io_gid;
+                        shim_config.runtime_path = PathBuf::from(&runtime_config.runtime_path);
+                        shim_config.monitor_env = runtime_config.monitor_env.clone();
+                        shim_config.no_sync_log = config.no_sync_log;
+                        shim_config.no_new_keyring = config.no_new_keyring;
+                        shim_config.systemd_cgroup =
+                            config.cgroup_driver == Some(CgroupDriver::Systemd);
+                        (handler.clone(), {
+                            let mut runtime = RuncRuntime::with_shim_and_image_storage(
+                                PathBuf::from(&runtime_config.runtime_path),
+                                PathBuf::from(&runtime_config.runtime_root),
+                                config.image_root.clone(),
+                                shim_config,
+                            );
+                            runtime.set_default_env(config.default_env.clone());
+                            runtime.set_default_capabilities(config.default_capabilities.clone());
+                            runtime.set_default_sysctls(config.default_sysctls.clone());
+                            runtime.set_default_ulimits(config.default_ulimits.clone());
+                            runtime.set_allowed_devices(config.allowed_devices.clone());
+                            runtime.set_additional_devices(config.additional_devices.clone());
+                            runtime.set_device_ownership_from_security_context(
+                                config.device_ownership_from_security_context,
+                            );
+                            runtime.set_privileged_without_host_devices(
+                                runtime_config.privileged_without_host_devices,
+                            );
+                            runtime.set_privileged_without_host_devices_all_devices_allowed(
+                                runtime_config.privileged_without_host_devices_all_devices_allowed,
+                            );
+                            runtime.set_add_inheritable_capabilities(
+                                config.add_inheritable_capabilities,
+                            );
+                            runtime.set_base_runtime_spec(config.base_runtime_spec.clone());
+                            runtime.set_default_mounts_file(config.default_mounts_file.clone());
+                            runtime.set_hooks_dirs(config.hooks_dir.clone());
+                            runtime.set_absent_mount_sources_to_reject(
+                                config.absent_mount_sources_to_reject.clone(),
+                            );
+                            runtime.set_image_volumes_mode(
+                                crate::runtime::ImageVolumesMode::from_config(
+                                    &config.image_volumes,
+                                ),
+                            );
+                            runtime.set_rootfs_snapshotter(
+                                crate::runtime::RootfsSnapshotter::from_config(
+                                    runtime_config.snapshotter.as_str(),
+                                ),
+                            );
+                            runtime.set_disable_proc_mount(config.disable_proc_mount);
+                            runtime.set_timezone(config.timezone.clone());
+                            runtime.set_runtime_config_path(PathBuf::from(
+                                runtime_config.runtime_config_path.as_str(),
+                            ));
+                            runtime.set_container_create_timeout_secs(
+                                runtime_config.container_create_timeout,
+                            );
+                            runtime.set_container_stop_timeout_secs(config.container_stop_timeout);
+                            runtime.set_state_db_path(config.root_dir.join("crius.db"));
+                            runtime.set_criu_path(config.criu_path.clone());
+                            runtime.set_restrict_oom_score_adj(config.restrict_oom_score_adj);
+                            runtime.set_bind_mount_prefix(config.bind_mount_prefix.clone());
+                            runtime.set_disable_cgroup(config.disable_cgroup);
+                            runtime.set_rootless(config.rootless.clone());
+                            runtime
+                                .set_default_seccomp_profile_path(config.seccomp_profile.clone());
+                            runtime.set_exec_cpu_affinity(config.exec_cpu_affinity.clone());
+                            runtime.set_no_pivot(config.no_pivot);
+                            runtime.set_no_new_keyring(config.no_new_keyring);
+                            runtime.set_cgroup_driver(match config.cgroup_driver {
+                                Some(CgroupDriver::Systemd) => {
+                                    crate::config::CgroupDriverConfig::Systemd
+                                }
+                                _ => crate::config::CgroupDriverConfig::Cgroupfs,
+                            });
+                            Arc::new(crate::runtime::RuncBackend::new(runtime))
+                                as Arc<dyn crate::runtime::RuntimeBackend>
+                        })
+                    })
+                    .collect()
+            };
         let runtime =
             RuntimeRegistry::new(config.runtime.clone(), runtimes, container_create_timeouts);
         let image_service = ImageServiceImpl::new_with_options(ImageServiceOptions {
