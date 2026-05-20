@@ -1037,6 +1037,21 @@ fn rootless_config_rewrites_default_paths_to_xdg_layout() {
 }
 
 #[test]
+fn validate_rejects_rootlesskit_network_mode() {
+    let mut config = Config::default();
+    config.rootless.enabled = true;
+    config.rootless.network_mode = crate::rootless::NetworkMode::Rootlesskit;
+
+    let err = config
+        .validate()
+        .expect_err("rootlesskit network mode is intentionally unsupported");
+
+    assert!(err
+        .to_string()
+        .contains("rootless.network_mode=rootlesskit is not implemented"));
+}
+
+#[test]
 fn validate_rejects_unsupported_image_driver() {
     let mut config = Config::default();
     config.image.driver = "btrfs".to_string();

@@ -58,6 +58,13 @@ impl IntrospectionService {
     }
 
     pub fn rootless(&self, rootless: &EffectiveRootlessConfig) -> Value {
+        let network_helper_path = match rootless.network_mode {
+            crate::rootless::NetworkMode::Slirp4netns => {
+                Some(rootless.slirp4netns_path.display().to_string())
+            }
+            crate::rootless::NetworkMode::Pasta => Some(rootless.pasta_path.display().to_string()),
+            crate::rootless::NetworkMode::None | crate::rootless::NetworkMode::Rootlesskit => None,
+        };
         json!({
             "enabled": rootless.enabled,
             "currentUid": rootless.current_uid,
@@ -69,6 +76,9 @@ impl IntrospectionService {
             "runtimeRoot": rootless.runtime_root.display().to_string(),
             "netnsDir": rootless.netns_dir.display().to_string(),
             "networkMode": rootless.network_mode.as_str(),
+            "networkModeSupported": rootless.network_mode.is_supported(),
+            "networkModeReason": rootless.network_mode.support_reason(),
+            "networkHelperPath": network_helper_path,
             "useFuseOverlayfs": rootless.use_fuse_overlayfs,
             "disableCgroup": rootless.disable_cgroup,
             "tolerateMissingHugetlbController": rootless.tolerate_missing_hugetlb_controller,
@@ -258,7 +268,25 @@ mod tests {
         let value = service.rootless(&rootless);
         assert_eq!(value["enabled"], true);
         assert_eq!(value["networkMode"], "slirp4netns");
+        assert_eq!(value["networkModeSupported"], true);
+        assert_eq!(value["networkModeReason"], "RootlessSlirp4netnsSupported");
+        assert_eq!(value["networkHelperPath"], "/usr/bin/slirp4netns");
         assert_eq!(value["storageRoot"], "/home/user/.local/share/crius");
+    }
+
+    #[test]
+    fn rootless_report_marks_rootlesskit_unsupported() {
+        let service = IntrospectionService;
+        let mut rootless = EffectiveRootlessConfig::disabled();
+        rootless.enabled = true;
+        rootless.network_mode = crate::rootless::NetworkMode::Rootlesskit;
+
+        let value = service.rootless(&rootless);
+
+        assert_eq!(value["networkMode"], "rootlesskit");
+        assert_eq!(value["networkModeSupported"], false);
+        assert_eq!(value["networkModeReason"], "RootlesskitUnsupported");
+        assert!(value["networkHelperPath"].is_null());
     }
 
     #[test]

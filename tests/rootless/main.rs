@@ -11,4 +11,7 @@ fn rootless_introspection_reports_effective_network_mode() {
 
     assert_eq!(value["enabled"], true);
     assert_eq!(value["networkMode"], "pasta");
+    assert_eq!(value["networkModeSupported"], true);
+    assert_eq!(value["networkModeReason"], "RootlessPastaSupported");
+    assert_eq!(value["networkHelperPath"], "pasta");
 }

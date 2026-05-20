@@ -86,6 +86,22 @@ impl NetworkMode {
             Self::None => "none",
         }
     }
+
+    pub fn is_supported(&self) -> bool {
+        match self {
+            Self::Slirp4netns | Self::Pasta | Self::None => true,
+            Self::Rootlesskit => false,
+        }
+    }
+
+    pub fn support_reason(&self) -> &'static str {
+        match self {
+            Self::Slirp4netns => "RootlessSlirp4netnsSupported",
+            Self::Pasta => "RootlessPastaSupported",
+            Self::None => "RootlessNetworkDisabled",
+            Self::Rootlesskit => "RootlesskitUnsupported",
+        }
+    }
 }
 
 impl Default for RootlessConfig {
