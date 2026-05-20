@@ -122,12 +122,26 @@ impl HealthService {
         cni_watch_error: Option<&str>,
     ) -> HealthCondition {
         if let Some(error) = reload_error {
+            return Self::network_reload_error_condition(error);
+        }
+
+        if let Some(error) = cni_watch_error.filter(|error| Self::is_cni_template_error(error)) {
             return HealthCondition {
                 ready: false,
-                reason: "ConfigReloadFailed".to_string(),
+                reason: "CniTemplateRenderFailed".to_string(),
                 message: error.to_string(),
             };
         }
+
+        let (ready, reason, message) = cni_status.condition();
+        if !ready {
+            return HealthCondition {
+                ready,
+                reason,
+                message,
+            };
+        }
+
         if let Some(error) = cni_watch_error {
             return HealthCondition {
                 ready: false,
@@ -136,12 +150,30 @@ impl HealthService {
             };
         }
 
-        let (ready, reason, message) = cni_status.condition();
         HealthCondition {
             ready,
             reason,
             message,
         }
+    }
+
+    fn network_reload_error_condition(error: &str) -> HealthCondition {
+        let reason = if Self::is_cni_template_error(error) {
+            "CniTemplateRenderFailed"
+        } else {
+            "ConfigReloadFailed"
+        };
+        HealthCondition {
+            ready: false,
+            reason: reason.to_string(),
+            message: error.to_string(),
+        }
+    }
+
+    fn is_cni_template_error(error: &str) -> bool {
+        error.contains("CNI config template")
+            || error.contains("generated CNI config")
+            || error.contains("PodCIDR")
     }
 
     pub fn watcher_status(
@@ -355,6 +387,57 @@ mod tests {
         assert_eq!(condition.message, "reload failed");
     }
 
+    #[test]
+    fn network_condition_reports_cni_template_reload_failure() {
+        let service = HealthService;
+        let status = ready_cni_status();
+
+        let condition = service.network_condition(
+            &status,
+            Some("Failed to render CNI config template: invalid PodCIDR"),
+            None,
+        );
+
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "CniTemplateRenderFailed");
+    }
+
+    #[test]
+    fn network_condition_preserves_cni_plugin_missing_reason() {
+        let service = HealthService;
+        let status = CniLoadStatus {
+            ready: false,
+            reason: "CNIPluginMissing".to_string(),
+            message: "missing or non-executable CNI plugin binary/binaries: bridge".to_string(),
+            declared_plugins: vec!["bridge".to_string()],
+            missing_plugin_binaries: vec!["bridge".to_string()],
+            ..ready_cni_status()
+        };
+
+        let condition = service.network_condition(&status, None, Some("missing plugin bridge"));
+
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "CNIPluginMissing");
+        assert_eq!(condition.message, status.message);
+    }
+
+    #[test]
+    fn network_condition_preserves_cni_config_invalid_reason() {
+        let service = HealthService;
+        let status = CniLoadStatus {
+            ready: false,
+            reason: "CNIConfigInvalid".to_string(),
+            message: "failed to parse 1 CNI config file(s): broken.conflist".to_string(),
+            invalid_files: vec!["broken.conflist".to_string()],
+            ..ready_cni_status()
+        };
+
+        let condition = service.network_condition(&status, None, Some("parse failed"));
+
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "CNIConfigInvalid");
+    }
+
     #[cfg(unix)]
     #[test]
     fn runtime_condition_accepts_executable_file() {
@@ -371,6 +454,21 @@ mod tests {
         let condition = service.runtime_condition_for_path(&path, Some("runtime 1.0".to_string()));
         assert!(condition.ready);
         assert_eq!(condition.reason, "RuntimeIsReady");
+    }
+
+    fn ready_cni_status() -> CniLoadStatus {
+        CniLoadStatus {
+            checked_at_unix_millis: 1,
+            ready: true,
+            reason: "CNINetworkConfigReady".to_string(),
+            message: "loaded 1 CNI network config(s) and 1 plugin type(s)".to_string(),
+            discovered_files: vec!["10-test.conflist".to_string()],
+            invalid_files: Vec::new(),
+            loaded_networks: vec!["test".to_string()],
+            declared_plugins: vec!["bridge".to_string()],
+            missing_plugin_binaries: Vec::new(),
+            default_network_name: Some("test".to_string()),
+        }
     }
 
     #[test]
