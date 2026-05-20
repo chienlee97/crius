@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,7 +25,7 @@ use crius::runtime::{
 };
 use crius::shim_rpc::{
     server::{serve, ShimRpcHandler},
-    ShimRpcClient, ShimRpcRequest, ShimRpcResponse, TaskState,
+    ShimRpcClient, ShimRpcRequest, ShimRpcResponse, StatusResponse, TaskState,
 };
 
 #[derive(Debug, Clone)]
@@ -583,6 +583,105 @@ impl ShimRpcHandler for PingShimHandler {
             }
             other => Err(anyhow::anyhow!(
                 "unsupported fake shim request: {:?}",
+                other
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScriptedShimHandler {
+    state: Arc<Mutex<ScriptedShimState>>,
+}
+
+#[derive(Debug, Clone)]
+struct ScriptedShimState {
+    requests: Vec<ShimRpcRequest>,
+    responses: VecDeque<Result<ShimRpcResponse, String>>,
+    status: StatusResponse,
+}
+
+impl ScriptedShimHandler {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ScriptedShimState {
+                requests: Vec::new(),
+                responses: VecDeque::new(),
+                status: StatusResponse {
+                    state: TaskState::Running,
+                    pid: Some(1),
+                    exit_code: None,
+                },
+            })),
+        }
+    }
+
+    pub fn with_response(self, response: ShimRpcResponse) -> Self {
+        self.push_response(response);
+        self
+    }
+
+    pub fn with_error(self, message: impl Into<String>) -> Self {
+        self.push_error(message);
+        self
+    }
+
+    pub fn push_response(&self, response: ShimRpcResponse) {
+        if let Ok(mut state) = self.state.lock() {
+            state.responses.push_back(Ok(response));
+        }
+    }
+
+    pub fn push_error(&self, message: impl Into<String>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.responses.push_back(Err(message.into()));
+        }
+    }
+
+    pub fn set_status(&self, status: StatusResponse) {
+        if let Ok(mut state) = self.state.lock() {
+            state.status = status;
+        }
+    }
+
+    pub fn requests(&self) -> Vec<ShimRpcRequest> {
+        self.state
+            .lock()
+            .map(|state| state.requests.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn clear_requests(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.requests.clear();
+        }
+    }
+}
+
+impl Default for ScriptedShimHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShimRpcHandler for ScriptedShimHandler {
+    fn handle_request(&self, request: ShimRpcRequest) -> Result<ShimRpcResponse> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("scripted shim handler state lock poisoned"))?;
+        state.requests.push(request.clone());
+
+        if let Some(response) = state.responses.pop_front() {
+            return response.map_err(|message| anyhow::anyhow!("{}", message));
+        }
+
+        match request {
+            ShimRpcRequest::Ping => Ok(ShimRpcResponse::Empty),
+            ShimRpcRequest::Status(_) => Ok(ShimRpcResponse::Status(state.status.clone())),
+            ShimRpcRequest::ContainerPid(_) => Ok(ShimRpcResponse::ContainerPid(state.status.pid)),
+            other => Err(anyhow::anyhow!(
+                "unsupported scripted shim request: {:?}",
                 other
             )),
         }
