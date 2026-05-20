@@ -1,8 +1,51 @@
-use crius::runtime::{ContainerStatus, RuntimeBackend};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use crius::runtime::{ContainerConfig, ContainerStatus, NamespacePaths, RuntimeBackend};
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::FakeRuntimeBackend;
+use common::{FakeRuntimeBackend, FakeRuntimeCall, FakeRuntimeOperation};
+
+fn test_container_config() -> ContainerConfig {
+    ContainerConfig {
+        name: "container-1".to_string(),
+        image: "image-1".to_string(),
+        command: vec!["sleep".to_string()],
+        args: vec!["1".to_string()],
+        env: Vec::new(),
+        working_dir: None,
+        mounts: Vec::new(),
+        labels: Vec::new(),
+        annotations: Vec::new(),
+        privileged: false,
+        user: None,
+        run_as_group: None,
+        supplemental_groups: Vec::new(),
+        hostname: None,
+        tty: false,
+        stdin: false,
+        stdin_once: false,
+        log_path: None,
+        readonly_rootfs: false,
+        seccomp_notifier: None,
+        pids_limit: None,
+        no_new_privileges: None,
+        apparmor_profile: None,
+        selinux_label: None,
+        seccomp_profile: None,
+        capabilities: None,
+        cgroup_parent: None,
+        sysctls: HashMap::new(),
+        namespace_options: None,
+        namespace_paths: NamespacePaths::default(),
+        linux_resources: None,
+        devices: Vec::new(),
+        masked_paths: Vec::new(),
+        readonly_paths: Vec::new(),
+        rootfs: PathBuf::from("/tmp/rootfs"),
+    }
+}
 
 #[test]
 fn fake_runtime_backend_exposes_runtime_contract() {
@@ -21,4 +64,66 @@ fn fake_runtime_backend_exposes_runtime_contract() {
         backend.container_status("container-1").unwrap(),
         ContainerStatus::Running
     ));
+}
+
+#[test]
+fn fake_runtime_backend_records_calls_and_state_transitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = FakeRuntimeBackend::new(dir.path().join("runtime"));
+    let config = test_container_config();
+
+    backend.create_container("container-1", &config).unwrap();
+    assert_eq!(backend.status_snapshot(), ContainerStatus::Created);
+    backend.start_container("container-1").unwrap();
+    assert_eq!(backend.status_snapshot(), ContainerStatus::Running);
+    backend.stop_container("container-1", Some(10)).unwrap();
+    assert_eq!(backend.status_snapshot(), ContainerStatus::Stopped(0));
+    backend.remove_container("container-1").unwrap();
+    assert_eq!(backend.status_snapshot(), ContainerStatus::Unknown);
+
+    assert_eq!(
+        backend.calls(),
+        vec![
+            FakeRuntimeCall::CreateContainer {
+                container_id: "container-1".to_string()
+            },
+            FakeRuntimeCall::StartContainer {
+                container_id: "container-1".to_string()
+            },
+            FakeRuntimeCall::StopContainer {
+                container_id: "container-1".to_string(),
+                timeout: Some(10)
+            },
+            FakeRuntimeCall::RemoveContainer {
+                container_id: "container-1".to_string()
+            },
+        ]
+    );
+}
+
+#[test]
+fn fake_runtime_backend_can_script_operation_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = FakeRuntimeBackend::new(dir.path().join("runtime")).with_failure(
+        FakeRuntimeOperation::StartContainer,
+        "scripted start failure",
+    );
+    let config = test_container_config();
+
+    backend.create_container("container-1", &config).unwrap();
+    let err = backend.start_container("container-1").unwrap_err();
+
+    assert!(err.to_string().contains("scripted start failure"));
+    assert_eq!(backend.status_snapshot(), ContainerStatus::Created);
+    assert_eq!(
+        backend.calls(),
+        vec![
+            FakeRuntimeCall::CreateContainer {
+                container_id: "container-1".to_string()
+            },
+            FakeRuntimeCall::StartContainer {
+                container_id: "container-1".to_string()
+            },
+        ]
+    );
 }

@@ -34,7 +34,56 @@ pub struct FakeRuntimeBackend {
     runtime_root: PathBuf,
     runtime_path: PathBuf,
     runtime_config_path: PathBuf,
+    state: Arc<Mutex<FakeRuntimeState>>,
+}
+
+#[derive(Debug, Clone)]
+struct FakeRuntimeState {
     status: ContainerStatus,
+    calls: Vec<FakeRuntimeCall>,
+    failures: HashMap<FakeRuntimeOperation, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FakeRuntimeCall {
+    CreateContainer {
+        container_id: String,
+    },
+    StartContainer {
+        container_id: String,
+    },
+    StopContainer {
+        container_id: String,
+        timeout: Option<u32>,
+    },
+    RemoveContainer {
+        container_id: String,
+    },
+    ContainerStatus {
+        container_id: String,
+    },
+    PrepareRootfs {
+        container_id: String,
+    },
+    BuildSpec {
+        container_id: String,
+    },
+    WriteBundle {
+        container_id: String,
+        rootfs: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FakeRuntimeOperation {
+    CreateContainer,
+    StartContainer,
+    StopContainer,
+    RemoveContainer,
+    ContainerStatus,
+    PrepareRootfs,
+    BuildSpec,
+    WriteBundle,
 }
 
 impl FakeRuntimeBackend {
@@ -44,18 +93,88 @@ impl FakeRuntimeBackend {
             runtime_root: runtime_root.into(),
             runtime_path: PathBuf::from("/fake/runtime"),
             runtime_config_path: PathBuf::from("/fake/runtime.conf"),
-            status: ContainerStatus::Created,
+            state: Arc::new(Mutex::new(FakeRuntimeState {
+                status: ContainerStatus::Created,
+                calls: Vec::new(),
+                failures: HashMap::new(),
+            })),
         }
     }
 
-    pub fn with_status(mut self, status: ContainerStatus) -> Self {
-        self.status = status;
+    pub fn with_status(self, status: ContainerStatus) -> Self {
+        self.set_status(status);
         self
     }
 
     pub fn with_backend_name(mut self, backend_name: &'static str) -> Self {
         self.backend_name = backend_name;
         self
+    }
+
+    pub fn with_failure(self, operation: FakeRuntimeOperation, message: impl Into<String>) -> Self {
+        self.fail_operation(operation, message);
+        self
+    }
+
+    pub fn fail_operation(&self, operation: FakeRuntimeOperation, message: impl Into<String>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.failures.insert(operation, message.into());
+        }
+    }
+
+    pub fn clear_failures(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.failures.clear();
+        }
+    }
+
+    pub fn set_status(&self, status: ContainerStatus) {
+        if let Ok(mut state) = self.state.lock() {
+            state.status = status;
+        }
+    }
+
+    pub fn status_snapshot(&self) -> ContainerStatus {
+        self.state
+            .lock()
+            .map(|state| state.status.clone())
+            .unwrap_or(ContainerStatus::Unknown)
+    }
+
+    pub fn calls(&self) -> Vec<FakeRuntimeCall> {
+        self.state
+            .lock()
+            .map(|state| state.calls.clone())
+            .unwrap_or_default()
+    }
+
+    fn record(&self, call: FakeRuntimeCall) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake runtime backend state lock poisoned"))?;
+        state.calls.push(call);
+        Ok(())
+    }
+
+    fn maybe_fail(&self, operation: FakeRuntimeOperation) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake runtime backend state lock poisoned"))?;
+        if let Some(message) = state.failures.get(&operation) {
+            return Err(anyhow::anyhow!("{}", message));
+        }
+        Ok(())
+    }
+
+    fn transition(&self, status: ContainerStatus) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake runtime backend state lock poisoned"))?;
+        state.status = status;
+        Ok(())
     }
 }
 
@@ -80,24 +199,49 @@ impl RuntimeBackend for FakeRuntimeBackend {
         self.runtime_root.join(container_id)
     }
 
-    fn create_container(&self, _container_id: &str, _config: &ContainerConfig) -> Result<String> {
+    fn create_container(&self, container_id: &str, _config: &ContainerConfig) -> Result<String> {
+        self.record(FakeRuntimeCall::CreateContainer {
+            container_id: container_id.to_string(),
+        })?;
+        self.maybe_fail(FakeRuntimeOperation::CreateContainer)?;
+        self.transition(ContainerStatus::Created)?;
         Ok("fake-created".to_string())
     }
 
-    fn start_container(&self, _container_id: &str) -> Result<()> {
+    fn start_container(&self, container_id: &str) -> Result<()> {
+        self.record(FakeRuntimeCall::StartContainer {
+            container_id: container_id.to_string(),
+        })?;
+        self.maybe_fail(FakeRuntimeOperation::StartContainer)?;
+        self.transition(ContainerStatus::Running)?;
         Ok(())
     }
 
-    fn stop_container(&self, _container_id: &str, _timeout: Option<u32>) -> Result<()> {
+    fn stop_container(&self, container_id: &str, timeout: Option<u32>) -> Result<()> {
+        self.record(FakeRuntimeCall::StopContainer {
+            container_id: container_id.to_string(),
+            timeout,
+        })?;
+        self.maybe_fail(FakeRuntimeOperation::StopContainer)?;
+        self.transition(ContainerStatus::Stopped(0))?;
         Ok(())
     }
 
-    fn remove_container(&self, _container_id: &str) -> Result<()> {
+    fn remove_container(&self, container_id: &str) -> Result<()> {
+        self.record(FakeRuntimeCall::RemoveContainer {
+            container_id: container_id.to_string(),
+        })?;
+        self.maybe_fail(FakeRuntimeOperation::RemoveContainer)?;
+        self.transition(ContainerStatus::Unknown)?;
         Ok(())
     }
 
-    fn container_status(&self, _container_id: &str) -> Result<ContainerStatus> {
-        Ok(self.status.clone())
+    fn container_status(&self, container_id: &str) -> Result<ContainerStatus> {
+        self.record(FakeRuntimeCall::ContainerStatus {
+            container_id: container_id.to_string(),
+        })?;
+        self.maybe_fail(FakeRuntimeOperation::ContainerStatus)?;
+        Ok(self.status_snapshot())
     }
 
     fn reopen_container_log(&self, _container_id: &str) -> Result<()> {
@@ -146,15 +290,28 @@ impl RuntimeBackend for FakeRuntimeBackend {
         Ok(())
     }
 
-    fn prepare_rootfs(&self, _container_id: &str, _config: &ContainerConfig) -> Result<()> {
+    fn prepare_rootfs(&self, container_id: &str, _config: &ContainerConfig) -> Result<()> {
+        self.record(FakeRuntimeCall::PrepareRootfs {
+            container_id: container_id.to_string(),
+        })?;
+        self.maybe_fail(FakeRuntimeOperation::PrepareRootfs)?;
         Ok(())
     }
 
-    fn build_spec(&self, _container_id: &str, _config: &ContainerConfig) -> Result<Spec> {
+    fn build_spec(&self, container_id: &str, _config: &ContainerConfig) -> Result<Spec> {
+        self.record(FakeRuntimeCall::BuildSpec {
+            container_id: container_id.to_string(),
+        })?;
+        self.maybe_fail(FakeRuntimeOperation::BuildSpec)?;
         Ok(Spec::new("1.0.2"))
     }
 
-    fn write_bundle(&self, _container_id: &str, _rootfs: &Path, _spec: &Spec) -> Result<()> {
+    fn write_bundle(&self, container_id: &str, rootfs: &Path, _spec: &Spec) -> Result<()> {
+        self.record(FakeRuntimeCall::WriteBundle {
+            container_id: container_id.to_string(),
+            rootfs: rootfs.to_path_buf(),
+        })?;
+        self.maybe_fail(FakeRuntimeOperation::WriteBundle)?;
         Ok(())
     }
 
