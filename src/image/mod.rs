@@ -86,6 +86,9 @@ pub struct ImageServiceImpl {
     in_progress_pulls: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     #[cfg(test)]
     test_pull_handler: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<TestPullHandler>>>>,
+    #[cfg(test)]
+    test_pull_scope_observer:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<TestPullScopeObserver>>>>,
     reloadable_config: Arc<RwLock<ReloadableImageConfig>>,
     pull_cgroup: PullCgroupExecutor,
 }
@@ -377,6 +380,9 @@ struct RegistryEndpoint {
 #[cfg(test)]
 pub(crate) type TestPullHandler =
     dyn Fn(TestPullRequest) -> Result<TestPullResponse, Status> + Send + Sync;
+
+#[cfg(test)]
+pub(crate) type TestPullScopeObserver = dyn Fn(&'static str, bool) + Send + Sync;
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1695,6 +1701,8 @@ impl ImageServiceImpl {
             in_progress_pulls: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_pull_handler: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            test_pull_scope_observer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             reloadable_config: Arc::new(RwLock::new(reloadable_config)),
             pull_cgroup,
         })
@@ -1740,12 +1748,37 @@ impl ImageServiceImpl {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_test_pull_scope_observer(
+        &self,
+        observer: std::sync::Arc<TestPullScopeObserver>,
+    ) {
+        if let Ok(mut slot) = self.test_pull_scope_observer.lock() {
+            *slot = Some(observer);
+        }
+    }
+
+    #[cfg(test)]
     fn snapshot_test_pull_handler(&self) -> Option<std::sync::Arc<TestPullHandler>> {
         self.test_pull_handler
             .lock()
             .ok()
             .and_then(|handler| handler.clone())
     }
+
+    #[cfg(test)]
+    fn observe_test_pull_scope(&self, stage: &'static str) {
+        if let Some(observer) = self
+            .test_pull_scope_observer
+            .lock()
+            .ok()
+            .and_then(|observer| observer.clone())
+        {
+            observer(stage, self.pull_cgroup.scope_active());
+        }
+    }
+
+    #[cfg(not(test))]
+    fn observe_test_pull_scope(&self, _stage: &'static str) {}
 
     #[cfg(test)]
     fn test_registry_auth(auth: &RegistryAuth) -> TestRegistryAuth {
@@ -1831,6 +1864,7 @@ impl ImageServiceImpl {
             .as_ref()
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false);
+        self.observe_test_pull_scope("persist-record-start");
         let record_dir = Self::local_record_dir(&self.storage_path, &image_id, is_artifact);
         std::fs::create_dir_all(&record_dir).map_err(|e: io::Error| {
             Status::internal(format!("Failed to create image record directory: {}", e))
@@ -1888,6 +1922,7 @@ impl ImageServiceImpl {
             error!("Failed to save image metadata: {}", e);
             Status::internal(format!("Failed to save image metadata: {}", e))
         })?;
+        self.observe_test_pull_scope("persist-metadata-saved");
 
         let image = Image {
             id: image_id.clone(),
@@ -1927,6 +1962,7 @@ impl ImageServiceImpl {
         auth: &RegistryAuth,
         pull_namespace: Option<&str>,
     ) -> Result<Response<PullImageResponse>, Status> {
+        self.observe_test_pull_scope("test-handler");
         let response = handler(TestPullRequest {
             requested_ref: requested_ref.to_string(),
             canonical_ref: canonical_ref.to_string(),

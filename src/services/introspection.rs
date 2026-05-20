@@ -316,9 +316,12 @@ mod tests {
             mode: PullCgroupMode::Pod,
             effective_path: Some("/sys/fs/cgroup/kubepods/pod1".to_string()),
             entered: false,
+            active: false,
             restored: false,
             error: Some("failed to create pull cgroup".to_string()),
             at_unix_millis: 42,
+            started_at_unix_millis: 42,
+            ended_at_unix_millis: Some(42),
         };
 
         let value = service.pull_cgroup(&effective, Some(&last_scope));

@@ -202,6 +202,13 @@ async fn pull_image_enters_configured_pull_cgroup_scope() {
         crate::rootless::EffectiveRootlessConfig::disabled(),
         false,
     );
+    let observed_scope = Arc::new(std::sync::Mutex::new(Vec::new()));
+    service.set_test_pull_scope_observer(Arc::new({
+        let observed_scope = Arc::clone(&observed_scope);
+        move |stage, active| {
+            observed_scope.lock().unwrap().push((stage, active));
+        }
+    }));
     service.set_test_pull_handler(Arc::new(|_| {
         Ok(TestPullResponse {
             image_id: "sha256:pull-cgroup".to_string(),
@@ -226,11 +233,26 @@ async fn pull_image_enters_configured_pull_cgroup_scope() {
     assert!(cgroup_root.join("kubepods/pod123/cgroup.procs").exists());
     let last_scope = service.last_pull_cgroup_scope().unwrap();
     assert!(last_scope.entered);
+    assert!(!last_scope.active);
+    assert!(last_scope.started_at_unix_millis <= last_scope.ended_at_unix_millis.unwrap());
     assert_eq!(last_scope.mode, PullCgroupMode::Path);
     assert!(last_scope
         .effective_path
         .unwrap()
         .ends_with("kubepods/pod123"));
+    let observations = observed_scope.lock().unwrap();
+    for stage in [
+        "test-handler",
+        "persist-record-start",
+        "persist-metadata-saved",
+    ] {
+        assert!(
+            observations
+                .iter()
+                .any(|(observed_stage, active)| observed_stage == &stage && *active),
+            "{stage} should run inside active pull cgroup scope; observed {observations:?}"
+        );
+    }
 }
 
 #[tokio::test]

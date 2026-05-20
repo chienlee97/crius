@@ -39,9 +39,12 @@ pub struct PullCgroupScopeRecord {
     pub mode: PullCgroupMode,
     pub effective_path: Option<String>,
     pub entered: bool,
+    pub active: bool,
     pub restored: bool,
     pub error: Option<String>,
     pub at_unix_millis: i64,
+    pub started_at_unix_millis: i64,
+    pub ended_at_unix_millis: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +115,12 @@ impl PullCgroupExecutor {
             .and_then(|record| record.clone())
     }
 
+    pub fn scope_active(&self) -> bool {
+        self.last_scope()
+            .map(|record| record.active)
+            .unwrap_or(false)
+    }
+
     pub fn target_for_pod(&self, pod_cgroup_parent: Option<&str>) -> Result<PullCgroupTarget> {
         if self.effective_config().enabled {
             match self.mode {
@@ -139,14 +148,18 @@ impl PullCgroupExecutor {
     pub fn enter(&self, target: &PullCgroupTarget) -> Result<PullCgroupScopeGuard> {
         let mode = target.mode();
         if matches!(target, PullCgroupTarget::Disabled) {
+            let now = chrono::Utc::now().timestamp_millis();
             let record = PullCgroupScopeRecord {
                 configured: self.configured.clone(),
                 mode,
                 effective_path: None,
                 entered: false,
+                active: false,
                 restored: false,
                 error: None,
-                at_unix_millis: chrono::Utc::now().timestamp_millis(),
+                at_unix_millis: now,
+                started_at_unix_millis: now,
+                ended_at_unix_millis: Some(now),
             };
             self.record_scope(record);
             return Ok(PullCgroupScopeGuard::inactive());
@@ -155,14 +168,18 @@ impl PullCgroupExecutor {
         match self.enter_active(target) {
             Ok(guard) => Ok(guard),
             Err(error) => {
+                let now = chrono::Utc::now().timestamp_millis();
                 self.record_scope(PullCgroupScopeRecord {
                     configured: self.configured.clone(),
                     mode,
                     effective_path: target.raw_path().map(ToOwned::to_owned),
                     entered: false,
+                    active: false,
                     restored: false,
                     error: Some(error.to_string()),
-                    at_unix_millis: chrono::Utc::now().timestamp_millis(),
+                    at_unix_millis: now,
+                    started_at_unix_millis: now,
+                    ended_at_unix_millis: Some(now),
                 });
                 Err(error)
             }
@@ -192,6 +209,7 @@ impl PullCgroupExecutor {
             })?;
         }
 
+        let started_at = chrono::Utc::now().timestamp_millis();
         self.record_scope(PullCgroupScopeRecord {
             configured: self.configured.clone(),
             mode: target.mode(),
@@ -200,9 +218,12 @@ impl PullCgroupExecutor {
                 .and_then(|path| path.parent())
                 .map(|path| path.display().to_string()),
             entered: true,
+            active: true,
             restored: false,
             error: None,
-            at_unix_millis: chrono::Utc::now().timestamp_millis(),
+            at_unix_millis: started_at,
+            started_at_unix_millis: started_at,
+            ended_at_unix_millis: None,
         });
 
         Ok(PullCgroupScopeGuard {
@@ -323,6 +344,8 @@ impl Drop for PullCgroupScopeGuard {
         }
         if let Ok(mut last_scope) = self.last_scope.write() {
             if let Some(record) = last_scope.as_mut() {
+                record.active = false;
+                record.ended_at_unix_millis = Some(chrono::Utc::now().timestamp_millis());
                 record.restored = restored;
                 if error.is_some() {
                     record.error = error;
