@@ -714,7 +714,13 @@ async fn status_verbose_returns_structured_config() {
     let health_conditions = config["internalServices"]["health"]["conditions"]
         .as_array()
         .unwrap();
-    for condition_type in ["ImageReady", "SnapshotReady", "ShimReady", "RecoveryReady"] {
+    for condition_type in [
+        "ImageReady",
+        "SnapshotReady",
+        "ShimReady",
+        "RecoveryReady",
+        "PullCgroupReady",
+    ] {
         let condition = health_conditions
             .iter()
             .find(|condition| condition["type"] == condition_type)
@@ -768,6 +774,10 @@ async fn status_verbose_returns_structured_config() {
     assert_eq!(config["disableCgroup"], false);
     assert_eq!(config["tolerateMissingHugetlbController"], true);
     assert_eq!(config["separatePullCgroup"], "");
+    assert_eq!(config["pullCgroup"]["requestedValue"], "");
+    assert_eq!(config["pullCgroup"]["effectiveMode"], "disabled");
+    assert_eq!(config["pullCgroup"]["enabled"], false);
+    assert_eq!(config["pullCgroup"]["lastError"], serde_json::Value::Null);
     assert_eq!(config["pullCgroup"]["effective"]["enabled"], false);
     assert_eq!(config["pullCgroup"]["effective"]["mode"], "disabled");
     assert!(config["pullCgroup"]["lastScope"].is_null());

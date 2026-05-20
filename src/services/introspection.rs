@@ -3,6 +3,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::config::NriConfig;
+use crate::image::{PullCgroupEffectiveConfig, PullCgroupScopeRecord};
 use crate::rootless::EffectiveRootlessConfig;
 use crate::server::{RuntimeConfig, RuntimeReloadState, RuntimeReloadableConfig};
 
@@ -73,6 +74,24 @@ impl IntrospectionService {
             "tolerateMissingHugetlbController": rootless.tolerate_missing_hugetlb_controller,
             "slirp4netnsPath": rootless.slirp4netns_path.display().to_string(),
             "pastaPath": rootless.pasta_path.display().to_string(),
+        })
+    }
+
+    pub fn pull_cgroup(
+        &self,
+        effective: &PullCgroupEffectiveConfig,
+        last_scope: Option<&PullCgroupScopeRecord>,
+    ) -> Value {
+        json!({
+            "requestedValue": effective.configured,
+            "effectiveMode": effective.mode,
+            "enabled": effective.enabled,
+            "rootlessDegraded": effective.rootless_degraded,
+            "disableCgroupDegraded": effective.disable_cgroup_degraded,
+            "cgroupDriver": effective.cgroup_driver,
+            "lastError": last_scope.and_then(|scope| scope.error.as_deref()),
+            "effective": effective,
+            "lastScope": last_scope,
         })
     }
 
@@ -211,6 +230,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::config::CgroupDriverConfig;
+    use crate::image::{PullCgroupEffectiveConfig, PullCgroupMode, PullCgroupScopeRecord};
     use crate::server::{RuntimeReloadState, RuntimeReloadableConfig};
 
     #[test]
@@ -277,5 +298,37 @@ mod tests {
         assert_eq!(value["watcherBackoffCount"], 0);
         assert_eq!(value["lastReloadError"], "failed");
         assert_eq!(value["configFilePath"], "/etc/crius/config.toml");
+    }
+
+    #[test]
+    fn pull_cgroup_report_exposes_effective_config_and_last_error() {
+        let service = IntrospectionService;
+        let effective = PullCgroupEffectiveConfig {
+            configured: "pod".to_string(),
+            mode: PullCgroupMode::Pod,
+            enabled: true,
+            rootless_degraded: false,
+            disable_cgroup_degraded: false,
+            cgroup_driver: CgroupDriverConfig::Cgroupfs,
+        };
+        let last_scope = PullCgroupScopeRecord {
+            configured: "pod".to_string(),
+            mode: PullCgroupMode::Pod,
+            effective_path: Some("/sys/fs/cgroup/kubepods/pod1".to_string()),
+            entered: false,
+            restored: false,
+            error: Some("failed to create pull cgroup".to_string()),
+            at_unix_millis: 42,
+        };
+
+        let value = service.pull_cgroup(&effective, Some(&last_scope));
+
+        assert_eq!(value["requestedValue"], "pod");
+        assert_eq!(value["effectiveMode"], "pod");
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["cgroupDriver"], "cgroupfs");
+        assert_eq!(value["lastError"], "failed to create pull cgroup");
+        assert_eq!(value["effective"]["mode"], "pod");
+        assert_eq!(value["lastScope"]["entered"], false);
     }
 }

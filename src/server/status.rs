@@ -745,13 +745,20 @@ impl RuntimeServiceImpl {
             let resource_class_support = crate::security::resource_classes::feature_support(Some(
                 &self.nri_config.blockio_config_path,
             ));
-            let extended_health_conditions = self.internal_services.health.extended_conditions(
+            let pull_cgroup_effective = self.image_service.pull_cgroup_effective_config();
+            let pull_cgroup_last_scope = self.image_service.last_pull_cgroup_scope();
+            let mut extended_health_conditions = self.internal_services.health.extended_conditions(
                 &self.config.image_root,
                 &self.config.image_root.join("snapshots"),
                 &self.shim_work_dir,
                 self.last_startup_attempted_repair(),
                 self.last_startup_repair_succeeded(),
                 true,
+            );
+            extended_health_conditions.push(
+                self.internal_services
+                    .health
+                    .pull_cgroup_condition(&pull_cgroup_effective, pull_cgroup_last_scope.as_ref()),
             );
             let payload = json!({
                 "runtimeName": self.cri_runtime_name(),
@@ -807,10 +814,10 @@ impl RuntimeServiceImpl {
                 "disableCgroup": self.config.disable_cgroup,
                 "tolerateMissingHugetlbController": self.config.tolerate_missing_hugetlb_controller,
                 "separatePullCgroup": self.config.separate_pull_cgroup,
-                "pullCgroup": {
-                    "effective": self.image_service.pull_cgroup_effective_config(),
-                    "lastScope": self.image_service.last_pull_cgroup_scope(),
-                },
+                "pullCgroup": self.internal_services.introspection.pull_cgroup(
+                    &pull_cgroup_effective,
+                    pull_cgroup_last_scope.as_ref(),
+                ),
                 "pidsLimit": self.config.pids_limit,
                 "infraCtrCpuset": self.config.infra_ctr_cpuset.clone(),
                 "sharedCpuset": self.config.shared_cpuset.clone(),

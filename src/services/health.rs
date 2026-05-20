@@ -2,6 +2,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::image::{PullCgroupEffectiveConfig, PullCgroupMode, PullCgroupScopeRecord};
 use crate::network::CniLoadStatus;
 use crate::proto::runtime::v1::RuntimeCondition;
 
@@ -287,6 +288,58 @@ impl HealthService {
         }
     }
 
+    pub fn pull_cgroup_condition(
+        &self,
+        effective: &PullCgroupEffectiveConfig,
+        last_scope: Option<&PullCgroupScopeRecord>,
+    ) -> InternalHealthCondition {
+        if let Some(error) = last_scope.and_then(|scope| scope.error.as_deref()) {
+            return InternalHealthCondition::not_ready(
+                "PullCgroupReady",
+                "PullCgroupScopeFailed",
+                error.to_string(),
+            );
+        }
+
+        if effective.rootless_degraded {
+            return InternalHealthCondition::ready(
+                "PullCgroupReady",
+                "PullCgroupDisabledByRootless",
+                format!(
+                    "runtime.separate_pull_cgroup={} is disabled because rootless mode disables cgroups",
+                    effective.configured
+                ),
+            );
+        }
+
+        if effective.disable_cgroup_degraded {
+            return InternalHealthCondition::ready(
+                "PullCgroupReady",
+                "PullCgroupDisabledByRuntimeConfig",
+                format!(
+                    "runtime.separate_pull_cgroup={} is disabled because runtime cgroups are disabled",
+                    effective.configured
+                ),
+            );
+        }
+
+        match effective.mode {
+            PullCgroupMode::Disabled => InternalHealthCondition::ready(
+                "PullCgroupReady",
+                "PullCgroupDisabled",
+                "separate pull cgroup is not configured".to_string(),
+            ),
+            PullCgroupMode::Pod | PullCgroupMode::Path => InternalHealthCondition::ready(
+                "PullCgroupReady",
+                "PullCgroupReady",
+                format!(
+                    "separate pull cgroup is enabled with {:?} mode",
+                    effective.mode
+                ),
+            ),
+        }
+    }
+
     pub fn extended_conditions(
         &self,
         image_root: &Path,
@@ -545,5 +598,34 @@ mod tests {
             .unwrap();
         assert!(!recovery.ready);
         assert_eq!(recovery.reason, "RecoveryRepairFailed");
+    }
+
+    #[test]
+    fn pull_cgroup_condition_reports_scope_failure() {
+        let service = HealthService;
+        let effective = PullCgroupEffectiveConfig {
+            configured: "kubepods/pod1".to_string(),
+            mode: PullCgroupMode::Path,
+            enabled: true,
+            rootless_degraded: false,
+            disable_cgroup_degraded: false,
+            cgroup_driver: crate::config::CgroupDriverConfig::Cgroupfs,
+        };
+        let last_scope = PullCgroupScopeRecord {
+            configured: "kubepods/pod1".to_string(),
+            mode: PullCgroupMode::Path,
+            effective_path: Some("/sys/fs/cgroup/kubepods/pod1".to_string()),
+            entered: false,
+            restored: false,
+            error: Some("failed to create pull cgroup".to_string()),
+            at_unix_millis: 7,
+        };
+
+        let condition = service.pull_cgroup_condition(&effective, Some(&last_scope));
+
+        assert_eq!(condition.condition_type, "PullCgroupReady");
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "PullCgroupScopeFailed");
+        assert_eq!(condition.message, "failed to create pull cgroup");
     }
 }
