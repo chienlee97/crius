@@ -1452,6 +1452,27 @@ impl StorageManager {
         details: Option<&str>,
     ) -> Result<()> {
         let timestamp = chrono::Utc::now().timestamp();
+        self.append_typed_event_at(
+            event_type,
+            entity_type,
+            entity_id,
+            old_state,
+            new_state,
+            details,
+            timestamp,
+        )
+    }
+
+    pub fn append_typed_event_at(
+        &mut self,
+        event_type: &str,
+        entity_type: &str,
+        entity_id: &str,
+        old_state: Option<&str>,
+        new_state: Option<&str>,
+        details: Option<&str>,
+        timestamp: i64,
+    ) -> Result<()> {
         self.conn
             .execute(
                 "INSERT INTO events
@@ -1495,6 +1516,40 @@ impl StorageManager {
             })?
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to get recent events")?;
+
+        Ok(events)
+    }
+
+    pub fn get_recent_events_for_subject(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StateEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, event_type, entity_type, entity_id, old_state, new_state, timestamp, details
+             FROM events
+             WHERE entity_type = ?1 AND entity_id = ?2
+             ORDER BY timestamp DESC, id DESC
+             LIMIT ?3",
+        )?;
+
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let events = stmt
+            .query_map(rusqlite::params![entity_type, entity_id, limit], |row| {
+                Ok(StateEvent {
+                    id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    entity_type: row.get(2)?,
+                    entity_id: row.get(3)?,
+                    old_state: row.get(4)?,
+                    new_state: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    details: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to get recent events for subject")?;
 
         Ok(events)
     }

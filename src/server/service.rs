@@ -1750,7 +1750,8 @@ impl RuntimeServiceImpl {
         let persistence = Arc::new(Mutex::new(persistence));
         let (events, _) = tokio::sync::broadcast::channel(256);
         let internal_services = crate::services::InternalServices::new(
-            crate::services::EventService::from_sender(events.clone()),
+            crate::services::EventService::from_sender(events.clone())
+                .with_ledger(persistence.clone()),
         );
         let nri: Arc<dyn NriApi> = injected_nri.unwrap_or_else(|| {
             if nri_manager_config.enable {

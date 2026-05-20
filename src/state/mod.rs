@@ -265,6 +265,17 @@ impl<'a> StateLedger<'a> {
             .get_recent_events(entity_type, since)
     }
 
+    pub fn recent_events_for_subject(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StateEvent>> {
+        self.persistence
+            .storage()
+            .get_recent_events_for_subject(subject_kind, subject_id, limit)
+    }
+
     pub fn recovery_snapshot(&self) -> Result<RecoveryLedgerSnapshot> {
         let containers = self.containers()?;
         let pods = self.pod_sandboxes()?;
@@ -440,6 +451,27 @@ impl<'a> StateLedgerWriter<'a> {
             old_state,
             new_state,
             details,
+        )
+    }
+
+    pub fn append_typed_event_at(
+        &mut self,
+        event_type: &str,
+        entity_type: &str,
+        entity_id: &str,
+        old_state: Option<&str>,
+        new_state: Option<&str>,
+        details: Option<&str>,
+        timestamp: i64,
+    ) -> Result<()> {
+        self.persistence.storage_mut().append_typed_event_at(
+            event_type,
+            entity_type,
+            entity_id,
+            old_state,
+            new_state,
+            details,
+            timestamp,
         )
     }
 }

@@ -2,7 +2,7 @@ pub mod event;
 pub mod health;
 pub mod introspection;
 
-pub use event::EventService;
+pub use event::{EventService, InternalEvent, InternalEventSeverity};
 pub use health::{HealthCondition, HealthService, InternalHealthCondition};
 pub use introspection::IntrospectionService;
 
