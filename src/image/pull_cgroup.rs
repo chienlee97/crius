@@ -351,7 +351,7 @@ pub fn validate_pull_cgroup_config(
         PullCgroupMode::Disabled | PullCgroupMode::Pod => Ok(()),
         PullCgroupMode::Path => {
             let trimmed = raw.trim();
-            if trimmed.contains("..") {
+            if has_parent_dir_component(trimmed) {
                 return Err(
                     "runtime.separate_pull_cgroup must not contain parent directory components"
                         .to_string(),
@@ -368,6 +368,12 @@ pub fn validate_pull_cgroup_config(
             Ok(())
         }
     }
+}
+
+fn has_parent_dir_component(raw: &str) -> bool {
+    Path::new(raw)
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
 }
 
 fn current_process_cgroup_relative_path() -> Option<PathBuf> {
@@ -419,11 +425,33 @@ mod tests {
         assert!(validate_pull_cgroup_config("pod", CgroupDriverConfig::Systemd).is_ok());
         assert!(validate_pull_cgroup_config("kubepods.slice", CgroupDriverConfig::Systemd).is_ok());
         assert!(
+            validate_pull_cgroup_config("crius-pull.scope", CgroupDriverConfig::Systemd).is_ok()
+        );
+        assert!(
             validate_pull_cgroup_config("kubepods/pod123", CgroupDriverConfig::Systemd).is_err()
         );
         assert!(
             validate_pull_cgroup_config("kubepods/pod123", CgroupDriverConfig::Cgroupfs).is_ok()
         );
+    }
+
+    #[test]
+    fn validates_cgroupfs_pull_cgroup_path_components() {
+        assert!(
+            validate_pull_cgroup_config("kubepods/pod123", CgroupDriverConfig::Cgroupfs).is_ok()
+        );
+        assert!(
+            validate_pull_cgroup_config("kubepods/foo..bar", CgroupDriverConfig::Cgroupfs).is_ok()
+        );
+        assert!(
+            validate_pull_cgroup_config("kubepods/../pod123", CgroupDriverConfig::Cgroupfs)
+                .is_err()
+        );
+        assert!(validate_pull_cgroup_config(
+            "kubepods/../pod123.slice",
+            CgroupDriverConfig::Systemd
+        )
+        .is_err());
     }
 
     #[test]
@@ -484,6 +512,58 @@ mod tests {
         let last = executor.last_scope().unwrap();
         assert!(!last.entered);
         assert!(last.error.unwrap().contains("failed to create pull cgroup"));
+    }
+
+    #[test]
+    fn systemd_slice_scope_and_pod_targets_use_expected_paths() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.controllers"), "cpu memory pids").unwrap();
+
+        let slice_executor = PullCgroupExecutor::new_with_root(
+            "kubepods.slice",
+            CgroupDriverConfig::Systemd,
+            false,
+            false,
+            dir.path().to_path_buf(),
+        );
+        let slice_target = slice_executor.target_for_pod(None).unwrap();
+        let slice_guard = slice_executor.enter(&slice_target).unwrap();
+        drop(slice_guard);
+        let slice_scope = slice_executor.last_scope().unwrap();
+        let slice_path = slice_scope.effective_path.unwrap();
+        assert!(slice_path.contains("kubepods.slice"));
+        assert!(slice_path.contains("crius-pull-"));
+        assert!(slice_path.ends_with(".scope"));
+
+        let scope_executor = PullCgroupExecutor::new_with_root(
+            "crius-pull.scope",
+            CgroupDriverConfig::Systemd,
+            false,
+            false,
+            dir.path().to_path_buf(),
+        );
+        let scope_target = scope_executor.target_for_pod(None).unwrap();
+        let scope_guard = scope_executor.enter(&scope_target).unwrap();
+        drop(scope_guard);
+        let scope_path = scope_executor.last_scope().unwrap().effective_path.unwrap();
+        assert!(scope_path.ends_with("crius-pull.scope"));
+
+        let pod_executor = PullCgroupExecutor::new_with_root(
+            "pod",
+            CgroupDriverConfig::Systemd,
+            false,
+            false,
+            dir.path().to_path_buf(),
+        );
+        let pod_target = pod_executor
+            .target_for_pod(Some("kubepods.slice/podabc.slice"))
+            .unwrap();
+        let pod_guard = pod_executor.enter(&pod_target).unwrap();
+        drop(pod_guard);
+        let pod_path = pod_executor.last_scope().unwrap().effective_path.unwrap();
+        assert!(pod_path.contains("kubepods.slice"));
+        assert!(pod_path.contains("podabc.slice"));
+        assert!(pod_path.ends_with(".scope"));
     }
 
     #[test]

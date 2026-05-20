@@ -1624,6 +1624,9 @@ fn validate_accepts_supported_separate_pull_cgroup_modes() {
 
     config.runtime.separate_pull_cgroup = "kubepods.slice".to_string();
     config.validate().unwrap();
+
+    config.runtime.separate_pull_cgroup = "crius-pull.scope".to_string();
+    config.validate().unwrap();
 }
 
 #[test]
@@ -1637,6 +1640,20 @@ fn validate_rejects_invalid_systemd_separate_pull_cgroup() {
     assert!(err
         .to_string()
         .contains("runtime.separate_pull_cgroup with systemd"));
+}
+
+#[test]
+fn validate_rejects_parent_directory_separate_pull_cgroup() {
+    let mut config = Config::default();
+    config.runtime.cgroup_driver = Some(CgroupDriverConfig::Cgroupfs);
+    config.runtime.separate_pull_cgroup = "kubepods/../escape".to_string();
+
+    let err = config
+        .validate()
+        .expect_err("parent directory component must fail");
+    assert!(err
+        .to_string()
+        .contains("runtime.separate_pull_cgroup must not contain parent directory components"));
 }
 
 #[test]
