@@ -632,6 +632,9 @@ async fn status_verbose_returns_structured_config() {
         .unwrap()
         .iter()
         .any(|field| field == "network.conf_template"));
+    assert!(config["reload"]["watcherStatus"].is_string());
+    assert!(config["reload"]["watcherBackoffCount"].is_u64());
+    assert!(config["reload"]["watcherNextRetryUnixMillis"].is_null());
     assert_eq!(
         config["reload"]["runtimeConfigApiOnly"][0],
         "UpdateRuntimeConfig.network_config.pod_cidr"
@@ -706,6 +709,8 @@ async fn status_verbose_returns_structured_config() {
     );
     assert!(config["internalServices"]["health"]["runtime"]["ready"].is_boolean());
     assert!(config["internalServices"]["health"]["network"]["ready"].is_boolean());
+    assert!(config["internalServices"]["health"]["watchers"]["watcherStatus"].is_string());
+    assert!(config["internalServices"]["health"]["watchers"]["watcherBackoffCount"].is_u64());
     let health_conditions = config["internalServices"]["health"]["conditions"]
         .as_array()
         .unwrap();
@@ -967,6 +972,38 @@ async fn reload_cni_watch_once_records_last_error() {
         .current_reload_state()
         .last_cni_watch_error
         .is_some());
+}
+
+#[test]
+fn reload_watcher_state_transitions_record_backoff_and_stop() {
+    let mut state = RuntimeReloadState::default();
+
+    state.mark_watcher_running();
+    assert!(state.watcher_active);
+    assert_eq!(state.watcher_status, RuntimeReloadWatcherStatus::Running);
+    assert_eq!(state.watcher_backoff_count, 0);
+    assert!(state.watcher_next_retry_unix_millis.is_none());
+
+    let first_backoff = state.mark_watcher_error("config reload failed", 1_000);
+    assert_eq!(first_backoff, std::time::Duration::from_secs(1));
+    assert!(state.watcher_active);
+    assert_eq!(state.watcher_status, RuntimeReloadWatcherStatus::Backoff);
+    assert_eq!(state.watcher_backoff_count, 1);
+    assert_eq!(state.watcher_next_retry_unix_millis, Some(2_000));
+    assert_eq!(
+        state.watcher_last_error.as_deref(),
+        Some("config reload failed")
+    );
+
+    let second_backoff = state.mark_watcher_error("cni reload failed", 2_000);
+    assert_eq!(second_backoff, std::time::Duration::from_secs(2));
+    assert_eq!(state.watcher_backoff_count, 2);
+    assert_eq!(state.watcher_next_retry_unix_millis, Some(4_000));
+
+    state.mark_watcher_stopped();
+    assert!(!state.watcher_active);
+    assert_eq!(state.watcher_status, RuntimeReloadWatcherStatus::Stopped);
+    assert!(state.watcher_next_retry_unix_millis.is_none());
 }
 
 #[tokio::test]

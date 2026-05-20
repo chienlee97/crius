@@ -179,12 +179,20 @@ impl HealthService {
     pub fn watcher_status(
         &self,
         reload_watcher_active: bool,
+        watcher_status: serde_json::Value,
+        watcher_backoff_count: u32,
+        watcher_next_retry_unix_millis: Option<i64>,
+        watcher_last_error: Option<&str>,
         reload_error: Option<&str>,
         cni_watch_error: Option<&str>,
         shim_reconnect_supported: bool,
     ) -> serde_json::Value {
         serde_json::json!({
             "reloadWatcherActive": reload_watcher_active,
+            "watcherStatus": watcher_status,
+            "watcherBackoffCount": watcher_backoff_count,
+            "watcherNextRetryUnixMillis": watcher_next_retry_unix_millis,
+            "watcherLastError": watcher_last_error,
             "lastReloadError": reload_error,
             "lastCniWatchError": cni_watch_error,
             "shimReconnectSupported": shim_reconnect_supported,

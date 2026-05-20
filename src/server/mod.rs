@@ -80,7 +80,7 @@ mod streaming_handlers;
 pub(super) use service::RuntimeRegistry;
 pub use service::{
     IrqBalanceRestoreStatus, RuntimeConfig, RuntimeMetricsProvider, RuntimeReloadState,
-    RuntimeReloadableConfig, RuntimeServiceImpl,
+    RuntimeReloadWatcherStatus, RuntimeReloadableConfig, RuntimeServiceImpl,
 };
 
 const INTERNAL_ANNOTATION_PREFIX: &str = "io.crius.internal/";

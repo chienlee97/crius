@@ -1167,6 +1167,10 @@ impl RuntimeServiceImpl {
                         "conditions": extended_health_conditions,
                         "watchers": self.internal_services.health.watcher_status(
                             reload_state.watcher_active,
+                            serde_json::json!(reload_state.watcher_status),
+                            reload_state.watcher_backoff_count,
+                            reload_state.watcher_next_retry_unix_millis,
+                            reload_state.watcher_last_error.as_deref(),
                             reload_state.last_reload_error.as_deref(),
                             reload_state.last_cni_watch_error.as_deref(),
                             true,

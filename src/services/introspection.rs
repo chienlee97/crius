@@ -88,6 +88,10 @@ impl IntrospectionService {
             "configFileWatch": reload_state.config_file_watch,
             "configFilePath": config_path.map(|path| path.display().to_string()),
             "watcherActive": reload_state.watcher_active,
+            "watcherStatus": reload_state.watcher_status,
+            "watcherBackoffCount": reload_state.watcher_backoff_count,
+            "watcherNextRetryUnixMillis": reload_state.watcher_next_retry_unix_millis,
+            "watcherLastError": reload_state.watcher_last_error,
             "cniWatchDirs": reload_state.cni_watch_dirs,
             "reloadableFields": [
                 "runtime.pause_image",
@@ -269,6 +273,8 @@ mod tests {
             &state,
         );
         assert_eq!(value["watcherActive"], true);
+        assert_eq!(value["watcherStatus"], "stopped");
+        assert_eq!(value["watcherBackoffCount"], 0);
         assert_eq!(value["lastReloadError"], "failed");
         assert_eq!(value["configFilePath"], "/etc/crius/config.toml");
     }

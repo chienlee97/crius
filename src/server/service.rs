@@ -112,6 +112,7 @@ pub struct RuntimeServiceImpl {
     pub(super) runtime_network_config: Arc<Mutex<Option<crate::proto::runtime::v1::NetworkConfig>>>,
     pub(super) reloadable_config: StdArc<StdMutex<RuntimeReloadableConfig>>,
     pub(super) reload_state: StdArc<StdMutex<RuntimeReloadState>>,
+    pub(super) reload_watcher_shutdown: tokio::sync::broadcast::Sender<()>,
     pub(super) exit_monitors: Arc<Mutex<HashSet<String>>>,
     pub(super) container_stats_cache:
         Arc<Mutex<HashMap<String, CachedStatsEntry<crate::proto::runtime::v1::ContainerStats>>>>,
@@ -449,10 +450,57 @@ pub struct RuntimeReloadState {
     pub last_reload_fields: Vec<String>,
     pub last_reload_error: Option<String>,
     pub watcher_active: bool,
+    pub watcher_status: RuntimeReloadWatcherStatus,
+    pub watcher_backoff_count: u32,
+    pub watcher_next_retry_unix_millis: Option<i64>,
+    pub watcher_last_error: Option<String>,
     pub config_file_watch: bool,
     pub cni_watch_dirs: Vec<String>,
     pub last_cni_watch_at_unix_millis: Option<i64>,
     pub last_cni_watch_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeReloadWatcherStatus {
+    #[default]
+    Stopped,
+    Running,
+    Backoff,
+    Error,
+}
+
+impl RuntimeReloadState {
+    pub fn mark_watcher_running(&mut self) {
+        self.watcher_active = true;
+        self.watcher_status = RuntimeReloadWatcherStatus::Running;
+        self.watcher_backoff_count = 0;
+        self.watcher_next_retry_unix_millis = None;
+        self.watcher_last_error = None;
+    }
+
+    pub fn mark_watcher_stopped(&mut self) {
+        self.watcher_active = false;
+        self.watcher_status = RuntimeReloadWatcherStatus::Stopped;
+        self.watcher_next_retry_unix_millis = None;
+    }
+
+    pub fn mark_watcher_error(
+        &mut self,
+        error: impl Into<String>,
+        now_unix_millis: i64,
+    ) -> std::time::Duration {
+        self.watcher_active = true;
+        self.watcher_status = RuntimeReloadWatcherStatus::Backoff;
+        self.watcher_backoff_count = self.watcher_backoff_count.saturating_add(1);
+        let exponent = self.watcher_backoff_count.saturating_sub(1).min(5);
+        let backoff_secs = 1_u64 << exponent;
+        let backoff = std::time::Duration::from_secs(backoff_secs);
+        self.watcher_next_retry_unix_millis =
+            Some(now_unix_millis + i64::try_from(backoff.as_millis()).unwrap_or(i64::MAX));
+        self.watcher_last_error = Some(error.into());
+        backoff
+    }
 }
 
 #[derive(Clone)]
@@ -833,6 +881,12 @@ impl RuntimeServiceImpl {
 
     pub fn image_service(&self) -> ImageServiceImpl {
         self.image_service.clone()
+    }
+}
+
+impl Drop for RuntimeServiceImpl {
+    fn drop(&mut self) {
+        let _ = self.reload_watcher_shutdown.send(());
     }
 }
 
@@ -1793,6 +1847,7 @@ impl RuntimeServiceImpl {
                 .collect(),
             ..Default::default()
         }));
+        let (reload_watcher_shutdown, _) = tokio::sync::broadcast::channel(1);
         let seccomp_notifier_dir = config.runtime_root.join("seccomp-notifier");
         let seccomp_notifiers = StdArc::new(StdMutex::new(HashMap::new()));
         let seccomp_notifier_snapshots = StdArc::new(StdMutex::new(HashMap::<
@@ -1881,6 +1936,7 @@ impl RuntimeServiceImpl {
             runtime_network_config: Arc::new(Mutex::new(runtime_network_config)),
             reloadable_config,
             reload_state,
+            reload_watcher_shutdown,
             exit_monitors: Arc::new(Mutex::new(HashSet::new())),
             container_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             pod_stats_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -2095,9 +2151,10 @@ impl RuntimeServiceImpl {
         };
         let config_state = self.reload_state.clone();
         let config_clone = self.clone_for_background();
+        let mut shutdown = self.reload_watcher_shutdown.subscribe();
         handle.spawn(async move {
             if let Ok(mut state) = config_state.lock() {
-                state.watcher_active = true;
+                state.mark_watcher_running();
             }
             let config_path = config_clone.config.config_path.clone();
             let mut last_config_signature = config_path
@@ -2108,12 +2165,36 @@ impl RuntimeServiceImpl {
                     .current_reloadable_config()
                     .with_cni_config(&config_clone.config.cni_config),
             );
+            let mut next_delay = std::time::Duration::from_secs(1);
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = shutdown.recv() => {
+                        if let Ok(mut state) = config_state.lock() {
+                            state.mark_watcher_stopped();
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(next_delay) => {}
+                }
+                next_delay = std::time::Duration::from_secs(1);
                 if let Some(path) = config_path.as_deref() {
                     let current_signature = Self::config_watch_signature(path);
                     if current_signature != last_config_signature {
-                        let _ = config_clone.reload_config_file_once().await;
+                        match config_clone.reload_config_file_once().await {
+                            Ok(_) => {
+                                if let Ok(mut state) = config_state.lock() {
+                                    state.mark_watcher_running();
+                                }
+                            }
+                            Err(err) => {
+                                if let Ok(mut state) = config_state.lock() {
+                                    next_delay = state.mark_watcher_error(
+                                        err.message().to_string(),
+                                        chrono::Utc::now().timestamp_millis(),
+                                    );
+                                }
+                            }
+                        }
                         last_config_signature = current_signature;
                     }
                 }
@@ -2123,7 +2204,17 @@ impl RuntimeServiceImpl {
                         .with_cni_config(&config_clone.config.cni_config),
                 );
                 if current_cni_signature != last_cni_signature {
-                    let _ = config_clone.reload_cni_watch_once().await;
+                    let status = config_clone.reload_cni_watch_once().await;
+                    if status.ready {
+                        if let Ok(mut state) = config_state.lock() {
+                            state.mark_watcher_running();
+                        }
+                    } else if let Ok(mut state) = config_state.lock() {
+                        next_delay = state.mark_watcher_error(
+                            status.message,
+                            chrono::Utc::now().timestamp_millis(),
+                        );
+                    }
                     last_cni_signature = current_cni_signature;
                 }
             }
@@ -2167,6 +2258,7 @@ impl RuntimeServiceImpl {
             runtime_network_config: self.runtime_network_config.clone(),
             reloadable_config: self.reloadable_config.clone(),
             reload_state: self.reload_state.clone(),
+            reload_watcher_shutdown: self.reload_watcher_shutdown.clone(),
             exit_monitors: self.exit_monitors.clone(),
             container_stats_cache: self.container_stats_cache.clone(),
             pod_stats_cache: self.pod_stats_cache.clone(),
