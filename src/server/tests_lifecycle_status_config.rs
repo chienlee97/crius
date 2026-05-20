@@ -953,6 +953,65 @@ async fn reload_config_file_once_applies_reloadable_subset() {
 }
 
 #[tokio::test]
+async fn config_file_watcher_applies_reloadable_subset() {
+    let root_dir = tempdir().unwrap().keep();
+    let config_path = root_dir.join("crius.toml");
+    let cni_dir = root_dir.join("cni");
+    fs::create_dir_all(&cni_dir).unwrap();
+
+    let initial_config = crate::config::Config::default();
+    fs::write(&config_path, toml::to_string_pretty(&initial_config).unwrap()).unwrap();
+
+    let mut runtime_config = test_runtime_config(root_dir.clone());
+    runtime_config.config_path = Some(config_path.clone());
+    let service = RuntimeServiceImpl::new(runtime_config);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if service.current_reload_state().watcher_status == RuntimeReloadWatcherStatus::Running
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("config file watcher did not reach running state");
+
+    let mut updated_config = crate::config::Config::default();
+    updated_config.runtime.pause_image = "registry.example/pause:v4-watcher".to_string();
+    updated_config.image.pinned_images = vec!["registry.example/watched:*".to_string()];
+    updated_config.network.config_dirs = vec![cni_dir.display().to_string()];
+    fs::write(&config_path, toml::to_string_pretty(&updated_config).unwrap()).unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let current = service.current_reloadable_config();
+            if current.pause_image == "registry.example/pause:v4-watcher"
+                && current.pinned_images == vec!["registry.example/watched:*".to_string()]
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("config file watcher did not apply reloadable fields");
+
+    let current = service.current_reloadable_config();
+    assert_eq!(current.cni_config_dirs, vec![cni_dir]);
+    let reload_state = service.current_reload_state();
+    assert_eq!(reload_state.last_reload_source.as_deref(), Some("config-file"));
+    assert!(reload_state
+        .last_reload_fields
+        .contains(&"runtime.pause_image".to_string()));
+    assert!(reload_state
+        .last_reload_fields
+        .contains(&"image.pinned_images".to_string()));
+    assert!(reload_state.last_reload_error.is_none());
+}
+
+#[tokio::test]
 async fn reload_cni_watch_once_records_last_error() {
     let service = test_service();
     let dir = tempdir().unwrap();

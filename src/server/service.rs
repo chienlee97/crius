@@ -2153,9 +2153,6 @@ impl RuntimeServiceImpl {
         let config_clone = self.clone_for_background();
         let mut shutdown = self.reload_watcher_shutdown.subscribe();
         handle.spawn(async move {
-            if let Ok(mut state) = config_state.lock() {
-                state.mark_watcher_running();
-            }
             let config_path = config_clone.config.config_path.clone();
             let mut last_config_signature = config_path
                 .as_deref()
@@ -2165,6 +2162,9 @@ impl RuntimeServiceImpl {
                     .current_reloadable_config()
                     .with_cni_config(&config_clone.config.cni_config),
             );
+            if let Ok(mut state) = config_state.lock() {
+                state.mark_watcher_running();
+            }
             let mut next_delay = std::time::Duration::from_secs(1);
             loop {
                 tokio::select! {
