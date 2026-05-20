@@ -209,6 +209,23 @@ pub struct EffectiveRootlessConfig {
     pub tolerate_missing_hugetlb_controller: bool,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RootlessLimitations {
+    pub cgroup: RootlessLimitation,
+    pub hugetlb: RootlessLimitation,
+    pub oom_score_adj: RootlessLimitation,
+    pub devices: RootlessLimitation,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RootlessLimitation {
+    pub degraded: bool,
+    pub reason: &'static str,
+    pub message: &'static str,
+}
+
 impl EffectiveRootlessConfig {
     pub fn disabled() -> Self {
         Self {
@@ -286,6 +303,80 @@ impl EffectiveRootlessConfig {
             disable_cgroup: true,
             tolerate_missing_hugetlb_controller: true,
         })
+    }
+
+    pub fn limitations(&self) -> RootlessLimitations {
+        if !self.enabled {
+            return RootlessLimitations {
+                cgroup: RootlessLimitation {
+                    degraded: false,
+                    reason: "RootlessDisabled",
+                    message: "rootless mode is disabled",
+                },
+                hugetlb: RootlessLimitation {
+                    degraded: false,
+                    reason: "RootlessDisabled",
+                    message: "rootless mode is disabled",
+                },
+                oom_score_adj: RootlessLimitation {
+                    degraded: false,
+                    reason: "RootlessDisabled",
+                    message: "rootless mode is disabled",
+                },
+                devices: RootlessLimitation {
+                    degraded: false,
+                    reason: "RootlessDisabled",
+                    message: "rootless mode is disabled",
+                },
+            };
+        }
+
+        RootlessLimitations {
+            cgroup: RootlessLimitation {
+                degraded: self.disable_cgroup,
+                reason: if self.disable_cgroup {
+                    "RootlessCgroupDisabled"
+                } else {
+                    "RootlessCgroupEnabled"
+                },
+                message: if self.disable_cgroup {
+                    "container cgroup paths and resource updates are disabled in rootless mode"
+                } else {
+                    "container cgroup paths remain enabled"
+                },
+            },
+            hugetlb: RootlessLimitation {
+                degraded: self.tolerate_missing_hugetlb_controller,
+                reason: if self.tolerate_missing_hugetlb_controller {
+                    "RootlessHugetlbControllerOptional"
+                } else {
+                    "RootlessHugetlbControllerRequired"
+                },
+                message: if self.tolerate_missing_hugetlb_controller {
+                    "missing hugetlb controller is tolerated in rootless mode"
+                } else {
+                    "hugetlb controller availability is enforced"
+                },
+            },
+            oom_score_adj: RootlessLimitation {
+                degraded: false,
+                reason: "RootlessOomScoreAdjPolicyUnchanged",
+                message: "oom_score_adj policy is still enforced by the runtime configuration",
+            },
+            devices: RootlessLimitation {
+                degraded: self.disable_cgroup,
+                reason: if self.disable_cgroup {
+                    "RootlessDeviceCgroupRulesDisabled"
+                } else {
+                    "RootlessDeviceCgroupRulesEnabled"
+                },
+                message: if self.disable_cgroup {
+                    "device cgroup rules are omitted because rootless mode disables cgroups"
+                } else {
+                    "device cgroup rules remain available"
+                },
+            },
+        }
     }
 }
 
@@ -741,6 +832,43 @@ mod tests {
             PathBuf::from("/tmp/crius-rootless-runtime")
                 .join("crius")
                 .join("netns")
+        );
+    }
+
+    #[test]
+    fn rootless_limitations_explain_degraded_resources() {
+        let effective = EffectiveRootlessConfig {
+            enabled: true,
+            current_uid: 1000,
+            current_gid: 1000,
+            in_user_namespace: true,
+            xdg_runtime_dir: PathBuf::from("/run/user/1000"),
+            xdg_data_home: PathBuf::from("/home/user/.local/share"),
+            storage_root: PathBuf::from("/home/user/.local/share/crius/storage"),
+            runtime_root: PathBuf::from("/run/user/1000/crius"),
+            netns_dir: PathBuf::from("/run/user/1000/crius/netns"),
+            use_fuse_overlayfs: true,
+            network_mode: NetworkMode::None,
+            slirp4netns_path: PathBuf::from("slirp4netns"),
+            pasta_path: PathBuf::from("pasta"),
+            disable_cgroup: true,
+            tolerate_missing_hugetlb_controller: true,
+        };
+
+        let limitations = effective.limitations();
+
+        assert!(limitations.cgroup.degraded);
+        assert_eq!(limitations.cgroup.reason, "RootlessCgroupDisabled");
+        assert!(limitations.hugetlb.degraded);
+        assert_eq!(
+            limitations.hugetlb.reason,
+            "RootlessHugetlbControllerOptional"
+        );
+        assert!(!limitations.oom_score_adj.degraded);
+        assert!(limitations.devices.degraded);
+        assert_eq!(
+            limitations.devices.reason,
+            "RootlessDeviceCgroupRulesDisabled"
         );
     }
 }

@@ -79,6 +79,7 @@ impl IntrospectionService {
             "networkModeSupported": rootless.network_mode.is_supported(),
             "networkModeReason": rootless.network_mode.support_reason(),
             "networkHelperPath": network_helper_path,
+            "limitations": rootless.limitations(),
             "useFuseOverlayfs": rootless.use_fuse_overlayfs,
             "disableCgroup": rootless.disable_cgroup,
             "tolerateMissingHugetlbController": rootless.tolerate_missing_hugetlb_controller,
@@ -271,6 +272,11 @@ mod tests {
         assert_eq!(value["networkModeSupported"], true);
         assert_eq!(value["networkModeReason"], "RootlessSlirp4netnsSupported");
         assert_eq!(value["networkHelperPath"], "/usr/bin/slirp4netns");
+        assert_eq!(
+            value["limitations"]["cgroup"]["reason"],
+            "RootlessCgroupDisabled"
+        );
+        assert_eq!(value["limitations"]["devices"]["degraded"], true);
         assert_eq!(value["storageRoot"], "/home/user/.local/share/crius");
     }
 

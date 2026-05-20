@@ -434,6 +434,14 @@ async fn status_verbose_returns_structured_config() {
         "/home/test/.local/share/crius/storage"
     );
     assert_eq!(
+        config["rootless"]["limitations"]["cgroup"]["reason"],
+        "RootlessCgroupDisabled"
+    );
+    assert_eq!(
+        config["rootless"]["limitations"]["devices"]["degraded"],
+        true
+    );
+    assert_eq!(
         config["imageStorageOptions"],
         serde_json::json!([
             "overlay.mount_program=/usr/bin/fuse-overlayfs",
