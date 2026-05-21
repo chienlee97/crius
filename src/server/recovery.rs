@@ -1,5 +1,6 @@
 use super::service::{
-    RecoveryCleanupCounter, RecoveryReconcileSummary, RecoveryResultSummary, RecoveryStage,
+    RecoveryCleanupCounter, RecoveryOrphanCleanupSummary, RecoveryReconcileSummary,
+    RecoveryResultSummary, RecoveryStage,
 };
 use super::*;
 use crate::state::{
@@ -938,76 +939,10 @@ impl RuntimeServiceImpl {
         summary
     }
 
-    async fn record_orphan_cleanup_event(&self, owner_kind: &str, owner_id: &str, path: &Path) {
-        let details = format!(
-            "pending cleanup for orphaned {owner_kind} artifact at {}",
-            path.display()
-        );
-        if let Err(err) = self
-            .persistence
-            .lock()
-            .await
-            .storage_mut()
-            .append_typed_event(
-                "reconcile",
-                "orphan_cleanup",
-                owner_id,
-                None,
-                Some("pending"),
-                Some(&details),
-            )
-        {
-            log::warn!(
-                "Failed to record orphan cleanup event for {} {}: {}",
-                owner_kind,
-                owner_id,
-                err
-            );
-        }
-    }
-
-    pub async fn recover_state(&self) -> Result<(), Status> {
-        let recovery_started = Instant::now();
-        let mut recovery_result = RecoveryResultSummary {
-            finished_at_unix_millis: chrono::Utc::now().timestamp_millis(),
-            success: false,
-            ..Default::default()
-        };
-
-        let stage_started = Instant::now();
-        let snapshot = match self.load_recovery_ledger_snapshot().await {
-            Ok(snapshot) => {
-                let items = snapshot.containers.len()
-                    + snapshot.pods.len()
-                    + snapshot.snapshots.len()
-                    + snapshot.runtime_artifacts.len()
-                    + snapshot.shim_processes.len();
-                recovery_result.stages.push(Self::recovery_stage_summary(
-                    RecoveryStage::LoadLedgerSnapshot,
-                    stage_started,
-                    true,
-                    items,
-                    None,
-                ));
-                snapshot
-            }
-            Err(status) => {
-                recovery_result.stages.push(Self::recovery_stage_summary(
-                    RecoveryStage::LoadLedgerSnapshot,
-                    stage_started,
-                    false,
-                    0,
-                    Some(status.message().to_string()),
-                ));
-                recovery_result.total_duration_millis =
-                    recovery_started.elapsed().as_millis() as u64;
-                recovery_result.finished_at_unix_millis = chrono::Utc::now().timestamp_millis();
-                self.record_last_recovery_result(recovery_result);
-                return Err(status);
-            }
-        };
-
-        let stage_started = Instant::now();
+    async fn restore_recovery_memory_state(
+        &self,
+        snapshot: &RecoveryLedgerSnapshot,
+    ) -> Result<usize, Status> {
         {
             let mut memory_containers = self.containers.lock().await;
             for RecoveryContainerEntry { status, record } in snapshot.containers.iter().cloned() {
@@ -1037,7 +972,7 @@ impl RuntimeServiceImpl {
                             .to_string()
                     });
 
-                let container = crate::proto::runtime::v1::Container {
+                let mut container = crate::proto::runtime::v1::Container {
                     id: record.id.clone(),
                     metadata: Some(crate::proto::runtime::v1::ContainerMetadata {
                         name: container_name.clone(),
@@ -1070,7 +1005,6 @@ impl RuntimeServiceImpl {
                     annotations,
                     created_at: record.created_at,
                 };
-                let mut container = container;
                 if let Some(mut state) = container_state.clone() {
                     if state.finished_at.is_none() {
                         state.finished_at = record.exit_time;
@@ -1190,56 +1124,57 @@ impl RuntimeServiceImpl {
                     .and_then(|ip| ip.parse::<IpAddr>().ok())
                     .or(selected_primary_ip);
                 let network_status = primary_ip.map(|parsed_ip| {
-                        let mut additional_ip_values = Vec::new();
-                        let mut seen = std::collections::HashSet::new();
-                        for ip in &ordered_ip_values {
-                            if ip == &parsed_ip {
-                                continue;
-                            }
-                            if seen.insert(*ip) {
-                                additional_ip_values.push(*ip);
-                            }
+                    let mut additional_ip_values = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    for ip in &ordered_ip_values {
+                        if ip == &parsed_ip {
+                            continue;
                         }
-                        let mut status = pod_state
-                            .raw_cni_result
-                            .as_ref()
-                            .and_then(|raw| {
-                                crate::network::CniManager::network_status_from_cni_result_with_preference(
-                                    Some(raw),
-                                    self.config.cni_config.ip_pref(),
-                                ).ok()
-                            })
-                            .unwrap_or(crate::network::NetworkStatus {
-                                name: "default".to_string(),
-                                ip: Some(parsed_ip),
-                                mac: None,
-                                interfaces: additional_ip_values
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(idx, ip)| crate::network::NetworkInterface {
-                                        name: format!("additional{}", idx),
-                                        ip: Some(*ip),
-                                        mac: None,
-                                        netmask: None,
-                                        gateway: None,
-                                    })
-                                    .collect(),
-                                raw_result: None,
-                            });
-                        status.ip = Some(parsed_ip);
-                        status.interfaces = additional_ip_values
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, ip)| crate::network::NetworkInterface {
-                                name: format!("additional{}", idx),
-                                ip: Some(*ip),
-                                mac: None,
-                                netmask: None,
-                                gateway: None,
-                            })
-                            .collect();
-                        status
-                    });
+                        if seen.insert(*ip) {
+                            additional_ip_values.push(*ip);
+                        }
+                    }
+                    let mut status = pod_state
+                        .raw_cni_result
+                        .as_ref()
+                        .and_then(|raw| {
+                            crate::network::CniManager::network_status_from_cni_result_with_preference(
+                                Some(raw),
+                                self.config.cni_config.ip_pref(),
+                            )
+                            .ok()
+                        })
+                        .unwrap_or(crate::network::NetworkStatus {
+                            name: "default".to_string(),
+                            ip: Some(parsed_ip),
+                            mac: None,
+                            interfaces: additional_ip_values
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, ip)| crate::network::NetworkInterface {
+                                    name: format!("additional{}", idx),
+                                    ip: Some(*ip),
+                                    mac: None,
+                                    netmask: None,
+                                    gateway: None,
+                                })
+                                .collect(),
+                            raw_result: None,
+                        });
+                    status.ip = Some(parsed_ip);
+                    status.interfaces = additional_ip_values
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, ip)| crate::network::NetworkInterface {
+                            name: format!("additional{}", idx),
+                            ip: Some(*ip),
+                            mac: None,
+                            netmask: None,
+                            gateway: None,
+                        })
+                        .collect();
+                    status
+                });
 
                 pod_manager.restore_pod_sandbox(crate::pod::PodSandbox {
                     id: record.id.clone(),
@@ -1341,15 +1276,11 @@ impl RuntimeServiceImpl {
                 memory_pods.len()
             );
         }
-        recovery_result.stages.push(Self::recovery_stage_summary(
-            RecoveryStage::RestoreMemoryState,
-            stage_started,
-            true,
-            snapshot.containers.len() + snapshot.pods.len(),
-            None,
-        ));
 
-        let stage_started = Instant::now();
+        Ok(snapshot.containers.len() + snapshot.pods.len())
+    }
+
+    async fn reserve_recovered_container_names(&self) -> usize {
         let recovered_container_name_keys = {
             let containers = self.containers.lock().await;
             let pods = self.pod_sandboxes.lock().await;
@@ -1380,6 +1311,178 @@ impl RuntimeServiceImpl {
                 );
             }
         }
+        recovered_container_name_key_count
+    }
+
+    async fn restore_recovered_seccomp_notifiers(&self) -> usize {
+        let mut restored_seccomp_notifiers = 0;
+        let recovered_seccomp_notifiers = {
+            let containers = self.containers.lock().await;
+            containers
+                .values()
+                .filter_map(|container| {
+                    let state = Self::read_internal_state::<StoredContainerState>(
+                        &container.annotations,
+                        INTERNAL_CONTAINER_STATE_KEY,
+                    )?;
+                    let mode = match state.seccomp_notifier_action.as_deref() {
+                        Some("stop") => Some(crate::runtime::SeccompNotifierMode::Stop),
+                        Some("log") | Some("") => Some(crate::runtime::SeccompNotifierMode::Log),
+                        _ => None,
+                    }?;
+                    Some((container.id.clone(), mode))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (container_id, mode) in recovered_seccomp_notifiers {
+            if let Err(err) = self.ensure_seccomp_notifier(&container_id, mode) {
+                log::warn!(
+                    "Failed to restore seccomp notifier for recovered container {}: {}",
+                    container_id,
+                    err
+                );
+            } else {
+                restored_seccomp_notifiers += 1;
+            }
+        }
+        restored_seccomp_notifiers
+    }
+
+    async fn cleanup_recovery_orphans(
+        &self,
+        snapshot: &RecoveryLedgerSnapshot,
+    ) -> RecoveryOrphanCleanupSummary {
+        let mut summary = RecoveryOrphanCleanupSummary::default();
+        if self.last_startup_clean_shutdown().unwrap_or(false)
+            && !self.last_startup_detected_reboot().unwrap_or(false)
+            && !self.last_startup_detected_upgrade().unwrap_or(false)
+        {
+            log::info!("Skipping orphan runtime sweeps because previous shutdown was clean");
+            summary.skipped = true;
+            summary.skip_reason = Some("clean-shutdown".to_string());
+        } else if !self.config.internal_wipe {
+            log::info!("Skipping orphan runtime sweeps because runtime.internal_wipe is disabled");
+            summary.skipped = true;
+            summary.skip_reason = Some("internal-wipe-disabled".to_string());
+        } else {
+            let runtime_cleanup = self
+                .cleanup_orphaned_runtime_bundles_from_ledger(snapshot)
+                .await;
+            let pod_cleanup = self
+                .cleanup_orphaned_pod_workspaces_from_ledger(snapshot)
+                .await;
+            let shim_cleanup = self.cleanup_orphaned_shim_artifacts().await;
+            let pause_cleanup = self.cleanup_orphaned_pause_processes().await;
+            summary.runtime_bundles_removed = runtime_cleanup.removed;
+            summary.pod_workspaces_removed = pod_cleanup.removed;
+            summary.shim_dirs_removed = shim_cleanup.shim_dirs_removed;
+            summary.attach_socket_dirs_removed = shim_cleanup.attach_socket_dirs_removed;
+            summary.pause_processes_killed = pause_cleanup.removed;
+            summary.failures = runtime_cleanup.failures
+                + pod_cleanup.failures
+                + shim_cleanup.failures
+                + pause_cleanup.failures;
+        }
+        summary
+    }
+
+    async fn record_orphan_cleanup_event(&self, owner_kind: &str, owner_id: &str, path: &Path) {
+        let details = format!(
+            "pending cleanup for orphaned {owner_kind} artifact at {}",
+            path.display()
+        );
+        if let Err(err) = self
+            .persistence
+            .lock()
+            .await
+            .storage_mut()
+            .append_typed_event(
+                "reconcile",
+                "orphan_cleanup",
+                owner_id,
+                None,
+                Some("pending"),
+                Some(&details),
+            )
+        {
+            log::warn!(
+                "Failed to record orphan cleanup event for {} {}: {}",
+                owner_kind,
+                owner_id,
+                err
+            );
+        }
+    }
+
+    pub async fn recover_state(&self) -> Result<(), Status> {
+        let recovery_started = Instant::now();
+        let mut recovery_result = RecoveryResultSummary {
+            finished_at_unix_millis: chrono::Utc::now().timestamp_millis(),
+            success: false,
+            ..Default::default()
+        };
+
+        let stage_started = Instant::now();
+        let snapshot = match self.load_recovery_ledger_snapshot().await {
+            Ok(snapshot) => {
+                let items = snapshot.containers.len()
+                    + snapshot.pods.len()
+                    + snapshot.snapshots.len()
+                    + snapshot.runtime_artifacts.len()
+                    + snapshot.shim_processes.len();
+                recovery_result.stages.push(Self::recovery_stage_summary(
+                    RecoveryStage::LoadLedgerSnapshot,
+                    stage_started,
+                    true,
+                    items,
+                    None,
+                ));
+                snapshot
+            }
+            Err(status) => {
+                recovery_result.stages.push(Self::recovery_stage_summary(
+                    RecoveryStage::LoadLedgerSnapshot,
+                    stage_started,
+                    false,
+                    0,
+                    Some(status.message().to_string()),
+                ));
+                recovery_result.total_duration_millis =
+                    recovery_started.elapsed().as_millis() as u64;
+                recovery_result.finished_at_unix_millis = chrono::Utc::now().timestamp_millis();
+                self.record_last_recovery_result(recovery_result);
+                return Err(status);
+            }
+        };
+
+        let stage_started = Instant::now();
+        let restored_memory_items = match self.restore_recovery_memory_state(&snapshot).await {
+            Ok(items) => items,
+            Err(status) => {
+                recovery_result.stages.push(Self::recovery_stage_summary(
+                    RecoveryStage::RestoreMemoryState,
+                    stage_started,
+                    false,
+                    0,
+                    Some(status.message().to_string()),
+                ));
+                recovery_result.total_duration_millis =
+                    recovery_started.elapsed().as_millis() as u64;
+                recovery_result.finished_at_unix_millis = chrono::Utc::now().timestamp_millis();
+                self.record_last_recovery_result(recovery_result);
+                return Err(status);
+            }
+        };
+        recovery_result.stages.push(Self::recovery_stage_summary(
+            RecoveryStage::RestoreMemoryState,
+            stage_started,
+            true,
+            restored_memory_items,
+            None,
+        ));
+
+        let stage_started = Instant::now();
+        let recovered_container_name_key_count = self.reserve_recovered_container_names().await;
         recovery_result.stages.push(Self::recovery_stage_summary(
             RecoveryStage::ReserveRecoveredNames,
             stage_started,
@@ -1414,36 +1517,7 @@ impl RuntimeServiceImpl {
         }
 
         let stage_started = Instant::now();
-        let mut restored_seccomp_notifiers = 0;
-        let recovered_seccomp_notifiers = {
-            let containers = self.containers.lock().await;
-            containers
-                .values()
-                .filter_map(|container| {
-                    let state = Self::read_internal_state::<StoredContainerState>(
-                        &container.annotations,
-                        INTERNAL_CONTAINER_STATE_KEY,
-                    )?;
-                    let mode = match state.seccomp_notifier_action.as_deref() {
-                        Some("stop") => Some(crate::runtime::SeccompNotifierMode::Stop),
-                        Some("log") | Some("") => Some(crate::runtime::SeccompNotifierMode::Log),
-                        _ => None,
-                    }?;
-                    Some((container.id.clone(), mode))
-                })
-                .collect::<Vec<_>>()
-        };
-        for (container_id, mode) in recovered_seccomp_notifiers {
-            if let Err(err) = self.ensure_seccomp_notifier(&container_id, mode) {
-                log::warn!(
-                    "Failed to restore seccomp notifier for recovered container {}: {}",
-                    container_id,
-                    err
-                );
-            } else {
-                restored_seccomp_notifiers += 1;
-            }
-        }
+        let restored_seccomp_notifiers = self.restore_recovered_seccomp_notifiers().await;
         recovery_result.stages.push(Self::recovery_stage_summary(
             RecoveryStage::RestoreSeccompNotifiers,
             stage_started,
@@ -1492,37 +1566,7 @@ impl RuntimeServiceImpl {
         ));
 
         let stage_started = Instant::now();
-        if self.last_startup_clean_shutdown().unwrap_or(false)
-            && !self.last_startup_detected_reboot().unwrap_or(false)
-            && !self.last_startup_detected_upgrade().unwrap_or(false)
-        {
-            log::info!("Skipping orphan runtime sweeps because previous shutdown was clean");
-            recovery_result.orphan_cleanup.skipped = true;
-            recovery_result.orphan_cleanup.skip_reason = Some("clean-shutdown".to_string());
-        } else if !self.config.internal_wipe {
-            log::info!("Skipping orphan runtime sweeps because runtime.internal_wipe is disabled");
-            recovery_result.orphan_cleanup.skipped = true;
-            recovery_result.orphan_cleanup.skip_reason = Some("internal-wipe-disabled".to_string());
-        } else {
-            let runtime_cleanup = self
-                .cleanup_orphaned_runtime_bundles_from_ledger(&snapshot)
-                .await;
-            let pod_cleanup = self
-                .cleanup_orphaned_pod_workspaces_from_ledger(&snapshot)
-                .await;
-            let shim_cleanup = self.cleanup_orphaned_shim_artifacts().await;
-            let pause_cleanup = self.cleanup_orphaned_pause_processes().await;
-            recovery_result.orphan_cleanup.runtime_bundles_removed = runtime_cleanup.removed;
-            recovery_result.orphan_cleanup.pod_workspaces_removed = pod_cleanup.removed;
-            recovery_result.orphan_cleanup.shim_dirs_removed = shim_cleanup.shim_dirs_removed;
-            recovery_result.orphan_cleanup.attach_socket_dirs_removed =
-                shim_cleanup.attach_socket_dirs_removed;
-            recovery_result.orphan_cleanup.pause_processes_killed = pause_cleanup.removed;
-            recovery_result.orphan_cleanup.failures = runtime_cleanup.failures
-                + pod_cleanup.failures
-                + shim_cleanup.failures
-                + pause_cleanup.failures;
-        }
+        recovery_result.orphan_cleanup = self.cleanup_recovery_orphans(&snapshot).await;
         let orphan_items = recovery_result.orphan_cleanup.runtime_bundles_removed
             + recovery_result.orphan_cleanup.pod_workspaces_removed
             + recovery_result.orphan_cleanup.shim_dirs_removed
