@@ -9,6 +9,18 @@ use crate::state::{
 };
 use std::time::Instant;
 
+#[derive(Default)]
+struct RecoveryRuntimeLiveState {
+    container_statuses: HashMap<String, ContainerStatus>,
+    pause_statuses: HashMap<String, ContainerStatus>,
+}
+
+#[derive(Default)]
+struct RecoveryShimReconnectResult {
+    reconnected_shims: Vec<String>,
+    broken_containers: HashMap<String, StoredBrokenState>,
+}
+
 impl RuntimeServiceImpl {
     fn broken_state(kind: impl Into<String>, details: impl Into<String>) -> StoredBrokenState {
         StoredBrokenState {
@@ -554,11 +566,131 @@ impl RuntimeServiceImpl {
         }
     }
 
+    async fn probe_runtime_live_state(
+        &self,
+        snapshot: &RecoveryLedgerSnapshot,
+    ) -> RecoveryRuntimeLiveState {
+        let mut live_state = RecoveryRuntimeLiveState::default();
+
+        for RecoveryContainerEntry { record, .. } in &snapshot.containers {
+            live_state.container_statuses.insert(
+                record.id.clone(),
+                self.runtime_container_status_checked(&record.id).await,
+            );
+        }
+
+        for pod in &snapshot.pods {
+            let pod_state = Self::read_internal_state::<StoredPodState>(
+                &serde_json::from_str::<HashMap<String, String>>(&pod.annotations)
+                    .unwrap_or_default(),
+                INTERNAL_POD_STATE_KEY,
+            )
+            .unwrap_or_default();
+            if let Some(pause_container_id) = pod_state.pause_container_id {
+                let status = self
+                    .runtime_container_status_checked(&pause_container_id)
+                    .await;
+                live_state.pause_statuses.insert(pause_container_id, status);
+            }
+        }
+
+        live_state
+    }
+
+    async fn reconnect_shims_from_ledger(
+        &self,
+        snapshot: &RecoveryLedgerSnapshot,
+    ) -> RecoveryShimReconnectResult {
+        let mut result = RecoveryShimReconnectResult::default();
+
+        for shim_record in &snapshot.shim_processes {
+            let container_id = shim_record.container_id.as_str();
+            let shim_pid_live = PathBuf::from("/proc")
+                .join(shim_record.shim_pid.to_string())
+                .exists();
+            let shim_socket_missing = !Path::new(&shim_record.socket_path).exists();
+            if shim_socket_missing && !shim_pid_live {
+                let broken = self
+                    .mark_shim_socket_missing(container_id, &shim_record.state)
+                    .await;
+                result
+                    .broken_containers
+                    .insert(container_id.to_string(), broken);
+                continue;
+            }
+
+            match self.runtime.shim_status(container_id) {
+                Ok(Some(status))
+                    if matches!(
+                        status.state,
+                        crate::shim_rpc::TaskState::Created
+                            | crate::shim_rpc::TaskState::Running
+                            | crate::shim_rpc::TaskState::Paused
+                    ) =>
+                {
+                    result.reconnected_shims.push(container_id.to_string());
+                }
+                Ok(None) if shim_pid_live => {
+                    result.reconnected_shims.push(container_id.to_string());
+                }
+                Ok(Some(_)) => {
+                    result.reconnected_shims.push(container_id.to_string());
+                }
+                Ok(None) => {
+                    let broken = self
+                        .mark_shim_socket_missing(container_id, &shim_record.state)
+                        .await;
+                    result
+                        .broken_containers
+                        .insert(container_id.to_string(), broken);
+                }
+                Err(err) => {
+                    let details = format!("failed to query shim live state: {}", err);
+                    self.mark_shim_process_state(
+                        container_id,
+                        &shim_record.state,
+                        ShimLedgerState::Degraded,
+                        &details,
+                    )
+                    .await;
+                    result.broken_containers.insert(
+                        container_id.to_string(),
+                        Self::broken_state("shim_reconcile_failed", details),
+                    );
+                }
+            }
+        }
+
+        result.reconnected_shims.sort();
+        result.reconnected_shims.dedup();
+        result
+    }
+
+    async fn mark_shim_socket_missing(
+        &self,
+        container_id: &str,
+        old_state: &str,
+    ) -> StoredBrokenState {
+        let details = "shim ledger entry exists but task socket is unavailable";
+        self.mark_shim_process_state(container_id, old_state, ShimLedgerState::Dead, details)
+            .await;
+        Self::broken_state(
+            "shim_socket_missing",
+            format!(
+                "shim ledger entry exists for {} but task socket is unavailable",
+                container_id
+            ),
+        )
+    }
+
     async fn reconcile_recovered_state_from_ledger(
         &self,
         snapshot: &RecoveryLedgerSnapshot,
+        live_state: &RecoveryRuntimeLiveState,
+        shim_reconnect: &RecoveryShimReconnectResult,
     ) -> Result<RecoveryReconcileSummary, Status> {
         let mut summary = RecoveryReconcileSummary::default();
+        summary.reconnected_shims = shim_reconnect.reconnected_shims.clone();
         for RecoveryContainerEntry { record, .. } in &snapshot.containers {
             let container_id = record.id.as_str();
             let runtime = record
@@ -566,7 +698,11 @@ impl RuntimeServiceImpl {
                 .as_deref()
                 .and_then(|handler| self.runtime.runtime_for_handler(handler).ok())
                 .or_else(|| self.runtime.runtime_for_container(container_id).ok());
-            let runtime_status = self.runtime_container_status_checked(container_id).await;
+            let runtime_status = live_state
+                .container_statuses
+                .get(container_id)
+                .cloned()
+                .unwrap_or(ContainerStatus::Unknown);
 
             let mut broken = None;
             if let Some(runtime) = runtime.as_ref() {
@@ -614,81 +750,7 @@ impl RuntimeServiceImpl {
             }
 
             if broken.is_none() {
-                if let Some(shim_record) = snapshot
-                    .shim_processes
-                    .iter()
-                    .find(|record| record.container_id == container_id)
-                {
-                    let shim_pid_live = PathBuf::from("/proc")
-                        .join(shim_record.shim_pid.to_string())
-                        .exists();
-                    let shim_socket_missing = !Path::new(&shim_record.socket_path).exists();
-                    if shim_socket_missing && !shim_pid_live {
-                        let details = "shim ledger entry exists but task socket is unavailable";
-                        self.mark_shim_process_state(
-                            container_id,
-                            &shim_record.state,
-                            ShimLedgerState::Dead,
-                            details,
-                        )
-                        .await;
-                        broken = Some(Self::broken_state(
-                            "shim_socket_missing",
-                            format!(
-                                "shim ledger entry exists for {} but task socket is unavailable",
-                                container_id
-                            ),
-                        ));
-                    } else {
-                        match self.runtime.shim_status(container_id) {
-                            Ok(Some(status))
-                                if matches!(
-                                    status.state,
-                                    crate::shim_rpc::TaskState::Created
-                                        | crate::shim_rpc::TaskState::Running
-                                        | crate::shim_rpc::TaskState::Paused
-                                ) =>
-                            {
-                                summary.reconnected_shims.push(container_id.to_string());
-                            }
-                            Ok(None) if shim_pid_live => {
-                                summary.reconnected_shims.push(container_id.to_string());
-                            }
-                            Ok(Some(_)) => {
-                                summary.reconnected_shims.push(container_id.to_string());
-                            }
-                            Ok(None) => {
-                                let details =
-                                    "shim ledger entry exists but task socket is unavailable";
-                                self.mark_shim_process_state(
-                                    container_id,
-                                    &shim_record.state,
-                                    ShimLedgerState::Dead,
-                                    details,
-                                )
-                                .await;
-                                broken = Some(Self::broken_state(
-                                    "shim_socket_missing",
-                                    format!(
-                                        "shim ledger entry exists for {} but task socket is unavailable",
-                                        container_id
-                                    ),
-                                ));
-                            }
-                            Err(err) => {
-                                let details = format!("failed to query shim live state: {}", err);
-                                self.mark_shim_process_state(
-                                    container_id,
-                                    &shim_record.state,
-                                    ShimLedgerState::Degraded,
-                                    &details,
-                                )
-                                .await;
-                                broken = Some(Self::broken_state("shim_reconcile_failed", details));
-                            }
-                        }
-                    }
-                }
+                broken = shim_reconnect.broken_containers.get(container_id).cloned();
             }
 
             let detected_broken = broken.clone();
@@ -786,9 +848,11 @@ impl RuntimeServiceImpl {
             }
 
             if let Some(pause_container_id) = pause_container_id {
-                let pause_status = self
-                    .runtime_container_status_checked(&pause_container_id)
-                    .await;
+                let pause_status = live_state
+                    .pause_statuses
+                    .get(&pause_container_id)
+                    .cloned()
+                    .unwrap_or(ContainerStatus::Unknown);
                 let next_state = match pause_status {
                     ContainerStatus::Running if has_netns => "ready",
                     ContainerStatus::Unknown if has_netns => pod.state.as_str(),
@@ -819,8 +883,6 @@ impl RuntimeServiceImpl {
             }
         }
 
-        summary.reconnected_shims.sort();
-        summary.reconnected_shims.dedup();
         Ok(summary)
     }
 
@@ -1527,7 +1589,35 @@ impl RuntimeServiceImpl {
         ));
 
         let stage_started = Instant::now();
-        match self.reconcile_recovered_state_from_ledger(&snapshot).await {
+        let live_state = self.probe_runtime_live_state(&snapshot).await;
+        let live_state_items =
+            live_state.container_statuses.len() + live_state.pause_statuses.len();
+        recovery_result.stages.push(Self::recovery_stage_summary(
+            RecoveryStage::ProbeRuntimeLiveState,
+            stage_started,
+            true,
+            live_state_items,
+            None,
+        ));
+
+        let stage_started = Instant::now();
+        let shim_reconnect = self.reconnect_shims_from_ledger(&snapshot).await;
+        let shim_reconnect_items =
+            shim_reconnect.reconnected_shims.len() + shim_reconnect.broken_containers.len();
+        recovery_result.reconcile.reconnected_shims = shim_reconnect.reconnected_shims.clone();
+        recovery_result.stages.push(Self::recovery_stage_summary(
+            RecoveryStage::ReconnectShims,
+            stage_started,
+            true,
+            shim_reconnect_items,
+            None,
+        ));
+
+        let stage_started = Instant::now();
+        match self
+            .reconcile_recovered_state_from_ledger(&snapshot, &live_state, &shim_reconnect)
+            .await
+        {
             Ok(summary) => {
                 let items = snapshot.containers.len() + snapshot.pods.len();
                 recovery_result.reconcile = summary;
