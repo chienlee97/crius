@@ -54,6 +54,54 @@ pub struct RootlessNetworkConfig {
     pasta_path: PathBuf,
 }
 
+impl RootlessNetworkConfig {
+    fn helper(&self) -> Option<(&'static str, &Path)> {
+        match self.mode {
+            crate::rootless::NetworkMode::Slirp4netns => {
+                Some(("slirp4netns", self.slirp4netns_path.as_path()))
+            }
+            crate::rootless::NetworkMode::Pasta => Some(("pasta", self.pasta_path.as_path())),
+            crate::rootless::NetworkMode::None | crate::rootless::NetworkMode::Rootlesskit => None,
+        }
+    }
+
+    fn load_status(&self) -> CniLoadStatus {
+        match self.mode {
+            crate::rootless::NetworkMode::Slirp4netns | crate::rootless::NetworkMode::Pasta => {
+                let (helper, path) = self.helper().expect("rootless helper exists for mode");
+                if path_is_executable(path) {
+                    CniLoadStatus::rootless_network_ready(self.mode.as_str(), Some(path))
+                } else {
+                    CniLoadStatus::rootless_network_helper_missing(self.mode.as_str(), helper, path)
+                }
+            }
+            crate::rootless::NetworkMode::None => {
+                CniLoadStatus::rootless_network_ready(self.mode.as_str(), None)
+            }
+            crate::rootless::NetworkMode::Rootlesskit => CniLoadStatus::rootlesskit_unsupported(),
+        }
+    }
+}
+
+fn path_is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 impl Default for CniConfig {
     fn default() -> Self {
         Self {
@@ -332,6 +380,12 @@ impl CniConfig {
 
     pub fn rootless_config(&self) -> Option<&RootlessNetworkConfig> {
         self.rootless.as_ref()
+    }
+
+    pub fn rootless_load_status(&self) -> Option<CniLoadStatus> {
+        self.rootless
+            .as_ref()
+            .map(RootlessNetworkConfig::load_status)
     }
 
     pub fn netns_path(&self, ns_name_or_path: &str) -> PathBuf {
@@ -755,6 +809,12 @@ impl DefaultNetworkManager {
                 ))
             }
         };
+        if !path_is_executable(program) {
+            return Err(NetworkError::RootlessNetworkHelperMissing {
+                helper: name.to_string(),
+                path: program.clone(),
+            });
+        }
         let mut command = StdCommand::new(program);
         match rootless.mode {
             crate::rootless::NetworkMode::Slirp4netns => {
@@ -898,6 +958,30 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn rootless_effective_config(
+        mode: crate::rootless::NetworkMode,
+        slirp4netns_path: PathBuf,
+        pasta_path: PathBuf,
+    ) -> crate::rootless::EffectiveRootlessConfig {
+        crate::rootless::EffectiveRootlessConfig {
+            enabled: true,
+            current_uid: 1000,
+            current_gid: 1000,
+            in_user_namespace: false,
+            xdg_runtime_dir: PathBuf::from("/tmp/rootless-runtime"),
+            xdg_data_home: PathBuf::from("/tmp/rootless-data"),
+            storage_root: PathBuf::from("/tmp/rootless-data/crius/storage"),
+            runtime_root: PathBuf::from("/tmp/rootless-runtime/crius"),
+            netns_dir: PathBuf::from("/tmp/rootless-runtime/crius/netns"),
+            use_fuse_overlayfs: true,
+            network_mode: mode,
+            slirp4netns_path,
+            pasta_path,
+            disable_cgroup: true,
+            tolerate_missing_hugetlb_controller: true,
+        }
+    }
+
     #[test]
     fn default_network_manager_prefers_runtime_specific_config_dirs() {
         let mut cni = CniConfig::default();
@@ -930,29 +1014,64 @@ mod tests {
     #[test]
     fn default_network_manager_supports_rootless_none_mode() {
         let mut cni = CniConfig::default();
-        cni.set_rootless_config(Some(crate::rootless::EffectiveRootlessConfig {
-            enabled: true,
-            current_uid: 1000,
-            current_gid: 1000,
-            in_user_namespace: false,
-            xdg_runtime_dir: PathBuf::from("/tmp/rootless-runtime"),
-            xdg_data_home: PathBuf::from("/tmp/rootless-data"),
-            storage_root: PathBuf::from("/tmp/rootless-data/crius/storage"),
-            runtime_root: PathBuf::from("/tmp/rootless-runtime/crius"),
-            netns_dir: PathBuf::from("/tmp/rootless-runtime/crius/netns"),
-            use_fuse_overlayfs: true,
-            network_mode: crate::rootless::NetworkMode::None,
-            slirp4netns_path: PathBuf::from("slirp4netns"),
-            pasta_path: PathBuf::from("pasta"),
-            disable_cgroup: true,
-            tolerate_missing_hugetlb_controller: true,
-        }));
+        cni.set_rootless_config(Some(rootless_effective_config(
+            crate::rootless::NetworkMode::None,
+            PathBuf::from("slirp4netns"),
+            PathBuf::from("pasta"),
+        )));
         let manager = DefaultNetworkManager::from_cni_config(cni);
         let status = manager
             .start_rootless_network_helper("pod-1", "/tmp/nonexistent-netns")
             .unwrap();
         assert_eq!(status.name, "none");
         assert!(status.ip.is_none());
+    }
+
+    #[test]
+    fn cni_config_reports_missing_rootless_slirp4netns_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper_path = dir.path().join("missing-slirp4netns");
+        let mut cni = CniConfig::default();
+        cni.set_rootless_config(Some(rootless_effective_config(
+            crate::rootless::NetworkMode::Slirp4netns,
+            helper_path.clone(),
+            PathBuf::from("pasta"),
+        )));
+
+        let status = cni.rootless_load_status().unwrap();
+
+        assert!(!status.ready);
+        assert_eq!(status.reason, "RootlessNetworkHelperMissing");
+        assert!(status.message.contains("slirp4netns"));
+        assert!(status.message.contains(&helper_path.display().to_string()));
+        assert_eq!(
+            status.missing_plugin_binaries,
+            vec!["slirp4netns".to_string()]
+        );
+    }
+
+    #[test]
+    fn default_network_manager_reports_missing_rootless_pasta_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper_path = dir.path().join("missing-pasta");
+        let mut cni = CniConfig::default();
+        cni.set_rootless_config(Some(rootless_effective_config(
+            crate::rootless::NetworkMode::Pasta,
+            PathBuf::from("slirp4netns"),
+            helper_path.clone(),
+        )));
+        let manager = DefaultNetworkManager::from_cni_config(cni);
+
+        let err = manager
+            .start_rootless_network_helper("pod-1", "/tmp/nonexistent-netns")
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            NetworkError::RootlessNetworkHelperMissing { ref helper, ref path }
+                if helper == "pasta" && path == &helper_path
+        ));
+        assert!(err.to_string().contains("RootlessNetworkHelperMissing"));
     }
 
     #[tokio::test]

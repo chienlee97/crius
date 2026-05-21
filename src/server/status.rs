@@ -432,6 +432,9 @@ impl RuntimeServiceImpl {
 
     pub(super) async fn probe_cni_load_status(&self) -> crate::network::CniLoadStatus {
         let cni_config = self.current_cni_config();
+        if let Some(status) = cni_config.rootless_load_status() {
+            return status;
+        }
         let mut cni = match crate::network::CniManager::new(
             cni_config
                 .plugin_dirs()

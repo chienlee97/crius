@@ -4,7 +4,7 @@ use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -78,6 +78,78 @@ impl CniLoadStatus {
 
     pub fn condition(&self) -> (bool, String, String) {
         (self.ready, self.reason.clone(), self.message.clone())
+    }
+
+    pub fn rootless_network_ready(mode: impl Into<String>, helper_path: Option<&Path>) -> Self {
+        let mode = mode.into();
+        let message = helper_path.map_or_else(
+            || format!("rootless network mode {mode} does not start a network helper"),
+            |path| {
+                format!(
+                    "rootless network mode {mode} helper is available at {}",
+                    path.display()
+                )
+            },
+        );
+        let declared_plugins = helper_path.map(|_| vec![mode.clone()]).unwrap_or_default();
+        CniLoadStatus::new(
+            true,
+            if helper_path.is_some() {
+                "RootlessNetworkReady"
+            } else {
+                "RootlessNetworkDisabled"
+            },
+            message,
+            CniLoadStatusDetails {
+                discovered_files: Vec::new(),
+                invalid_files: Vec::new(),
+                loaded_networks: vec![mode.clone()],
+                declared_plugins,
+                missing_plugin_binaries: Vec::new(),
+                default_network_name: Some(mode),
+            },
+        )
+    }
+
+    pub fn rootless_network_helper_missing(
+        mode: impl Into<String>,
+        helper: impl Into<String>,
+        path: &Path,
+    ) -> Self {
+        let mode = mode.into();
+        let helper = helper.into();
+        CniLoadStatus::new(
+            false,
+            "RootlessNetworkHelperMissing",
+            format!(
+                "rootless network helper {helper} at {} is missing or not executable",
+                path.display()
+            ),
+            CniLoadStatusDetails {
+                discovered_files: Vec::new(),
+                invalid_files: Vec::new(),
+                loaded_networks: vec![mode],
+                declared_plugins: vec![helper.clone()],
+                missing_plugin_binaries: vec![helper],
+                default_network_name: None,
+            },
+        )
+    }
+
+    pub fn rootlesskit_unsupported() -> Self {
+        CniLoadStatus::new(
+            false,
+            "RootlesskitUnsupported",
+            "rootlesskit network mode is not implemented",
+            CniLoadStatusDetails {
+                discovered_files: Vec::new(),
+                invalid_files: Vec::new(),
+                loaded_networks: Vec::new(),
+                declared_plugins: vec!["rootlesskit".to_string()],
+                missing_plugin_binaries: Vec::new(),
+                default_network_name: None,
+            },
+        )
     }
 }
 

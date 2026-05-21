@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 use std::process::ExitStatus;
 
 use thiserror::Error;
@@ -29,6 +30,12 @@ pub enum NetworkError {
     /// 网络错误
     #[error("Network error: {0}")]
     Network(String),
+
+    /// Rootless 网络 helper 缺失或不可执行
+    #[error(
+        "RootlessNetworkHelperMissing: rootless network helper {helper} at {path} is missing or not executable"
+    )]
+    RootlessNetworkHelperMissing { helper: String, path: PathBuf },
 
     /// 其他错误
     #[error("{0}")]

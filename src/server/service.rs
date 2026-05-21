@@ -1988,8 +1988,14 @@ impl RuntimeServiceImpl {
     }
 
     pub(super) fn current_cni_config(&self) -> crate::network::CniConfig {
-        self.current_reloadable_config()
-            .with_cni_config(&self.config.cni_config)
+        let mut config = self
+            .current_reloadable_config()
+            .with_cni_config(&self.config.cni_config);
+        config.set_rootless_config(Some(self.config.rootless.clone()));
+        if self.config.rootless.enabled {
+            config.set_netns_mount_dir(self.config.rootless.netns_dir.clone());
+        }
+        config
     }
 
     fn update_reload_state(&self, update: impl FnOnce(&mut RuntimeReloadState)) {

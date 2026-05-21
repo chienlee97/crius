@@ -1105,6 +1105,58 @@ async fn reload_failure_marks_network_not_ready_condition() {
     assert_eq!(network.message, "reload failed");
 }
 
+#[tokio::test]
+async fn rootless_missing_helper_marks_network_not_ready_condition() {
+    let dir = tempdir().unwrap();
+    let missing_helper = dir.path().join("missing-slirp4netns");
+    let mut service = test_service();
+    service.config.rootless = crate::rootless::EffectiveRootlessConfig {
+        enabled: true,
+        current_uid: 1000,
+        current_gid: 1000,
+        in_user_namespace: true,
+        xdg_runtime_dir: dir.path().join("runtime"),
+        xdg_data_home: dir.path().join("data"),
+        storage_root: dir.path().join("data").join("crius/storage"),
+        runtime_root: dir.path().join("runtime").join("crius"),
+        netns_dir: dir.path().join("runtime").join("crius/netns"),
+        use_fuse_overlayfs: true,
+        network_mode: crate::rootless::NetworkMode::Slirp4netns,
+        slirp4netns_path: missing_helper.clone(),
+        pasta_path: PathBuf::from("pasta"),
+        disable_cgroup: true,
+        tolerate_missing_hugetlb_controller: true,
+    };
+
+    let response = RuntimeService::status(&service, Request::new(StatusRequest { verbose: true }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let network = response
+        .status
+        .unwrap()
+        .conditions
+        .into_iter()
+        .find(|condition| condition.r#type == "NetworkReady")
+        .unwrap();
+    assert!(!network.status);
+    assert_eq!(network.reason, "RootlessNetworkHelperMissing");
+    assert!(network.message.contains("slirp4netns"));
+    assert!(network.message.contains(&missing_helper.display().to_string()));
+
+    let info: serde_json::Value =
+        serde_json::from_str(response.info.get("config").unwrap()).unwrap();
+    assert_eq!(
+        info["lastCniLoadStatus"]["reason"],
+        "RootlessNetworkHelperMissing"
+    );
+    assert_eq!(
+        info["networkReason"],
+        serde_json::Value::String("RootlessNetworkHelperMissing".to_string())
+    );
+}
+
 #[test]
 fn runtime_registry_returns_handler_specific_create_timeout() {
     let runtime = RuntimeRegistry::new(
