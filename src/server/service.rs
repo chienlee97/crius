@@ -721,7 +721,11 @@ impl RuntimeRegistry {
         }
 
         for (handler, runtime) in self.runtimes.iter() {
-            if runtime.bundle_path_for(container_id).exists() {
+            if runtime
+                .runtime_context()
+                .bundle_path_for(container_id)
+                .exists()
+            {
                 self.remember_container_handler(container_id, handler);
                 return Ok(runtime.clone());
             }
@@ -741,7 +745,11 @@ impl RuntimeRegistry {
         }
 
         for (handler, runtime) in self.runtimes.iter() {
-            if runtime.bundle_path_for(container_id).exists() {
+            if runtime
+                .runtime_context()
+                .bundle_path_for(container_id)
+                .exists()
+            {
                 self.remember_container_handler(container_id, handler);
                 return Ok(handler.clone());
             }
@@ -753,6 +761,7 @@ impl RuntimeRegistry {
     pub(super) fn bundle_path_for_container(&self, container_id: &str) -> anyhow::Result<PathBuf> {
         Ok(self
             .runtime_for_container(container_id)?
+            .runtime_context()
             .bundle_path_for(container_id))
     }
 
@@ -762,21 +771,24 @@ impl RuntimeRegistry {
 
     pub(super) fn container_has_active_runtime_state(&self, container_id: &str) -> bool {
         self.runtimes.values().any(|runtime| {
+            let task = runtime.task_controller();
             matches!(
-                runtime.container_status(container_id),
+                task.container_status(container_id),
                 Ok(crate::runtime::ContainerStatus::Created
                     | crate::runtime::ContainerStatus::Running)
-            ) || runtime.is_container_paused(container_id).unwrap_or(false)
+            ) || task.is_container_paused(container_id).unwrap_or(false)
         })
     }
 
     pub(super) fn is_container_paused(&self, container_id: &str) -> anyhow::Result<bool> {
         self.runtime_for_container(container_id)?
+            .task_controller()
             .is_container_paused(container_id)
     }
 
     pub(super) fn restore_attach_shim(&self, container_id: &str) -> anyhow::Result<()> {
         self.runtime_for_container(container_id)?
+            .task_controller()
             .restore_attach_shim(container_id)
     }
 
@@ -785,6 +797,7 @@ impl RuntimeRegistry {
         container_id: &str,
     ) -> anyhow::Result<Option<crate::shim_rpc::StatusResponse>> {
         self.runtime_for_container(container_id)?
+            .task_controller()
             .shim_status(container_id)
     }
 
@@ -795,6 +808,7 @@ impl RuntimeRegistry {
         work_path: &Path,
     ) -> anyhow::Result<()> {
         self.runtime_for_container(container_id)?
+            .task_controller()
             .restore_container_from_checkpoint(container_id, checkpoint_path, work_path)
     }
 
@@ -804,6 +818,7 @@ impl RuntimeRegistry {
         spec: &mut crate::oci::spec::Spec,
     ) -> anyhow::Result<()> {
         self.runtime_for_container(container_id)?
+            .runtime_context()
             .enforce_oom_score_adj_policy(spec)
     }
 
@@ -817,6 +832,7 @@ impl RuntimeRegistry {
             .unwrap_or_else(|| self.default_handler.clone());
         self.remember_container_handler(container_id, &handler);
         self.runtime_for_handler(&handler)?
+            .runtime_context()
             .prepare_rootfs(container_id, config)
     }
 
@@ -830,6 +846,7 @@ impl RuntimeRegistry {
             .unwrap_or_else(|| self.default_handler.clone());
         self.remember_container_handler(container_id, &handler);
         self.runtime_for_handler(&handler)?
+            .runtime_context()
             .build_spec(container_id, config)
     }
 
@@ -840,11 +857,13 @@ impl RuntimeRegistry {
         spec: &crate::oci::spec::Spec,
     ) -> anyhow::Result<()> {
         self.runtime_for_container(container_id)?
+            .runtime_context()
             .write_bundle(container_id, rootfs, spec)
     }
 
     pub(super) fn pause_container(&self, container_id: &str) -> anyhow::Result<()> {
         self.runtime_for_container(container_id)?
+            .task_controller()
             .pause_container(container_id)
     }
 
@@ -855,11 +874,13 @@ impl RuntimeRegistry {
         work_path: &Path,
     ) -> anyhow::Result<()> {
         self.runtime_for_container(container_id)?
+            .task_controller()
             .checkpoint_container(container_id, location, work_path)
     }
 
     pub(super) fn resume_container(&self, container_id: &str) -> anyhow::Result<()> {
         self.runtime_for_container(container_id)?
+            .task_controller()
             .resume_container(container_id)
     }
 }
@@ -874,24 +895,29 @@ impl crate::runtime::ContainerRuntime for RuntimeRegistry {
             .handler_from_annotations(&config.annotations)
             .unwrap_or_else(|| self.default_handler.clone());
         let runtime = self.runtime_for_handler(&handler)?;
-        let created = runtime.create_container(container_id, config)?;
+        let created = runtime
+            .task_controller()
+            .create_container(container_id, config)?;
         self.remember_container_handler(container_id, &handler);
         Ok(created)
     }
 
     fn start_container(&self, container_id: &str) -> anyhow::Result<()> {
         self.runtime_for_container(container_id)?
+            .task_controller()
             .start_container(container_id)
     }
 
     fn stop_container(&self, container_id: &str, timeout: Option<u32>) -> anyhow::Result<()> {
         self.runtime_for_container(container_id)?
+            .task_controller()
             .stop_container(container_id, timeout)
     }
 
     fn remove_container(&self, container_id: &str) -> anyhow::Result<()> {
         let result = self
             .runtime_for_container(container_id)?
+            .task_controller()
             .remove_container(container_id);
         self.forget_container_handler(container_id);
         result
@@ -902,11 +928,13 @@ impl crate::runtime::ContainerRuntime for RuntimeRegistry {
         container_id: &str,
     ) -> anyhow::Result<crate::runtime::ContainerStatus> {
         self.runtime_for_container(container_id)?
+            .task_controller()
             .container_status(container_id)
     }
 
     fn reopen_container_log(&self, container_id: &str) -> anyhow::Result<()> {
         self.runtime_for_container(container_id)?
+            .task_controller()
             .reopen_container_log(container_id)
     }
 
@@ -917,6 +945,7 @@ impl crate::runtime::ContainerRuntime for RuntimeRegistry {
         tty: bool,
     ) -> anyhow::Result<i32> {
         self.runtime_for_container(container_id)?
+            .task_controller()
             .exec_in_container(container_id, command, tty)
     }
 
@@ -926,6 +955,7 @@ impl crate::runtime::ContainerRuntime for RuntimeRegistry {
         resources: &crate::proto::runtime::v1::LinuxContainerResources,
     ) -> anyhow::Result<()> {
         self.runtime_for_container(container_id)?
+            .task_controller()
             .update_container_resources(container_id, resources)
     }
 }

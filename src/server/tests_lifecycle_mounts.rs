@@ -262,7 +262,10 @@ fn runtime_mount_validation_reports_rro_unsupported_as_failed_precondition() {
         image_sub_path: None,
     }]);
 
-    let err = runtime.validate_mount_requests(&config).unwrap_err();
+    let err = runtime
+        .runtime_context()
+        .validate_mount_requests(&config)
+        .unwrap_err();
     let status = err.to_status();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert!(status.message().contains("recursive_read_only"));
@@ -288,7 +291,10 @@ fn runtime_mount_validation_reports_selinux_relabel_without_label() {
         image_sub_path: None,
     }]);
 
-    let err = runtime.validate_mount_requests(&config).unwrap_err();
+    let err = runtime
+        .runtime_context()
+        .validate_mount_requests(&config)
+        .unwrap_err();
     let status = err.to_status();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert!(status.message().contains("SELinux"));
@@ -313,7 +319,10 @@ fn runtime_mount_validation_reports_missing_source_as_failed_precondition() {
         image_sub_path: None,
     }]);
 
-    let err = runtime.validate_mount_requests(&config).unwrap_err();
+    let err = runtime
+        .runtime_context()
+        .validate_mount_requests(&config)
+        .unwrap_err();
     let status = err.to_status();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert!(status.message().contains(source.to_string_lossy().as_ref()));

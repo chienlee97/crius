@@ -6,7 +6,7 @@ use crate::config::CgroupDriverConfig;
 use crate::oci::spec::Spec;
 use crate::proto::runtime::v1::LinuxContainerResources;
 
-use super::backend::RuntimeBackend;
+use super::backend::{RuntimeBackend, RuntimeContextManager, TaskController};
 use super::{
     ContainerConfig, ContainerRuntime, ContainerStatus, MountSemanticsError, RuncRuntime,
     RuntimeFeatureProbe,
@@ -27,27 +27,7 @@ impl RuncBackend {
     }
 }
 
-impl RuntimeBackend for RuncBackend {
-    fn backend_name(&self) -> &str {
-        "runc"
-    }
-
-    fn runtime_root(&self) -> &Path {
-        self.inner.runtime_root()
-    }
-
-    fn runtime_path(&self) -> &Path {
-        self.inner.runtime_path()
-    }
-
-    fn runtime_config_path(&self) -> &Path {
-        self.inner.runtime_config_path()
-    }
-
-    fn bundle_path_for(&self, container_id: &str) -> PathBuf {
-        self.inner.bundle_path_for(container_id)
-    }
-
+impl TaskController for RuncBackend {
     fn create_container(&self, container_id: &str, config: &ContainerConfig) -> Result<String> {
         self.inner.create_container(container_id, config)
     }
@@ -107,6 +87,34 @@ impl RuntimeBackend for RuncBackend {
             .restore_container_from_checkpoint(container_id, checkpoint_path, work_path)
     }
 
+    fn pause_container(&self, container_id: &str) -> Result<()> {
+        self.inner.pause_container(container_id)
+    }
+
+    fn checkpoint_container(
+        &self,
+        container_id: &str,
+        location: &Path,
+        work_path: &Path,
+    ) -> Result<()> {
+        self.inner
+            .checkpoint_container(container_id, location, work_path)
+    }
+
+    fn resume_container(&self, container_id: &str) -> Result<()> {
+        self.inner.resume_container(container_id)
+    }
+
+    fn container_pid(&self, container_id: &str) -> Result<Option<i32>> {
+        self.inner.container_pid(container_id)
+    }
+}
+
+impl RuntimeContextManager for RuncBackend {
+    fn bundle_path_for(&self, container_id: &str) -> PathBuf {
+        self.inner.bundle_path_for(container_id)
+    }
+
     fn enforce_oom_score_adj_policy(&self, spec: &mut Spec) -> Result<()> {
         self.inner.enforce_oom_score_adj_policy(spec)
     }
@@ -133,27 +141,31 @@ impl RuntimeBackend for RuncBackend {
     ) -> std::result::Result<(), MountSemanticsError> {
         self.inner.validate_mount_requests(config)
     }
+}
 
-    fn pause_container(&self, container_id: &str) -> Result<()> {
-        self.inner.pause_container(container_id)
+impl RuntimeBackend for RuncBackend {
+    fn backend_name(&self) -> &str {
+        "runc"
     }
 
-    fn checkpoint_container(
-        &self,
-        container_id: &str,
-        location: &Path,
-        work_path: &Path,
-    ) -> Result<()> {
-        self.inner
-            .checkpoint_container(container_id, location, work_path)
+    fn runtime_root(&self) -> &Path {
+        self.inner.runtime_root()
     }
 
-    fn resume_container(&self, container_id: &str) -> Result<()> {
-        self.inner.resume_container(container_id)
+    fn runtime_path(&self) -> &Path {
+        self.inner.runtime_path()
     }
 
-    fn container_pid(&self, container_id: &str) -> Result<Option<i32>> {
-        self.inner.container_pid(container_id)
+    fn runtime_config_path(&self) -> &Path {
+        self.inner.runtime_config_path()
+    }
+
+    fn task_controller(&self) -> &dyn TaskController {
+        self
+    }
+
+    fn runtime_context(&self) -> &dyn RuntimeContextManager {
+        self
     }
 
     fn probe_runtime_features(&self) -> RuntimeFeatureProbe {

@@ -833,9 +833,13 @@ impl RuntimeServiceImpl {
         let pause_container_id = pod_state
             .as_ref()
             .and_then(|state| state.pause_container_id.clone());
-        let pause_spec = pause_container_id
-            .as_deref()
-            .and_then(|container_id| runtime.as_ref()?.load_spec(container_id).ok());
+        let pause_spec = pause_container_id.as_deref().and_then(|container_id| {
+            runtime
+                .as_ref()?
+                .runtime_context()
+                .load_spec(container_id)
+                .ok()
+        });
 
         let mut pod = crate::nri_proto::api::PodSandbox::new();
         pod.id = pod_sandbox.id.clone();
@@ -920,7 +924,12 @@ impl RuntimeServiceImpl {
         if let Some(pause_container_id) = pause_container_id.as_deref() {
             pod.pid = runtime
                 .as_ref()
-                .and_then(|runtime| runtime.container_pid(pause_container_id).ok())
+                .and_then(|runtime| {
+                    runtime
+                        .task_controller()
+                        .container_pid(pause_container_id)
+                        .ok()
+                })
                 .flatten()
                 .unwrap_or_default() as u32;
         }
@@ -941,7 +950,7 @@ impl RuntimeServiceImpl {
         );
         let spec = runtime
             .as_ref()
-            .and_then(|runtime| runtime.load_spec(&container.id).ok());
+            .and_then(|runtime| runtime.runtime_context().load_spec(&container.id).ok());
         let spec_annotations = spec.as_ref().and_then(|loaded| loaded.annotations.as_ref());
 
         let mut nri_container = crate::nri_proto::api::Container::new();
@@ -977,7 +986,12 @@ impl RuntimeServiceImpl {
             .unwrap_or_default();
         nri_container.state = if runtime
             .as_ref()
-            .and_then(|runtime| runtime.is_container_paused(&container.id).ok())
+            .and_then(|runtime| {
+                runtime
+                    .task_controller()
+                    .is_container_paused(&container.id)
+                    .ok()
+            })
             .unwrap_or(false)
         {
             crate::nri_proto::api::ContainerState::CONTAINER_PAUSED.into()
@@ -1008,7 +1022,7 @@ impl RuntimeServiceImpl {
         nri_container.status_message = message;
         nri_container.pid = runtime
             .as_ref()
-            .and_then(|runtime| runtime.container_pid(&container.id).ok())
+            .and_then(|runtime| runtime.task_controller().container_pid(&container.id).ok())
             .flatten()
             .unwrap_or_default() as u32;
 
@@ -2149,11 +2163,13 @@ impl RuntimeServiceImpl {
             Err(_) => return ContainerStatus::Unknown,
         };
         let container_id = container_id.to_string();
-        tokio::task::spawn_blocking(move || runtime.container_status(&container_id))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(ContainerStatus::Unknown)
+        tokio::task::spawn_blocking(move || {
+            runtime.task_controller().container_status(&container_id)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(ContainerStatus::Unknown)
     }
 
     fn runtime_container_status_name(status: &ContainerStatus) -> &'static str {
@@ -2225,7 +2241,7 @@ impl RuntimeServiceImpl {
             .await
             .ok()?;
         let container_id = container_id.to_string();
-        tokio::task::spawn_blocking(move || runtime.container_pid(&container_id))
+        tokio::task::spawn_blocking(move || runtime.task_controller().container_pid(&container_id))
             .await
             .ok()
             .and_then(Result::ok)
@@ -2487,15 +2503,17 @@ impl RuntimeServiceImpl {
             .runtime_for_container_request(runtime_container_id)
             .await?;
         let container_id = runtime_container_id.to_string();
-        let pid = tokio::task::spawn_blocking(move || runtime.container_pid(&container_id))
-            .await
-            .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-            .map_err(|e| {
-                Status::internal(format!(
-                    "Failed to query container PID for {}: {}",
-                    runtime_container_id, e
-                ))
-            })?;
+        let pid = tokio::task::spawn_blocking(move || {
+            runtime.task_controller().container_pid(&container_id)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(|e| {
+            Status::internal(format!(
+                "Failed to query container PID for {}: {}",
+                runtime_container_id, e
+            ))
+        })?;
 
         Ok(pid.map(|pid| PathBuf::from(format!("/proc/{}/ns/{}", pid, namespace))))
     }

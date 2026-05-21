@@ -21,7 +21,8 @@ use crius::image::snapshotter::{
 };
 use crius::oci::spec::Spec;
 use crius::runtime::{
-    ContainerConfig, ContainerStatus, MountSemanticsError, RuntimeBackend, RuntimeFeatureProbe,
+    ContainerConfig, ContainerStatus, MountSemanticsError, RuntimeBackend, RuntimeContextManager,
+    RuntimeFeatureProbe, TaskController,
 };
 use crius::shim_rpc::{
     server::{serve, ShimRpcHandler},
@@ -178,27 +179,7 @@ impl FakeRuntimeBackend {
     }
 }
 
-impl RuntimeBackend for FakeRuntimeBackend {
-    fn backend_name(&self) -> &str {
-        self.backend_name
-    }
-
-    fn runtime_root(&self) -> &Path {
-        &self.runtime_root
-    }
-
-    fn runtime_path(&self) -> &Path {
-        &self.runtime_path
-    }
-
-    fn runtime_config_path(&self) -> &Path {
-        &self.runtime_config_path
-    }
-
-    fn bundle_path_for(&self, container_id: &str) -> PathBuf {
-        self.runtime_root.join(container_id)
-    }
-
+impl TaskController for FakeRuntimeBackend {
     fn create_container(&self, container_id: &str, _config: &ContainerConfig) -> Result<String> {
         self.record(FakeRuntimeCall::CreateContainer {
             container_id: container_id.to_string(),
@@ -286,6 +267,33 @@ impl RuntimeBackend for FakeRuntimeBackend {
         Ok(())
     }
 
+    fn pause_container(&self, _container_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn checkpoint_container(
+        &self,
+        _container_id: &str,
+        _location: &Path,
+        _work_path: &Path,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn resume_container(&self, _container_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn container_pid(&self, _container_id: &str) -> Result<Option<i32>> {
+        Ok(Some(1))
+    }
+}
+
+impl RuntimeContextManager for FakeRuntimeBackend {
+    fn bundle_path_for(&self, container_id: &str) -> PathBuf {
+        self.runtime_root.join(container_id)
+    }
+
     fn enforce_oom_score_adj_policy(&self, _spec: &mut Spec) -> Result<()> {
         Ok(())
     }
@@ -325,26 +333,31 @@ impl RuntimeBackend for FakeRuntimeBackend {
     ) -> std::result::Result<(), MountSemanticsError> {
         Ok(())
     }
+}
 
-    fn pause_container(&self, _container_id: &str) -> Result<()> {
-        Ok(())
+impl RuntimeBackend for FakeRuntimeBackend {
+    fn backend_name(&self) -> &str {
+        self.backend_name
     }
 
-    fn checkpoint_container(
-        &self,
-        _container_id: &str,
-        _location: &Path,
-        _work_path: &Path,
-    ) -> Result<()> {
-        Ok(())
+    fn runtime_root(&self) -> &Path {
+        &self.runtime_root
     }
 
-    fn resume_container(&self, _container_id: &str) -> Result<()> {
-        Ok(())
+    fn runtime_path(&self) -> &Path {
+        &self.runtime_path
     }
 
-    fn container_pid(&self, _container_id: &str) -> Result<Option<i32>> {
-        Ok(Some(1))
+    fn runtime_config_path(&self) -> &Path {
+        &self.runtime_config_path
+    }
+
+    fn task_controller(&self) -> &dyn TaskController {
+        self
+    }
+
+    fn runtime_context(&self) -> &dyn RuntimeContextManager {
+        self
     }
 
     fn probe_runtime_features(&self) -> RuntimeFeatureProbe {

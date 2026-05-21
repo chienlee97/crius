@@ -2007,6 +2007,7 @@ impl RuntimeServiceImpl {
             .map_err(|e| {
                 Status::failed_precondition(format!("Failed to resolve runtime handler: {}", e))
             })?
+            .runtime_context()
             .validate_mount_requests(&container_config)
             .map_err(|e| e.to_status())?;
         let create_deadline = self.container_create_deadline_for_handler(runtime_handler);

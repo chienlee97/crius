@@ -1380,27 +1380,7 @@ impl crate::shim_rpc::server::ShimRpcHandler for TestShimExecSessionHandler {
     }
 }
 
-impl crate::runtime::RuntimeBackend for FakeBackend {
-    fn backend_name(&self) -> &str {
-        self.name
-    }
-
-    fn runtime_root(&self) -> &Path {
-        &self.runtime_root
-    }
-
-    fn runtime_path(&self) -> &Path {
-        Path::new("/fake/runtime")
-    }
-
-    fn runtime_config_path(&self) -> &Path {
-        Path::new("/fake/runtime.conf")
-    }
-
-    fn bundle_path_for(&self, container_id: &str) -> PathBuf {
-        self.runtime_root.join(container_id)
-    }
-
+impl crate::runtime::TaskController for FakeBackend {
     fn create_container(
         &self,
         _container_id: &str,
@@ -1473,6 +1453,33 @@ impl crate::runtime::RuntimeBackend for FakeBackend {
         Ok(())
     }
 
+    fn pause_container(&self, _container_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn checkpoint_container(
+        &self,
+        _container_id: &str,
+        _location: &Path,
+        _work_path: &Path,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn resume_container(&self, _container_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn container_pid(&self, _container_id: &str) -> anyhow::Result<Option<i32>> {
+        Ok(None)
+    }
+}
+
+impl crate::runtime::RuntimeContextManager for FakeBackend {
+    fn bundle_path_for(&self, container_id: &str) -> PathBuf {
+        self.runtime_root.join(container_id)
+    }
+
     fn enforce_oom_score_adj_policy(
         &self,
         _spec: &mut crate::oci::spec::Spec,
@@ -1515,26 +1522,31 @@ impl crate::runtime::RuntimeBackend for FakeBackend {
     ) -> std::result::Result<(), crate::runtime::MountSemanticsError> {
         Ok(())
     }
+}
 
-    fn pause_container(&self, _container_id: &str) -> anyhow::Result<()> {
-        Ok(())
+impl crate::runtime::RuntimeBackend for FakeBackend {
+    fn backend_name(&self) -> &str {
+        self.name
     }
 
-    fn checkpoint_container(
-        &self,
-        _container_id: &str,
-        _location: &Path,
-        _work_path: &Path,
-    ) -> anyhow::Result<()> {
-        Ok(())
+    fn runtime_root(&self) -> &Path {
+        &self.runtime_root
     }
 
-    fn resume_container(&self, _container_id: &str) -> anyhow::Result<()> {
-        Ok(())
+    fn runtime_path(&self) -> &Path {
+        Path::new("/fake/runtime")
     }
 
-    fn container_pid(&self, _container_id: &str) -> anyhow::Result<Option<i32>> {
-        Ok(None)
+    fn runtime_config_path(&self) -> &Path {
+        Path::new("/fake/runtime.conf")
+    }
+
+    fn task_controller(&self) -> &dyn crate::runtime::TaskController {
+        self
+    }
+
+    fn runtime_context(&self) -> &dyn crate::runtime::RuntimeContextManager {
+        self
     }
 
     fn probe_runtime_features(&self) -> crate::runtime::RuntimeFeatureProbe {
@@ -1607,7 +1619,10 @@ fn runtime_service_can_use_injected_fake_backend_for_handler() {
     let backend = service.runtime.runtime_for_handler("fake").unwrap();
     assert_eq!(backend.backend_name(), "fake");
     assert_eq!(
-        backend.container_status("container-1").unwrap(),
+        backend
+            .task_controller()
+            .container_status("container-1")
+            .unwrap(),
         crate::runtime::ContainerStatus::Created
     );
     assert_eq!(service.runtime.container_create_timeout_for_handler("fake"), 77);

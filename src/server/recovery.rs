@@ -697,7 +697,7 @@ impl RuntimeServiceImpl {
             .or_else(|| self.runtime.runtime_for_container(container_id).ok());
 
         if let Some(runtime) = runtime.as_ref() {
-            let bundle_path = runtime.bundle_path_for(container_id);
+            let bundle_path = runtime.runtime_context().bundle_path_for(container_id);
             if !bundle_path.exists() {
                 let bundle_path = bundle_path.display().to_string();
                 self.mark_runtime_artifact_broken(

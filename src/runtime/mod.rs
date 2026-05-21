@@ -27,7 +27,7 @@ use crate::storage::{RuntimeArtifactRecord, StorageManager};
 pub mod backend;
 pub mod runc_backend;
 pub mod shim_manager;
-pub use backend::RuntimeBackend;
+pub use backend::{RuntimeBackend, RuntimeContextManager, TaskController};
 pub use runc_backend::RuncBackend;
 pub use shim_manager::{default_shim_work_dir, ShimConfig, ShimManager, ShimProcess};
 

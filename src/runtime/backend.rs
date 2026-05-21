@@ -8,12 +8,7 @@ use crate::proto::runtime::v1::LinuxContainerResources;
 
 use super::{ContainerConfig, ContainerStatus, MountSemanticsError, RuntimeFeatureProbe};
 
-pub trait RuntimeBackend: Send + Sync {
-    fn backend_name(&self) -> &str;
-    fn runtime_root(&self) -> &Path;
-    fn runtime_path(&self) -> &Path;
-    fn runtime_config_path(&self) -> &Path;
-    fn bundle_path_for(&self, container_id: &str) -> PathBuf;
+pub trait TaskController: Send + Sync {
     fn create_container(&self, container_id: &str, config: &ContainerConfig) -> Result<String>;
     fn start_container(&self, container_id: &str) -> Result<()>;
     fn stop_container(&self, container_id: &str, timeout: Option<u32>) -> Result<()>;
@@ -35,15 +30,6 @@ pub trait RuntimeBackend: Send + Sync {
         checkpoint_path: &Path,
         work_path: &Path,
     ) -> Result<()>;
-    fn enforce_oom_score_adj_policy(&self, spec: &mut Spec) -> Result<()>;
-    fn prepare_rootfs(&self, container_id: &str, config: &ContainerConfig) -> Result<()>;
-    fn build_spec(&self, container_id: &str, config: &ContainerConfig) -> Result<Spec>;
-    fn write_bundle(&self, container_id: &str, rootfs: &Path, spec: &Spec) -> Result<()>;
-    fn load_spec(&self, container_id: &str) -> Result<Spec>;
-    fn validate_mount_requests(
-        &self,
-        config: &ContainerConfig,
-    ) -> std::result::Result<(), MountSemanticsError>;
     fn pause_container(&self, container_id: &str) -> Result<()>;
     fn checkpoint_container(
         &self,
@@ -53,6 +39,28 @@ pub trait RuntimeBackend: Send + Sync {
     ) -> Result<()>;
     fn resume_container(&self, container_id: &str) -> Result<()>;
     fn container_pid(&self, container_id: &str) -> Result<Option<i32>>;
+}
+
+pub trait RuntimeContextManager: Send + Sync {
+    fn bundle_path_for(&self, container_id: &str) -> PathBuf;
+    fn enforce_oom_score_adj_policy(&self, spec: &mut Spec) -> Result<()>;
+    fn prepare_rootfs(&self, container_id: &str, config: &ContainerConfig) -> Result<()>;
+    fn build_spec(&self, container_id: &str, config: &ContainerConfig) -> Result<Spec>;
+    fn write_bundle(&self, container_id: &str, rootfs: &Path, spec: &Spec) -> Result<()>;
+    fn load_spec(&self, container_id: &str) -> Result<Spec>;
+    fn validate_mount_requests(
+        &self,
+        config: &ContainerConfig,
+    ) -> std::result::Result<(), MountSemanticsError>;
+}
+
+pub trait RuntimeBackend: Send + Sync {
+    fn backend_name(&self) -> &str;
+    fn runtime_root(&self) -> &Path;
+    fn runtime_path(&self) -> &Path;
+    fn runtime_config_path(&self) -> &Path;
+    fn task_controller(&self) -> &dyn TaskController;
+    fn runtime_context(&self) -> &dyn RuntimeContextManager;
     fn probe_runtime_features(&self) -> RuntimeFeatureProbe;
     fn cgroup_driver(&self) -> CgroupDriverConfig;
 }

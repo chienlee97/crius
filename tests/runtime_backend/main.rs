@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crius::runtime::{ContainerConfig, ContainerStatus, NamespacePaths, RuntimeBackend};
+use crius::runtime::{
+    ContainerConfig, ContainerStatus, NamespacePaths, RuntimeBackend, TaskController,
+};
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -57,11 +59,14 @@ fn fake_runtime_backend_exposes_runtime_contract() {
 
     assert_eq!(backend.backend_name(), "fake-runc");
     assert_eq!(
-        backend.bundle_path_for("container-1"),
+        backend.runtime_context().bundle_path_for("container-1"),
         runtime_root.join("container-1")
     );
     assert!(matches!(
-        backend.container_status("container-1").unwrap(),
+        backend
+            .task_controller()
+            .container_status("container-1")
+            .unwrap(),
         ContainerStatus::Running
     ));
 }
