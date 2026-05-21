@@ -1,5 +1,7 @@
 use super::*;
-use crate::state::{RecoveryContainerEntry, RecoveryLedgerSnapshot};
+use crate::state::{
+    RecoveryContainerEntry, RecoveryLedgerSnapshot, RuntimeArtifactLedgerState, SnapshotLedgerState,
+};
 
 impl RuntimeServiceImpl {
     fn broken_state(kind: impl Into<String>, details: impl Into<String>) -> StoredBrokenState {
@@ -96,6 +98,44 @@ impl RuntimeServiceImpl {
             }
         }
         Ok(())
+    }
+
+    async fn mark_runtime_artifact_broken(
+        &self,
+        owner_kind: &str,
+        owner_id: &str,
+        artifact_kind: &str,
+        path: &str,
+    ) {
+        if let Err(err) = self
+            .persistence
+            .lock()
+            .await
+            .storage_mut()
+            .update_runtime_artifact_state(
+                owner_kind,
+                owner_id,
+                artifact_kind,
+                path,
+                RuntimeArtifactLedgerState::Broken.as_str(),
+            )
+        {
+            log::warn!(
+                "Failed to mark runtime artifact {owner_kind}/{owner_id}/{artifact_kind} at {path} broken: {err}"
+            );
+        }
+    }
+
+    async fn mark_snapshot_broken(&self, key: &str) {
+        if let Err(err) = self
+            .persistence
+            .lock()
+            .await
+            .storage_mut()
+            .update_snapshot_state(key, SnapshotLedgerState::Broken.as_str())
+        {
+            log::warn!("Failed to mark snapshot {key} broken: {err}");
+        }
     }
 
     async fn mark_pod_broken(&self, pod_id: &str, broken: StoredBrokenState) -> Result<(), Status> {
@@ -494,9 +534,17 @@ impl RuntimeServiceImpl {
             if let Some(runtime) = runtime.as_ref() {
                 let bundle_path = runtime.bundle_path_for(container_id);
                 if !bundle_path.exists() {
+                    let bundle_path = bundle_path.display().to_string();
+                    self.mark_runtime_artifact_broken(
+                        "container",
+                        container_id,
+                        "bundle",
+                        &bundle_path,
+                    )
+                    .await;
                     broken = Some(Self::broken_state(
                         "bundle_missing",
-                        format!("runtime bundle {} is missing", bundle_path.display()),
+                        format!("runtime bundle {bundle_path} is missing"),
                     ));
                 }
             }
@@ -509,6 +557,16 @@ impl RuntimeServiceImpl {
                 }) {
                     let rootfs_path = Path::new(&rootfs_artifact.path);
                     if !rootfs_path.exists() {
+                        self.mark_runtime_artifact_broken(
+                            "container",
+                            container_id,
+                            "rootfs",
+                            &rootfs_artifact.path,
+                        )
+                        .await;
+                        if let Some(snapshot_key) = record.snapshot_key.as_deref() {
+                            self.mark_snapshot_broken(snapshot_key).await;
+                        }
                         broken = Some(Self::broken_state(
                             "rootfs_missing",
                             format!("rootfs artifact {} is missing", rootfs_path.display()),
@@ -555,6 +613,7 @@ impl RuntimeServiceImpl {
                 }
             }
 
+            let detected_broken = broken.clone();
             if let Some(broken) = broken {
                 self.mark_container_broken(container_id, broken).await?;
             } else {
@@ -573,28 +632,29 @@ impl RuntimeServiceImpl {
                 let mut containers = self.containers.lock().await;
                 if let Some(container) = containers.get_mut(container_id) {
                     container.state = runtime_state;
-                    if let Some(mut state) = Self::read_internal_state::<StoredContainerState>(
+                    let mut state = Self::read_internal_state::<StoredContainerState>(
                         &container.annotations,
                         INTERNAL_CONTAINER_STATE_KEY,
-                    ) {
-                        match &persistence_status {
-                            crate::runtime::ContainerStatus::Running => {
-                                state.started_at.get_or_insert(Self::now_nanos());
-                                state.finished_at = None;
-                                state.exit_code = None;
-                            }
-                            crate::runtime::ContainerStatus::Stopped(code) => {
-                                state.finished_at.get_or_insert(Self::now_nanos());
-                                state.exit_code = Some(*code);
-                            }
-                            _ => {}
+                    )
+                    .unwrap_or_default();
+                    state.broken = detected_broken;
+                    match &persistence_status {
+                        crate::runtime::ContainerStatus::Running => {
+                            state.started_at.get_or_insert(Self::now_nanos());
+                            state.finished_at = None;
+                            state.exit_code = None;
                         }
-                        Self::insert_internal_state(
-                            &mut container.annotations,
-                            INTERNAL_CONTAINER_STATE_KEY,
-                            &state,
-                        )?;
+                        crate::runtime::ContainerStatus::Stopped(code) => {
+                            state.finished_at.get_or_insert(Self::now_nanos());
+                            state.exit_code = Some(*code);
+                        }
+                        _ => {}
                     }
+                    Self::insert_internal_state(
+                        &mut container.annotations,
+                        INTERNAL_CONTAINER_STATE_KEY,
+                        &state,
+                    )?;
                     Some(container.annotations.clone())
                 } else {
                     None

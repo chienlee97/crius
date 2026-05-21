@@ -97,7 +97,6 @@ async fn recover_state_marks_ready_pod_notready_when_pause_is_stopped() {
             ip: None,
         })
         .unwrap();
-
     service.recover_state().await.unwrap();
 
     let pod = service
@@ -1625,6 +1624,7 @@ async fn recover_state_recovers_running_container_without_shim_metadata_file_fro
 async fn recover_state_marks_container_broken_when_runtime_bundle_is_missing() {
     let (dir, service) = test_service_with_fake_runtime();
     set_fake_runtime_state(&dir, "broken-bundle", "running");
+    let bundle_path = dir.path().join("runtime-root").join("broken-bundle");
 
     let mut annotations = HashMap::new();
     RuntimeServiceImpl::insert_internal_state(
@@ -1656,6 +1656,26 @@ async fn recover_state_marks_container_broken_when_runtime_bundle_is_missing() {
         .await
         .update_container_ledger_metadata("broken-bundle", Some("runc"), Some("runc"), None)
         .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .replace_runtime_artifacts(
+            "container",
+            "broken-bundle",
+            &[crate::storage::RuntimeArtifactRecord {
+                owner_kind: "container".to_string(),
+                owner_id: "broken-bundle".to_string(),
+                artifact_kind: "bundle".to_string(),
+                path: bundle_path.display().to_string(),
+                state: crate::state::RuntimeArtifactLedgerState::Active
+                    .as_str()
+                    .to_string(),
+                runtime_handler: Some("runc".to_string()),
+                runtime_root: Some(dir.path().join("runtime-root").display().to_string()),
+            }],
+        )
+        .unwrap();
 
     service.recover_state().await.unwrap();
 
@@ -1670,13 +1690,145 @@ async fn recover_state_marks_container_broken_when_runtime_bundle_is_missing() {
         &recovered.annotations,
         INTERNAL_CONTAINER_STATE_KEY,
     )
-    .unwrap();
+    .unwrap_or_default();
     assert_eq!(
         internal_state
             .broken
             .as_ref()
             .map(|broken| broken.kind.as_str()),
         Some("bundle_missing")
+    );
+    assert_eq!(
+        service
+            .persistence
+            .lock()
+            .await
+            .list_runtime_artifacts()
+            .unwrap()
+            .into_iter()
+            .find(|artifact| artifact.owner_id == "broken-bundle"
+                && artifact.artifact_kind == "bundle")
+            .map(|artifact| artifact.state),
+        Some(
+            crate::state::RuntimeArtifactLedgerState::Broken
+                .as_str()
+                .to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn recover_state_marks_rootfs_artifact_and_snapshot_broken_when_rootfs_is_missing() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "broken-rootfs", "running");
+    fs::create_dir_all(dir.path().join("runtime-root").join("broken-rootfs")).unwrap();
+    let rootfs_path = dir.path().join("snapshots").join("snapshot-rootfs").join("rootfs");
+
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "broken-rootfs",
+            "pod-1",
+            crate::runtime::ContainerStatus::Running,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .update_container_ledger_metadata(
+            "broken-rootfs",
+            Some("runc"),
+            Some("runc"),
+            Some("snapshot-rootfs"),
+        )
+        .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .save_snapshot_record(&crate::storage::SnapshotRecord {
+            key: "snapshot-rootfs".to_string(),
+            image_id: "busybox:latest".to_string(),
+            owner_kind: "container".to_string(),
+            owner_id: "broken-rootfs".to_string(),
+            state: crate::state::SnapshotLedgerState::Mounted
+                .as_str()
+                .to_string(),
+            mountpoint: rootfs_path.display().to_string(),
+        })
+        .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .replace_runtime_artifacts(
+            "container",
+            "broken-rootfs",
+            &[crate::storage::RuntimeArtifactRecord {
+                owner_kind: "container".to_string(),
+                owner_id: "broken-rootfs".to_string(),
+                artifact_kind: "rootfs".to_string(),
+                path: rootfs_path.display().to_string(),
+                state: crate::state::RuntimeArtifactLedgerState::Active
+                    .as_str()
+                    .to_string(),
+                runtime_handler: Some("runc".to_string()),
+                runtime_root: Some(dir.path().join("runtime-root").display().to_string()),
+            }],
+        )
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    let recovered = service
+        .containers
+        .lock()
+        .await
+        .get("broken-rootfs")
+        .cloned()
+        .unwrap();
+    let internal_state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+        &recovered.annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+    )
+    .unwrap_or_default();
+    assert_eq!(
+        internal_state
+            .broken
+            .as_ref()
+            .map(|broken| broken.kind.as_str()),
+        Some("rootfs_missing")
+    );
+    let persistence = service.persistence.lock().await;
+    assert_eq!(
+        persistence
+            .list_runtime_artifacts()
+            .unwrap()
+            .into_iter()
+            .find(|artifact| artifact.owner_id == "broken-rootfs"
+                && artifact.artifact_kind == "rootfs")
+            .map(|artifact| artifact.state),
+        Some(
+            crate::state::RuntimeArtifactLedgerState::Broken
+                .as_str()
+                .to_string()
+        )
+    );
+    assert_eq!(
+        persistence
+            .list_snapshot_records()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.key == "snapshot-rootfs")
+            .map(|snapshot| snapshot.state),
+        Some(crate::state::SnapshotLedgerState::Broken.as_str().to_string())
     );
 }
 
