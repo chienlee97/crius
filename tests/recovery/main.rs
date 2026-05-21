@@ -203,6 +203,16 @@ impl RecoveryFixture {
         fs::remove_dir_all(&self.rootfs_path).unwrap();
     }
 
+    fn remove_shim_socket(&self) {
+        fs::remove_file(&self.shim_socket_path).unwrap();
+    }
+
+    fn remove_shim_metadata(&mut self) {
+        StateLedgerWriter::new(&mut self.persistence)
+            .delete_shim_process(&self.container_id)
+            .unwrap();
+    }
+
     fn add_orphan_bundle_artifact(&mut self, owner_id: &str) -> PathBuf {
         let runtime_root = self
             .bundle_path
@@ -268,6 +278,36 @@ fn recovery_fixture_models_missing_container_artifacts() {
             && artifact.artifact_kind == "rootfs"
             && artifact.path == fixture.rootfs_path.display().to_string()
     }));
+}
+
+#[test]
+fn recovery_fixture_models_missing_shim_socket() {
+    let fixture = RecoveryFixture::new();
+
+    fixture.remove_shim_socket();
+    let snapshot = fixture.snapshot();
+
+    assert!(!fixture.shim_socket_path.exists());
+    assert_eq!(snapshot.shim_processes.len(), 1);
+    assert_eq!(
+        snapshot.shim_processes[0].socket_path,
+        fixture.shim_socket_path.display().to_string()
+    );
+}
+
+#[test]
+fn recovery_fixture_models_missing_shim_metadata() {
+    let mut fixture = RecoveryFixture::new();
+
+    fixture.remove_shim_metadata();
+    let snapshot = fixture.snapshot();
+
+    assert!(fixture.shim_socket_path.exists());
+    assert!(snapshot.shim_processes.is_empty());
+    assert!(snapshot
+        .containers
+        .iter()
+        .any(|entry| entry.record.id == fixture.container_id));
 }
 
 #[test]
