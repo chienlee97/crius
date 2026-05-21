@@ -1,6 +1,7 @@
 use super::*;
 use crate::state::{
-    RecoveryContainerEntry, RecoveryLedgerSnapshot, RuntimeArtifactLedgerState, SnapshotLedgerState,
+    RecoveryContainerEntry, RecoveryLedgerSnapshot, RuntimeArtifactLedgerState, ShimLedgerState,
+    SnapshotLedgerState,
 };
 
 impl RuntimeServiceImpl {
@@ -135,6 +136,33 @@ impl RuntimeServiceImpl {
             .update_snapshot_state(key, SnapshotLedgerState::Broken.as_str())
         {
             log::warn!("Failed to mark snapshot {key} broken: {err}");
+        }
+    }
+
+    async fn mark_shim_process_state(
+        &self,
+        container_id: &str,
+        old_state: &str,
+        next_state: ShimLedgerState,
+        details: &str,
+    ) {
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = persistence
+            .storage_mut()
+            .update_shim_process_state(container_id, next_state.as_str())
+        {
+            log::warn!("Failed to mark shim process {container_id} {next_state}: {err}");
+            return;
+        }
+
+        if let Err(err) = persistence.storage_mut().append_event(
+            "shim_process",
+            container_id,
+            Some(old_state),
+            Some(next_state.as_str()),
+            Some(details),
+        ) {
+            log::warn!("Failed to append shim process state event for {container_id}: {err}");
         }
     }
 
@@ -584,30 +612,63 @@ impl RuntimeServiceImpl {
                     let shim_pid_live = PathBuf::from("/proc")
                         .join(shim_record.shim_pid.to_string())
                         .exists();
-                    match self.runtime.shim_status(container_id) {
-                        Ok(Some(status))
-                            if matches!(
-                                status.state,
-                                crate::shim_rpc::TaskState::Created
-                                    | crate::shim_rpc::TaskState::Running
-                                    | crate::shim_rpc::TaskState::Paused
-                            ) => {}
-                        Ok(None) if shim_pid_live => {}
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            broken = Some(Self::broken_state(
-                                "shim_socket_missing",
-                                format!(
-                                    "shim ledger entry exists for {} but task socket is unavailable",
-                                    container_id
-                                ),
-                            ));
-                        }
-                        Err(err) => {
-                            broken = Some(Self::broken_state(
-                                "shim_reconcile_failed",
-                                format!("failed to query shim live state: {}", err),
-                            ));
+                    let shim_socket_missing = !Path::new(&shim_record.socket_path).exists();
+                    if shim_socket_missing && !shim_pid_live {
+                        let details = "shim ledger entry exists but task socket is unavailable";
+                        self.mark_shim_process_state(
+                            container_id,
+                            &shim_record.state,
+                            ShimLedgerState::Dead,
+                            details,
+                        )
+                        .await;
+                        broken = Some(Self::broken_state(
+                            "shim_socket_missing",
+                            format!(
+                                "shim ledger entry exists for {} but task socket is unavailable",
+                                container_id
+                            ),
+                        ));
+                    } else {
+                        match self.runtime.shim_status(container_id) {
+                            Ok(Some(status))
+                                if matches!(
+                                    status.state,
+                                    crate::shim_rpc::TaskState::Created
+                                        | crate::shim_rpc::TaskState::Running
+                                        | crate::shim_rpc::TaskState::Paused
+                                ) => {}
+                            Ok(None) if shim_pid_live => {}
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                let details =
+                                    "shim ledger entry exists but task socket is unavailable";
+                                self.mark_shim_process_state(
+                                    container_id,
+                                    &shim_record.state,
+                                    ShimLedgerState::Dead,
+                                    details,
+                                )
+                                .await;
+                                broken = Some(Self::broken_state(
+                                    "shim_socket_missing",
+                                    format!(
+                                        "shim ledger entry exists for {} but task socket is unavailable",
+                                        container_id
+                                    ),
+                                ));
+                            }
+                            Err(err) => {
+                                let details = format!("failed to query shim live state: {}", err);
+                                self.mark_shim_process_state(
+                                    container_id,
+                                    &shim_record.state,
+                                    ShimLedgerState::Degraded,
+                                    &details,
+                                )
+                                .await;
+                                broken = Some(Self::broken_state("shim_reconcile_failed", details));
+                            }
                         }
                     }
                 }

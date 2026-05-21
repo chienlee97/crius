@@ -1598,7 +1598,6 @@ async fn recover_state_recovers_running_container_without_shim_metadata_file_fro
             last_seen_at: RuntimeServiceImpl::now_nanos(),
         })
         .unwrap();
-
     service.recover_state().await.unwrap();
 
     let recovered = service
@@ -1618,6 +1617,126 @@ async fn recover_state_recovers_running_container_without_shim_metadata_file_fro
 
     let _ = shim_child.kill();
     let _ = shim_child.wait();
+}
+
+#[tokio::test]
+async fn recover_state_marks_missing_shim_socket_dead_in_ledger() {
+    let (dir, service) = test_service_with_fake_runtime();
+    set_fake_runtime_state(&dir, "missing-shim-socket", "running");
+    let bundle_path = dir.path().join("runtime-root").join("missing-shim-socket");
+    fs::create_dir_all(&bundle_path).unwrap();
+
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "missing-shim-socket",
+            "pod-1",
+            crate::runtime::ContainerStatus::Running,
+            "busybox:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .update_container_ledger_metadata("missing-shim-socket", Some("runc"), Some("runc"), None)
+        .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .save_shim_process_record(&crate::storage::ShimProcessRecord {
+            container_id: "missing-shim-socket".to_string(),
+            shim_pid: u32::MAX,
+            work_dir: dir.path().join("shims").display().to_string(),
+            socket_path: dir
+                .path()
+                .join("shims")
+                .join("missing-shim-socket")
+                .join("missing-task.sock")
+                .display()
+                .to_string(),
+            exit_code_file: dir
+                .path()
+                .join("exits")
+                .join("missing-shim-socket")
+                .display()
+                .to_string(),
+            log_file: dir
+                .path()
+                .join("shims")
+                .join("missing-shim-socket")
+                .join("shim.log")
+                .display()
+                .to_string(),
+            bundle_path: bundle_path.display().to_string(),
+            state: crate::state::ShimLedgerState::Running
+                .as_str()
+                .to_string(),
+            last_seen_at: RuntimeServiceImpl::now_nanos(),
+        })
+        .unwrap();
+    assert_eq!(
+        service
+            .persistence
+            .lock()
+            .await
+            .get_shim_process_record("missing-shim-socket")
+            .unwrap()
+            .map(|record| record.state),
+        Some(crate::state::ShimLedgerState::Running.as_str().to_string())
+    );
+
+    service.recover_state().await.unwrap();
+
+    let persistence = service.persistence.lock().await;
+    assert_eq!(
+        persistence
+            .get_shim_process_record("missing-shim-socket")
+            .unwrap()
+            .map(|record| record.state),
+        Some(crate::state::ShimLedgerState::Dead.as_str().to_string())
+    );
+    drop(persistence);
+
+    let recovered = service
+        .containers
+        .lock()
+        .await
+        .get("missing-shim-socket")
+        .cloned()
+        .unwrap();
+    let internal_state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+        &recovered.annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+    )
+    .unwrap_or_default();
+    assert_eq!(
+        internal_state
+            .broken
+            .as_ref()
+            .map(|broken| broken.kind.as_str()),
+        Some("shim_socket_missing")
+    );
+
+    let persistence = service.persistence.lock().await;
+    assert!(persistence
+        .storage()
+        .get_recent_events("shim_process", 0)
+        .unwrap()
+        .into_iter()
+        .any(|event| event.entity_id == "missing-shim-socket"
+            && event.old_state == "running"
+            && event.new_state == "dead"
+            && event
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("task socket is unavailable"))));
 }
 
 #[tokio::test]
