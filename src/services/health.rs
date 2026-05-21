@@ -24,6 +24,34 @@ pub struct InternalHealthCondition {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryLedgerHealthSummary {
+    pub broken_containers: usize,
+    pub broken_pods: usize,
+    pub broken_snapshots: usize,
+    pub broken_runtime_artifacts: usize,
+    pub dead_shims: usize,
+    pub broken_shims: usize,
+    pub degraded_shims: usize,
+}
+
+impl RecoveryLedgerHealthSummary {
+    pub fn unhealthy_object_count(&self) -> usize {
+        self.broken_containers
+            + self.broken_pods
+            + self.broken_snapshots
+            + self.broken_runtime_artifacts
+            + self.dead_shims
+            + self.broken_shims
+            + self.degraded_shims
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.unhealthy_object_count() == 0
+    }
+}
+
 impl InternalHealthCondition {
     fn ready(condition_type: &str, reason: &str, message: String) -> Self {
         Self {
@@ -258,7 +286,26 @@ impl HealthService {
         &self,
         attempted_repair: Option<bool>,
         repair_succeeded: Option<bool>,
+        ledger_summary: Option<&RecoveryLedgerHealthSummary>,
     ) -> InternalHealthCondition {
+        if let Some(summary) = ledger_summary.filter(|summary| !summary.is_healthy()) {
+            return InternalHealthCondition::not_ready(
+                "RecoveryReady",
+                "RecoveryObjectsDegraded",
+                format!(
+                    "recovery ledger has {} unhealthy object(s): {} broken container(s), {} broken pod(s), {} broken snapshot(s), {} broken runtime artifact(s), {} dead shim(s), {} broken shim(s), {} degraded shim(s)",
+                    summary.unhealthy_object_count(),
+                    summary.broken_containers,
+                    summary.broken_pods,
+                    summary.broken_snapshots,
+                    summary.broken_runtime_artifacts,
+                    summary.dead_shims,
+                    summary.broken_shims,
+                    summary.degraded_shims
+                ),
+            );
+        }
+
         match (attempted_repair, repair_succeeded) {
             (Some(true), Some(false)) => InternalHealthCondition::not_ready(
                 "RecoveryReady",
@@ -348,12 +395,13 @@ impl HealthService {
         attempted_repair: Option<bool>,
         repair_succeeded: Option<bool>,
         shim_reconnect_supported: bool,
+        recovery_ledger_summary: Option<&RecoveryLedgerHealthSummary>,
     ) -> Vec<InternalHealthCondition> {
         vec![
             self.image_condition(image_root),
             self.snapshot_condition(snapshot_root),
             self.shim_condition(shim_work_dir, shim_reconnect_supported),
-            self.recovery_condition(attempted_repair, repair_succeeded),
+            self.recovery_condition(attempted_repair, repair_succeeded, recovery_ledger_summary),
         ]
     }
 
@@ -549,6 +597,7 @@ mod tests {
             Some(false),
             None,
             true,
+            None,
         );
 
         assert_eq!(conditions.len(), 4);
@@ -583,6 +632,7 @@ mod tests {
             Some(true),
             Some(false),
             true,
+            None,
         );
 
         let snapshot = conditions
@@ -598,6 +648,26 @@ mod tests {
             .unwrap();
         assert!(!recovery.ready);
         assert_eq!(recovery.reason, "RecoveryRepairFailed");
+    }
+
+    #[test]
+    fn recovery_condition_reports_unhealthy_ledger_objects() {
+        let service = HealthService;
+        let summary = RecoveryLedgerHealthSummary {
+            broken_runtime_artifacts: 2,
+            dead_shims: 1,
+            degraded_shims: 1,
+            ..Default::default()
+        };
+
+        let condition = service.recovery_condition(Some(false), None, Some(&summary));
+
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "RecoveryObjectsDegraded");
+        assert!(condition.message.contains("4 unhealthy object"));
+        assert!(condition.message.contains("2 broken runtime artifact"));
+        assert!(condition.message.contains("1 dead shim"));
+        assert!(condition.message.contains("1 degraded shim"));
     }
 
     #[test]

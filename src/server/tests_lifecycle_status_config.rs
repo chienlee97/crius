@@ -1157,6 +1157,126 @@ async fn rootless_missing_helper_marks_network_not_ready_condition() {
     );
 }
 
+#[tokio::test]
+async fn status_verbose_reports_recovery_ledger_degraded_objects() {
+    let service = test_service();
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            broken: Some(StoredBrokenState {
+                kind: "rootfs_missing".to_string(),
+                details: "rootfs artifact is missing".to_string(),
+                detected_at: RuntimeServiceImpl::now_nanos(),
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    {
+        let mut persistence = service.persistence.lock().await;
+        persistence
+            .save_container(
+                "recovery-broken",
+                "pod-1",
+                crate::runtime::ContainerStatus::Running,
+                "busybox:latest",
+                &Vec::new(),
+                &HashMap::new(),
+                &annotations,
+            )
+            .unwrap();
+        persistence
+            .save_snapshot_record(&crate::storage::SnapshotRecord {
+                key: "snapshot-broken".to_string(),
+                image_id: "busybox:latest".to_string(),
+                owner_kind: "container".to_string(),
+                owner_id: "recovery-broken".to_string(),
+                state: crate::state::SnapshotLedgerState::Broken
+                    .as_str()
+                    .to_string(),
+                mountpoint: "/tmp/recovery-broken/rootfs".to_string(),
+            })
+            .unwrap();
+        persistence
+            .replace_runtime_artifacts(
+                "container",
+                "recovery-broken",
+                &[crate::storage::RuntimeArtifactRecord {
+                    owner_kind: "container".to_string(),
+                    owner_id: "recovery-broken".to_string(),
+                    artifact_kind: "rootfs".to_string(),
+                    path: "/tmp/recovery-broken/rootfs".to_string(),
+                    state: crate::state::RuntimeArtifactLedgerState::Broken
+                        .as_str()
+                        .to_string(),
+                    runtime_handler: Some("runc".to_string()),
+                    runtime_root: Some("/tmp/runtime-root".to_string()),
+                }],
+            )
+            .unwrap();
+        persistence
+            .save_shim_process_record(&crate::storage::ShimProcessRecord {
+                container_id: "recovery-broken".to_string(),
+                shim_pid: u32::MAX,
+                work_dir: "/tmp/shims".to_string(),
+                socket_path: "/tmp/shims/recovery-broken/task.sock".to_string(),
+                exit_code_file: "/tmp/exits/recovery-broken".to_string(),
+                log_file: "/tmp/shims/recovery-broken/shim.log".to_string(),
+                bundle_path: "/tmp/runtime-root/recovery-broken".to_string(),
+                state: crate::state::ShimLedgerState::Dead.as_str().to_string(),
+                last_seen_at: RuntimeServiceImpl::now_nanos(),
+            })
+            .unwrap();
+    }
+
+    let response = RuntimeService::status(&service, Request::new(StatusRequest { verbose: true }))
+        .await
+        .unwrap()
+        .into_inner();
+    let config: serde_json::Value =
+        serde_json::from_str(response.info.get("config").unwrap()).unwrap();
+
+    assert_eq!(
+        config["recovery"]["ledgerSummary"]["brokenContainers"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        config["recovery"]["ledgerSummary"]["brokenSnapshots"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        config["recovery"]["ledgerSummary"]["brokenRuntimeArtifacts"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        config["recovery"]["ledgerSummary"]["deadShims"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        config["internalServices"]["introspection"]["recovery"]["ledgerSummary"]["deadShims"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        config["internalServices"]["introspection"]["recovery"]["unhealthyObjectCount"],
+        serde_json::json!(4)
+    );
+    let recovery = config["internalServices"]["health"]["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|condition| condition["type"] == "RecoveryReady")
+        .unwrap();
+    assert_eq!(recovery["ready"], false);
+    assert_eq!(recovery["reason"], "RecoveryObjectsDegraded");
+    assert!(recovery["message"]
+        .as_str()
+        .unwrap()
+        .contains("4 unhealthy object"));
+}
+
 #[test]
 fn runtime_registry_returns_handler_specific_create_timeout() {
     let runtime = RuntimeRegistry::new(

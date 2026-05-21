@@ -430,6 +430,83 @@ impl RuntimeServiceImpl {
         })
     }
 
+    pub(super) async fn recovery_ledger_health_summary(
+        &self,
+    ) -> Result<crate::services::RecoveryLedgerHealthSummary, String> {
+        let snapshot = {
+            let persistence = self.persistence.lock().await;
+            crate::state::RecoveryLedgerSnapshot::load(&persistence)
+                .map_err(|err| format!("failed to load recovery ledger snapshot: {err}"))?
+        };
+
+        let broken_containers = snapshot
+            .containers
+            .iter()
+            .filter(|entry| {
+                serde_json::from_str::<HashMap<String, String>>(&entry.record.annotations)
+                    .ok()
+                    .and_then(|annotations| {
+                        Self::read_internal_state::<StoredContainerState>(
+                            &annotations,
+                            INTERNAL_CONTAINER_STATE_KEY,
+                        )
+                    })
+                    .and_then(|state| state.broken)
+                    .is_some()
+            })
+            .count();
+        let broken_pods = snapshot
+            .pods
+            .iter()
+            .filter(|record| {
+                serde_json::from_str::<HashMap<String, String>>(&record.annotations)
+                    .ok()
+                    .and_then(|annotations| {
+                        Self::read_internal_state::<StoredPodState>(
+                            &annotations,
+                            INTERNAL_POD_STATE_KEY,
+                        )
+                    })
+                    .and_then(|state| state.broken)
+                    .is_some()
+            })
+            .count();
+
+        Ok(crate::services::RecoveryLedgerHealthSummary {
+            broken_containers,
+            broken_pods,
+            broken_snapshots: snapshot
+                .snapshots
+                .iter()
+                .filter(|snapshot| {
+                    snapshot.state == crate::state::SnapshotLedgerState::Broken.as_str()
+                })
+                .count(),
+            broken_runtime_artifacts: snapshot
+                .runtime_artifacts
+                .iter()
+                .filter(|artifact| {
+                    artifact.state == crate::state::RuntimeArtifactLedgerState::Broken.as_str()
+                })
+                .count(),
+            dead_shims: snapshot
+                .shim_processes
+                .iter()
+                .filter(|shim| shim.state == crate::state::ShimLedgerState::Dead.as_str())
+                .count(),
+            broken_shims: snapshot
+                .shim_processes
+                .iter()
+                .filter(|shim| shim.state == crate::state::ShimLedgerState::Broken.as_str())
+                .count(),
+            degraded_shims: snapshot
+                .shim_processes
+                .iter()
+                .filter(|shim| shim.state == crate::state::ShimLedgerState::Degraded.as_str())
+                .count(),
+        })
+    }
+
     pub(super) async fn probe_cni_load_status(&self) -> crate::network::CniLoadStatus {
         let cni_config = self.current_cni_config();
         if let Some(status) = cni_config.rootless_load_status() {
@@ -750,6 +827,11 @@ impl RuntimeServiceImpl {
             ));
             let pull_cgroup_effective = self.image_service.pull_cgroup_effective_config();
             let pull_cgroup_last_scope = self.image_service.last_pull_cgroup_scope();
+            let (recovery_ledger_summary, recovery_ledger_summary_error) =
+                match self.recovery_ledger_health_summary().await {
+                    Ok(summary) => (Some(summary), None),
+                    Err(err) => (None, Some(err)),
+                };
             let mut extended_health_conditions = self.internal_services.health.extended_conditions(
                 &self.config.image_root,
                 &self.config.image_root.join("snapshots"),
@@ -757,6 +839,7 @@ impl RuntimeServiceImpl {
                 self.last_startup_attempted_repair(),
                 self.last_startup_repair_succeeded(),
                 true,
+                recovery_ledger_summary.as_ref(),
             );
             extended_health_conditions.push(
                 self.internal_services
@@ -1164,6 +1247,10 @@ impl RuntimeServiceImpl {
                         "runtimeBackend": self.internal_services.introspection.runtime_backend(&self.config),
                         "snapshotBackend": self.internal_services.introspection.snapshot_backend(&self.config),
                         "rootless": self.internal_services.introspection.rootless(&self.config.rootless),
+                        "recovery": self.internal_services.introspection.recovery(
+                            recovery_ledger_summary.as_ref(),
+                            recovery_ledger_summary_error.as_deref(),
+                        ),
                         "featureFlags": self.internal_services.introspection.feature_flags(
                             self.runtime_feature_flags(),
                             self.security_availability_info(),
@@ -1278,6 +1365,8 @@ impl RuntimeServiceImpl {
                     "lastStartupDetectedUpgrade": self.last_startup_detected_upgrade(),
                     "lastStartupAttemptedRepair": self.last_startup_attempted_repair(),
                     "lastStartupRepairSucceeded": self.last_startup_repair_succeeded(),
+                    "ledgerSummary": recovery_ledger_summary,
+                    "ledgerSummaryError": recovery_ledger_summary_error,
                     "internalWipe": self.config.internal_wipe,
                     "internalRepair": self.config.internal_repair,
                     "policy": {

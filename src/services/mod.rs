@@ -3,7 +3,9 @@ pub mod health;
 pub mod introspection;
 
 pub use event::{EventService, InternalEvent, InternalEventSeverity};
-pub use health::{HealthCondition, HealthService, InternalHealthCondition};
+pub use health::{
+    HealthCondition, HealthService, InternalHealthCondition, RecoveryLedgerHealthSummary,
+};
 pub use introspection::IntrospectionService;
 
 #[derive(Debug, Clone)]

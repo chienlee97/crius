@@ -7,6 +7,8 @@ use crate::image::{PullCgroupEffectiveConfig, PullCgroupScopeRecord};
 use crate::rootless::EffectiveRootlessConfig;
 use crate::server::{RuntimeConfig, RuntimeReloadState, RuntimeReloadableConfig};
 
+use super::health::RecoveryLedgerHealthSummary;
+
 #[derive(Debug, Clone, Default)]
 pub struct IntrospectionService;
 
@@ -85,6 +87,20 @@ impl IntrospectionService {
             "tolerateMissingHugetlbController": rootless.tolerate_missing_hugetlb_controller,
             "slirp4netnsPath": rootless.slirp4netns_path.display().to_string(),
             "pastaPath": rootless.pasta_path.display().to_string(),
+        })
+    }
+
+    pub fn recovery(
+        &self,
+        ledger_summary: Option<&RecoveryLedgerHealthSummary>,
+        ledger_summary_error: Option<&str>,
+    ) -> Value {
+        json!({
+            "ledgerSummary": ledger_summary,
+            "ledgerSummaryError": ledger_summary_error,
+            "unhealthyObjectCount": ledger_summary
+                .map(RecoveryLedgerHealthSummary::unhealthy_object_count)
+                .unwrap_or_default(),
         })
     }
 
