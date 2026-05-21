@@ -206,6 +206,66 @@ async fn exec_sync_prefers_task_shim_rpc_when_socket_is_available() {
 }
 
 #[tokio::test]
+async fn exec_sync_rejects_shim_owned_container_when_task_socket_is_missing() {
+    let (dir, service) = test_service_with_fake_runtime();
+    let container_id = "container-shim-missing-socket";
+    service.containers.lock().await.insert(
+        container_id.to_string(),
+        test_container(container_id, "pod-1", HashMap::new()),
+    );
+
+    let task_socket = dir.path().join("shims").join(container_id).join("task.sock");
+    service
+        .persistence
+        .lock()
+        .await
+        .save_shim_process_record(&crate::storage::ShimProcessRecord {
+            container_id: container_id.to_string(),
+            shim_pid: std::process::id(),
+            work_dir: task_socket.parent().unwrap().display().to_string(),
+            socket_path: task_socket.display().to_string(),
+            exit_code_file: dir.path().join("exits").join(container_id).display().to_string(),
+            log_file: dir.path().join("logs").join(container_id).display().to_string(),
+            bundle_path: dir
+                .path()
+                .join("runtime-root")
+                .join(container_id)
+                .display()
+                .to_string(),
+            state: "running".to_string(),
+            last_seen_at: RuntimeServiceImpl::now_nanos(),
+        })
+        .unwrap();
+    assert!(!task_socket.exists());
+
+    let err = RuntimeService::exec_sync(
+        &service,
+        Request::new(ExecSyncRequest {
+            container_id: container_id.to_string(),
+            cmd: vec!["true".to_string()],
+            timeout: 0,
+        }),
+    )
+    .await
+    .expect_err("shim-owned exec_sync must not fall back to direct runtime exec");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("shim task socket"));
+    let events = service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_recent_events("task", 0)
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.event_type == "exec"
+            && event.entity_id == container_id
+            && event.new_state == "shim_socket_missing"
+    }));
+}
+
+#[tokio::test]
 async fn exec_opens_shim_exec_session_when_task_socket_is_available() {
     let (dir, service) = test_service_with_fake_runtime();
 
@@ -279,6 +339,74 @@ async fn exec_opens_shim_exec_session_when_task_socket_is_available() {
     running.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = std::os::unix::net::UnixStream::connect(&task_socket);
     handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn exec_rejects_shim_owned_container_when_task_socket_is_missing() {
+    let (dir, service) = test_service_with_fake_runtime();
+    service
+        .set_streaming_server(crate::streaming::StreamingServer::for_test(
+            "http://127.0.0.1:12345",
+        ))
+        .await;
+    let container_id = "container-shim-missing-exec-socket";
+    service.containers.lock().await.insert(
+        container_id.to_string(),
+        test_container(container_id, "pod-1", HashMap::new()),
+    );
+
+    let task_socket = dir.path().join("shims").join(container_id).join("task.sock");
+    service
+        .persistence
+        .lock()
+        .await
+        .save_shim_process_record(&crate::storage::ShimProcessRecord {
+            container_id: container_id.to_string(),
+            shim_pid: std::process::id(),
+            work_dir: task_socket.parent().unwrap().display().to_string(),
+            socket_path: task_socket.display().to_string(),
+            exit_code_file: dir.path().join("exits").join(container_id).display().to_string(),
+            log_file: dir.path().join("logs").join(container_id).display().to_string(),
+            bundle_path: dir
+                .path()
+                .join("runtime-root")
+                .join(container_id)
+                .display()
+                .to_string(),
+            state: "running".to_string(),
+            last_seen_at: RuntimeServiceImpl::now_nanos(),
+        })
+        .unwrap();
+    assert!(!task_socket.exists());
+
+    let err = RuntimeService::exec(
+        &service,
+        Request::new(ExecRequest {
+            container_id: container_id.to_string(),
+            cmd: vec!["sh".to_string()],
+            stdin: false,
+            stdout: true,
+            stderr: true,
+            tty: false,
+        }),
+    )
+    .await
+    .expect_err("shim-owned exec must not fall back to streaming direct runtime exec");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("shim task socket"));
+    let events = service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_recent_events("task", 0)
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.event_type == "exec"
+            && event.entity_id == container_id
+            && event.new_state == "shim_socket_missing"
+    }));
 }
 
 #[tokio::test]

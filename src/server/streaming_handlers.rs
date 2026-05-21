@@ -94,12 +94,77 @@ impl RuntimeServiceImpl {
         crate::shim_rpc::default_task_socket_path(&self.shim_work_dir, container_id)
     }
 
+    async fn fail_if_shim_owned_task_socket_missing(
+        &self,
+        container_id: &str,
+        operation: &str,
+        task_socket_path: &Path,
+    ) -> Result<(), Status> {
+        let shim_record = {
+            let persistence = self.persistence.lock().await;
+            persistence
+                .get_shim_process_record(container_id)
+                .map_err(|err| {
+                    Status::internal(format!(
+                        "Failed to inspect shim ledger for container {}: {}",
+                        container_id, err
+                    ))
+                })?
+        };
+
+        if shim_record.is_none() {
+            return Ok(());
+        }
+
+        let details = format!(
+            "{} requires shim task socket {}, but the ledger-owned shim task socket is missing",
+            operation,
+            task_socket_path.display()
+        );
+        if let Err(err) = self
+            .persistence
+            .lock()
+            .await
+            .storage_mut()
+            .append_typed_event(
+                "exec",
+                "task",
+                container_id,
+                None,
+                Some("shim_socket_missing"),
+                Some(&details),
+            )
+        {
+            log::warn!(
+                "Failed to record missing shim task socket event for {}: {}",
+                container_id,
+                err
+            );
+        }
+
+        Err(Status::failed_precondition(format!(
+            "{} is not available for container {}: shim task socket {} is missing",
+            operation,
+            container_id,
+            task_socket_path.display()
+        )))
+    }
+
     pub(super) async fn exec(
         &self,
         request: Request<ExecRequest>,
     ) -> Result<Response<ExecResponse>, Status> {
         let mut req = request.into_inner();
         req.container_id = self.resolve_container_id(&req.container_id).await?;
+        let task_socket_path = self.task_socket_path(&req.container_id);
+        if !task_socket_path.exists() {
+            self.fail_if_shim_owned_task_socket_missing(
+                &req.container_id,
+                "exec",
+                &task_socket_path,
+            )
+            .await?;
+        }
         self.ensure_container_is_streamable(&req.container_id, "exec")
             .await?;
         let runtime = self
@@ -117,7 +182,6 @@ impl RuntimeServiceImpl {
             .map(|config| config.stream_websockets)
             .unwrap_or(false);
         let exec_cpu_affinity = self.effective_exec_cpu_affinity(&req.container_id).await;
-        let task_socket_path = self.task_socket_path(&req.container_id);
         let (exec_io_socket_path, exec_resize_socket_path) = if task_socket_path.exists() {
             let request = crate::shim_rpc::ShimRpcRequest::OpenExecSession(
                 crate::shim_rpc::OpenExecSessionRequest {
@@ -155,6 +219,12 @@ impl RuntimeServiceImpl {
                 }
             }
         } else {
+            self.fail_if_shim_owned_task_socket_missing(
+                &req.container_id,
+                "exec",
+                &task_socket_path,
+            )
+            .await?;
             (None, None)
         };
         let streaming = self.get_streaming_server().await?;
@@ -189,12 +259,21 @@ impl RuntimeServiceImpl {
             return Err(Status::invalid_argument("cmd must not be empty"));
         }
 
+        let task_socket_path = self.task_socket_path(&container_id);
+        if !task_socket_path.exists() {
+            self.fail_if_shim_owned_task_socket_missing(
+                &container_id,
+                "exec_sync",
+                &task_socket_path,
+            )
+            .await?;
+        }
+
         self.ensure_container_is_streamable(&container_id, "exec_sync")
             .await?;
 
         let runtime = self.runtime_for_container_request(&container_id).await?;
         let exec_cpu_affinity = self.effective_exec_cpu_affinity(&container_id).await;
-        let task_socket_path = self.task_socket_path(&container_id);
         if task_socket_path.exists() {
             let request =
                 crate::shim_rpc::ShimRpcRequest::ExecProcess(crate::shim_rpc::ExecProcessRequest {
@@ -240,6 +319,9 @@ impl RuntimeServiceImpl {
                 container_id
             )));
         }
+
+        self.fail_if_shim_owned_task_socket_missing(&container_id, "exec_sync", &task_socket_path)
+            .await?;
 
         let runtime_path = runtime.runtime_path().to_path_buf();
         let runtime_config_path = runtime.runtime_config_path().to_path_buf();
