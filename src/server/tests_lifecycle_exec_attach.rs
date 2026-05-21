@@ -921,6 +921,92 @@ async fn attach_uses_log_stream_fallback_when_recovered_socket_is_missing() {
 }
 
 #[tokio::test]
+async fn attach_rejects_shim_owned_container_when_attach_socket_is_missing() {
+    let (dir, service) = test_service_with_fake_runtime();
+    service
+        .set_streaming_server(crate::streaming::StreamingServer::for_test(
+            "http://127.0.0.1:12345",
+        ))
+        .await;
+
+    let container_id = "container-shim-missing-attach-socket";
+    set_fake_runtime_state(&dir, container_id, "running");
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            log_path: Some(
+                dir.path()
+                    .join("logs")
+                    .join("shim-owned.log")
+                    .display()
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service.containers.lock().await.insert(
+        container_id.to_string(),
+        test_container(container_id, "pod-1", annotations),
+    );
+
+    let task_socket = dir.path().join("shims").join(container_id).join("task.sock");
+    service
+        .persistence
+        .lock()
+        .await
+        .save_shim_process_record(&crate::storage::ShimProcessRecord {
+            container_id: container_id.to_string(),
+            shim_pid: std::process::id(),
+            work_dir: task_socket.parent().unwrap().display().to_string(),
+            socket_path: task_socket.display().to_string(),
+            exit_code_file: dir.path().join("exits").join(container_id).display().to_string(),
+            log_file: dir.path().join("logs").join(container_id).display().to_string(),
+            bundle_path: dir
+                .path()
+                .join("runtime-root")
+                .join(container_id)
+                .display()
+                .to_string(),
+            state: "running".to_string(),
+            last_seen_at: RuntimeServiceImpl::now_nanos(),
+        })
+        .unwrap();
+    let attach_socket = dir.path().join("attach").join(container_id).join("attach.sock");
+    assert!(!attach_socket.exists());
+
+    let err = RuntimeService::attach(
+        &service,
+        Request::new(AttachRequest {
+            container_id: container_id.to_string(),
+            stdin: false,
+            stdout: true,
+            stderr: true,
+            tty: false,
+        }),
+    )
+    .await
+    .expect_err("shim-owned attach must not fall back to log streaming");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("attach socket"));
+    let events = service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_recent_events("task", 0)
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.event_type == "attach"
+            && event.entity_id == container_id
+            && event.new_state == "attach_socket_missing"
+    }));
+}
+
+#[tokio::test]
 async fn attach_uses_log_stream_fallback_for_read_only_tty_when_socket_is_missing() {
     let (dir, service) = test_service_with_fake_runtime();
     service

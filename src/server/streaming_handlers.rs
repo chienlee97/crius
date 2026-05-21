@@ -94,11 +94,14 @@ impl RuntimeServiceImpl {
         crate::shim_rpc::default_task_socket_path(&self.shim_work_dir, container_id)
     }
 
-    async fn fail_if_shim_owned_task_socket_missing(
+    async fn fail_if_shim_owned_socket_missing(
         &self,
         container_id: &str,
         operation: &str,
+        socket_name: &str,
         task_socket_path: &Path,
+        event_type: &str,
+        event_new_state: &str,
     ) -> Result<(), Status> {
         let shim_record = {
             let persistence = self.persistence.lock().await;
@@ -117,9 +120,11 @@ impl RuntimeServiceImpl {
         }
 
         let details = format!(
-            "{} requires shim task socket {}, but the ledger-owned shim task socket is missing",
+            "{} requires shim {} {}, but the ledger-owned shim {} is missing",
             operation,
-            task_socket_path.display()
+            socket_name,
+            task_socket_path.display(),
+            socket_name
         );
         if let Err(err) = self
             .persistence
@@ -127,11 +132,11 @@ impl RuntimeServiceImpl {
             .await
             .storage_mut()
             .append_typed_event(
-                "exec",
+                event_type,
                 "task",
                 container_id,
                 None,
-                Some("shim_socket_missing"),
+                Some(event_new_state),
                 Some(&details),
             )
         {
@@ -143,9 +148,10 @@ impl RuntimeServiceImpl {
         }
 
         Err(Status::failed_precondition(format!(
-            "{} is not available for container {}: shim task socket {} is missing",
+            "{} is not available for container {}: shim {} {} is missing",
             operation,
             container_id,
+            socket_name,
             task_socket_path.display()
         )))
     }
@@ -158,10 +164,13 @@ impl RuntimeServiceImpl {
         req.container_id = self.resolve_container_id(&req.container_id).await?;
         let task_socket_path = self.task_socket_path(&req.container_id);
         if !task_socket_path.exists() {
-            self.fail_if_shim_owned_task_socket_missing(
+            self.fail_if_shim_owned_socket_missing(
                 &req.container_id,
                 "exec",
+                "task socket",
                 &task_socket_path,
+                "exec",
+                "shim_socket_missing",
             )
             .await?;
         }
@@ -219,10 +228,13 @@ impl RuntimeServiceImpl {
                 }
             }
         } else {
-            self.fail_if_shim_owned_task_socket_missing(
+            self.fail_if_shim_owned_socket_missing(
                 &req.container_id,
                 "exec",
+                "task socket",
                 &task_socket_path,
+                "exec",
+                "shim_socket_missing",
             )
             .await?;
             (None, None)
@@ -261,10 +273,13 @@ impl RuntimeServiceImpl {
 
         let task_socket_path = self.task_socket_path(&container_id);
         if !task_socket_path.exists() {
-            self.fail_if_shim_owned_task_socket_missing(
+            self.fail_if_shim_owned_socket_missing(
                 &container_id,
                 "exec_sync",
+                "task socket",
                 &task_socket_path,
+                "exec",
+                "shim_socket_missing",
             )
             .await?;
         }
@@ -320,8 +335,15 @@ impl RuntimeServiceImpl {
             )));
         }
 
-        self.fail_if_shim_owned_task_socket_missing(&container_id, "exec_sync", &task_socket_path)
-            .await?;
+        self.fail_if_shim_owned_socket_missing(
+            &container_id,
+            "exec_sync",
+            "task socket",
+            &task_socket_path,
+            "exec",
+            "shim_socket_missing",
+        )
+        .await?;
 
         let runtime_path = runtime.runtime_path().to_path_buf();
         let runtime_config_path = runtime.runtime_config_path().to_path_buf();
@@ -518,6 +540,16 @@ impl RuntimeServiceImpl {
             }
         }
         if !attach_socket_path.exists() {
+            self.fail_if_shim_owned_socket_missing(
+                &req.container_id,
+                "attach",
+                "attach socket",
+                &attach_socket_path,
+                "attach",
+                "attach_socket_missing",
+            )
+            .await?;
+
             let log_path = {
                 let containers = self.containers.lock().await;
                 containers
