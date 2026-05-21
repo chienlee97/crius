@@ -1,4 +1,6 @@
-use super::service::{RecoveryCleanupCounter, RecoveryReconcileSummary, RecoveryResultSummary};
+use super::service::{
+    RecoveryCleanupCounter, RecoveryReconcileSummary, RecoveryResultSummary, RecoveryStage,
+};
 use super::*;
 use crate::state::{
     RecoveryContainerEntry, RecoveryLedgerSnapshot, RuntimeArtifactLedgerState, ShimLedgerState,
@@ -981,7 +983,7 @@ impl RuntimeServiceImpl {
                     + snapshot.runtime_artifacts.len()
                     + snapshot.shim_processes.len();
                 recovery_result.stages.push(Self::recovery_stage_summary(
-                    "loadLedgerSnapshot",
+                    RecoveryStage::LoadLedgerSnapshot,
                     stage_started,
                     true,
                     items,
@@ -991,7 +993,7 @@ impl RuntimeServiceImpl {
             }
             Err(status) => {
                 recovery_result.stages.push(Self::recovery_stage_summary(
-                    "loadLedgerSnapshot",
+                    RecoveryStage::LoadLedgerSnapshot,
                     stage_started,
                     false,
                     0,
@@ -1340,7 +1342,7 @@ impl RuntimeServiceImpl {
             );
         }
         recovery_result.stages.push(Self::recovery_stage_summary(
-            "restoreMemoryState",
+            RecoveryStage::RestoreMemoryState,
             stage_started,
             true,
             snapshot.containers.len() + snapshot.pods.len(),
@@ -1379,7 +1381,7 @@ impl RuntimeServiceImpl {
             }
         }
         recovery_result.stages.push(Self::recovery_stage_summary(
-            "reserveRecoveredNames",
+            RecoveryStage::ReserveRecoveredNames,
             stage_started,
             true,
             recovered_container_name_key_count,
@@ -1389,7 +1391,7 @@ impl RuntimeServiceImpl {
         let stage_started = Instant::now();
         match self.prune_recovered_logical_duplicates().await {
             Ok(()) => recovery_result.stages.push(Self::recovery_stage_summary(
-                "pruneLogicalDuplicates",
+                RecoveryStage::PruneLogicalDuplicates,
                 stage_started,
                 true,
                 0,
@@ -1397,7 +1399,7 @@ impl RuntimeServiceImpl {
             )),
             Err(status) => {
                 recovery_result.stages.push(Self::recovery_stage_summary(
-                    "pruneLogicalDuplicates",
+                    RecoveryStage::PruneLogicalDuplicates,
                     stage_started,
                     false,
                     0,
@@ -1443,7 +1445,7 @@ impl RuntimeServiceImpl {
             }
         }
         recovery_result.stages.push(Self::recovery_stage_summary(
-            "restoreSeccompNotifiers",
+            RecoveryStage::RestoreSeccompNotifiers,
             stage_started,
             true,
             restored_seccomp_notifiers,
@@ -1456,7 +1458,7 @@ impl RuntimeServiceImpl {
                 let items = snapshot.containers.len() + snapshot.pods.len();
                 recovery_result.reconcile = summary;
                 recovery_result.stages.push(Self::recovery_stage_summary(
-                    "reconcileObjects",
+                    RecoveryStage::ReconcileObjects,
                     stage_started,
                     true,
                     items,
@@ -1465,7 +1467,7 @@ impl RuntimeServiceImpl {
             }
             Err(status) => {
                 recovery_result.stages.push(Self::recovery_stage_summary(
-                    "reconcileObjects",
+                    RecoveryStage::ReconcileObjects,
                     stage_started,
                     false,
                     snapshot.containers.len() + snapshot.pods.len(),
@@ -1482,7 +1484,7 @@ impl RuntimeServiceImpl {
         let stage_started = Instant::now();
         self.ensure_exit_monitors_for_active_containers().await;
         recovery_result.stages.push(Self::recovery_stage_summary(
-            "restoreExitMonitors",
+            RecoveryStage::RestoreExitMonitors,
             stage_started,
             true,
             0,
@@ -1527,7 +1529,7 @@ impl RuntimeServiceImpl {
             + recovery_result.orphan_cleanup.attach_socket_dirs_removed
             + recovery_result.orphan_cleanup.pause_processes_killed;
         recovery_result.stages.push(Self::recovery_stage_summary(
-            "cleanupOrphans",
+            RecoveryStage::CleanupOrphans,
             stage_started,
             true,
             orphan_items,

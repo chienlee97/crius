@@ -134,6 +134,44 @@ pub struct RecoveryStageSummary {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecoveryStage {
+    LoadLedgerSnapshot,
+    RestoreMemoryState,
+    ReserveRecoveredNames,
+    PruneLogicalDuplicates,
+    RestoreSeccompNotifiers,
+    ReconcileObjects,
+    RestoreExitMonitors,
+    CleanupOrphans,
+}
+
+impl RecoveryStage {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::LoadLedgerSnapshot => "loadLedgerSnapshot",
+            Self::RestoreMemoryState => "restoreMemoryState",
+            Self::ReserveRecoveredNames => "reserveRecoveredNames",
+            Self::PruneLogicalDuplicates => "pruneLogicalDuplicates",
+            Self::RestoreSeccompNotifiers => "restoreSeccompNotifiers",
+            Self::ReconcileObjects => "reconcileObjects",
+            Self::RestoreExitMonitors => "restoreExitMonitors",
+            Self::CleanupOrphans => "cleanupOrphans",
+        }
+    }
+}
+
+pub(super) const RECOVERY_STAGE_ORDER: &[RecoveryStage] = &[
+    RecoveryStage::LoadLedgerSnapshot,
+    RecoveryStage::RestoreMemoryState,
+    RecoveryStage::ReserveRecoveredNames,
+    RecoveryStage::PruneLogicalDuplicates,
+    RecoveryStage::RestoreSeccompNotifiers,
+    RecoveryStage::ReconcileObjects,
+    RecoveryStage::RestoreExitMonitors,
+    RecoveryStage::CleanupOrphans,
+];
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryReconcileSummary {
@@ -1430,14 +1468,14 @@ impl RuntimeServiceImpl {
     }
 
     pub(super) fn recovery_stage_summary(
-        name: &str,
+        stage: RecoveryStage,
         started_at: Instant,
         success: bool,
         items: usize,
         error: Option<String>,
     ) -> RecoveryStageSummary {
         RecoveryStageSummary {
-            name: name.to_string(),
+            name: stage.as_str().to_string(),
             success,
             duration_millis: started_at.elapsed().as_millis() as u64,
             items,

@@ -2102,11 +2102,22 @@ async fn recover_state_cleans_orphaned_runtime_bundles_but_keeps_recovered_ones(
         recovery_result["orphanCleanup"]["runtimeBundlesRemoved"],
         serde_json::json!(1)
     );
+    let stage_names = recovery_result["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|stage| stage["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let expected_stage_names = crate::server::service::RECOVERY_STAGE_ORDER
+        .iter()
+        .map(|stage| stage.as_str().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(stage_names, expected_stage_names);
     assert!(recovery_result["stages"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|stage| stage["name"] == "cleanupOrphans" && stage["success"] == true));
+        .all(|stage| stage["success"] == true));
     assert_eq!(
         config["internalServices"]["introspection"]["recovery"]["lastRecoveryResult"]
             ["orphanCleanup"]["runtimeBundlesRemoved"],
