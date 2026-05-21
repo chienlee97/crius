@@ -7,6 +7,7 @@ use crate::state::{
     RecoveryContainerEntry, RecoveryLedgerSnapshot, RuntimeArtifactLedgerState, ShimLedgerState,
     SnapshotLedgerState,
 };
+use crate::storage::{ContainerRecord, PodSandboxRecord};
 use std::time::Instant;
 
 #[derive(Default)]
@@ -683,203 +684,245 @@ impl RuntimeServiceImpl {
         )
     }
 
+    async fn detect_recovered_container_artifact_breakage(
+        &self,
+        snapshot: &RecoveryLedgerSnapshot,
+        record: &ContainerRecord,
+    ) -> Option<StoredBrokenState> {
+        let container_id = record.id.as_str();
+        let runtime = record
+            .runtime_handler
+            .as_deref()
+            .and_then(|handler| self.runtime.runtime_for_handler(handler).ok())
+            .or_else(|| self.runtime.runtime_for_container(container_id).ok());
+
+        if let Some(runtime) = runtime.as_ref() {
+            let bundle_path = runtime.bundle_path_for(container_id);
+            if !bundle_path.exists() {
+                let bundle_path = bundle_path.display().to_string();
+                self.mark_runtime_artifact_broken(
+                    "container",
+                    container_id,
+                    "bundle",
+                    &bundle_path,
+                )
+                .await;
+                return Some(Self::broken_state(
+                    "bundle_missing",
+                    format!("runtime bundle {bundle_path} is missing"),
+                ));
+            }
+        }
+
+        if let Some(rootfs_artifact) = snapshot.runtime_artifacts.iter().find(|artifact| {
+            artifact.owner_kind == "container"
+                && artifact.owner_id == container_id
+                && artifact.artifact_kind == "rootfs"
+        }) {
+            let rootfs_path = Path::new(&rootfs_artifact.path);
+            if !rootfs_path.exists() {
+                self.mark_runtime_artifact_broken(
+                    "container",
+                    container_id,
+                    "rootfs",
+                    &rootfs_artifact.path,
+                )
+                .await;
+                if let Some(snapshot_key) = record.snapshot_key.as_deref() {
+                    self.mark_snapshot_broken(snapshot_key).await;
+                }
+                return Some(Self::broken_state(
+                    "rootfs_missing",
+                    format!("rootfs artifact {} is missing", rootfs_path.display()),
+                ));
+            }
+        }
+
+        None
+    }
+
+    async fn reconcile_recovered_container_from_ledger(
+        &self,
+        snapshot: &RecoveryLedgerSnapshot,
+        record: &ContainerRecord,
+        runtime_status: ContainerStatus,
+        shim_reconnect: &RecoveryShimReconnectResult,
+    ) -> Result<bool, Status> {
+        let container_id = record.id.as_str();
+        let broken = self
+            .detect_recovered_container_artifact_breakage(snapshot, record)
+            .await
+            .or_else(|| shim_reconnect.broken_containers.get(container_id).cloned());
+
+        let detected_broken = broken.clone();
+        if let Some(broken) = broken {
+            self.mark_container_broken(container_id, broken).await?;
+        } else {
+            self.clear_container_broken(container_id).await?;
+        }
+
+        let runtime_state = Self::map_runtime_container_state(runtime_status.clone());
+        let persistence_status = match runtime_status {
+            ContainerStatus::Created => crate::runtime::ContainerStatus::Created,
+            ContainerStatus::Running => crate::runtime::ContainerStatus::Running,
+            ContainerStatus::Stopped(code) => crate::runtime::ContainerStatus::Stopped(code),
+            ContainerStatus::Unknown => crate::runtime::ContainerStatus::Unknown,
+        };
+
+        let updated_annotations = {
+            let mut containers = self.containers.lock().await;
+            if let Some(container) = containers.get_mut(container_id) {
+                container.state = runtime_state;
+                let mut state = Self::read_internal_state::<StoredContainerState>(
+                    &container.annotations,
+                    INTERNAL_CONTAINER_STATE_KEY,
+                )
+                .unwrap_or_default();
+                state.broken = detected_broken.clone();
+                match &persistence_status {
+                    crate::runtime::ContainerStatus::Running => {
+                        state.started_at.get_or_insert(Self::now_nanos());
+                        state.finished_at = None;
+                        state.exit_code = None;
+                    }
+                    crate::runtime::ContainerStatus::Stopped(code) => {
+                        state.finished_at.get_or_insert(Self::now_nanos());
+                        state.exit_code = Some(*code);
+                    }
+                    _ => {}
+                }
+                Self::insert_internal_state(
+                    &mut container.annotations,
+                    INTERNAL_CONTAINER_STATE_KEY,
+                    &state,
+                )?;
+                Some(container.annotations.clone())
+            } else {
+                None
+            }
+        };
+        let mut persistence = self.persistence.lock().await;
+        if let Some(annotations) = updated_annotations {
+            if let Err(e) = persistence.update_container_annotations(container_id, &annotations) {
+                log::warn!(
+                    "Failed to persist ledger-driven annotations for container {}: {}",
+                    container_id,
+                    e
+                );
+            }
+        }
+        if let Err(e) = persistence.update_container_state(container_id, persistence_status) {
+            log::warn!(
+                "Failed to reconcile ledger-driven container {} state in database: {}",
+                container_id,
+                e
+            );
+        }
+
+        Ok(detected_broken.is_some())
+    }
+
+    async fn reconcile_recovered_pod_from_ledger(
+        &self,
+        pod: &PodSandboxRecord,
+        live_state: &RecoveryRuntimeLiveState,
+    ) -> Result<bool, Status> {
+        let pod_id = pod.id.as_str();
+        let pod_state = Self::read_internal_state::<StoredPodState>(
+            &serde_json::from_str::<HashMap<String, String>>(&pod.annotations).unwrap_or_default(),
+            INTERNAL_POD_STATE_KEY,
+        )
+        .unwrap_or_default();
+        let pause_container_id = pod_state.pause_container_id.clone();
+        let has_netns = !pod.netns_path.trim().is_empty() && Path::new(&pod.netns_path).exists();
+
+        if !has_netns {
+            self.mark_pod_broken(
+                pod_id,
+                Self::broken_state(
+                    "netns_missing",
+                    format!("pod network namespace {} is missing", pod.netns_path),
+                ),
+            )
+            .await?;
+        } else {
+            self.clear_pod_broken(pod_id).await?;
+        }
+
+        if let Some(pause_container_id) = pause_container_id {
+            let pause_status = live_state
+                .pause_statuses
+                .get(&pause_container_id)
+                .cloned()
+                .unwrap_or(ContainerStatus::Unknown);
+            let next_state = match pause_status {
+                ContainerStatus::Running if has_netns => "ready",
+                ContainerStatus::Unknown if has_netns => pod.state.as_str(),
+                _ => "notready",
+            };
+            if let Err(err) = self
+                .persistence
+                .lock()
+                .await
+                .update_pod_state(pod_id, next_state)
+            {
+                log::warn!(
+                    "Failed to reconcile ledger-driven pod {} state in database: {}",
+                    pod_id,
+                    err
+                );
+            }
+            {
+                let mut pods = self.pod_sandboxes.lock().await;
+                if let Some(pod) = pods.get_mut(pod_id) {
+                    pod.state = if next_state == "ready" {
+                        PodSandboxState::SandboxReady as i32
+                    } else {
+                        PodSandboxState::SandboxNotready as i32
+                    };
+                }
+            }
+        }
+
+        Ok(!has_netns)
+    }
+
     async fn reconcile_recovered_state_from_ledger(
         &self,
         snapshot: &RecoveryLedgerSnapshot,
         live_state: &RecoveryRuntimeLiveState,
         shim_reconnect: &RecoveryShimReconnectResult,
     ) -> Result<RecoveryReconcileSummary, Status> {
-        let mut summary = RecoveryReconcileSummary::default();
-        summary.reconnected_shims = shim_reconnect.reconnected_shims.clone();
+        let mut summary = RecoveryReconcileSummary {
+            reconnected_shims: shim_reconnect.reconnected_shims.clone(),
+            ..Default::default()
+        };
+
         for RecoveryContainerEntry { record, .. } in &snapshot.containers {
-            let container_id = record.id.as_str();
-            let runtime = record
-                .runtime_handler
-                .as_deref()
-                .and_then(|handler| self.runtime.runtime_for_handler(handler).ok())
-                .or_else(|| self.runtime.runtime_for_container(container_id).ok());
             let runtime_status = live_state
                 .container_statuses
-                .get(container_id)
+                .get(record.id.as_str())
                 .cloned()
                 .unwrap_or(ContainerStatus::Unknown);
-
-            let mut broken = None;
-            if let Some(runtime) = runtime.as_ref() {
-                let bundle_path = runtime.bundle_path_for(container_id);
-                if !bundle_path.exists() {
-                    let bundle_path = bundle_path.display().to_string();
-                    self.mark_runtime_artifact_broken(
-                        "container",
-                        container_id,
-                        "bundle",
-                        &bundle_path,
-                    )
-                    .await;
-                    broken = Some(Self::broken_state(
-                        "bundle_missing",
-                        format!("runtime bundle {bundle_path} is missing"),
-                    ));
-                }
-            }
-
-            if broken.is_none() {
-                if let Some(rootfs_artifact) = snapshot.runtime_artifacts.iter().find(|artifact| {
-                    artifact.owner_kind == "container"
-                        && artifact.owner_id == container_id
-                        && artifact.artifact_kind == "rootfs"
-                }) {
-                    let rootfs_path = Path::new(&rootfs_artifact.path);
-                    if !rootfs_path.exists() {
-                        self.mark_runtime_artifact_broken(
-                            "container",
-                            container_id,
-                            "rootfs",
-                            &rootfs_artifact.path,
-                        )
-                        .await;
-                        if let Some(snapshot_key) = record.snapshot_key.as_deref() {
-                            self.mark_snapshot_broken(snapshot_key).await;
-                        }
-                        broken = Some(Self::broken_state(
-                            "rootfs_missing",
-                            format!("rootfs artifact {} is missing", rootfs_path.display()),
-                        ));
-                    }
-                }
-            }
-
-            if broken.is_none() {
-                broken = shim_reconnect.broken_containers.get(container_id).cloned();
-            }
-
-            let detected_broken = broken.clone();
-            if let Some(broken) = broken {
+            if self
+                .reconcile_recovered_container_from_ledger(
+                    snapshot,
+                    record,
+                    runtime_status,
+                    shim_reconnect,
+                )
+                .await?
+            {
                 summary.broken_containers += 1;
-                self.mark_container_broken(container_id, broken).await?;
-            } else {
-                self.clear_container_broken(container_id).await?;
-            }
-
-            let runtime_state = Self::map_runtime_container_state(runtime_status.clone());
-            let persistence_status = match runtime_status {
-                ContainerStatus::Created => crate::runtime::ContainerStatus::Created,
-                ContainerStatus::Running => crate::runtime::ContainerStatus::Running,
-                ContainerStatus::Stopped(code) => crate::runtime::ContainerStatus::Stopped(code),
-                ContainerStatus::Unknown => crate::runtime::ContainerStatus::Unknown,
-            };
-
-            let updated_annotations = {
-                let mut containers = self.containers.lock().await;
-                if let Some(container) = containers.get_mut(container_id) {
-                    container.state = runtime_state;
-                    let mut state = Self::read_internal_state::<StoredContainerState>(
-                        &container.annotations,
-                        INTERNAL_CONTAINER_STATE_KEY,
-                    )
-                    .unwrap_or_default();
-                    state.broken = detected_broken;
-                    match &persistence_status {
-                        crate::runtime::ContainerStatus::Running => {
-                            state.started_at.get_or_insert(Self::now_nanos());
-                            state.finished_at = None;
-                            state.exit_code = None;
-                        }
-                        crate::runtime::ContainerStatus::Stopped(code) => {
-                            state.finished_at.get_or_insert(Self::now_nanos());
-                            state.exit_code = Some(*code);
-                        }
-                        _ => {}
-                    }
-                    Self::insert_internal_state(
-                        &mut container.annotations,
-                        INTERNAL_CONTAINER_STATE_KEY,
-                        &state,
-                    )?;
-                    Some(container.annotations.clone())
-                } else {
-                    None
-                }
-            };
-            let mut persistence = self.persistence.lock().await;
-            if let Some(annotations) = updated_annotations {
-                if let Err(e) = persistence.update_container_annotations(container_id, &annotations)
-                {
-                    log::warn!(
-                        "Failed to persist ledger-driven annotations for container {}: {}",
-                        container_id,
-                        e
-                    );
-                }
-            }
-            if let Err(e) = persistence.update_container_state(container_id, persistence_status) {
-                log::warn!(
-                    "Failed to reconcile ledger-driven container {} state in database: {}",
-                    container_id,
-                    e
-                );
             }
         }
 
         for pod in &snapshot.pods {
-            let pod_id = pod.id.as_str();
-            let pod_state = Self::read_internal_state::<StoredPodState>(
-                &serde_json::from_str::<HashMap<String, String>>(&pod.annotations)
-                    .unwrap_or_default(),
-                INTERNAL_POD_STATE_KEY,
-            )
-            .unwrap_or_default();
-            let pause_container_id = pod_state.pause_container_id.clone();
-            let has_netns =
-                !pod.netns_path.trim().is_empty() && Path::new(&pod.netns_path).exists();
-
-            if !has_netns {
+            if self
+                .reconcile_recovered_pod_from_ledger(pod, live_state)
+                .await?
+            {
                 summary.broken_pods += 1;
-                self.mark_pod_broken(
-                    pod_id,
-                    Self::broken_state(
-                        "netns_missing",
-                        format!("pod network namespace {} is missing", pod.netns_path),
-                    ),
-                )
-                .await?;
-            } else {
-                self.clear_pod_broken(pod_id).await?;
-            }
-
-            if let Some(pause_container_id) = pause_container_id {
-                let pause_status = live_state
-                    .pause_statuses
-                    .get(&pause_container_id)
-                    .cloned()
-                    .unwrap_or(ContainerStatus::Unknown);
-                let next_state = match pause_status {
-                    ContainerStatus::Running if has_netns => "ready",
-                    ContainerStatus::Unknown if has_netns => pod.state.as_str(),
-                    _ => "notready",
-                };
-                if let Err(err) = self
-                    .persistence
-                    .lock()
-                    .await
-                    .update_pod_state(pod_id, next_state)
-                {
-                    log::warn!(
-                        "Failed to reconcile ledger-driven pod {} state in database: {}",
-                        pod_id,
-                        err
-                    );
-                }
-                {
-                    let mut pods = self.pod_sandboxes.lock().await;
-                    if let Some(pod) = pods.get_mut(pod_id) {
-                        pod.state = if next_state == "ready" {
-                            PodSandboxState::SandboxReady as i32
-                        } else {
-                            PodSandboxState::SandboxNotready as i32
-                        };
-                    }
-                }
             }
         }
 
