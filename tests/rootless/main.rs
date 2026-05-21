@@ -7,7 +7,9 @@ use crius::{
         snapshotter::{FilesystemSnapshotter, SnapshotMode, SnapshotState, Snapshotter},
         CriusImage, StoredLayerMeta,
     },
+    network::CniConfig,
     rootless::{RootlessConfig, RootlessManager},
+    runtime::RuncRuntime,
     storage::StorageManager,
 };
 use std::os::unix::fs::MetadataExt;
@@ -116,4 +118,43 @@ fn rootless_snapshot_prepare_uses_xdg_storage_root() {
     assert!(snapshots[0]
         .mountpoint
         .starts_with(storage_root.to_str().unwrap()));
+}
+
+#[test]
+fn rootless_baseline_keeps_runtime_storage_and_network_under_xdg() {
+    let dir = tempfile::tempdir().unwrap();
+    let xdg_runtime_dir = dir.path().join("xdg-runtime");
+    let xdg_data_home = dir.path().join("xdg-data");
+    let rootless = EffectiveRootlessConfig::resolve(&RootlessConfig {
+        enabled: true,
+        xdg_runtime_dir: xdg_runtime_dir.display().to_string(),
+        xdg_data_home: xdg_data_home.display().to_string(),
+        network_mode: NetworkMode::None,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let mut runtime = RuncRuntime::new(
+        dir.path().join("missing-runc"),
+        rootless.runtime_root.join("containers"),
+    );
+    runtime.set_rootless(rootless.clone());
+
+    let mut cni = CniConfig::default();
+    cni.set_rootless_config(Some(rootless.clone()));
+    cni.set_netns_mount_dir(rootless.netns_dir.clone());
+
+    assert_eq!(rootless.network_mode, NetworkMode::None);
+    assert!(rootless.storage_root.starts_with(&xdg_data_home));
+    assert!(rootless.runtime_root.starts_with(&xdg_runtime_dir));
+    assert!(rootless.netns_dir.starts_with(&xdg_runtime_dir));
+    assert!(runtime.runtime_root().starts_with(&rootless.runtime_root));
+    assert!(runtime
+        .bundle_path_for("container-1")
+        .starts_with(&xdg_runtime_dir));
+    assert!(cni.rootless_config().is_some());
+    assert_eq!(cni.netns_mount_dir(), rootless.netns_dir.as_path());
+    assert!(cni.netns_path("pod-1").starts_with(&rootless.netns_dir));
+    assert!(!rootless.storage_root.starts_with("/var/lib"));
+    assert!(!rootless.runtime_root.starts_with("/run/crius"));
 }
