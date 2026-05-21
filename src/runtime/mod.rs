@@ -2407,6 +2407,7 @@ impl RuncRuntime {
         config: &ContainerConfig,
         restore: &RestoreCheckpointMetadata,
     ) -> Result<Spec> {
+        self.validate_rootless_resource_requests(config)?;
         let mut spec: Spec = serde_json::from_value(restore.oci_config.clone())
             .context("Failed to parse OCI config from checkpoint artifact")?;
 
@@ -3153,6 +3154,7 @@ impl RuncRuntime {
 
     /// 创建OCI配置
     fn create_spec(&self, config: &ContainerConfig, container_id: &str) -> Result<Spec> {
+        self.validate_rootless_resource_requests(config)?;
         let mut spec = self.base_spec_template();
         let image_defaults = self.image_runtime_defaults(&config.image)?;
 
@@ -3556,6 +3558,32 @@ impl RuncRuntime {
             self.create_spec(config, container_id)
                 .context("Failed to create OCI spec")
         }
+    }
+
+    fn validate_rootless_resource_requests(&self, config: &ContainerConfig) -> Result<()> {
+        if !self.rootless.enabled {
+            return Ok(());
+        }
+
+        if config.privileged {
+            return Err(anyhow::anyhow!(
+                "privileged containers are not supported in rootless mode"
+            ));
+        }
+
+        if !config.devices.is_empty() {
+            return Err(anyhow::anyhow!(
+                "explicit device requests are not supported in rootless mode because device cgroup rules are disabled"
+            ));
+        }
+
+        if !self.additional_devices.is_empty() {
+            return Err(anyhow::anyhow!(
+                "runtime.additional_devices cannot be applied in rootless mode because device cgroup rules are disabled"
+            ));
+        }
+
+        Ok(())
     }
 
     pub(crate) fn validate_mount_requests(

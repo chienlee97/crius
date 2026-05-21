@@ -14,10 +14,8 @@ fn create_test_runtime_with_restrict(restrict: bool) -> (RuncRuntime, tempfile::
     (runtime, temp_dir)
 }
 
-#[test]
-fn runtime_uses_rootless_xdg_runtime_dir_when_enabled() {
-    let (mut runtime, _dir) = create_test_runtime();
-    runtime.set_rootless(crate::rootless::EffectiveRootlessConfig {
+fn rootless_effective_config() -> crate::rootless::EffectiveRootlessConfig {
+    crate::rootless::EffectiveRootlessConfig {
         enabled: true,
         current_uid: 1000,
         current_gid: 1000,
@@ -33,7 +31,13 @@ fn runtime_uses_rootless_xdg_runtime_dir_when_enabled() {
         pasta_path: PathBuf::from("pasta"),
         disable_cgroup: true,
         tolerate_missing_hugetlb_controller: true,
-    });
+    }
+}
+
+#[test]
+fn runtime_uses_rootless_xdg_runtime_dir_when_enabled() {
+    let (mut runtime, _dir) = create_test_runtime();
+    runtime.set_rootless(rootless_effective_config());
 
     assert_eq!(
         runtime.effective_xdg_runtime_dir(),
@@ -1325,6 +1329,62 @@ fn test_spec_rejects_unlisted_requested_device() {
     assert!(err
         .to_string()
         .contains("device /dev/null is not allowed by runtime.allowed_devices"));
+}
+
+#[test]
+fn test_rootless_create_spec_rejects_privileged_container() {
+    let (mut runtime, _temp) = create_test_runtime();
+    runtime.set_rootless(rootless_effective_config());
+    let mut config = create_test_config();
+    config.privileged = true;
+
+    let err = runtime
+        .create_spec(&config, "test-id")
+        .expect_err("rootless privileged containers must be rejected");
+
+    assert!(err
+        .to_string()
+        .contains("privileged containers are not supported in rootless mode"));
+}
+
+#[test]
+fn test_rootless_create_spec_rejects_explicit_devices() {
+    let (mut runtime, _temp) = create_test_runtime();
+    runtime.set_rootless(rootless_effective_config());
+    let mut config = create_test_config();
+    config.devices = vec![DeviceMapping {
+        source: PathBuf::from("/dev/null"),
+        destination: PathBuf::from("/dev/null"),
+        permissions: "rwm".to_string(),
+    }];
+
+    let err = runtime
+        .create_spec(&config, "test-id")
+        .expect_err("rootless explicit device requests must be rejected");
+
+    assert!(err
+        .to_string()
+        .contains("explicit device requests are not supported in rootless mode"));
+}
+
+#[test]
+fn test_rootless_create_spec_rejects_additional_devices() {
+    let (mut runtime, _temp) = create_test_runtime();
+    runtime.set_rootless(rootless_effective_config());
+    runtime.set_additional_devices(vec![DeviceMapping {
+        source: PathBuf::from("/dev/null"),
+        destination: PathBuf::from("/dev/null"),
+        permissions: "rwm".to_string(),
+    }]);
+    let config = create_test_config();
+
+    let err = runtime
+        .create_spec(&config, "test-id")
+        .expect_err("rootless runtime additional devices must be rejected");
+
+    assert!(err
+        .to_string()
+        .contains("runtime.additional_devices cannot be applied in rootless mode"));
 }
 
 #[test]
