@@ -2089,6 +2089,29 @@ async fn recover_state_cleans_orphaned_runtime_bundles_but_keeps_recovered_ones(
                 && event.entity_id == "orphan-bundle"
                 && event.new_state == "pending"));
     }
+
+    let response = RuntimeService::status(&service, Request::new(StatusRequest { verbose: true }))
+        .await
+        .unwrap()
+        .into_inner();
+    let config: serde_json::Value =
+        serde_json::from_str(response.info.get("config").unwrap()).unwrap();
+    let recovery_result = &config["recovery"]["lastRecoveryResult"];
+    assert_eq!(recovery_result["success"], serde_json::json!(true));
+    assert_eq!(
+        recovery_result["orphanCleanup"]["runtimeBundlesRemoved"],
+        serde_json::json!(1)
+    );
+    assert!(recovery_result["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|stage| stage["name"] == "cleanupOrphans" && stage["success"] == true));
+    assert_eq!(
+        config["internalServices"]["introspection"]["recovery"]["lastRecoveryResult"]
+            ["orphanCleanup"]["runtimeBundlesRemoved"],
+        serde_json::json!(1)
+    );
 }
 
 #[tokio::test]

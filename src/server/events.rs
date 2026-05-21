@@ -1,3 +1,4 @@
+use super::service::RecoveryShimCleanupSummary;
 use super::*;
 
 impl RuntimeServiceImpl {
@@ -260,7 +261,8 @@ impl RuntimeServiceImpl {
         }
     }
 
-    pub(super) async fn cleanup_orphaned_shim_artifacts(&self) {
+    pub(super) async fn cleanup_orphaned_shim_artifacts(&self) -> RecoveryShimCleanupSummary {
+        let mut summary = RecoveryShimCleanupSummary::default();
         let known_container_ids: HashSet<String> =
             self.containers.lock().await.keys().cloned().collect();
         let known_pause_ids: HashSet<String> = self
@@ -293,7 +295,7 @@ impl RuntimeServiceImpl {
             .collect();
 
         let Ok(entries) = std::fs::read_dir(&self.shim_work_dir) else {
-            return;
+            return summary;
         };
 
         for entry in entries.flatten() {
@@ -319,20 +321,23 @@ impl RuntimeServiceImpl {
             }
 
             if let Err(err) = std::fs::remove_dir_all(&path) {
+                summary.failures += 1;
                 log::warn!(
                     "Failed to remove orphaned shim directory {}: {}",
                     path.display(),
                     err
                 );
+            } else {
+                summary.shim_dirs_removed += 1;
             }
         }
 
         if self.attach_socket_dir == self.shim_work_dir {
-            return;
+            return summary;
         }
 
         let Ok(entries) = std::fs::read_dir(&self.attach_socket_dir) else {
-            return;
+            return summary;
         };
 
         for entry in entries.flatten() {
@@ -358,13 +363,17 @@ impl RuntimeServiceImpl {
             }
 
             if let Err(err) = std::fs::remove_dir_all(&path) {
+                summary.failures += 1;
                 log::warn!(
                     "Failed to remove orphaned attach socket directory {}: {}",
                     path.display(),
                     err
                 );
+            } else {
+                summary.attach_socket_dirs_removed += 1;
             }
         }
+        summary
     }
 
     #[allow(dead_code)]

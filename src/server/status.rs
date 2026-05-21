@@ -827,6 +827,7 @@ impl RuntimeServiceImpl {
             ));
             let pull_cgroup_effective = self.image_service.pull_cgroup_effective_config();
             let pull_cgroup_last_scope = self.image_service.last_pull_cgroup_scope();
+            let last_recovery_result = self.last_recovery_result();
             let (recovery_ledger_summary, recovery_ledger_summary_error) =
                 match self.recovery_ledger_health_summary().await {
                     Ok(summary) => (Some(summary), None),
@@ -1250,6 +1251,7 @@ impl RuntimeServiceImpl {
                         "recovery": self.internal_services.introspection.recovery(
                             recovery_ledger_summary.as_ref(),
                             recovery_ledger_summary_error.as_deref(),
+                            last_recovery_result.as_ref(),
                         ),
                         "featureFlags": self.internal_services.introspection.feature_flags(
                             self.runtime_feature_flags(),
@@ -1365,6 +1367,7 @@ impl RuntimeServiceImpl {
                     "lastStartupDetectedUpgrade": self.last_startup_detected_upgrade(),
                     "lastStartupAttemptedRepair": self.last_startup_attempted_repair(),
                     "lastStartupRepairSucceeded": self.last_startup_repair_succeeded(),
+                    "lastRecoveryResult": last_recovery_result,
                     "ledgerSummary": recovery_ledger_summary,
                     "ledgerSummaryError": recovery_ledger_summary_error,
                     "internalWipe": self.config.internal_wipe,

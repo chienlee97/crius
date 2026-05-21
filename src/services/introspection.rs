@@ -90,10 +90,11 @@ impl IntrospectionService {
         })
     }
 
-    pub fn recovery(
+    pub fn recovery<T: serde::Serialize>(
         &self,
         ledger_summary: Option<&RecoveryLedgerHealthSummary>,
         ledger_summary_error: Option<&str>,
+        last_recovery_result: Option<&T>,
     ) -> Value {
         json!({
             "ledgerSummary": ledger_summary,
@@ -101,6 +102,7 @@ impl IntrospectionService {
             "unhealthyObjectCount": ledger_summary
                 .map(RecoveryLedgerHealthSummary::unhealthy_object_count)
                 .unwrap_or_default(),
+            "lastRecoveryResult": last_recovery_result,
         })
     }
 

@@ -101,6 +101,7 @@ pub struct RuntimeServiceImpl {
     pub(super) last_startup_detected_upgrade: StdArc<StdMutex<Option<bool>>>,
     pub(super) last_startup_attempted_repair: StdArc<StdMutex<Option<bool>>>,
     pub(super) last_startup_repair_succeeded: StdArc<StdMutex<Option<bool>>>,
+    pub(super) last_recovery_result: StdArc<StdMutex<Option<RecoveryResultSummary>>>,
     pub(super) last_irqbalance_restore_status: StdArc<StdMutex<Option<IrqBalanceRestoreStatus>>>,
     pub(super) seccomp_notifier_dir: PathBuf,
     pub(super) seccomp_notifiers:
@@ -120,6 +121,65 @@ pub struct RuntimeServiceImpl {
         Arc<Mutex<HashMap<String, CachedStatsEntry<crate::proto::runtime::v1::PodSandboxStats>>>>,
     pub(super) pod_metrics_cache:
         Arc<Mutex<HashMap<String, CachedStatsEntry<crate::proto::runtime::v1::PodSandboxMetrics>>>>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryStageSummary {
+    pub name: String,
+    pub success: bool,
+    pub duration_millis: u64,
+    pub items: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryReconcileSummary {
+    pub reconnected_shims: Vec<String>,
+    pub broken_containers: usize,
+    pub broken_pods: usize,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryShimCleanupSummary {
+    pub shim_dirs_removed: usize,
+    pub attach_socket_dirs_removed: usize,
+    pub failures: usize,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryCleanupCounter {
+    pub removed: usize,
+    pub failures: usize,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryOrphanCleanupSummary {
+    pub skipped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    pub runtime_bundles_removed: usize,
+    pub pod_workspaces_removed: usize,
+    pub shim_dirs_removed: usize,
+    pub attach_socket_dirs_removed: usize,
+    pub pause_processes_killed: usize,
+    pub failures: usize,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryResultSummary {
+    pub finished_at_unix_millis: i64,
+    pub success: bool,
+    pub total_duration_millis: u64,
+    pub stages: Vec<RecoveryStageSummary>,
+    pub reconcile: RecoveryReconcileSummary,
+    pub orphan_cleanup: RecoveryOrphanCleanupSummary,
 }
 
 #[derive(Clone)]
@@ -1369,6 +1429,35 @@ impl RuntimeServiceImpl {
             .and_then(|state| *state)
     }
 
+    pub(super) fn recovery_stage_summary(
+        name: &str,
+        started_at: Instant,
+        success: bool,
+        items: usize,
+        error: Option<String>,
+    ) -> RecoveryStageSummary {
+        RecoveryStageSummary {
+            name: name.to_string(),
+            success,
+            duration_millis: started_at.elapsed().as_millis() as u64,
+            items,
+            error,
+        }
+    }
+
+    pub(super) fn record_last_recovery_result(&self, result: RecoveryResultSummary) {
+        if let Ok(mut state) = self.last_recovery_result.lock() {
+            *state = Some(result);
+        }
+    }
+
+    pub fn last_recovery_result(&self) -> Option<RecoveryResultSummary> {
+        self.last_recovery_result
+            .lock()
+            .ok()
+            .and_then(|state| state.clone())
+    }
+
     pub async fn maybe_repair_persistence_after_unclean_shutdown(&self) -> Result<(), Status> {
         if self.last_startup_clean_shutdown().unwrap_or(false) || !self.config.internal_repair {
             self.record_startup_attempted_repair(false, None);
@@ -1928,6 +2017,7 @@ impl RuntimeServiceImpl {
             last_startup_detected_upgrade: StdArc::new(StdMutex::new(None)),
             last_startup_attempted_repair: StdArc::new(StdMutex::new(None)),
             last_startup_repair_succeeded: StdArc::new(StdMutex::new(None)),
+            last_recovery_result: StdArc::new(StdMutex::new(None)),
             last_irqbalance_restore_status: StdArc::new(StdMutex::new(None)),
             seccomp_notifier_dir,
             seccomp_notifiers,
@@ -2256,6 +2346,7 @@ impl RuntimeServiceImpl {
             last_startup_detected_upgrade: self.last_startup_detected_upgrade.clone(),
             last_startup_attempted_repair: self.last_startup_attempted_repair.clone(),
             last_startup_repair_succeeded: self.last_startup_repair_succeeded.clone(),
+            last_recovery_result: self.last_recovery_result.clone(),
             last_irqbalance_restore_status: self.last_irqbalance_restore_status.clone(),
             seccomp_notifier_dir: self.seccomp_notifier_dir.clone(),
             seccomp_notifiers: self.seccomp_notifiers.clone(),
