@@ -475,6 +475,105 @@ async fn fake_cni_plugin_fixture_can_inject_add_failure() {
 }
 
 #[tokio::test]
+async fn teardown_uses_pod_cached_cni_config_after_reload() {
+    let dir = tempdir().unwrap();
+    let plugin_dir = dir.path().join("bin");
+    let config_dir = dir.path().join("net.d");
+    let cache_dir = dir.path().join("cache");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    tokio::fs::create_dir_all(&config_dir).await.unwrap();
+
+    for plugin in ["bridge", "macvlan"] {
+        let plugin_path = plugin_dir.join(plugin);
+        tokio::fs::write(
+            &plugin_path,
+            format!(
+                "#!/bin/sh\nset -eu\nrecord_dir=\"{}\"\nmkdir -p \"$record_dir\"\ncat >/dev/null\nprintf '%s\\n' \"$CNI_COMMAND\" >> \"$record_dir/{plugin}.commands\"\nif [ \"${{CNI_COMMAND:-}}\" != \"DEL\" ]; then printf '%s\\n' '{{\"cniVersion\":\"1.0.0\",\"ips\":[{{\"address\":\"10.88.0.2/16\"}}]}}'; fi\n",
+                dir.path().display()
+            ),
+        )
+        .await
+        .unwrap();
+        let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&plugin_path, perms).unwrap();
+    }
+
+    tokio::fs::write(
+        config_dir.join("10-test.conf"),
+        r#"{"cniVersion":"1.0.0","name":"test-net","type":"bridge"}"#,
+    )
+    .await
+    .unwrap();
+
+    let mut first = CniManager::new(
+        vec![plugin_dir.display().to_string()],
+        vec![config_dir.display().to_string()],
+        cache_dir.display().to_string(),
+    )
+    .unwrap();
+    assert!(first.load_network_configs().await.unwrap().ready);
+    first
+        .setup_pod_network(
+            "pod-old",
+            "/var/run/netns/pod-old",
+            "old",
+            "default",
+            "uid-old",
+            None,
+        )
+        .await
+        .unwrap();
+
+    tokio::fs::write(
+        config_dir.join("10-test.conf"),
+        r#"{"cniVersion":"1.0.0","name":"test-net","type":"macvlan"}"#,
+    )
+    .await
+    .unwrap();
+    let mut reloaded = CniManager::new(
+        vec![plugin_dir.display().to_string()],
+        vec![config_dir.display().to_string()],
+        cache_dir.display().to_string(),
+    )
+    .unwrap();
+    assert!(reloaded.load_network_configs().await.unwrap().ready);
+    reloaded
+        .setup_pod_network(
+            "pod-new",
+            "/var/run/netns/pod-new",
+            "new",
+            "default",
+            "uid-new",
+            None,
+        )
+        .await
+        .unwrap();
+    reloaded
+        .teardown_pod_network(
+            "pod-old",
+            "/var/run/netns/pod-old",
+            "default",
+            "old",
+            "uid-old",
+        )
+        .await
+        .unwrap();
+
+    let bridge_commands = tokio::fs::read_to_string(dir.path().join("bridge.commands"))
+        .await
+        .unwrap();
+    let macvlan_commands = tokio::fs::read_to_string(dir.path().join("macvlan.commands"))
+        .await
+        .unwrap();
+    assert_eq!(bridge_commands.lines().collect::<Vec<_>>(), ["ADD", "DEL"]);
+    assert_eq!(macvlan_commands.lines().collect::<Vec<_>>(), ["ADD"]);
+    assert!(tokio::fs::metadata(cache_dir.join("pod-old.config.json"))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn teardown_pod_network_times_out_stuck_del_plugin() {
     let dir = tempdir().unwrap();
     let plugin_dir = dir.path().join("bin");

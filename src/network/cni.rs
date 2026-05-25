@@ -12,7 +12,7 @@ use tokio::process::Command;
 const DEFAULT_CNI_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// CNI网络配置
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CniNetworkConfig {
     /// 网络名称
     pub name: String,
@@ -395,6 +395,10 @@ impl CniManager {
         self.cache_dir.join(format!("{}.result.json", pod_id))
     }
 
+    fn cache_config_path(&self, pod_id: &str) -> PathBuf {
+        self.cache_dir.join(format!("{}.config.json", pod_id))
+    }
+
     async fn write_cached_result(&self, pod_id: &str, result: &Value) -> Result<()> {
         tokio::fs::create_dir_all(&self.cache_dir)
             .await
@@ -416,6 +420,29 @@ impl CniManager {
 
     async fn remove_cached_result(&self, pod_id: &str) {
         let _ = tokio::fs::remove_file(self.cache_result_path(pod_id)).await;
+    }
+
+    async fn write_cached_config(&self, pod_id: &str, config: &CniNetworkConfig) -> Result<()> {
+        tokio::fs::create_dir_all(&self.cache_dir)
+            .await
+            .context("Failed to create CNI cache directory")?;
+        tokio::fs::write(
+            self.cache_config_path(pod_id),
+            serde_json::to_vec_pretty(config)?,
+        )
+        .await
+        .context("Failed to write CNI cached config")?;
+        Ok(())
+    }
+
+    async fn read_cached_config(&self, pod_id: &str) -> Option<CniNetworkConfig> {
+        let path = self.cache_config_path(pod_id);
+        let raw = tokio::fs::read(path).await.ok()?;
+        serde_json::from_slice(&raw).ok()
+    }
+
+    async fn remove_cached_config(&self, pod_id: &str) {
+        let _ = tokio::fs::remove_file(self.cache_config_path(pod_id)).await;
     }
 
     /// 加载网络配置
@@ -737,6 +764,7 @@ impl CniManager {
             )
             .await?;
         let network_status = self.parse_cni_result(result.as_ref())?;
+        self.write_cached_config(pod_id, config).await?;
 
         info!("Pod {} network setup completed", pod_id);
         Ok(network_status)
@@ -751,7 +779,9 @@ impl CniManager {
         pod_name: &str,
         pod_uid: &str,
     ) -> Result<()> {
-        if let Some(config) = self.default_network_config() {
+        let cached_config = self.read_cached_config(pod_id).await;
+        let default_config = self.default_network_config();
+        if let Some(config) = cached_config.as_ref().or(default_config) {
             let teardown = self.exec_cni_chain(
                 config,
                 "DEL",
@@ -779,6 +809,7 @@ impl CniManager {
                     return Err(err);
                 }
             }
+            self.remove_cached_config(pod_id).await;
         }
         Ok(())
     }
