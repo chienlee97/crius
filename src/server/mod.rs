@@ -61,7 +61,7 @@ use crate::nri::{
 use crate::pod::{PodSandboxConfig, PodSandboxManager};
 use crate::runtime::{
     ContainerConfig, ContainerRuntime, ContainerStatus, DeviceMapping, MountConfig, NamespacePaths,
-    RuncRuntime, SeccompProfile, ShimConfig,
+    RuncRuntime, RuntimeContextKind, SeccompProfile, ShimConfig,
 };
 use crate::streaming::StreamingServer;
 
@@ -1151,6 +1151,23 @@ impl RuntimeServiceImpl {
                 e
             ))
         })
+    }
+
+    fn persist_bundle_annotations_if_oci(
+        &self,
+        container_id: &str,
+        annotations: &HashMap<String, String>,
+    ) -> Result<(), Status> {
+        let backend = self
+            .runtime
+            .runtime_for_container(container_id)
+            .map_err(|e| {
+                Status::failed_precondition(format!("Failed to resolve runtime handler: {}", e))
+            })?;
+        if matches!(backend.context_kind(), RuntimeContextKind::OciBundle) {
+            self.persist_bundle_annotations(container_id, annotations)?;
+        }
+        Ok(())
     }
 
     async fn mutate_container_internal_state<F>(

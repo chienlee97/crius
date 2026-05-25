@@ -8,6 +8,12 @@ use crate::proto::runtime::v1::LinuxContainerResources;
 
 use super::{ContainerConfig, ContainerStatus, MountSemanticsError, RuntimeFeatureProbe};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeContextKind {
+    OciBundle,
+    DirectTask,
+}
+
 pub trait TaskController: Send + Sync {
     fn create_container(&self, container_id: &str, config: &ContainerConfig) -> Result<String>;
     fn start_container(&self, container_id: &str) -> Result<()>;
@@ -56,6 +62,9 @@ pub trait RuntimeContextManager: Send + Sync {
 
 pub trait RuntimeBackend: Send + Sync {
     fn backend_name(&self) -> &str;
+    fn context_kind(&self) -> RuntimeContextKind {
+        RuntimeContextKind::OciBundle
+    }
     fn runtime_root(&self) -> &Path;
     fn runtime_path(&self) -> &Path;
     fn runtime_config_path(&self) -> &Path;

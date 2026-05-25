@@ -397,9 +397,10 @@ impl RuntimeServiceImpl {
                     .ok()
                     .flatten()
                 {
-                    if let Err(err) =
-                        self.persist_bundle_annotations(&event.container.id, &container.annotations)
-                    {
+                    if let Err(err) = self.persist_bundle_annotations_if_oci(
+                        &event.container.id,
+                        &container.annotations,
+                    ) {
                         log::warn!(
                             "Failed to persist undo stop annotations for {}: {}",
                             event.container.id,
@@ -610,7 +611,7 @@ impl RuntimeServiceImpl {
         if let Some(container) = &updated_container {
             self.persist_container_annotations(container_id, &container.annotations)
                 .await?;
-            self.persist_bundle_annotations(container_id, &container.annotations)?;
+            self.persist_bundle_annotations_if_oci(container_id, &container.annotations)?;
         }
 
         let persistence_status = match final_runtime_status {
@@ -2002,33 +2003,43 @@ impl RuntimeServiceImpl {
                 .join(&container_id)
                 .join("rootfs"),
         };
-        self.runtime
+        let runtime_backend = self
+            .runtime
             .runtime_for_handler(runtime_handler)
             .map_err(|e| {
                 Status::failed_precondition(format!("Failed to resolve runtime handler: {}", e))
-            })?
-            .runtime_context()
-            .validate_mount_requests(&container_config)
-            .map_err(|e| e.to_status())?;
+            })?;
+        let uses_oci_context = matches!(
+            runtime_backend.context_kind(),
+            RuntimeContextKind::OciBundle
+        );
+        if uses_oci_context {
+            runtime_backend
+                .runtime_context()
+                .validate_mount_requests(&container_config)
+                .map_err(|e| e.to_status())?;
+        }
         let create_deadline = self.container_create_deadline_for_handler(runtime_handler);
-        let runtime = self.runtime.clone();
-        let requested_container_id = container_id.clone();
-        let container_config_clone = container_config.clone();
-        self.run_container_create_phase_until(create_deadline, "prepare_rootfs", async move {
-            tokio::task::spawn_blocking(move || {
-                runtime.prepare_rootfs(&requested_container_id, &container_config_clone)
+        if uses_oci_context {
+            let runtime = self.runtime.clone();
+            let requested_container_id = container_id.clone();
+            let container_config_clone = container_config.clone();
+            self.run_container_create_phase_until(create_deadline, "prepare_rootfs", async move {
+                tokio::task::spawn_blocking(move || {
+                    runtime.prepare_rootfs(&requested_container_id, &container_config_clone)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+                .map_err(|e| Status::internal(format!("Failed to prepare container rootfs: {}", e)))
             })
-            .await
-            .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-            .map_err(|e| Status::internal(format!("Failed to prepare container rootfs: {}", e)))
-        })
-        .await?;
+            .await?;
+        }
 
-        let runtime = self.runtime.clone();
-        let requested_container_id = container_id.clone();
-        let container_config_clone = container_config.clone();
-        let pristine_spec = self
-            .run_container_create_phase_until(create_deadline, "build_spec", async move {
+        let pristine_spec = if uses_oci_context {
+            let runtime = self.runtime.clone();
+            let requested_container_id = container_id.clone();
+            let container_config_clone = container_config.clone();
+            self.run_container_create_phase_until(create_deadline, "build_spec", async move {
                 tokio::task::spawn_blocking(move || {
                     runtime.build_spec(&requested_container_id, &container_config_clone)
                 })
@@ -2036,7 +2047,10 @@ impl RuntimeServiceImpl {
                 .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
                 .map_err(|e| Status::internal(format!("Failed to build pristine OCI spec: {}", e)))
             })
-            .await?;
+            .await?
+        } else {
+            Self::direct_task_pristine_spec(&container_config)
+        };
 
         let mut nri_event = self
             .nri_container_event(&pod_sandbox_id, &container_id, &stored_annotations)
@@ -2135,11 +2149,13 @@ impl RuntimeServiceImpl {
             cgroup_support,
             self.config.tolerate_missing_hugetlb_controller,
         );
-        self.runtime
-            .enforce_oom_score_adj_policy(&container_id, &mut adjusted_spec)
-            .map_err(|e| {
-                Status::internal(format!("Failed to enforce oom_score_adj policy: {}", e))
-            })?;
+        if uses_oci_context {
+            self.runtime
+                .enforce_oom_score_adj_policy(&container_id, &mut adjusted_spec)
+                .map_err(|e| {
+                    Status::internal(format!("Failed to enforce oom_score_adj policy: {}", e))
+                })?;
+        }
         Self::apply_adjusted_annotations(&mut stored_annotations, &nri_create_result.adjustment);
         Self::refresh_nri_event_container_from_spec(
             &mut nri_event,
@@ -2147,27 +2163,52 @@ impl RuntimeServiceImpl {
             &stored_annotations,
         );
 
-        let runtime = self.runtime.clone();
-        let requested_container_id = container_id.clone();
-        let rootfs = container_config.rootfs.clone();
-        let write_bundle_result = self
-            .run_container_create_phase_until(create_deadline, "write_bundle", async move {
-                tokio::task::spawn_blocking(move || {
-                    runtime.write_bundle(&requested_container_id, &rootfs, &adjusted_spec)
-                })
-                .await
-                .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))
-                .and_then(|result| {
-                    result.map_err(|e| {
-                        Status::internal(format!("Failed to write container bundle: {}", e))
+        if uses_oci_context {
+            let runtime = self.runtime.clone();
+            let requested_container_id = container_id.clone();
+            let rootfs = container_config.rootfs.clone();
+            let write_bundle_result = self
+                .run_container_create_phase_until(create_deadline, "write_bundle", async move {
+                    tokio::task::spawn_blocking(move || {
+                        runtime.write_bundle(&requested_container_id, &rootfs, &adjusted_spec)
+                    })
+                    .await
+                    .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))
+                    .and_then(|result| {
+                        result.map_err(|e| {
+                            Status::internal(format!("Failed to write container bundle: {}", e))
+                        })
                     })
                 })
-            })
-            .await;
-        if let Err(status) = write_bundle_result {
-            self.rollback_failed_container_create(&container_id, nri_event.clone())
                 .await;
-            return Err(status);
+            if let Err(status) = write_bundle_result {
+                self.rollback_failed_container_create(&container_id, nri_event.clone())
+                    .await;
+                return Err(status);
+            }
+        } else {
+            let runtime = self.runtime.clone();
+            let requested_container_id = container_id.clone();
+            let container_config_clone = container_config.clone();
+            let create_result = self
+                .run_container_create_phase_until(create_deadline, "create_task", async move {
+                    tokio::task::spawn_blocking(move || {
+                        runtime.create_container(&requested_container_id, &container_config_clone)
+                    })
+                    .await
+                    .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))
+                    .and_then(|result| {
+                        result.map(|_| ()).map_err(|e| {
+                            Status::internal(format!("Failed to create backend task: {}", e))
+                        })
+                    })
+                })
+                .await;
+            if let Err(status) = create_result {
+                self.rollback_failed_container_create(&container_id, nri_event.clone())
+                    .await;
+                return Err(status);
+            }
         }
 
         let created_id = container_id.clone();
@@ -2237,7 +2278,7 @@ impl RuntimeServiceImpl {
             if let Err(err) = persistence.update_container_ledger_metadata(
                 &created_id,
                 Some(runtime_handler),
-                Some("runc"),
+                Some(runtime_backend.backend_name()),
                 Some(&created_id),
             ) {
                 drop(persistence);
@@ -2264,6 +2305,40 @@ impl RuntimeServiceImpl {
         Ok(Response::new(CreateContainerResponse {
             container_id: created_id,
         }))
+    }
+
+    fn direct_task_pristine_spec(config: &ContainerConfig) -> crate::oci::spec::Spec {
+        let mut spec = crate::oci::spec::Spec::new("1.0.2");
+        let mut args = Vec::with_capacity(1 + config.args.len());
+        args.extend(config.command.iter().cloned());
+        args.extend(config.args.iter().cloned());
+        spec.process = Some(crate::oci::spec::Process {
+            terminal: Some(config.tty),
+            user: None,
+            args,
+            env: Some(
+                config
+                    .env
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect(),
+            ),
+            cwd: config
+                .working_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "/".to_string()),
+            capabilities: None,
+            rlimits: None,
+            oom_score_adj: None,
+            scheduler: None,
+            no_new_privileges: config.no_new_privileges,
+            apparmor_profile: config.apparmor_profile.clone(),
+            selinux_label: config.selinux_label.clone(),
+            io_priority: None,
+        });
+        spec.annotations = Some(config.annotations.iter().cloned().collect());
+        spec
     }
 
     pub(super) async fn start_container_impl(
@@ -2502,7 +2577,7 @@ impl RuntimeServiceImpl {
             })
             .await?;
         if let Some(container) = updated_container.as_ref() {
-            self.persist_bundle_annotations(&actual_container_id, &container.annotations)?;
+            self.persist_bundle_annotations_if_oci(&actual_container_id, &container.annotations)?;
         }
 
         let persistence_state = match observed_state {
@@ -2542,7 +2617,7 @@ impl RuntimeServiceImpl {
             if let Some(updated_annotations) = updated_annotations {
                 self.persist_container_annotations(&actual_container_id, &updated_annotations)
                     .await?;
-                self.persist_bundle_annotations(&actual_container_id, &updated_annotations)?;
+                self.persist_bundle_annotations_if_oci(&actual_container_id, &updated_annotations)?;
             }
         }
 

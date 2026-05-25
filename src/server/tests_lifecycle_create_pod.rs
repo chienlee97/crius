@@ -181,6 +181,117 @@ async fn create_container_reclaims_exited_reserved_name_without_live_runtime() {
 }
 
 #[tokio::test]
+async fn create_container_direct_task_backend_skips_oci_context() {
+    let dir = tempdir().unwrap();
+    let runtime_root = dir.path().join("direct-runtime-root");
+    let direct_backend = Arc::new(common::DirectTaskRuntimeBackend::new(&runtime_root));
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime = "wasm".to_string();
+    config.runtime_handlers = vec!["wasm".to_string()];
+    config.runtime_root = runtime_root.clone();
+    config.runtime_configs = HashMap::from([(
+        "wasm".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "wasm".to_string(),
+            backend_options: HashMap::from([("sandboxer".to_string(), "test".to_string())]),
+            runtime_path: "/definitely/missing/wasm-runtime".to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/definitely/missing/crius-shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 30,
+            snapshotter: "internal-overlay-untar".to_string(),
+        },
+    )]);
+    let service = RuntimeServiceImpl::new_with_runtime_backends(
+        config,
+        HashMap::from([(
+            "wasm".to_string(),
+            direct_backend.clone() as Arc<dyn crate::runtime::RuntimeBackend>,
+        )]),
+    );
+    let mut pod = test_pod("pod-direct-task", HashMap::new());
+    pod.runtime_handler = "wasm".to_string();
+    service
+        .pod_sandboxes
+        .lock()
+        .await
+        .insert("pod-direct-task".to_string(), pod);
+
+    let response = RuntimeService::create_container(
+        &service,
+        Request::new(CreateContainerRequest {
+            pod_sandbox_id: "pod-direct-task".to_string(),
+            config: Some(crate::proto::runtime::v1::ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "direct-workload".to_string(),
+                    attempt: 1,
+                }),
+                image: Some(ImageSpec {
+                    image: "wasm.example/workload:v1".to_string(),
+                    user_specified_image: "wasm.example/workload:v1".to_string(),
+                    ..Default::default()
+                }),
+                command: vec!["run".to_string()],
+                args: vec!["module.wasm".to_string()],
+                envs: vec![crate::proto::runtime::v1::KeyValue {
+                    key: "RUNTIME".to_string(),
+                    value: "direct".to_string(),
+                }],
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect("direct task backend should create workload without local OCI context")
+    .into_inner();
+    assert!(!response.container_id.is_empty());
+
+    let calls = direct_backend.calls();
+    assert_eq!(
+        calls,
+        vec![common::FakeRuntimeCall::CreateContainer {
+            container_id: response.container_id.clone()
+        }]
+    );
+    assert!(!runtime_root.join(&response.container_id).join("config.json").exists());
+    let record = service
+        .persistence
+        .lock()
+        .await
+        .storage()
+        .get_container(&response.container_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.runtime_handler.as_deref(), Some("wasm"));
+    assert_eq!(record.runtime_backend.as_deref(), Some("direct-task"));
+
+    RuntimeService::start_container(
+        &service,
+        Request::new(StartContainerRequest {
+            container_id: response.container_id.clone(),
+        }),
+    )
+    .await
+    .expect("direct task backend should start workload");
+    let calls = direct_backend.calls();
+    assert!(calls.contains(&common::FakeRuntimeCall::StartContainer {
+        container_id: response.container_id.clone()
+    }));
+    assert!(calls.contains(&common::FakeRuntimeCall::ContainerStatus {
+        container_id: response.container_id,
+    }));
+}
+
+#[tokio::test]
 async fn create_container_rejects_empty_image_ref() {
     let service = test_service();
     service.pod_sandboxes.lock().await.insert(

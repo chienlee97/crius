@@ -4,6 +4,9 @@
 //!
 //! A Rust implementation of the Kubernetes Container Runtime Interface (CRI).
 
+#[cfg(test)]
+extern crate self as crius;
+
 pub mod attach;
 pub mod cgroups;
 pub mod config;

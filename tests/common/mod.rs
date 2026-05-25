@@ -21,8 +21,8 @@ use crius::image::snapshotter::{
 };
 use crius::oci::spec::Spec;
 use crius::runtime::{
-    ContainerConfig, ContainerStatus, MountSemanticsError, RuntimeBackend, RuntimeContextManager,
-    RuntimeFeatureProbe, TaskController,
+    ContainerConfig, ContainerStatus, MountSemanticsError, RuntimeBackend, RuntimeContextKind,
+    RuntimeContextManager, RuntimeFeatureProbe, TaskController,
 };
 use crius::shim_rpc::{
     server::{serve, ShimRpcHandler},
@@ -385,6 +385,188 @@ impl RuntimeBackend for FakeRuntimeBackend {
     fn probe_runtime_features(&self) -> RuntimeFeatureProbe {
         RuntimeFeatureProbe {
             available: true,
+            ..Default::default()
+        }
+    }
+
+    fn cgroup_driver(&self) -> CgroupDriverConfig {
+        CgroupDriverConfig::Cgroupfs
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DirectTaskRuntimeBackend {
+    inner: FakeRuntimeBackend,
+}
+
+impl DirectTaskRuntimeBackend {
+    pub fn new(runtime_root: impl Into<PathBuf>) -> Self {
+        Self {
+            inner: FakeRuntimeBackend::new(runtime_root).with_backend_name("direct-task"),
+        }
+    }
+
+    pub fn calls(&self) -> Vec<FakeRuntimeCall> {
+        self.inner.calls()
+    }
+
+    fn unsupported_context(operation: &str) -> anyhow::Error {
+        anyhow::anyhow!("direct-task backend must not use OCI context operation {operation}")
+    }
+}
+
+impl TaskController for DirectTaskRuntimeBackend {
+    fn create_container(&self, container_id: &str, config: &ContainerConfig) -> Result<String> {
+        self.inner.create_container(container_id, config)
+    }
+
+    fn start_container(&self, container_id: &str) -> Result<()> {
+        self.inner.start_container(container_id)
+    }
+
+    fn stop_container(&self, container_id: &str, timeout: Option<u32>) -> Result<()> {
+        self.inner.stop_container(container_id, timeout)
+    }
+
+    fn remove_container(&self, container_id: &str) -> Result<()> {
+        self.inner.remove_container(container_id)
+    }
+
+    fn container_status(&self, container_id: &str) -> Result<ContainerStatus> {
+        self.inner.container_status(container_id)
+    }
+
+    fn reopen_container_log(&self, container_id: &str) -> Result<()> {
+        self.inner.reopen_container_log(container_id)
+    }
+
+    fn exec_in_container(&self, container_id: &str, command: &[String], tty: bool) -> Result<i32> {
+        self.inner.exec_in_container(container_id, command, tty)
+    }
+
+    fn update_container_resources(
+        &self,
+        container_id: &str,
+        resources: &crius::proto::runtime::v1::LinuxContainerResources,
+    ) -> Result<()> {
+        self.inner
+            .update_container_resources(container_id, resources)
+    }
+
+    fn is_container_paused(&self, container_id: &str) -> Result<bool> {
+        self.inner.is_container_paused(container_id)
+    }
+
+    fn restore_attach_shim(&self, container_id: &str) -> Result<()> {
+        self.inner.restore_attach_shim(container_id)
+    }
+
+    fn shim_status(&self, container_id: &str) -> Result<Option<crius::shim_rpc::StatusResponse>> {
+        self.inner.shim_status(container_id)
+    }
+
+    fn restore_container_from_checkpoint(
+        &self,
+        container_id: &str,
+        checkpoint_path: &Path,
+        work_path: &Path,
+    ) -> Result<()> {
+        self.inner
+            .restore_container_from_checkpoint(container_id, checkpoint_path, work_path)
+    }
+
+    fn pause_container(&self, container_id: &str) -> Result<()> {
+        self.inner.pause_container(container_id)
+    }
+
+    fn checkpoint_container(
+        &self,
+        container_id: &str,
+        location: &Path,
+        work_path: &Path,
+    ) -> Result<()> {
+        self.inner
+            .checkpoint_container(container_id, location, work_path)
+    }
+
+    fn resume_container(&self, container_id: &str) -> Result<()> {
+        self.inner.resume_container(container_id)
+    }
+
+    fn container_pid(&self, container_id: &str) -> Result<Option<i32>> {
+        self.inner.container_pid(container_id)
+    }
+}
+
+impl RuntimeContextManager for DirectTaskRuntimeBackend {
+    fn bundle_path_for(&self, container_id: &str) -> PathBuf {
+        self.inner.bundle_path_for(container_id)
+    }
+
+    fn enforce_oom_score_adj_policy(&self, _spec: &mut Spec) -> Result<()> {
+        Err(Self::unsupported_context("enforce_oom_score_adj_policy"))
+    }
+
+    fn prepare_rootfs(&self, _container_id: &str, _config: &ContainerConfig) -> Result<()> {
+        Err(Self::unsupported_context("prepare_rootfs"))
+    }
+
+    fn build_spec(&self, _container_id: &str, _config: &ContainerConfig) -> Result<Spec> {
+        Err(Self::unsupported_context("build_spec"))
+    }
+
+    fn write_bundle(&self, _container_id: &str, _rootfs: &Path, _spec: &Spec) -> Result<()> {
+        Err(Self::unsupported_context("write_bundle"))
+    }
+
+    fn load_spec(&self, _container_id: &str) -> Result<Spec> {
+        Err(Self::unsupported_context("load_spec"))
+    }
+
+    fn validate_mount_requests(
+        &self,
+        _config: &ContainerConfig,
+    ) -> std::result::Result<(), MountSemanticsError> {
+        Err(MountSemanticsError::MissingSource {
+            source_path: PathBuf::from("/direct-task/unsupported"),
+            destination: PathBuf::from("/direct-task/unsupported"),
+        })
+    }
+}
+
+impl RuntimeBackend for DirectTaskRuntimeBackend {
+    fn backend_name(&self) -> &str {
+        "direct-task"
+    }
+
+    fn context_kind(&self) -> RuntimeContextKind {
+        RuntimeContextKind::DirectTask
+    }
+
+    fn runtime_root(&self) -> &Path {
+        self.inner.runtime_root()
+    }
+
+    fn runtime_path(&self) -> &Path {
+        self.inner.runtime_path()
+    }
+
+    fn runtime_config_path(&self) -> &Path {
+        self.inner.runtime_config_path()
+    }
+
+    fn task_controller(&self) -> &dyn TaskController {
+        self
+    }
+
+    fn runtime_context(&self) -> &dyn RuntimeContextManager {
+        self
+    }
+
+    fn probe_runtime_features(&self) -> RuntimeFeatureProbe {
+        RuntimeFeatureProbe {
+            available: true,
+            rootless: true,
             ..Default::default()
         }
     }

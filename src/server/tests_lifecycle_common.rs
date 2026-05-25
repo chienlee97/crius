@@ -17,6 +17,9 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 
+#[path = "../../tests/common/mod.rs"]
+mod common;
+
 fn disabled_rootless() -> crate::rootless::EffectiveRootlessConfig {
     crate::rootless::EffectiveRootlessConfig::disabled()
 }

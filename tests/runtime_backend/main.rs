@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crius::runtime::{
-    ContainerConfig, ContainerStatus, NamespacePaths, RuntimeBackend, TaskController,
+    ContainerConfig, ContainerStatus, NamespacePaths, RuntimeBackend, RuntimeContextKind,
+    TaskController,
 };
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::{FakeRuntimeBackend, FakeRuntimeCall, FakeRuntimeOperation};
+use common::{DirectTaskRuntimeBackend, FakeRuntimeBackend, FakeRuntimeCall, FakeRuntimeOperation};
 
 fn test_container_config() -> ContainerConfig {
     ContainerConfig {
@@ -120,6 +121,37 @@ fn fake_runtime_backend_can_script_operation_failures() {
 
     assert!(err.to_string().contains("scripted start failure"));
     assert_eq!(backend.status_snapshot(), ContainerStatus::Created);
+    assert_eq!(
+        backend.calls(),
+        vec![
+            FakeRuntimeCall::CreateContainer {
+                container_id: "container-1".to_string()
+            },
+            FakeRuntimeCall::StartContainer {
+                container_id: "container-1".to_string()
+            },
+        ]
+    );
+}
+
+#[test]
+fn direct_task_backend_advertises_non_oci_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = DirectTaskRuntimeBackend::new(dir.path().join("direct-runtime"));
+    let config = test_container_config();
+
+    assert_eq!(backend.backend_name(), "direct-task");
+    assert_eq!(backend.context_kind(), RuntimeContextKind::DirectTask);
+    assert!(backend
+        .runtime_context()
+        .prepare_rootfs("container-1", &config)
+        .unwrap_err()
+        .to_string()
+        .contains("must not use OCI context operation"));
+
+    backend.create_container("container-1", &config).unwrap();
+    backend.start_container("container-1").unwrap();
+
     assert_eq!(
         backend.calls(),
         vec![
