@@ -215,6 +215,7 @@ fn create_test_config() -> ContainerConfig {
         mounts: vec![],
         labels: vec![],
         annotations: vec![],
+        cdi_devices: Vec::new(),
         privileged: false,
         user: None,
         run_as_group: None,

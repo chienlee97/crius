@@ -21,6 +21,7 @@ fn test_container_config() -> ContainerConfig {
         mounts: Vec::new(),
         labels: Vec::new(),
         annotations: Vec::new(),
+        cdi_devices: Vec::new(),
         privileged: false,
         user: None,
         run_as_group: None,

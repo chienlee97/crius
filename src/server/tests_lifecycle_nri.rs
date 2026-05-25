@@ -976,6 +976,7 @@ async fn nri_create_result_applies_adjustments_and_side_effects() {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
+        cdi_devices: Vec::new(),
         privileged: false,
         user: None,
         run_as_group: None,
@@ -1619,4 +1620,3 @@ fn sanitize_nri_adjustment_for_nri_config_clears_blockio_without_config() {
         assert!(linux.rdt.is_none());
     }
 }
-

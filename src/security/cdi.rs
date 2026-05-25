@@ -523,6 +523,51 @@ pub fn apply_cdi_devices(
     Ok(())
 }
 
+const CDI_ANNOTATION_PREFIX: &str = "cdi.k8s.io/";
+
+pub fn requested_devices_from_cri_and_annotations(
+    cdi_devices: &[String],
+    annotations: &HashMap<String, String>,
+) -> Result<Vec<String>> {
+    let mut requested = Vec::new();
+    let mut seen = HashSet::new();
+
+    for device in cdi_devices {
+        let trimmed = device.trim();
+        if trimmed.is_empty() {
+            return Err(CdiError::Invalid(
+                "CDI device name from CRI config must not be empty".to_string(),
+            ));
+        }
+        if seen.insert(trimmed.to_string()) {
+            requested.push(trimmed.to_string());
+        }
+    }
+
+    for (key, value) in annotations
+        .iter()
+        .filter(|(key, _)| key.starts_with(CDI_ANNOTATION_PREFIX))
+    {
+        for device in value.split(',').map(str::trim) {
+            if device.is_empty() {
+                return Err(CdiError::Invalid(format!(
+                    "CDI annotation {key:?} contains an empty device name"
+                )));
+            }
+            if device.split_once('=').is_none() {
+                return Err(CdiError::Invalid(format!(
+                    "invalid CDI device name {device:?} in annotation {key:?}"
+                )));
+            }
+            if seen.insert(device.to_string()) {
+                requested.push(device.to_string());
+            }
+        }
+    }
+
+    Ok(requested)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -589,5 +634,45 @@ mod tests {
         assert!(err
             .to_string()
             .contains("expected <vendor>/<class>=<device>"));
+    }
+
+    #[test]
+    fn collects_cdi_devices_from_cri_field_and_annotations() {
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "cdi.k8s.io/vendor_devices".to_string(),
+            "vendor.com/device=gpu0,vendor.com/device=gpu1".to_string(),
+        );
+
+        let requested = requested_devices_from_cri_and_annotations(
+            &[
+                "vendor.com/device=gpu0".to_string(),
+                "other.com/device=fpga0".to_string(),
+            ],
+            &annotations,
+        )
+        .unwrap();
+
+        assert_eq!(
+            requested,
+            vec![
+                "vendor.com/device=gpu0".to_string(),
+                "other.com/device=fpga0".to_string(),
+                "vendor.com/device=gpu1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_cdi_annotation_device_name() {
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "cdi.k8s.io/devices".to_string(),
+            "not-qualified".to_string(),
+        );
+
+        let err = requested_devices_from_cri_and_annotations(&[], &annotations).unwrap_err();
+
+        assert!(err.to_string().contains("invalid CDI device name"));
     }
 }

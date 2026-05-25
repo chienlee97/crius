@@ -1005,6 +1005,7 @@ impl<R: ContainerRuntime, N: NetworkManager> PodSandboxManager<R, N> {
             mounts: pause_mounts,
             labels: pod_config.labels.clone(),
             annotations: pause_annotations,
+            cdi_devices: Vec::new(),
             privileged: pod_config.privileged,
             user: pod_config.run_as_user.clone(),
             run_as_group: pod_config.run_as_group,

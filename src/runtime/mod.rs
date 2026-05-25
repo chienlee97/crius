@@ -104,6 +104,7 @@ pub struct ContainerConfig {
     pub mounts: Vec<MountConfig>,
     pub labels: Vec<(String, String)>,
     pub annotations: Vec<(String, String)>,
+    pub cdi_devices: Vec<String>,
     pub privileged: bool,
     pub user: Option<String>,
     pub run_as_group: Option<u32>,

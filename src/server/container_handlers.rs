@@ -1936,6 +1936,11 @@ impl RuntimeServiceImpl {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            cdi_devices: config
+                .cdi_devices
+                .iter()
+                .map(|device| device.name.clone())
+                .collect(),
             privileged: container_privileged,
             user: run_as_user,
             run_as_group,
@@ -2127,9 +2132,31 @@ impl RuntimeServiceImpl {
         }
 
         let mut adjusted_spec = pristine_spec.clone();
+        let mut cdi_requests = crate::security::cdi::requested_devices_from_cri_and_annotations(
+            &container_config.cdi_devices,
+            &stored_annotations,
+        )
+        .map_err(|e| Status::invalid_argument(format!("CDI device request failed: {}", e)))?;
+        let mut seen_cdi_requests: std::collections::HashSet<String> =
+            cdi_requests.iter().cloned().collect();
+        for device in &nri_create_result.adjustment.CDI_devices {
+            let name = device.name.trim();
+            if !name.is_empty() && seen_cdi_requests.insert(name.to_string()) {
+                cdi_requests.push(name.to_string());
+            }
+        }
+        let mut adjustment_without_cdi = nri_create_result.adjustment.clone();
+        adjustment_without_cdi.CDI_devices.clear();
+        crate::security::cdi::apply_cdi_devices(
+            &mut adjusted_spec,
+            &cdi_requests,
+            self.nri_config.enable_cdi,
+            Some(&self.nri_config.cdi_spec_dirs),
+        )
+        .map_err(|e| Status::internal(format!("CDI device injection failed: {}", e)))?;
         crate::nri::apply_container_adjustment_with_options(
             &mut adjusted_spec,
-            &nri_create_result.adjustment,
+            &adjustment_without_cdi,
             crate::nri::AdjustmentOptions {
                 blockio_config_path: Some(&self.nri_config.blockio_config_path),
                 cdi_enabled: self.nri_config.enable_cdi,

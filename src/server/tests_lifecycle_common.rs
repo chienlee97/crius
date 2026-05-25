@@ -262,6 +262,7 @@ fn test_runtime_container_config_with_mounts(mounts: Vec<MountConfig>) -> Contai
         mounts,
         labels: Vec::new(),
         annotations: Vec::new(),
+        cdi_devices: Vec::new(),
         privileged: false,
         user: None,
         run_as_group: None,
@@ -1228,6 +1229,23 @@ fn test_service_with_runtime_path_and_shim_path_and_configure<F>(
 where
     F: FnOnce(&mut RuntimeConfig),
 {
+    test_service_with_runtime_path_and_shim_path_and_configure_all(
+        dir,
+        runtime_path,
+        shim_path_override,
+        |config, _nri_config| configure(config),
+    )
+}
+
+fn test_service_with_runtime_path_and_shim_path_and_configure_all<F>(
+    dir: TempDir,
+    runtime_path: PathBuf,
+    shim_path_override: Option<PathBuf>,
+    configure: F,
+) -> (TempDir, RuntimeServiceImpl)
+where
+    F: FnOnce(&mut RuntimeConfig, &mut NriConfig),
+{
     let default_test_shim_path = write_test_shim_binary(dir.path());
     let shim_work_dir = dir.path().join("shims");
     let shim_runtime_path = runtime_path.clone();
@@ -1412,11 +1430,11 @@ where
         streaming: crate::streaming::StreamingConfig::default(),
         config_path: None,
     };
-    configure(&mut config);
-    let nri_config = NriConfig {
+    let mut nri_config = NriConfig {
         blockio_config_path: write_blockio_config(&dir).display().to_string(),
         ..Default::default()
     };
+    configure(&mut config, &mut nri_config);
     let service = RuntimeServiceImpl::new_with_shim_work_dir(config, nri_config, shim_work_dir);
     (dir, service)
 }

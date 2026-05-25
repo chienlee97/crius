@@ -292,6 +292,321 @@ async fn create_container_direct_task_backend_skips_oci_context() {
 }
 
 #[tokio::test]
+async fn create_container_applies_cdi_devices_without_nri_adjustment() {
+    let cdi_dir = tempdir().unwrap();
+    fs::write(
+        cdi_dir.path().join("vendor-device.json"),
+        r#"{
+            "cdiVersion": "0.7.0",
+            "kind": "vendor.com/device",
+            "containerEdits": {
+                "env": ["GLOBAL_CDI=1"]
+            },
+            "devices": [{
+                "name": "gpu0",
+                "containerEdits": {
+                    "env": ["GPU0=1"],
+                    "deviceNodes": [{
+                        "path": "/dev/fake-gpu0",
+                        "type": "c",
+                        "major": 195,
+                        "minor": 0,
+                        "permissions": "rw"
+                    }]
+                }
+            }, {
+                "name": "gpu1",
+                "containerEdits": {
+                    "env": ["GPU1=1"],
+                    "deviceNodes": [{
+                        "path": "/dev/fake-gpu1",
+                        "type": "c",
+                        "major": 195,
+                        "minor": 1,
+                        "permissions": "rw"
+                    }]
+                }
+            }]
+        }"#,
+    )
+    .unwrap();
+    let dir = tempdir().unwrap();
+    let runtime_root = dir.path().join("fake-runtime-root");
+    let fake_backend = Arc::new(common::FakeRuntimeBackend::new(&runtime_root));
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime = "fake".to_string();
+    config.runtime_handlers = vec!["fake".to_string()];
+    config.runtime_root = runtime_root.clone();
+    config.runtime_configs = HashMap::from([(
+        "fake".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "fake".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: "/fake/runtime".to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/fake/shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 30,
+            snapshotter: "internal-overlay-untar".to_string(),
+        },
+    )]);
+    let mut nri_config = NriConfig {
+        enable: false,
+        enable_cdi: true,
+        cdi_spec_dirs: vec![cdi_dir.path().display().to_string()],
+        ..Default::default()
+    };
+    nri_config.blockio_config_path = String::new();
+    let mut service = RuntimeServiceImpl::new_with_runtime_backends(
+        config,
+        HashMap::from([(
+            "fake".to_string(),
+            fake_backend as Arc<dyn crate::runtime::RuntimeBackend>,
+        )]),
+    );
+    service.nri_config = nri_config;
+    let mut pod = test_pod("pod-cdi", HashMap::new());
+    pod.runtime_handler = "fake".to_string();
+    service.pod_sandboxes.lock().await.insert(
+        "pod-cdi".to_string(),
+        pod,
+    );
+
+    let response = RuntimeService::create_container(
+        &service,
+        Request::new(CreateContainerRequest {
+            pod_sandbox_id: "pod-cdi".to_string(),
+            config: Some(crate::proto::runtime::v1::ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "workload-cdi".to_string(),
+                    attempt: 1,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:latest".to_string(),
+                    user_specified_image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }),
+                command: vec!["sleep".to_string()],
+                args: vec!["1".to_string()],
+                annotations: HashMap::from([(
+                    "cdi.k8s.io/vendor_devices".to_string(),
+                    "vendor.com/device=gpu0,vendor.com/device=gpu1".to_string(),
+                )]),
+                cdi_devices: vec![crate::proto::runtime::v1::CdiDevice {
+                    name: "vendor.com/device=gpu0".to_string(),
+                }],
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect("CDI devices should be injected from the CRI field and annotations")
+    .into_inner();
+
+    let bundle_config: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            dir.path()
+                .join("fake-runtime-root")
+                .join(&response.container_id)
+                .join("config.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let env = bundle_config["process"]["env"].as_array().unwrap();
+    assert!(env.iter().any(|entry| entry == "GLOBAL_CDI=1"));
+    assert!(env.iter().any(|entry| entry == "GPU0=1"));
+    assert!(env.iter().any(|entry| entry == "GPU1=1"));
+    let devices = bundle_config["linux"]["devices"].as_array().unwrap();
+    assert!(devices
+        .iter()
+        .any(|device| device["path"] == "/dev/fake-gpu0"));
+    assert!(devices
+        .iter()
+        .any(|device| device["path"] == "/dev/fake-gpu1"));
+    assert_eq!(
+        devices
+            .iter()
+            .filter(|device| device["path"] == "/dev/fake-gpu0")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn create_container_merges_nri_cdi_devices_without_duplicate_injection() {
+    let cdi_dir = tempdir().unwrap();
+    fs::write(
+        cdi_dir.path().join("vendor-device.json"),
+        r#"{
+            "cdiVersion": "0.7.0",
+            "kind": "vendor.com/device",
+            "devices": [{
+                "name": "gpu0",
+                "containerEdits": {
+                    "env": ["GPU0=1"],
+                    "deviceNodes": [{
+                        "path": "/dev/fake-gpu0",
+                        "type": "c",
+                        "major": 195,
+                        "minor": 0,
+                        "permissions": "rw"
+                    }]
+                }
+            }, {
+                "name": "gpu2",
+                "containerEdits": {
+                    "env": ["GPU2=1"],
+                    "deviceNodes": [{
+                        "path": "/dev/fake-gpu2",
+                        "type": "c",
+                        "major": 195,
+                        "minor": 2,
+                        "permissions": "rw"
+                    }]
+                }
+            }]
+        }"#,
+    )
+    .unwrap();
+    let dir = tempdir().unwrap();
+    let runtime_root = dir.path().join("fake-runtime-root");
+    let fake_backend = Arc::new(common::FakeRuntimeBackend::new(&runtime_root));
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime = "fake".to_string();
+    config.runtime_handlers = vec!["fake".to_string()];
+    config.runtime_root = runtime_root.clone();
+    config.runtime_configs = HashMap::from([(
+        "fake".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "fake".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: "/fake/runtime".to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/fake/shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 30,
+            snapshotter: "internal-overlay-untar".to_string(),
+        },
+    )]);
+    let fake_nri = Arc::new(FakeNri {
+        create_result: tokio::sync::Mutex::new(Some(NriCreateContainerResult {
+            adjustment: {
+                let mut adjustment = crate::nri_proto::api::ContainerAdjustment::new();
+                adjustment
+                    .CDI_devices
+                    .push(crate::nri_proto::api::CDIDevice {
+                        name: "vendor.com/device=gpu0".to_string(),
+                        ..Default::default()
+                    });
+                adjustment
+                    .CDI_devices
+                    .push(crate::nri_proto::api::CDIDevice {
+                        name: "vendor.com/device=gpu2".to_string(),
+                        ..Default::default()
+                    });
+                adjustment
+            },
+            ..Default::default()
+        })),
+        ..Default::default()
+    });
+    let mut service = RuntimeServiceImpl::new_with_nri_api(
+        config,
+        NriConfig {
+            enable: true,
+            enable_cdi: true,
+            cdi_spec_dirs: vec![cdi_dir.path().display().to_string()],
+            ..Default::default()
+        },
+        fake_nri,
+    );
+    service.runtime = RuntimeRegistry::new(
+        "fake".to_string(),
+        HashMap::from([(
+            "fake".to_string(),
+            fake_backend as Arc<dyn crate::runtime::RuntimeBackend>,
+        )]),
+        HashMap::from([("fake".to_string(), 30)]),
+    );
+    let mut pod = test_pod("pod-cdi-nri", HashMap::new());
+    pod.runtime_handler = "fake".to_string();
+    service
+        .pod_sandboxes
+        .lock()
+        .await
+        .insert("pod-cdi-nri".to_string(), pod);
+
+    let response = RuntimeService::create_container(
+        &service,
+        Request::new(CreateContainerRequest {
+            pod_sandbox_id: "pod-cdi-nri".to_string(),
+            config: Some(crate::proto::runtime::v1::ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "workload-cdi-nri".to_string(),
+                    attempt: 1,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:latest".to_string(),
+                    user_specified_image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }),
+                cdi_devices: vec![crate::proto::runtime::v1::CdiDevice {
+                    name: "vendor.com/device=gpu0".to_string(),
+                }],
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect("NRI CDI devices should be merged with CRI CDI devices")
+    .into_inner();
+
+    let bundle_config: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            runtime_root
+                .join(&response.container_id)
+                .join("config.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let devices = bundle_config["linux"]["devices"].as_array().unwrap();
+    assert_eq!(
+        devices
+            .iter()
+            .filter(|device| device["path"] == "/dev/fake-gpu0")
+            .count(),
+        1
+    );
+    assert_eq!(
+        devices
+            .iter()
+            .filter(|device| device["path"] == "/dev/fake-gpu2")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn create_container_rejects_empty_image_ref() {
     let service = test_service();
     service.pod_sandboxes.lock().await.insert(
