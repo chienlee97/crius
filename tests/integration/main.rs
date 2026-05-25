@@ -266,6 +266,140 @@ mod rootless_lifecycle {
     }
 }
 
+mod reload_watcher {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use crius::config::ResolvedRuntimeHandlerConfig;
+    use crius::network::CniConfig;
+    use crius::runtime::ShimConfig;
+    use crius::server::{RuntimeConfig, RuntimeReloadWatcherStatus, RuntimeServiceImpl};
+
+    fn runtime_handler(runtime_root: &Path, runtime_path: &Path) -> ResolvedRuntimeHandlerConfig {
+        ResolvedRuntimeHandlerConfig {
+            backend: "runc".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: runtime_path.display().to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/missing/crius-shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 30,
+            snapshotter: "internal-overlay-untar".to_string(),
+        }
+    }
+
+    fn runtime_config(temp: &Path, cni_config: CniConfig) -> RuntimeConfig {
+        let root_dir = temp.join("state");
+        let runtime_root = temp.join("runtime");
+        let runtime_path = temp.join("missing-runc");
+        RuntimeConfig {
+            root_dir: root_dir.clone(),
+            runtime: "runc".to_string(),
+            runtime_handlers: vec!["runc".to_string()],
+            runtime_configs: HashMap::from([(
+                "runc".to_string(),
+                runtime_handler(&runtime_root, &runtime_path),
+            )]),
+            runtime_root: runtime_root.clone(),
+            runtime_path: runtime_path.clone(),
+            image_root: temp.join("images"),
+            attach_socket_dir: temp.join("attach"),
+            container_exits_dir: temp.join("exits"),
+            clean_shutdown_file: root_dir.join("clean.shutdown"),
+            version_file: temp.join("version"),
+            version_file_persist: root_dir.join("version"),
+            cni_config,
+            shim: ShimConfig {
+                shim_path: PathBuf::from("/missing/crius-shim"),
+                runtime_config_path: PathBuf::new(),
+                monitor_cgroup: String::new(),
+                work_dir: temp.join("shims"),
+                attach_socket_dir: temp.join("attach"),
+                container_exits_dir: temp.join("exits"),
+                io_uid: 0,
+                io_gid: 0,
+                monitor_env: Vec::new(),
+                debug: false,
+                log_to_journald: false,
+                no_sync_log: false,
+                no_pivot: false,
+                no_new_keyring: false,
+                systemd_cgroup: false,
+                runtime_path,
+                max_container_log_line_size: 4096,
+                state_db_path: root_dir.join("crius.db"),
+            },
+            ..RuntimeConfig::default()
+        }
+    }
+
+    async fn wait_until<F>(mut predicate: F)
+    where
+        F: FnMut() -> bool,
+    {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if predicate() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("condition was not reached before timeout");
+    }
+
+    #[tokio::test]
+    async fn cni_directory_watcher_records_reload_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let cni_dir = temp.path().join("cni");
+        let plugin_dir = temp.path().join("bin");
+        tokio::fs::create_dir_all(&cni_dir).await.unwrap();
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+
+        let mut cni_config = CniConfig::default();
+        cni_config.set_config_dirs(vec![cni_dir.clone()]);
+        cni_config.set_plugin_dirs(vec![plugin_dir.clone()]);
+        cni_config.set_max_conf_num(1);
+        let service = RuntimeServiceImpl::new(runtime_config(temp.path(), cni_config));
+
+        wait_until(|| {
+            service.current_reload_state().watcher_status == RuntimeReloadWatcherStatus::Running
+        })
+        .await;
+
+        tokio::fs::write(
+            cni_dir.join("10-reload.conf"),
+            r#"{"cniVersion":"1.0.0","name":"reload-net","type":"bridge"}"#,
+        )
+        .await
+        .unwrap();
+
+        wait_until(|| {
+            let state = service.current_reload_state();
+            state.last_cni_watch_at_unix_millis.is_some()
+                && state
+                    .last_cni_watch_error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("missing or non-executable"))
+        })
+        .await;
+
+        let state = service.current_reload_state();
+        assert_eq!(state.cni_watch_dirs, vec![cni_dir.display().to_string()]);
+        assert_eq!(state.watcher_status, RuntimeReloadWatcherStatus::Backoff);
+    }
+}
+
 mod cross_module {
     use std::collections::HashMap;
 
