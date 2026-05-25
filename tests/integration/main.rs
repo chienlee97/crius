@@ -10,6 +10,262 @@ fn temp_dir() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
 }
 
+#[path = "../common/mod.rs"]
+mod common;
+
+mod rootless_lifecycle {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use crius::config::ResolvedRuntimeHandlerConfig;
+    use crius::image::{metadata_store::FilesystemImageMetadataStore, CriusImage};
+    use crius::network::CniConfig;
+    use crius::proto::runtime::v1::{
+        runtime_service_server::RuntimeService, ContainerConfig, ContainerMetadata,
+        CreateContainerRequest, ImageSpec, LinuxPodSandboxConfig, LinuxSandboxSecurityContext,
+        NamespaceMode, NamespaceOption, PodSandboxConfig, PodSandboxMetadata, RunPodSandboxRequest,
+        StartContainerRequest, StopContainerRequest,
+    };
+    use crius::rootless::{EffectiveRootlessConfig, NetworkMode, RootlessConfig};
+    use crius::runtime::ShimConfig;
+    use crius::server::{RuntimeConfig, RuntimeServiceImpl};
+    use tonic::Request;
+
+    use crate::common::{FakeRuntimeBackend, FakeRuntimeCall};
+
+    fn runtime_handler(runtime_root: &Path, runtime_path: &Path) -> ResolvedRuntimeHandlerConfig {
+        ResolvedRuntimeHandlerConfig {
+            backend: "fake".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: runtime_path.display().to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/missing/crius-shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 30,
+            snapshotter: "internal-overlay-untar".to_string(),
+        }
+    }
+
+    fn rootless_runtime_config(temp: &Path, rootless: EffectiveRootlessConfig) -> RuntimeConfig {
+        let root_dir = temp.join("state");
+        let runtime_root = rootless.runtime_root.join("containers");
+        let runtime_path = temp.join("missing-runc");
+        let image_root = rootless.storage_root.clone();
+        let attach_socket_dir = rootless.runtime_root.join("attach");
+        let exits_dir = rootless.runtime_root.join("exits");
+        let shim_work_dir = rootless.runtime_root.join("shims");
+        let mut cni_config = CniConfig::default();
+        cni_config.set_rootless_config(Some(rootless.clone()));
+        cni_config.set_netns_mount_dir(rootless.netns_dir.clone());
+
+        RuntimeConfig {
+            root_dir: root_dir.clone(),
+            runtime: "runc".to_string(),
+            runtime_handlers: vec!["runc".to_string()],
+            runtime_configs: HashMap::from([(
+                "runc".to_string(),
+                runtime_handler(&runtime_root, &runtime_path),
+            )]),
+            runtime_root: runtime_root.clone(),
+            runtime_path: runtime_path.clone(),
+            image_root: image_root.clone(),
+            attach_socket_dir: attach_socket_dir.clone(),
+            container_exits_dir: exits_dir.clone(),
+            clean_shutdown_file: root_dir.join("clean.shutdown"),
+            version_file: rootless.runtime_root.join("version"),
+            version_file_persist: root_dir.join("version"),
+            disable_cgroup: rootless.disable_cgroup,
+            tolerate_missing_hugetlb_controller: rootless.tolerate_missing_hugetlb_controller,
+            cni_config,
+            cgroup_driver: Some(crius::proto::runtime::v1::CgroupDriver::Cgroupfs),
+            rootless: rootless.clone(),
+            shim: ShimConfig {
+                shim_path: PathBuf::from("/missing/crius-shim"),
+                runtime_config_path: PathBuf::new(),
+                monitor_cgroup: String::new(),
+                work_dir: shim_work_dir,
+                attach_socket_dir,
+                container_exits_dir: exits_dir,
+                io_uid: 0,
+                io_gid: 0,
+                monitor_env: Vec::new(),
+                debug: false,
+                log_to_journald: false,
+                no_sync_log: false,
+                no_pivot: false,
+                no_new_keyring: false,
+                systemd_cgroup: false,
+                runtime_path,
+                max_container_log_line_size: 4096,
+                state_db_path: root_dir.join("crius.db"),
+            },
+            ..RuntimeConfig::default()
+        }
+    }
+
+    fn pod_request(name: &str) -> RunPodSandboxRequest {
+        RunPodSandboxRequest {
+            config: Some(PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: name.to_string(),
+                    uid: format!("{name}-uid"),
+                    namespace: "default".to_string(),
+                    attempt: 1,
+                }),
+                hostname: name.to_string(),
+                linux: Some(LinuxPodSandboxConfig {
+                    security_context: Some(LinuxSandboxSecurityContext {
+                        namespace_options: Some(NamespaceOption {
+                            network: NamespaceMode::Node as i32,
+                            pid: NamespaceMode::Pod as i32,
+                            ipc: NamespaceMode::Pod as i32,
+                            target_id: String::new(),
+                            userns_options: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            runtime_handler: String::new(),
+        }
+    }
+
+    fn container_request(pod_id: &str) -> CreateContainerRequest {
+        CreateContainerRequest {
+            pod_sandbox_id: pod_id.to_string(),
+            config: Some(ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "workload".to_string(),
+                    attempt: 1,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:latest".to_string(),
+                    user_specified_image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }),
+                command: vec!["sleep".to_string()],
+                args: vec!["1".to_string()],
+                ..Default::default()
+            }),
+            sandbox_config: Some(pod_request("rootless-life").config.unwrap()),
+        }
+    }
+
+    fn seed_pause_image(storage_root: &Path, db_path: &Path) {
+        FilesystemImageMetadataStore::new(storage_root, Vec::new(), Some(db_path.to_path_buf()))
+            .save(&CriusImage {
+                id: "sha256:rootless-pause".to_string(),
+                repo_tags: vec!["registry.k8s.io/pause:3.9".to_string()],
+                size: 64,
+                pinned: true,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rootless_minimal_lifecycle_uses_xdg_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let xdg_runtime_dir = temp.path().join("xdg-runtime");
+        let xdg_data_home = temp.path().join("xdg-data");
+        let rootless = EffectiveRootlessConfig::resolve(&RootlessConfig {
+            enabled: true,
+            xdg_runtime_dir: xdg_runtime_dir.display().to_string(),
+            xdg_data_home: xdg_data_home.display().to_string(),
+            network_mode: NetworkMode::None,
+            ..Default::default()
+        })
+        .unwrap();
+        let runtime_root = rootless.runtime_root.join("containers");
+        let fake_backend = Arc::new(FakeRuntimeBackend::new(&runtime_root));
+        seed_pause_image(&rootless.storage_root, &temp.path().join("state/crius.db"));
+        let service = RuntimeServiceImpl::new_with_runtime_backends(
+            rootless_runtime_config(temp.path(), rootless.clone()),
+            HashMap::from([(
+                "runc".to_string(),
+                fake_backend.clone() as Arc<dyn crius::runtime::RuntimeBackend>,
+            )]),
+        );
+
+        let pod_id =
+            RuntimeService::run_pod_sandbox(&service, Request::new(pod_request("rootless-life")))
+                .await
+                .unwrap()
+                .into_inner()
+                .pod_sandbox_id;
+        assert!(!pod_id.is_empty());
+
+        let container_id =
+            RuntimeService::create_container(&service, Request::new(container_request(&pod_id)))
+                .await
+                .unwrap()
+                .into_inner()
+                .container_id;
+        RuntimeService::start_container(
+            &service,
+            Request::new(StartContainerRequest {
+                container_id: container_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        RuntimeService::stop_container(
+            &service,
+            Request::new(StopContainerRequest {
+                container_id: container_id.clone(),
+                timeout: 0,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let image_usage = service.image_service().metrics_provider().snapshot().await;
+        assert!(image_usage.image_fs_bytes_used > 0);
+        assert!(rootless.storage_root.starts_with(&xdg_data_home));
+        assert!(rootless.runtime_root.starts_with(&xdg_runtime_dir));
+        assert!(rootless.netns_dir.starts_with(&xdg_runtime_dir));
+        assert!(!rootless.storage_root.starts_with("/var/lib"));
+        assert!(!rootless.runtime_root.starts_with("/run/crius"));
+        assert!(!rootless.netns_dir.starts_with("/var/run/netns"));
+
+        let calls = fake_backend.calls();
+        assert!(calls.contains(&FakeRuntimeCall::CreateContainer {
+            container_id: format!("pause-{pod_id}")
+        }));
+        assert!(calls.contains(&FakeRuntimeCall::PrepareRootfs {
+            container_id: container_id.clone()
+        }));
+        assert!(calls.contains(&FakeRuntimeCall::BuildSpec {
+            container_id: container_id.clone()
+        }));
+        assert!(calls.iter().any(|call| matches!(
+            call,
+            FakeRuntimeCall::WriteBundle {
+                container_id: id,
+                rootfs
+            } if id == &container_id && rootfs.starts_with(temp.path().join("state/containers"))
+        )));
+        assert!(calls.contains(&FakeRuntimeCall::StartContainer {
+            container_id: container_id.clone()
+        }));
+        assert!(calls.contains(&FakeRuntimeCall::StopContainer {
+            container_id,
+            timeout: Some(30)
+        }));
+    }
+}
+
 mod cross_module {
     use std::collections::HashMap;
 

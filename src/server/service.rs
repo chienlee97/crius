@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::CgroupDriverConfig;
 use crate::image::{ImageServiceImpl, ImageServiceOptions, ReloadableImageConfig};
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
 use std::time::Instant;
@@ -383,6 +384,237 @@ pub struct RuntimeConfig {
     pub shim: ShimConfig,
     pub streaming: crate::streaming::StreamingConfig,
     pub config_path: Option<PathBuf>,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        let loaded = crate::config::Config::default();
+        let runtime_name = loaded.runtime.runtime_type.clone();
+        let runtime_configs = loaded.runtime.resolved_runtimes().unwrap_or_else(|_| {
+            HashMap::from([(
+                runtime_name.clone(),
+                crate::config::ResolvedRuntimeHandlerConfig {
+                    backend: "runc".to_string(),
+                    backend_options: HashMap::new(),
+                    runtime_path: loaded.runtime.runtime_path.clone(),
+                    runtime_config_path: loaded.runtime.runtime_config_path.clone(),
+                    runtime_root: loaded.runtime.root.clone(),
+                    platform_runtime_paths: loaded.runtime.platform_runtime_paths.clone(),
+                    monitor_path: loaded.runtime.shim_path.clone(),
+                    monitor_cgroup: loaded.runtime.monitor_cgroup.clone(),
+                    monitor_env: loaded.runtime.monitor_env.clone(),
+                    stream_websockets: false,
+                    allowed_annotations: Vec::new(),
+                    default_annotations: HashMap::new(),
+                    privileged_without_host_devices: false,
+                    privileged_without_host_devices_all_devices_allowed: false,
+                    container_create_timeout: 240,
+                    snapshotter: "internal-overlay-untar".to_string(),
+                },
+            )])
+        });
+        let mut cni_config = loaded.network.cni_config();
+        if loaded.network.netns_mounts_under_state_dir {
+            cni_config.set_netns_mount_dir(PathBuf::from(&loaded.runtime.root).join("netns"));
+        }
+        if !loaded.runtime.pinns_path.trim().is_empty() {
+            cni_config.set_namespace_helper_path(Some(PathBuf::from(&loaded.runtime.pinns_path)));
+        }
+        for (handler, handler_config) in &loaded.runtime.runtimes {
+            let cni_conf_dir = handler_config.cni_conf_dir.trim();
+            if !cni_conf_dir.is_empty() {
+                cni_config
+                    .set_handler_config_dirs(handler.clone(), vec![PathBuf::from(cni_conf_dir)]);
+            }
+            if let Some(cni_max_conf_num) = handler_config.cni_max_conf_num {
+                cni_config.set_handler_max_conf_num(handler.clone(), cni_max_conf_num);
+            }
+        }
+        let root_dir = PathBuf::from(&loaded.root);
+        let runtime_root = PathBuf::from(&loaded.runtime.root);
+        let log_dir = PathBuf::from(&loaded.logging.dir);
+        let runtime_path = PathBuf::from(&loaded.runtime.runtime_path);
+        let runtime_config_path = PathBuf::from(&loaded.runtime.runtime_config_path);
+        let attach_socket_dir = PathBuf::from(&loaded.runtime.attach_socket_dir);
+        let container_exits_dir = PathBuf::from(&loaded.runtime.container_exits_dir);
+        let cgroup_driver = loaded.runtime.cgroup_driver.map(|driver| driver.as_proto());
+        let shim = ShimConfig {
+            shim_path: PathBuf::from(&loaded.runtime.shim_path),
+            runtime_config_path: runtime_config_path.clone(),
+            monitor_cgroup: loaded.runtime.monitor_cgroup.clone(),
+            work_dir: PathBuf::from(&loaded.runtime.shim_dir),
+            attach_socket_dir: attach_socket_dir.clone(),
+            container_exits_dir: container_exits_dir.clone(),
+            io_uid: loaded.runtime.io_uid,
+            io_gid: loaded.runtime.io_gid,
+            monitor_env: loaded.runtime.monitor_env.clone(),
+            debug: loaded.runtime.shim_debug,
+            log_to_journald: loaded.runtime.log_to_journald,
+            no_sync_log: loaded.runtime.no_sync_log,
+            no_pivot: loaded.runtime.no_pivot,
+            no_new_keyring: loaded.runtime.no_new_keyring,
+            systemd_cgroup: matches!(
+                loaded.runtime.cgroup_driver,
+                Some(CgroupDriverConfig::Systemd)
+            ),
+            runtime_path: runtime_path.clone(),
+            max_container_log_line_size: loaded.logging.max_container_log_line_size,
+            state_db_path: root_dir.join("crius.db"),
+        };
+
+        Self {
+            root_dir,
+            runtime: runtime_name,
+            runtime_handlers: loaded.runtime.normalized_handlers(),
+            runtime_configs,
+            runtime_root,
+            log_dir,
+            runtime_path,
+            runtime_config_path,
+            image_root: PathBuf::from(&loaded.image.root),
+            image_driver: loaded.image.driver.clone(),
+            image_global_auth_file: PathBuf::from(&loaded.image.global_auth_file),
+            image_namespaced_auth_dir: PathBuf::from(&loaded.image.namespaced_auth_dir),
+            image_default_transport: loaded.image.default_transport.clone(),
+            image_short_name_mode: loaded.image.short_name_mode.clone(),
+            image_pull_progress_timeout: loaded.image.pull_progress_timeout,
+            image_max_concurrent_downloads: loaded.image.max_concurrent_downloads,
+            image_pull_retry_count: loaded.image.pull_retry_count,
+            image_registry_config_dir: PathBuf::from(&loaded.image.registry_config_dir),
+            image_decryption_keys_path: PathBuf::from(&loaded.image.decryption_keys_path),
+            image_decryption_decoder_path: loaded.image.decryption_decoder_path.clone(),
+            image_decryption_keyprovider_config: PathBuf::from(
+                &loaded.image.decryption_keyprovider_config,
+            ),
+            image_additional_artifact_stores: loaded
+                .image
+                .additional_artifact_stores
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+            image_signature_policy: PathBuf::from(&loaded.image.signature_policy),
+            image_signature_policy_dir: PathBuf::from(&loaded.image.signature_policy_dir),
+            image_storage_options: loaded.image.storage_options.clone(),
+            image_volumes: loaded.image.image_volumes.clone(),
+            image_pinned_images: loaded.image.pinned_images.clone(),
+            image_big_files_temporary_dir: PathBuf::from(&loaded.image.big_files_temporary_dir),
+            image_oci_artifact_mount_support: loaded.image.oci_artifact_mount_support,
+            workloads: loaded.runtime.workloads.clone(),
+            enable_pod_events: loaded.api.enable_pod_events,
+            included_pod_metrics: loaded.api.included_pod_metrics.clone(),
+            stats_collection_period: loaded.api.stats_collection_period,
+            pod_sandbox_metrics_collection_period: loaded.api.pod_sandbox_metrics_collection_period,
+            grpc_max_send_msg_size: loaded.api.grpc_max_send_msg_size,
+            grpc_max_recv_msg_size: loaded.api.grpc_max_recv_msg_size,
+            metrics_enable: loaded.metrics.enable,
+            metrics_host: loaded.metrics.host.clone(),
+            metrics_port: loaded.metrics.port,
+            metrics_socket_path: PathBuf::from(&loaded.metrics.socket_path),
+            metrics_enable_tls: loaded.metrics.enable_tls,
+            metrics_tls_cert_file: PathBuf::from(&loaded.metrics.tls_cert_file),
+            metrics_tls_key_file: PathBuf::from(&loaded.metrics.tls_key_file),
+            metrics_tls_ca_file: PathBuf::from(&loaded.metrics.tls_ca_file),
+            metrics_tls_min_version: loaded.metrics.tls_min_version.clone(),
+            metrics_tls_cipher_suites: loaded.metrics.tls_cipher_suites.clone(),
+            metrics_collectors: loaded.metrics.collectors.clone(),
+            tracing_enable: loaded.tracing.enable,
+            tracing_endpoint: loaded.tracing.endpoint.clone(),
+            tracing_sampling_rate_per_million: loaded.tracing.sampling_rate_per_million,
+            monitor_env: loaded.runtime.monitor_env.clone(),
+            monitor_cgroup: loaded.runtime.monitor_cgroup.clone(),
+            default_env: loaded.runtime.parsed_default_env(),
+            default_capabilities: loaded
+                .runtime
+                .default_capabilities
+                .iter()
+                .map(|capability| {
+                    let upper = capability.trim().to_ascii_uppercase();
+                    if upper.starts_with("CAP_") {
+                        upper
+                    } else {
+                        format!("CAP_{upper}")
+                    }
+                })
+                .collect(),
+            default_sysctls: loaded.runtime.parsed_default_sysctls().unwrap_or_default(),
+            default_ulimits: loaded.runtime.parsed_default_ulimits().unwrap_or_default(),
+            allowed_devices: loaded.runtime.parsed_allowed_devices(),
+            additional_devices: loaded
+                .runtime
+                .parsed_additional_devices()
+                .unwrap_or_default(),
+            device_ownership_from_security_context: loaded
+                .runtime
+                .device_ownership_from_security_context,
+            add_inheritable_capabilities: loaded.runtime.add_inheritable_capabilities,
+            base_runtime_spec: None,
+            default_mounts_file: PathBuf::from(&loaded.runtime.default_mounts_file),
+            hooks_dir: loaded.runtime.hooks_dir.iter().map(PathBuf::from).collect(),
+            absent_mount_sources_to_reject: loaded
+                .runtime
+                .absent_mount_sources_to_reject
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+            disable_proc_mount: loaded.runtime.disable_proc_mount,
+            timezone: loaded.runtime.timezone.clone(),
+            attach_socket_dir,
+            container_exits_dir,
+            clean_shutdown_file: PathBuf::from(&loaded.runtime.clean_shutdown_file),
+            container_stop_timeout: loaded.runtime.container_stop_timeout,
+            version_file: PathBuf::from(&loaded.runtime.version_file),
+            version_file_persist: PathBuf::from(&loaded.runtime.version_file_persist),
+            criu_path: PathBuf::from(&loaded.runtime.criu_path),
+            criu_image_path: PathBuf::from(&loaded.runtime.criu_image_path),
+            criu_work_path: PathBuf::from(&loaded.runtime.criu_work_path),
+            enable_criu_support: loaded.runtime.enable_criu_support,
+            internal_wipe: loaded.runtime.internal_wipe,
+            internal_repair: loaded.runtime.internal_repair,
+            bind_mount_prefix: PathBuf::from(&loaded.runtime.bind_mount_prefix),
+            disable_cgroup: loaded.runtime.disable_cgroup,
+            tolerate_missing_hugetlb_controller: loaded.runtime.tolerate_missing_hugetlb_controller,
+            separate_pull_cgroup: loaded.runtime.separate_pull_cgroup.clone(),
+            seccomp_profile: PathBuf::from(&loaded.security.seccomp_profile),
+            privileged_seccomp_profile: loaded.security.privileged_seccomp_profile.clone(),
+            unset_seccomp_profile: loaded.security.unset_seccomp_profile.clone(),
+            apparmor_default_profile: loaded.security.apparmor_default_profile.clone(),
+            disable_apparmor: loaded.security.disable_apparmor,
+            enable_selinux: loaded.security.enable_selinux,
+            selinux_category_range: loaded.security.selinux_category_range,
+            hostnetwork_disable_selinux: loaded.security.hostnetwork_disable_selinux,
+            uid_mappings: None,
+            gid_mappings: None,
+            minimum_mappable_uid: loaded.runtime.minimum_mappable_uid,
+            minimum_mappable_gid: loaded.runtime.minimum_mappable_gid,
+            io_uid: loaded.runtime.io_uid,
+            io_gid: loaded.runtime.io_gid,
+            pids_limit: loaded.runtime.pids_limit,
+            infra_ctr_cpuset: loaded.runtime.infra_ctr_cpuset.clone(),
+            shared_cpuset: loaded.runtime.shared_cpuset.clone(),
+            exec_cpu_affinity: loaded.runtime.exec_cpu_affinity.clone(),
+            irqbalance_config_file: PathBuf::from(&loaded.runtime.irqbalance_config_file),
+            irqbalance_config_restore_file: loaded.runtime.irqbalance_config_restore_file.clone(),
+            read_only: loaded.runtime.read_only,
+            no_pivot: loaded.runtime.no_pivot,
+            no_new_keyring: loaded.runtime.no_new_keyring,
+            pause_image: loaded.runtime.pause_image.clone(),
+            pause_command: loaded.runtime.pause_command.clone(),
+            drop_infra_ctr: loaded.runtime.drop_infra_ctr,
+            cni_config,
+            cgroup_driver,
+            exec_sync_io_drain_timeout: loaded.api.exec_sync_io_drain_timeout,
+            max_container_log_line_size: loaded.logging.max_container_log_line_size,
+            log_to_journald: loaded.runtime.log_to_journald,
+            no_sync_log: loaded.runtime.no_sync_log,
+            restrict_oom_score_adj: loaded.runtime.restrict_oom_score_adj,
+            enable_unprivileged_ports: loaded.runtime.enable_unprivileged_ports,
+            enable_unprivileged_icmp: loaded.runtime.enable_unprivileged_icmp,
+            rootless: crate::rootless::EffectiveRootlessConfig::disabled(),
+            shim,
+            streaming: loaded.api.streaming.clone(),
+            config_path: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1949,13 +2181,18 @@ impl RuntimeServiceImpl {
         })
         .expect("Failed to initialize image service");
 
+        let mut pod_cni_config = config.cni_config.clone();
+        pod_cni_config.set_rootless_config(Some(config.rootless.clone()));
+        if config.rootless.enabled {
+            pod_cni_config.set_netns_mount_dir(config.rootless.netns_dir.clone());
+        }
         let pod_manager = PodSandboxManager::new(
             runtime.clone(),
             config.root_dir.join("pods"),
             config.pause_image.clone(),
             config.pause_command.clone(),
             config.infra_ctr_cpuset.clone(),
-            config.cni_config.clone(),
+            pod_cni_config,
         );
         let persistence_config = PersistenceConfig {
             db_path: config.root_dir.join("crius.db"),
@@ -2190,7 +2427,11 @@ impl RuntimeServiceImpl {
 
         {
             let mut pod_manager = self.pod_manager.lock().await;
-            let next_cni = next.with_cni_config(&self.config.cni_config);
+            let mut next_cni = next.with_cni_config(&self.config.cni_config);
+            next_cni.set_rootless_config(Some(self.config.rootless.clone()));
+            if self.config.rootless.enabled {
+                next_cni.set_netns_mount_dir(self.config.rootless.netns_dir.clone());
+            }
             let runtime_network_config = self.runtime_network_config.lock().await.clone();
             Self::sync_generated_cni_config(&next_cni, runtime_network_config.as_ref()).map_err(
                 |err| {

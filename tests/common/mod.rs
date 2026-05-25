@@ -41,6 +41,7 @@ pub struct FakeRuntimeBackend {
 #[derive(Debug, Clone)]
 struct FakeRuntimeState {
     status: ContainerStatus,
+    statuses: HashMap<String, ContainerStatus>,
     calls: Vec<FakeRuntimeCall>,
     failures: HashMap<FakeRuntimeOperation, String>,
 }
@@ -96,6 +97,7 @@ impl FakeRuntimeBackend {
             runtime_config_path: PathBuf::from("/fake/runtime.conf"),
             state: Arc::new(Mutex::new(FakeRuntimeState {
                 status: ContainerStatus::Created,
+                statuses: HashMap::new(),
                 calls: Vec::new(),
                 failures: HashMap::new(),
             })),
@@ -169,12 +171,13 @@ impl FakeRuntimeBackend {
         Ok(())
     }
 
-    fn transition(&self, status: ContainerStatus) -> Result<()> {
+    fn transition(&self, container_id: &str, status: ContainerStatus) -> Result<()> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("fake runtime backend state lock poisoned"))?;
-        state.status = status;
+        state.status = status.clone();
+        state.statuses.insert(container_id.to_string(), status);
         Ok(())
     }
 }
@@ -185,7 +188,7 @@ impl TaskController for FakeRuntimeBackend {
             container_id: container_id.to_string(),
         })?;
         self.maybe_fail(FakeRuntimeOperation::CreateContainer)?;
-        self.transition(ContainerStatus::Created)?;
+        self.transition(container_id, ContainerStatus::Created)?;
         Ok("fake-created".to_string())
     }
 
@@ -194,7 +197,7 @@ impl TaskController for FakeRuntimeBackend {
             container_id: container_id.to_string(),
         })?;
         self.maybe_fail(FakeRuntimeOperation::StartContainer)?;
-        self.transition(ContainerStatus::Running)?;
+        self.transition(container_id, ContainerStatus::Running)?;
         Ok(())
     }
 
@@ -204,7 +207,7 @@ impl TaskController for FakeRuntimeBackend {
             timeout,
         })?;
         self.maybe_fail(FakeRuntimeOperation::StopContainer)?;
-        self.transition(ContainerStatus::Stopped(0))?;
+        self.transition(container_id, ContainerStatus::Stopped(0))?;
         Ok(())
     }
 
@@ -213,7 +216,7 @@ impl TaskController for FakeRuntimeBackend {
             container_id: container_id.to_string(),
         })?;
         self.maybe_fail(FakeRuntimeOperation::RemoveContainer)?;
-        self.transition(ContainerStatus::Unknown)?;
+        self.transition(container_id, ContainerStatus::Unknown)?;
         Ok(())
     }
 
@@ -222,7 +225,21 @@ impl TaskController for FakeRuntimeBackend {
             container_id: container_id.to_string(),
         })?;
         self.maybe_fail(FakeRuntimeOperation::ContainerStatus)?;
-        Ok(self.status_snapshot())
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake runtime backend state lock poisoned"))?;
+        Ok(state
+            .statuses
+            .get(container_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                if state.statuses.is_empty() {
+                    state.status.clone()
+                } else {
+                    ContainerStatus::Unknown
+                }
+            }))
     }
 
     fn reopen_container_log(&self, _container_id: &str) -> Result<()> {
@@ -320,6 +337,11 @@ impl RuntimeContextManager for FakeRuntimeBackend {
             rootfs: rootfs.to_path_buf(),
         })?;
         self.maybe_fail(FakeRuntimeOperation::WriteBundle)?;
+        let bundle_dir = self.bundle_path_for(container_id);
+        std::fs::create_dir_all(&bundle_dir)
+            .with_context(|| format!("failed to create fake bundle {}", bundle_dir.display()))?;
+        std::fs::write(bundle_dir.join("config.json"), serde_json::to_vec(_spec)?)
+            .with_context(|| format!("failed to write fake bundle {}", bundle_dir.display()))?;
         Ok(())
     }
 
