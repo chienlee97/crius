@@ -1513,80 +1513,21 @@ impl RuntimeServiceImpl {
         profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
         deprecated_profile: &str,
     ) -> Option<SeccompProfile> {
-        if let Some(profile) = profile {
-            return match profile.profile_type {
-                x if x
-                    == crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
-                        as i32 =>
-                {
-                    Some(SeccompProfile::RuntimeDefault)
-                }
-                x if x
-                    == crate::proto::runtime::v1::security_profile::ProfileType::Unconfined
-                        as i32 =>
-                {
-                    Some(SeccompProfile::Unconfined)
-                }
-                x if x
-                    == crate::proto::runtime::v1::security_profile::ProfileType::Localhost
-                        as i32 =>
-                {
-                    if profile.localhost_ref.is_empty() {
-                        None
-                    } else {
-                        Some(SeccompProfile::Localhost(PathBuf::from(
-                            profile.localhost_ref.clone(),
-                        )))
-                    }
-                }
-                _ => None,
-            };
-        }
-
-        if deprecated_profile.is_empty() {
-            None
-        } else {
-            Some(SeccompProfile::Localhost(PathBuf::from(
-                deprecated_profile.to_string(),
-            )))
-        }
+        crate::security::seccomp::profile_from_proto(profile, deprecated_profile)
     }
 
     fn seccomp_profile_from_selector(selector: &str) -> Option<SeccompProfile> {
-        let selector = selector.trim();
-        if selector.is_empty() {
-            return None;
-        }
-        if selector.eq_ignore_ascii_case("runtime/default")
-            || selector.eq_ignore_ascii_case("docker/default")
-        {
-            return Some(SeccompProfile::RuntimeDefault);
-        }
-        if selector.eq_ignore_ascii_case("unconfined") {
-            return Some(SeccompProfile::Unconfined);
-        }
-        if let Some(localhost_ref) = selector.strip_prefix("localhost/") {
-            return (!localhost_ref.trim().is_empty())
-                .then(|| SeccompProfile::Localhost(PathBuf::from(localhost_ref)));
-        }
-        Some(SeccompProfile::Localhost(PathBuf::from(selector)))
+        crate::security::seccomp::profile_from_selector(selector)
     }
 
     fn expand_runtime_default_seccomp_profile(
         &self,
         profile: Option<SeccompProfile>,
     ) -> Option<SeccompProfile> {
-        match profile {
-            Some(SeccompProfile::RuntimeDefault) => {
-                let path = self.current_reloadable_config().seccomp_profile;
-                if path.as_os_str().is_empty() {
-                    Some(SeccompProfile::RuntimeDefault)
-                } else {
-                    Some(SeccompProfile::Localhost(path))
-                }
-            }
-            other => other,
-        }
+        crate::security::seccomp::expand_runtime_default_profile(
+            profile,
+            &self.current_reloadable_config().seccomp_profile,
+        )
     }
 
     fn effective_seccomp_profile_from_proto(
@@ -1595,17 +1536,14 @@ impl RuntimeServiceImpl {
         deprecated_profile: &str,
         privileged: bool,
     ) -> Option<SeccompProfile> {
-        let selected = match Self::seccomp_profile_from_proto(profile, deprecated_profile) {
-            Some(SeccompProfile::RuntimeDefault) if privileged => {
-                Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
-            }
-            Some(explicit) => Some(explicit),
-            None if privileged => {
-                Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
-            }
-            None => Self::seccomp_profile_from_selector(&self.config.unset_seccomp_profile),
-        };
-        self.expand_runtime_default_seccomp_profile(selected)
+        crate::security::seccomp::effective_profile(
+            profile,
+            deprecated_profile,
+            privileged,
+            &self.config.privileged_seccomp_profile,
+            &self.config.unset_seccomp_profile,
+            &self.current_reloadable_config().seccomp_profile,
+        )
     }
 
     fn stored_seccomp_profile_from_proto(

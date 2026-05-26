@@ -14,6 +14,7 @@ pub mod apparmor;
 pub mod cdi;
 pub mod devices;
 pub mod resource_classes;
+pub mod seccomp;
 pub mod selinux;
 
 /// 安全配置
