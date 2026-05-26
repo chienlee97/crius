@@ -8,6 +8,13 @@ pub enum AppArmorError {
     Unavailable,
 }
 
+#[derive(Debug, Clone)]
+pub struct AppArmorPolicy {
+    pub default_profile: String,
+    pub disabled: bool,
+    pub available: bool,
+}
+
 pub fn profile_name(profile: Option<&SecurityProfile>, deprecated_profile: &str) -> Option<String> {
     if let Some(profile) = profile {
         match profile.profile_type {
@@ -23,6 +30,21 @@ pub fn profile_name(profile: Option<&SecurityProfile>, deprecated_profile: &str)
     } else {
         Some(deprecated_profile.to_string())
     }
+}
+
+pub fn effective_profile_from_proto(
+    profile: Option<&SecurityProfile>,
+    deprecated_profile: &str,
+    privileged: bool,
+    policy: &AppArmorPolicy,
+) -> Result<Option<String>, AppArmorError> {
+    effective_profile(
+        profile_name(profile, deprecated_profile),
+        &policy.default_profile,
+        privileged,
+        policy.disabled,
+        policy.available,
+    )
 }
 
 pub fn effective_profile(
@@ -107,6 +129,40 @@ mod tests {
             false,
         )
         .unwrap_err();
+        assert_eq!(err, AppArmorError::Unavailable);
+    }
+
+    #[test]
+    fn effective_profile_from_proto_maps_runtime_default_to_policy_default() {
+        let profile = SecurityProfile {
+            profile_type: ProfileType::RuntimeDefault as i32,
+            localhost_ref: String::new(),
+        };
+        let policy = AppArmorPolicy {
+            default_profile: "crius-default".to_string(),
+            disabled: false,
+            available: true,
+        };
+
+        assert_eq!(
+            effective_profile_from_proto(Some(&profile), "", false, &policy).unwrap(),
+            Some("crius-default".to_string())
+        );
+    }
+
+    #[test]
+    fn effective_profile_from_proto_rejects_named_profile_when_disabled() {
+        let profile = SecurityProfile {
+            profile_type: ProfileType::Localhost as i32,
+            localhost_ref: "custom-profile".to_string(),
+        };
+        let policy = AppArmorPolicy {
+            default_profile: "crius-default".to_string(),
+            disabled: true,
+            available: true,
+        };
+
+        let err = effective_profile_from_proto(Some(&profile), "", false, &policy).unwrap_err();
         assert_eq!(err, AppArmorError::Unavailable);
     }
 }

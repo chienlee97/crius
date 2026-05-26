@@ -1416,13 +1416,6 @@ impl RuntimeServiceImpl {
         Ok(())
     }
 
-    fn security_profile_name(
-        profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
-        deprecated_profile: &str,
-    ) -> Option<String> {
-        crate::security::apparmor::profile_name(profile, deprecated_profile)
-    }
-
     fn security_availability() -> crate::security::SecurityManager {
         crate::security::SecurityManager::new()
     }
@@ -1433,18 +1426,19 @@ impl RuntimeServiceImpl {
         deprecated_profile: &str,
         privileged: bool,
     ) -> Result<Option<String>, Status> {
-        let requested = Self::security_profile_name(profile, deprecated_profile);
         let security = Self::security_availability();
-        let default_profile = self
-            .current_reloadable_config()
-            .apparmor_default_profile
-            .clone();
-        crate::security::apparmor::effective_profile(
-            requested,
-            &default_profile,
+        crate::security::apparmor::effective_profile_from_proto(
+            profile,
+            deprecated_profile,
             privileged,
-            self.config.disable_apparmor,
-            security.is_apparmor_available(),
+            &crate::security::apparmor::AppArmorPolicy {
+                default_profile: self
+                    .current_reloadable_config()
+                    .apparmor_default_profile
+                    .clone(),
+                disabled: self.config.disable_apparmor,
+                available: security.is_apparmor_available(),
+            },
         )
         .map_err(|err| Status::failed_precondition(err.to_string()))
     }
