@@ -4,6 +4,11 @@ use tonic::Status;
 use crate::proto::runtime::v1::ContainerEventResponse;
 
 #[derive(Debug, Clone)]
+pub struct LedgerInternalEventSink {
+    db_path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone)]
 pub struct EventService {
     sender: tokio::sync::broadcast::Sender<ContainerEventResponse>,
     internal_sender: tokio::sync::broadcast::Sender<InternalEvent>,
@@ -107,6 +112,27 @@ impl InternalEvent {
 
     fn details_for_ledger(&self) -> Option<String> {
         (!self.details.is_null()).then(|| self.details.to_string())
+    }
+}
+
+impl LedgerInternalEventSink {
+    pub fn new(db_path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            db_path: db_path.into(),
+        }
+    }
+
+    pub fn publish(&self, event: &InternalEvent) -> anyhow::Result<()> {
+        let mut storage = crate::storage::StorageManager::new(&self.db_path)?;
+        storage.append_typed_event_at(
+            &event.kind,
+            &event.subject_kind,
+            &event.subject_id,
+            None,
+            Some(event.severity.as_str()),
+            event.details_for_ledger().as_deref(),
+            event.timestamp,
+        )
     }
 }
 
@@ -332,6 +358,41 @@ mod tests {
         let events = EventService::with_capacity(16).with_ledger(reloaded);
         let recent = events
             .recent_internal_events("shim", "container-1", 10)
+            .await
+            .unwrap();
+        assert_eq!(recent, vec![event]);
+    }
+
+    #[tokio::test]
+    async fn ledger_sink_persists_events_for_service_queries() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+        let sink = LedgerInternalEventSink::new(db_path.clone());
+        let event = InternalEvent::with_timestamp(
+            "task.state",
+            "task",
+            "container-1",
+            InternalEventSeverity::Info,
+            1234,
+            serde_json::json!({
+                "previousState": "created",
+                "state": "running",
+            }),
+        );
+
+        sink.publish(&event).unwrap();
+
+        let persistence = Arc::new(tokio::sync::Mutex::new(
+            PersistenceManager::new(PersistenceConfig {
+                db_path,
+                enable_recovery: true,
+                auto_save_interval: 30,
+            })
+            .unwrap(),
+        ));
+        let events = EventService::with_capacity(16).with_ledger(persistence);
+        let recent = events
+            .recent_internal_events("task", "container-1", 10)
             .await
             .unwrap();
         assert_eq!(recent, vec![event]);

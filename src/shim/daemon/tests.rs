@@ -1,6 +1,9 @@
 use super::*;
+use crate::services::{EventService, InternalEventSeverity};
+use crate::storage::persistence::{PersistenceConfig, PersistenceManager};
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 fn parse_cri_log_lines(contents: &str) -> Vec<(String, String, String, String)> {
@@ -16,6 +19,68 @@ fn parse_cri_log_lines(contents: &str) -> Vec<(String, String, String, String)> 
             )
         })
         .collect()
+}
+
+#[tokio::test]
+async fn shim_daemon_records_task_and_exec_internal_events() {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("state").join("crius.db");
+    let bundle_dir = temp_dir.path().join("bundle");
+    fs::create_dir_all(&bundle_dir).unwrap();
+
+    let daemon = Daemon::new(
+        "container-1".to_string(),
+        bundle_dir,
+        temp_dir.path().join("runtime"),
+        DaemonOptions {
+            runtime_config_path: PathBuf::new(),
+            monitor_cgroup: String::new(),
+            work_dir: temp_dir.path().join("shim"),
+            state_db_path: Some(db_path.clone()),
+            exit_code_file: None,
+            attach_socket_dir: None,
+            io_uid: 0,
+            io_gid: 0,
+            max_container_log_line_size: 4096,
+            log_to_journald: false,
+            no_sync_log: false,
+            no_pivot: false,
+            no_new_keyring: false,
+            systemd_cgroup: false,
+        },
+    );
+
+    daemon.set_task_state(DaemonTaskState::Created);
+    daemon.record_exec_event("exit:0:[\"/bin/true\"]").unwrap();
+
+    let persistence = Arc::new(tokio::sync::Mutex::new(
+        PersistenceManager::new(PersistenceConfig {
+            db_path,
+            enable_recovery: true,
+            auto_save_interval: 30,
+        })
+        .unwrap(),
+    ));
+    let events = EventService::with_capacity(16).with_ledger(persistence);
+
+    let task_events = events
+        .recent_internal_events("task", "container-1", 10)
+        .await
+        .unwrap();
+    assert_eq!(task_events.len(), 1);
+    assert_eq!(task_events[0].kind, "task.state");
+    assert_eq!(task_events[0].severity, InternalEventSeverity::Info);
+    assert_eq!(task_events[0].details["previousState"], "init");
+    assert_eq!(task_events[0].details["state"], "created");
+
+    let shim_events = events
+        .recent_internal_events("shim", "container-1", 10)
+        .await
+        .unwrap();
+    assert_eq!(shim_events.len(), 1);
+    assert_eq!(shim_events[0].kind, "exec.event");
+    assert_eq!(shim_events[0].severity, InternalEventSeverity::Info);
+    assert_eq!(shim_events[0].details["message"], "exit:0:[\"/bin/true\"]");
 }
 
 #[test]

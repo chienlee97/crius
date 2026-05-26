@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use super::io::{IoConfig, IoManager, JournalConfig, DEFAULT_JOURNALD_SOCKET_PATH};
 use crate::runtime::RuncRuntime;
+use crate::services::{InternalEvent, InternalEventSeverity, LedgerInternalEventSink};
 use crate::shim_rpc::server::{default_task_socket_path, serve, ShimRpcHandler};
 use crate::shim_rpc::{
     CheckpointTaskRequest, CreateTaskRequest, DeleteTaskRequest, ExecProcessRequest,
@@ -38,7 +39,6 @@ use crate::shim_rpc::{
     ShimRpcRequest, ShimRpcResponse, StartTaskRequest, StatusRequest, StatusResponse, TaskState,
     UpdateResourcesRequest, WaitProcessRequest, WaitProcessResponse,
 };
-use crate::storage::StorageManager;
 
 const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";
 
@@ -290,22 +290,37 @@ impl Daemon {
         let Some(path) = self.state_db_path.as_ref() else {
             return Ok(());
         };
-        let mut storage = StorageManager::new(path)?;
-        storage.append_event(
-            "shim_task",
+        let mut event_details = serde_json::json!({
+            "previousState": previous.as_str(),
+            "state": next.as_str(),
+        });
+        if let Some(details) = details {
+            event_details["details"] = serde_json::Value::String(details);
+        }
+        let event = InternalEvent::new(
+            "task.state",
+            "task",
             &self.container_id,
-            Some(previous.as_str()),
-            Some(next.as_str()),
-            details.as_deref(),
-        )
+            InternalEventSeverity::Info,
+            event_details,
+        );
+        LedgerInternalEventSink::new(path).publish(&event)
     }
 
     fn record_exec_event(&self, details: &str) -> Result<()> {
         let Some(path) = self.state_db_path.as_ref() else {
             return Ok(());
         };
-        let mut storage = StorageManager::new(path)?;
-        storage.append_event("shim_exec", &self.container_id, None, None, Some(details))
+        let event = InternalEvent::new(
+            "exec.event",
+            "shim",
+            &self.container_id,
+            InternalEventSeverity::Info,
+            serde_json::json!({
+                "message": details,
+            }),
+        );
+        LedgerInternalEventSink::new(path).publish(&event)
     }
 
     fn apply_rootfs_override(&self, rootfs_path: &Path) -> Result<()> {

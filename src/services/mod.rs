@@ -2,7 +2,7 @@ pub mod event;
 pub mod health;
 pub mod introspection;
 
-pub use event::{EventService, InternalEvent, InternalEventSeverity};
+pub use event::{EventService, InternalEvent, InternalEventSeverity, LedgerInternalEventSink};
 pub use health::{
     HealthCondition, HealthService, InternalHealthCondition, RecoveryLedgerHealthSummary,
 };
