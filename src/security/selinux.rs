@@ -10,6 +10,13 @@ pub struct SelinuxPolicy {
     pub hostnetwork_disable: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SelinuxResolverConfig {
+    pub enabled: bool,
+    pub category_range: u32,
+    pub hostnetwork_disable: bool,
+}
+
 pub fn generated_level(seed: &str, category_range: u32) -> String {
     let effective_range = category_range.max(1);
     if effective_range == 1 {
@@ -85,6 +92,26 @@ pub fn effective_label(
     label_from_options(options, auto_level_seed, policy.category_range)
 }
 
+pub fn effective_label_from_config(
+    options: Option<&SeLinuxOption>,
+    host_network: bool,
+    auto_level_seed: Option<&str>,
+    config: SelinuxResolverConfig,
+    available: bool,
+) -> Option<String> {
+    effective_label(
+        options,
+        host_network,
+        auto_level_seed,
+        SelinuxPolicy {
+            enabled: config.enabled,
+            available,
+            category_range: config.category_range,
+            hostnetwork_disable: config.hostnetwork_disable,
+        },
+    )
+}
+
 pub fn is_available() -> bool {
     std::path::Path::new("/sys/fs/selinux").exists() || std::path::Path::new("/selinux").exists()
 }
@@ -132,5 +159,27 @@ mod tests {
         };
 
         assert_eq!(effective_label(Some(&options), true, None, policy), None);
+    }
+
+    #[test]
+    fn effective_label_from_config_combines_config_and_availability() {
+        let options = SeLinuxOption {
+            r#type: "spc_t".to_string(),
+            ..Default::default()
+        };
+        let config = SelinuxResolverConfig {
+            enabled: true,
+            category_range: 8,
+            hostnetwork_disable: false,
+        };
+
+        assert!(
+            effective_label_from_config(Some(&options), false, Some("pod"), config, false)
+                .is_none()
+        );
+
+        let label = effective_label_from_config(Some(&options), false, Some("pod"), config, true)
+            .expect("available selinux should produce a label");
+        assert!(label.starts_with("system_u:system_r:spc_t:s0:c"));
     }
 }

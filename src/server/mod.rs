@@ -1490,16 +1490,16 @@ impl RuntimeServiceImpl {
         auto_level_seed: Option<&str>,
     ) -> Option<String> {
         let security = Self::security_availability();
-        crate::security::selinux::effective_label(
+        crate::security::selinux::effective_label_from_config(
             options,
             host_network,
             auto_level_seed,
-            crate::security::selinux::SelinuxPolicy {
+            crate::security::selinux::SelinuxResolverConfig {
                 enabled: self.config.enable_selinux,
-                available: security.is_selinux_available(),
                 category_range: self.config.selinux_category_range,
                 hostnetwork_disable: self.config.hostnetwork_disable_selinux,
             },
+            security.is_selinux_available(),
         )
     }
 
