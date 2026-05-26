@@ -1614,6 +1614,14 @@ async fn recover_state_recovers_running_container_without_shim_metadata_file_fro
     )
     .unwrap_or_default();
     assert!(internal_state.broken.is_none());
+    let events = service
+        .internal_services
+        .events
+        .recent_internal_events("shim", "recover-ledger-only", 10)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| event.kind == "shim.reconnect"
+        && event.details["reason"].as_str().is_some()));
 
     let _ = shim_child.kill();
     let _ = shim_child.wait();

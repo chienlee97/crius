@@ -638,12 +638,45 @@ impl RuntimeServiceImpl {
                             | crate::shim_rpc::TaskState::Paused
                     ) =>
                 {
+                    self.publish_shim_reconnect_event(
+                        container_id,
+                        "shim.reconnect",
+                        InternalEventSeverity::Info,
+                        "task service reported active task state",
+                        serde_json::json!({
+                            "taskState": format!("{:?}", status.state),
+                            "pid": status.pid,
+                        }),
+                    )
+                    .await;
                     result.reconnected_shims.push(container_id.to_string());
                 }
                 Ok(None) if shim_pid_live => {
+                    self.publish_shim_reconnect_event(
+                        container_id,
+                        "shim.reconnect",
+                        InternalEventSeverity::Info,
+                        "shim process is live without task status",
+                        serde_json::json!({
+                            "shimPid": shim_record.shim_pid,
+                            "socketPath": shim_record.socket_path,
+                        }),
+                    )
+                    .await;
                     result.reconnected_shims.push(container_id.to_string());
                 }
-                Ok(Some(_)) => {
+                Ok(Some(status)) => {
+                    self.publish_shim_reconnect_event(
+                        container_id,
+                        "shim.reconnect",
+                        InternalEventSeverity::Info,
+                        "task service responded with terminal task state",
+                        serde_json::json!({
+                            "taskState": format!("{:?}", status.state),
+                            "pid": status.pid,
+                        }),
+                    )
+                    .await;
                     result.reconnected_shims.push(container_id.to_string());
                 }
                 Ok(None) => {
@@ -665,8 +698,19 @@ impl RuntimeServiceImpl {
                     .await;
                     result.broken_containers.insert(
                         container_id.to_string(),
-                        Self::broken_state("shim_reconcile_failed", details),
+                        Self::broken_state("shim_reconcile_failed", details.clone()),
                     );
+                    self.publish_shim_reconnect_event(
+                        container_id,
+                        "shim.reconnect_failed",
+                        InternalEventSeverity::Warning,
+                        "failed to query shim live state",
+                        serde_json::json!({
+                            "state": "degraded",
+                            "details": details,
+                        }),
+                    )
+                    .await;
                 }
             }
         }
@@ -674,6 +718,25 @@ impl RuntimeServiceImpl {
         result.reconnected_shims.sort();
         result.reconnected_shims.dedup();
         result
+    }
+
+    async fn publish_shim_reconnect_event(
+        &self,
+        container_id: &str,
+        kind: &str,
+        severity: InternalEventSeverity,
+        reason: &str,
+        mut details: serde_json::Value,
+    ) {
+        details["reason"] = serde_json::Value::String(reason.to_string());
+        self.publish_reconcile_event(InternalEvent::new(
+            kind,
+            "shim",
+            container_id,
+            severity,
+            details,
+        ))
+        .await;
     }
 
     async fn mark_shim_socket_missing(
