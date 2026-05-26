@@ -1,11 +1,10 @@
 use anyhow::{Context, Result};
 use log::{debug, error, info};
 use nix::libc;
-use nix::sys::stat::{major, makedev, minor, mknod, Mode, SFlag};
+use nix::sys::stat::{makedev, mknod, Mode, SFlag};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -15,8 +14,8 @@ use thiserror::Error;
 use crate::cgroups::{to_oci_resources, CgroupManager, CpuLimit, MemoryLimit, ResourceLimits};
 use crate::config::CgroupDriverConfig;
 use crate::oci::spec::{
-    Device as OciDevice, Linux, LinuxCapabilities, LinuxDeviceCgroup, LinuxPids, LinuxResources,
-    Mount, Namespace as OciNamespace, Process, Rlimit, Root, Spec, User,
+    Linux, LinuxCapabilities, LinuxPids, LinuxResources, Mount, Namespace as OciNamespace, Process,
+    Rlimit, Root, Spec, User,
 };
 use crate::proto::runtime::v1::{
     Capability, LinuxContainerResources, NamespaceMode, NamespaceOption,
@@ -2028,81 +2027,6 @@ impl RuncRuntime {
         oci_resources
     }
 
-    fn host_devices() -> Result<Vec<OciDevice>> {
-        let mut devices = Vec::new();
-        Self::collect_host_devices(Path::new("/dev"), &mut devices)?;
-        Ok(devices)
-    }
-
-    fn should_skip_host_device_dir(name: &str) -> bool {
-        matches!(
-            name,
-            "pts" | "shm" | "fd" | "mqueue" | ".lxc" | ".lxd-mounts" | ".udev"
-        )
-    }
-
-    fn should_skip_host_device_file(name: &str) -> bool {
-        name == "console"
-    }
-
-    fn collect_host_devices(path: &Path, devices: &mut Vec<OciDevice>) -> Result<()> {
-        for entry in std::fs::read_dir(path)
-            .with_context(|| format!("failed to read host device directory {}", path.display()))?
-        {
-            let entry = entry?;
-            let entry_path = entry.path();
-            let entry_name = entry.file_name();
-            let entry_name = entry_name.to_string_lossy();
-            let metadata = std::fs::symlink_metadata(&entry_path).with_context(|| {
-                format!("failed to stat host device path {}", entry_path.display())
-            })?;
-            let file_type = metadata.file_type();
-            if file_type.is_dir() {
-                if Self::should_skip_host_device_dir(&entry_name) {
-                    continue;
-                }
-                Self::collect_host_devices(&entry_path, devices)?;
-                continue;
-            }
-            if file_type.is_symlink() {
-                continue;
-            }
-            if Self::should_skip_host_device_file(&entry_name) {
-                continue;
-            }
-            if !(file_type.is_char_device() || file_type.is_block_device()) {
-                continue;
-            }
-
-            let mode = metadata.mode();
-            let sflag = SFlag::from_bits_truncate(mode);
-            let device_type = if sflag.contains(SFlag::S_IFCHR) {
-                "c"
-            } else if sflag.contains(SFlag::S_IFBLK) {
-                "b"
-            } else {
-                continue;
-            };
-            let major_id = major(metadata.rdev()) as i64;
-            let minor_id = minor(metadata.rdev()) as i64;
-            if major_id == 0 && minor_id == 0 {
-                continue;
-            }
-
-            devices.push(OciDevice {
-                device_type: device_type.to_string(),
-                path: entry_path.display().to_string(),
-                major: Some(major_id),
-                minor: Some(minor_id),
-                file_mode: Some(mode & 0o777),
-                uid: Some(metadata.uid()),
-                gid: Some(metadata.gid()),
-            });
-        }
-
-        Ok(())
-    }
-
     fn normalize_image_id(id: &str) -> &str {
         id.strip_prefix("sha256:").unwrap_or(id)
     }
@@ -3257,17 +3181,6 @@ impl RuncRuntime {
             });
         }
 
-        // 设置Linux配置
-        let mut devices = if config.privileged {
-            if self.privileged_without_host_devices {
-                Vec::new()
-            } else {
-                Self::host_devices()?
-            }
-        } else {
-            Spec::default_devices(config.tty)
-        };
-
         let mut resources = config
             .linux_resources
             .as_ref()
@@ -3284,66 +3197,28 @@ impl RuncRuntime {
                 unified: None,
             });
 
-        let device_ownership = crate::security::devices::ownership_from_security_context(
-            self.device_ownership_from_security_context,
-            config.user.as_deref(),
-            config.run_as_group,
-        );
-
-        if !self.additional_devices.is_empty() {
-            let resolved = crate::security::devices::mappings_to_oci(
-                &self.additional_devices,
-                device_ownership,
-            )?;
-            devices.extend(resolved.devices);
-            resources
-                .devices
-                .get_or_insert_with(Vec::new)
-                .extend(resolved.cgroup_rules);
-        }
-
-        if !config.devices.is_empty() {
-            crate::security::devices::validate_allowed_devices(
-                &config.devices,
-                &self.allowed_devices,
-            )?;
-
-            let resolved =
-                crate::security::devices::mappings_to_oci(&config.devices, device_ownership)?;
-            devices.extend(resolved.devices);
-            resources
-                .devices
-                .get_or_insert_with(Vec::new)
-                .extend(resolved.cgroup_rules);
-        }
-
         if let Some(limit) = config.pids_limit {
             resources.pids = Some(LinuxPids { limit });
         }
 
-        if config.privileged {
-            if !self.privileged_without_host_devices
-                || self.privileged_without_host_devices_all_devices_allowed
-            {
-                resources.devices = Some(vec![LinuxDeviceCgroup {
-                    allow: true,
-                    device_type: None,
-                    major: None,
-                    minor: None,
-                    access: Some("rwm".to_string()),
-                }]);
-            } else {
-                resources.devices.get_or_insert_with(Vec::new);
-            }
-        } else if resources.devices.is_none() {
-            resources.devices = Some(vec![LinuxDeviceCgroup {
-                allow: true,
-                device_type: None,
-                major: None,
-                minor: None,
-                access: Some("rwm".to_string()),
-            }]);
-        }
+        let resolved_devices = crate::security::devices::resolve_devices(
+            crate::security::devices::DeviceResolverInput {
+                privileged: config.privileged,
+                tty: config.tty,
+                requested_devices: &config.devices,
+                additional_devices: &self.additional_devices,
+                existing_cgroup_rules: resources.devices.as_deref().unwrap_or(&[]),
+                allowed_devices: &self.allowed_devices,
+                device_ownership_from_security_context: self.device_ownership_from_security_context,
+                user: config.user.as_deref(),
+                run_as_group: config.run_as_group,
+                privileged_without_host_devices: self.privileged_without_host_devices,
+                privileged_without_host_devices_all_devices_allowed: self
+                    .privileged_without_host_devices_all_devices_allowed,
+                rootless: self.rootless.enabled,
+            },
+        )?;
+        resources.devices = Some(resolved_devices.cgroup_rules);
 
         let mut namespaces = self.build_namespaces(config);
         let (uid_mappings, gid_mappings) = Self::build_user_namespace_mappings(config)?;
@@ -3382,7 +3257,7 @@ impl RuncRuntime {
         linux.namespaces = Some(namespaces);
         linux.uid_mappings = uid_mappings;
         linux.gid_mappings = gid_mappings;
-        linux.devices = Some(devices);
+        linux.devices = Some(resolved_devices.devices);
         linux.cgroups_path = if self.disable_cgroup {
             None
         } else {
@@ -3566,25 +3441,22 @@ impl RuncRuntime {
             return Ok(());
         }
 
-        if config.privileged {
-            return Err(anyhow::anyhow!(
-                "privileged containers are not supported in rootless mode"
-            ));
-        }
-
-        if !config.devices.is_empty() {
-            return Err(anyhow::anyhow!(
-                "explicit device requests are not supported in rootless mode because device cgroup rules are disabled"
-            ));
-        }
-
-        if !self.additional_devices.is_empty() {
-            return Err(anyhow::anyhow!(
-                "runtime.additional_devices cannot be applied in rootless mode because device cgroup rules are disabled"
-            ));
-        }
-
-        Ok(())
+        crate::security::devices::resolve_devices(crate::security::devices::DeviceResolverInput {
+            privileged: config.privileged,
+            tty: config.tty,
+            requested_devices: &config.devices,
+            additional_devices: &self.additional_devices,
+            existing_cgroup_rules: &[],
+            allowed_devices: &self.allowed_devices,
+            device_ownership_from_security_context: self.device_ownership_from_security_context,
+            user: config.user.as_deref(),
+            run_as_group: config.run_as_group,
+            privileged_without_host_devices: self.privileged_without_host_devices,
+            privileged_without_host_devices_all_devices_allowed: self
+                .privileged_without_host_devices_all_devices_allowed,
+            rootless: true,
+        })
+        .map(|_| ())
     }
 
     pub(crate) fn validate_mount_requests(

@@ -785,19 +785,6 @@ fn test_spec_privileged_without_host_devices_can_keep_allow_all_rule() {
 }
 
 #[test]
-fn test_host_device_skip_rules_match_containerd_style_filters() {
-    assert!(RuncRuntime::should_skip_host_device_dir("pts"));
-    assert!(RuncRuntime::should_skip_host_device_dir("shm"));
-    assert!(RuncRuntime::should_skip_host_device_dir("fd"));
-    assert!(RuncRuntime::should_skip_host_device_dir("mqueue"));
-    assert!(RuncRuntime::should_skip_host_device_dir(".udev"));
-    assert!(!RuncRuntime::should_skip_host_device_dir("mapper"));
-
-    assert!(RuncRuntime::should_skip_host_device_file("console"));
-    assert!(!RuncRuntime::should_skip_host_device_file("null"));
-}
-
-#[test]
 fn test_privileged_spec_uses_full_capability_baseline() {
     let (mut runtime, _temp) = create_test_runtime();
     runtime.set_default_capabilities(vec!["CAP_CHOWN".to_string()]);
