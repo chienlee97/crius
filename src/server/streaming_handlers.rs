@@ -1,4 +1,5 @@
 use super::*;
+use crate::services::{InternalEvent, InternalEventSeverity};
 
 impl RuntimeServiceImpl {
     async fn await_exec_sync_reader(
@@ -126,20 +127,20 @@ impl RuntimeServiceImpl {
             task_socket_path.display(),
             socket_name
         );
-        if let Err(err) = self
-            .persistence
-            .lock()
-            .await
-            .storage_mut()
-            .append_typed_event(
-                event_type,
-                "task",
-                container_id,
-                None,
-                Some(event_new_state),
-                Some(&details),
-            )
-        {
+        let event = InternalEvent::new(
+            format!("{event_type}.{event_new_state}"),
+            "task",
+            container_id,
+            InternalEventSeverity::Warning,
+            serde_json::json!({
+                "operation": operation,
+                "socketName": socket_name,
+                "socketPath": task_socket_path.display().to_string(),
+                "state": event_new_state,
+                "details": details,
+            }),
+        );
+        if let Err(err) = self.internal_services.events.publish_internal(event).await {
             log::warn!(
                 "Failed to record missing shim task socket event for {}: {}",
                 container_id,

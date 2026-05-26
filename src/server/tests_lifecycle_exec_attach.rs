@@ -252,16 +252,15 @@ async fn exec_sync_rejects_shim_owned_container_when_task_socket_is_missing() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("shim task socket"));
     let events = service
-        .persistence
-        .lock()
+        .internal_services
+        .events
+        .recent_internal_events("task", container_id, 10)
         .await
-        .storage()
-        .get_recent_events("task", 0)
         .unwrap();
     assert!(events.iter().any(|event| {
-        event.event_type == "exec"
-            && event.entity_id == container_id
-            && event.new_state == "shim_socket_missing"
+        event.kind == "exec.shim_socket_missing"
+            && event.details["state"] == "shim_socket_missing"
+            && event.details["operation"] == "exec_sync"
     }));
 }
 
@@ -396,16 +395,15 @@ async fn exec_rejects_shim_owned_container_when_task_socket_is_missing() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("shim task socket"));
     let events = service
-        .persistence
-        .lock()
+        .internal_services
+        .events
+        .recent_internal_events("task", container_id, 10)
         .await
-        .storage()
-        .get_recent_events("task", 0)
         .unwrap();
     assert!(events.iter().any(|event| {
-        event.event_type == "exec"
-            && event.entity_id == container_id
-            && event.new_state == "shim_socket_missing"
+        event.kind == "exec.shim_socket_missing"
+            && event.details["state"] == "shim_socket_missing"
+            && event.details["operation"] == "exec"
     }));
 }
 
@@ -993,16 +991,15 @@ async fn attach_rejects_shim_owned_container_when_attach_socket_is_missing() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("attach socket"));
     let events = service
-        .persistence
-        .lock()
+        .internal_services
+        .events
+        .recent_internal_events("task", container_id, 10)
         .await
-        .storage()
-        .get_recent_events("task", 0)
         .unwrap();
     assert!(events.iter().any(|event| {
-        event.event_type == "attach"
-            && event.entity_id == container_id
-            && event.new_state == "attach_socket_missing"
+        event.kind == "attach.attach_socket_missing"
+            && event.details["state"] == "attach_socket_missing"
+            && event.details["operation"] == "attach"
     }));
 }
 
