@@ -3,6 +3,7 @@ use super::service::{
     RecoveryResultSummary, RecoveryStage,
 };
 use super::*;
+use crate::services::{InternalEvent, InternalEventSeverity};
 use crate::state::{
     RecoveryContainerEntry, RecoveryLedgerSnapshot, RuntimeArtifactLedgerState, ShimLedgerState,
     SnapshotLedgerState,
@@ -68,16 +69,19 @@ impl RuntimeServiceImpl {
             );
         }
 
-        {
-            let mut persistence = self.persistence.lock().await;
-            let _ = persistence.storage_mut().append_event(
-                "reconcile_container",
-                container_id,
-                None,
-                Some("broken"),
-                Some(&broken.details),
-            );
-        }
+        self.publish_reconcile_event(InternalEvent::new(
+            "reconcile.container_broken",
+            "container",
+            container_id,
+            InternalEventSeverity::Warning,
+            serde_json::json!({
+                "state": "broken",
+                "kind": broken.kind,
+                "details": broken.details,
+                "detectedAt": broken.detected_at,
+            }),
+        ))
+        .await;
 
         Ok(())
     }
@@ -173,15 +177,20 @@ impl RuntimeServiceImpl {
             return;
         }
 
-        if let Err(err) = persistence.storage_mut().append_event(
-            "shim_process",
+        drop(persistence);
+
+        self.publish_reconcile_event(InternalEvent::new(
+            "shim.state",
+            "shim",
             container_id,
-            Some(old_state),
-            Some(next_state.as_str()),
-            Some(details),
-        ) {
-            log::warn!("Failed to append shim process state event for {container_id}: {err}");
-        }
+            InternalEventSeverity::Warning,
+            serde_json::json!({
+                "previousState": old_state,
+                "state": next_state.as_str(),
+                "details": details,
+            }),
+        ))
+        .await;
     }
 
     async fn mark_pod_broken(&self, pod_id: &str, broken: StoredBrokenState) -> Result<(), Status> {
@@ -1496,24 +1505,33 @@ impl RuntimeServiceImpl {
             "pending cleanup for orphaned {owner_kind} artifact at {}",
             path.display()
         );
+        self.publish_reconcile_event(InternalEvent::new(
+            "reconcile.orphan_cleanup",
+            "orphan_cleanup",
+            owner_id,
+            InternalEventSeverity::Info,
+            serde_json::json!({
+                "state": "pending",
+                "ownerKind": owner_kind,
+                "path": path.display().to_string(),
+                "details": details,
+            }),
+        ))
+        .await;
+    }
+
+    async fn publish_reconcile_event(&self, event: InternalEvent) {
         if let Err(err) = self
-            .persistence
-            .lock()
+            .internal_services
+            .events
+            .publish_internal(event.clone())
             .await
-            .storage_mut()
-            .append_typed_event(
-                "reconcile",
-                "orphan_cleanup",
-                owner_id,
-                None,
-                Some("pending"),
-                Some(&details),
-            )
         {
             log::warn!(
-                "Failed to record orphan cleanup event for {} {}: {}",
-                owner_kind,
-                owner_id,
+                "Failed to publish internal recovery event {} for {} {}: {}",
+                event.kind,
+                event.subject_kind,
+                event.subject_id,
                 err
             );
         }

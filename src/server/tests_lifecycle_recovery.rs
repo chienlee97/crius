@@ -1724,19 +1724,18 @@ async fn recover_state_marks_missing_shim_socket_dead_in_ledger() {
         Some("shim_socket_missing")
     );
 
-    let persistence = service.persistence.lock().await;
-    assert!(persistence
-        .storage()
-        .get_recent_events("shim_process", 0)
-        .unwrap()
-        .into_iter()
-        .any(|event| event.entity_id == "missing-shim-socket"
-            && event.old_state == "running"
-            && event.new_state == "dead"
-            && event
-                .details
-                .as_deref()
-                .is_some_and(|details| details.contains("task socket is unavailable"))));
+    let shim_events = service
+        .internal_services
+        .events
+        .recent_internal_events("shim", "missing-shim-socket", 10)
+        .await
+        .unwrap();
+    assert!(shim_events.iter().any(|event| event.kind == "shim.state"
+        && event.details["previousState"] == "running"
+        && event.details["state"] == "dead"
+        && event.details["details"]
+            .as_str()
+            .is_some_and(|details| details.contains("task socket is unavailable"))));
 }
 
 #[tokio::test]
@@ -1834,6 +1833,15 @@ async fn recover_state_marks_container_broken_when_runtime_bundle_is_missing() {
                 .to_string()
         )
     );
+    let broken_events = service
+        .internal_services
+        .events
+        .recent_internal_events("container", "broken-bundle", 10)
+        .await
+        .unwrap();
+    assert!(broken_events.iter().any(|event| event.kind == "reconcile.container_broken"
+        && event.details["state"] == "broken"
+        && event.details["kind"] == "bundle_missing"));
 }
 
 #[tokio::test]
@@ -2080,15 +2088,18 @@ async fn recover_state_cleans_orphaned_runtime_bundles_but_keeps_recovered_ones(
                 .any(|artifact| artifact.owner_id == "orphan-bundle"),
             "orphan cleanup should delete ledger artifacts with no container owner"
         );
-        assert!(persistence
-            .storage()
-            .get_recent_events("orphan_cleanup", 0)
-            .unwrap()
-            .iter()
-            .any(|event| event.event_type == "reconcile"
-                && event.entity_id == "orphan-bundle"
-                && event.new_state == "pending"));
     }
+    let cleanup_events = service
+        .internal_services
+        .events
+        .recent_internal_events("orphan_cleanup", "orphan-bundle", 10)
+        .await
+        .unwrap();
+    assert!(cleanup_events
+        .iter()
+        .any(|event| event.kind == "reconcile.orphan_cleanup"
+            && event.details["state"] == "pending"
+            && event.details["ownerKind"] == "container"));
 
     let response = RuntimeService::status(&service, Request::new(StatusRequest { verbose: true }))
         .await
@@ -2209,13 +2220,16 @@ async fn recover_state_cleans_orphaned_pod_workspaces_but_keeps_recovered_ones()
                 .any(|artifact| artifact.owner_id == "orphan-pod"),
             "orphan cleanup should delete pod artifact ledger entries with no pod owner"
         );
-        assert!(persistence
-            .storage()
-            .get_recent_events("orphan_cleanup", 0)
-            .unwrap()
-            .iter()
-            .any(|event| event.event_type == "reconcile"
-                && event.entity_id == "orphan-pod"
-                && event.new_state == "pending"));
     }
+    let cleanup_events = service
+        .internal_services
+        .events
+        .recent_internal_events("orphan_cleanup", "orphan-pod", 10)
+        .await
+        .unwrap();
+    assert!(cleanup_events
+        .iter()
+        .any(|event| event.kind == "reconcile.orphan_cleanup"
+            && event.details["state"] == "pending"
+            && event.details["ownerKind"] == "pod"));
 }
