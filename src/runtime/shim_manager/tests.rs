@@ -1,6 +1,9 @@
 use super::*;
+use crate::services::EventService;
+use crate::storage::persistence::{PersistenceConfig, PersistenceManager};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 fn write_ping_shim(dir: &Path, args_path: Option<&Path>) -> PathBuf {
@@ -161,8 +164,8 @@ fn test_shim_manager_restores_live_metadata_from_disk() {
     );
 }
 
-#[test]
-fn test_shim_manager_restores_live_metadata_from_ledger() {
+#[tokio::test]
+async fn test_shim_manager_restores_live_metadata_from_ledger() {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("crius.db");
     let mut storage = StorageManager::new(&db_path).unwrap();
@@ -208,19 +211,31 @@ fn test_shim_manager_restores_live_metadata_from_ledger() {
     assert_eq!(shims.len(), 1);
     assert_eq!(shims[0].container_id, "container-ledger");
 
-    let storage = StorageManager::new(&db_path).unwrap();
-    let record = storage
-        .get_shim_process("container-ledger")
+    let persistence = Arc::new(tokio::sync::Mutex::new(
+        PersistenceManager::new(PersistenceConfig {
+            db_path: db_path.clone(),
+            enable_recovery: true,
+            auto_save_interval: 30,
+        })
+        .unwrap(),
+    ));
+    let record = persistence
+        .lock()
+        .await
+        .get_shim_process_record("container-ledger")
         .unwrap()
         .unwrap();
     assert_eq!(record.state, "degraded");
-    assert!(storage
-        .get_recent_events("shim_process", 0)
-        .unwrap()
-        .iter()
-        .any(|event| event.event_type == "shim"
-            && event.entity_id == "container-ledger"
-            && event.new_state == "degraded"));
+    let events = EventService::with_capacity(16)
+        .with_ledger(persistence)
+        .recent_internal_events("shim", "container-ledger", 10)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| event.kind == "shim.degraded"
+        && event.details["previousState"] == "running"
+        && event.details["state"] == "degraded"
+        && event.details["metadataExists"] == false
+        && event.details["pidfileExists"] == false));
 }
 
 #[test]

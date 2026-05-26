@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::proto::runtime::v1::LinuxContainerResources;
+use crate::services::{InternalEvent, InternalEventSeverity, LedgerInternalEventSink};
 use crate::shim_rpc::{
     default_task_socket_path, CheckpointTaskRequest, CreateTaskRequest, DeleteTaskRequest,
     ExecProcessRequest, KillTaskRequest, PauseTaskRequest, ReopenLogRequest, ResizePtyRequest,
@@ -299,14 +300,21 @@ impl ShimManager {
                                     metadata_path.exists(),
                                     pidfile_path.exists()
                                 );
-                                let _ = storage.append_typed_event(
+                                let event = InternalEvent::new(
+                                    "shim.degraded",
                                     "shim",
-                                    "shim_process",
                                     &record.container_id,
-                                    Some(&previous_state),
-                                    Some("degraded"),
-                                    Some(&details),
+                                    InternalEventSeverity::Warning,
+                                    serde_json::json!({
+                                        "previousState": previous_state,
+                                        "state": "degraded",
+                                        "details": details,
+                                        "metadataExists": metadata_path.exists(),
+                                        "pidfileExists": pidfile_path.exists(),
+                                    }),
                                 );
+                                let _ = LedgerInternalEventSink::new(&config.state_db_path)
+                                    .publish(&event);
                             }
 
                             Some(ShimProcess {
