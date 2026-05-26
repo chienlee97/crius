@@ -1480,14 +1480,15 @@ impl RuntimeServiceImpl {
                 )
             })
         };
+        let pod_external_annotations = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes
+                .get(&pod_sandbox_id)
+                .map(|pod| Self::external_pod_annotations(&pod.annotations))
+                .unwrap_or_default()
+        };
         let nri_activation_annotations = {
-            let mut annotations = {
-                let pod_sandboxes = self.pod_sandboxes.lock().await;
-                pod_sandboxes
-                    .get(&pod_sandbox_id)
-                    .map(|pod| Self::external_pod_annotations(&pod.annotations))
-                    .unwrap_or_default()
-            };
+            let mut annotations = pod_external_annotations.clone();
             if let Some(sandbox_config) = sandbox_config.as_ref() {
                 for (key, value) in &sandbox_config.annotations {
                     annotations.insert(key.clone(), value.clone());
@@ -1758,6 +1759,27 @@ impl RuntimeServiceImpl {
             );
         }
         let mut stored_annotations = config.annotations.clone();
+        let mut effective_pod_resource_class_annotations = pod_external_annotations.clone();
+        if let Some(sandbox_config) = sandbox_config.as_ref() {
+            for (key, value) in &sandbox_config.annotations {
+                effective_pod_resource_class_annotations.insert(key.clone(), value.clone());
+            }
+        }
+        let resource_class_request =
+            crate::security::resource_classes::requested_classes_from_annotations(
+                &container_metadata.name,
+                &config.annotations,
+                &effective_pod_resource_class_annotations,
+            );
+        if let Some(blockio_class) = resource_class_request.blockio_class.as_ref() {
+            let resources = linux_resources.get_or_insert_with(Default::default);
+            resources.blockio_class = Some(blockio_class.clone());
+        }
+        if let Some(rdt_class) = resource_class_request.rdt_class.as_ref() {
+            let resources = linux_resources.get_or_insert_with(Default::default);
+            resources.rdt_class = crate::security::resource_classes::resolve_rdt_class(rdt_class)
+                .and_then(|rdt| rdt.clos_id);
+        }
         if let Some(raw) =
             nri_activation_annotations.get(CRIO_SECCOMP_NOTIFIER_ACTION_V2_ANNOTATION)
         {
@@ -2154,6 +2176,12 @@ impl RuntimeServiceImpl {
             Some(&self.nri_config.cdi_spec_dirs),
         )
         .map_err(|e| Status::internal(format!("CDI device injection failed: {}", e)))?;
+        crate::security::resource_classes::apply_resource_class_request(
+            &mut adjusted_spec,
+            &resource_class_request,
+            Some(&self.nri_config.blockio_config_path),
+        )
+        .map_err(|e| Status::internal(format!("Resource class resolution failed: {}", e)))?;
         crate::nri::apply_container_adjustment_with_options(
             &mut adjusted_spec,
             &adjustment_without_cdi,

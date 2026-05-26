@@ -607,6 +607,140 @@ async fn create_container_merges_nri_cdi_devices_without_duplicate_injection() {
 }
 
 #[tokio::test]
+async fn create_container_applies_blockio_and_rdt_classes_from_annotations() {
+    let dir = tempdir().unwrap();
+    let blockio_config_path = dir.path().join("blockio.json");
+    fs::write(
+        &blockio_config_path,
+        r#"{
+            "classes": {
+                "pod-gold": { "weight": 300 },
+                "container-gold": { "weight": 700 }
+            }
+        }"#,
+    )
+    .unwrap();
+    let runtime_root = dir.path().join("fake-runtime-root");
+    let fake_backend = Arc::new(common::FakeRuntimeBackend::new(&runtime_root));
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime = "fake".to_string();
+    config.runtime_handlers = vec!["fake".to_string()];
+    config.runtime_root = runtime_root.clone();
+    config.runtime_configs = HashMap::from([(
+        "fake".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "fake".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: "/fake/runtime".to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/fake/shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 30,
+            snapshotter: "internal-overlay-untar".to_string(),
+        },
+    )]);
+    let mut service = RuntimeServiceImpl::new_with_runtime_backends(
+        config,
+        HashMap::from([(
+            "fake".to_string(),
+            fake_backend as Arc<dyn crate::runtime::RuntimeBackend>,
+        )]),
+    );
+    service.nri_config.blockio_config_path = blockio_config_path.display().to_string();
+    let mut pod = test_pod(
+        "pod-resource-class",
+        HashMap::from([
+            (
+                "blockio.resources.beta.kubernetes.io/pod".to_string(),
+                "pod-gold".to_string(),
+            ),
+            (
+                "rdt.resources.beta.kubernetes.io/pod".to_string(),
+                "pod-rdt".to_string(),
+            ),
+        ]),
+    );
+    pod.runtime_handler = "fake".to_string();
+    service
+        .pod_sandboxes
+        .lock()
+        .await
+        .insert("pod-resource-class".to_string(), pod);
+
+    let response = RuntimeService::create_container(
+        &service,
+        Request::new(CreateContainerRequest {
+            pod_sandbox_id: "pod-resource-class".to_string(),
+            config: Some(crate::proto::runtime::v1::ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "workload-resource-class".to_string(),
+                    attempt: 1,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:latest".to_string(),
+                    user_specified_image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }),
+                annotations: HashMap::from([
+                    (
+                        "io.kubernetes.cri.blockio-class".to_string(),
+                        "container-gold".to_string(),
+                    ),
+                    (
+                        "io.kubernetes.cri.rdt-class".to_string(),
+                        "container-rdt".to_string(),
+                    ),
+                ]),
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect("resource class annotations should be applied during create")
+    .into_inner();
+
+    let bundle_config: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            runtime_root
+                .join(&response.container_id)
+                .join("config.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bundle_config["linux"]["resources"]["block_io"]["weight"], 700);
+    assert_eq!(
+        bundle_config["linux"]["intelRdt"]["closId"],
+        "container-rdt"
+    );
+
+    let container = service
+        .containers
+        .lock()
+        .await
+        .get(&response.container_id)
+        .cloned()
+        .unwrap();
+    let state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+        &container.annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+    )
+    .unwrap();
+    let resources = state.linux_resources.unwrap();
+    assert_eq!(resources.blockio_class.as_deref(), Some("container-gold"));
+    assert_eq!(resources.rdt_class.as_deref(), Some("container-rdt"));
+}
+
+#[tokio::test]
 async fn create_container_rejects_empty_image_ref() {
     let service = test_service();
     service.pod_sandboxes.lock().await.insert(
