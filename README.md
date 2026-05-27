@@ -58,8 +58,8 @@
 - Rust 稳定版工具链
 - `runc`
 - `protobuf-compiler`
+- `zlib-devel`
 - `tar`
-- `iproute2`
 - CNI plugins
 - 可选：`crictl`
 

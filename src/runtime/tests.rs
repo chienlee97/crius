@@ -152,6 +152,13 @@ exit 0
     script_path
 }
 
+fn write_noop_shim_script(dir: &Path) -> PathBuf {
+    let script_path = dir.join("fake-shim-noop.sh");
+    fs::write(&script_path, "#!/bin/sh\nsleep 60\n").unwrap();
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+    script_path
+}
+
 fn write_stop_runtime_script(dir: &Path, command_log_path: &Path, initial_state: &str) -> PathBuf {
     let script_path = dir.join("fake-runtime-stop.sh");
     let state_dir = dir.join("runtime-state");
@@ -2537,6 +2544,7 @@ fn test_shim_start_container_does_not_query_runc_state() {
         write_runtime_script_that_fails_state(temp_dir.path()),
         temp_dir.path().join("containers"),
         ShimConfig {
+            shim_path: write_noop_shim_script(temp_dir.path()),
             work_dir: shim_dir.clone(),
             attach_socket_dir: temp_dir.path().join("attach"),
             container_exits_dir: temp_dir.path().join("exits"),

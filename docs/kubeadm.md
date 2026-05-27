@@ -34,7 +34,6 @@
 
 - `runc`
 - CNI plugins
-- `iproute2`
 - `tar`
 - `crictl`
 - 可工作的 Kubernetes 节点基础环境

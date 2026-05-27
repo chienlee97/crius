@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use log::{debug, error, info};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -17,8 +18,6 @@ use crate::proto::runtime::v1::{LinuxContainerResources, NamespaceOption};
 use crate::runtime::{
     ContainerConfig, ContainerRuntime, ContainerStatus, NamespacePaths, SeccompProfile,
 };
-use std::collections::HashSet;
-use std::net::IpAddr;
 
 const CRIO_CONTAINER_ID_ANNOTATION: &str = "io.kubernetes.cri-o.ContainerID";
 const CRIO_CONTAINER_NAME_ANNOTATION: &str = "io.kubernetes.cri-o.ContainerName";
@@ -355,94 +354,17 @@ impl<R: ContainerRuntime, N: NetworkManager> PodSandboxManager<R, N> {
     }
 
     async fn discover_netns_interfaces(&self, netns_path: &Path) -> Vec<NetworkInterface> {
-        let netns_path = netns_path.to_path_buf();
-        let netns_path_for_log = netns_path.clone();
-        let output = match tokio::task::spawn_blocking(move || {
-            use std::os::fd::AsRawFd;
-            use std::os::unix::process::CommandExt;
-
-            let netns_file = std::fs::File::open(&netns_path)?;
-            let netns_fd = netns_file.as_raw_fd();
-            let mut command = std::process::Command::new("ip");
-            command.args(["-o", "addr", "show"]);
-            unsafe {
-                command.pre_exec(move || {
-                    nix::sched::setns(netns_fd, nix::sched::CloneFlags::CLONE_NEWNET).map_err(
-                        |err| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("failed to enter network namespace: {err}"),
-                            )
-                        },
-                    )?;
-                    Ok(())
-                });
-            }
-            command.output()
-        })
-        .await
-        {
-            Ok(Ok(output)) if output.status.success() => output,
-            Ok(Ok(output)) => {
+        match crate::network::netlink::discover_interfaces(netns_path).await {
+            Ok(interfaces) => interfaces,
+            Err(err) => {
                 debug!(
-                    "Failed to probe netns addresses for {}: status {:?}",
-                    netns_path_for_log.display(),
-                    output.status.code()
+                    "Failed to probe netns addresses for {}: {}",
+                    netns_path.display(),
+                    err
                 );
-                return Vec::new();
+                Vec::new()
             }
-            Ok(Err(e)) => {
-                debug!(
-                    "Failed to execute ip addr in netns {}: {}",
-                    netns_path_for_log.display(),
-                    e
-                );
-                return Vec::new();
-            }
-            Err(e) => {
-                debug!(
-                    "Netns interface probe task failed for {}: {}",
-                    netns_path_for_log.display(),
-                    e
-                );
-                return Vec::new();
-            }
-        };
-
-        let mut seen = HashSet::new();
-        let mut interfaces = Vec::new();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 4 {
-                continue;
-            }
-            let iface_name = fields[1].trim_end_matches(':');
-            let family = fields[2];
-            if family != "inet" && family != "inet6" {
-                continue;
-            }
-            let addr = fields[3].split('/').next().unwrap_or_default();
-            let ip = match addr.parse::<IpAddr>() {
-                Ok(ip) => ip,
-                Err(_) => continue,
-            };
-            if ip.is_loopback() {
-                continue;
-            }
-            if !seen.insert(ip) {
-                continue;
-            }
-            interfaces.push(NetworkInterface {
-                name: iface_name.to_string(),
-                ip: Some(ip),
-                mac: None,
-                netmask: None,
-                gateway: None,
-            });
         }
-
-        interfaces
     }
 
     fn resolve_pause_image(&self, pod_config: &PodSandboxConfig) -> Result<String> {

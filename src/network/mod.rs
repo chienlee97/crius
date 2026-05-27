@@ -8,12 +8,13 @@ use std::process::Command as StdCommand;
 
 use async_trait::async_trait;
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use nix::sched::{setns, unshare, CloneFlags};
+use nix::sched::{unshare, CloneFlags};
 use nix::unistd::gettid;
 
 pub mod cni;
 mod error;
 pub mod multi;
+pub(crate) mod netlink;
 mod port_mapping;
 mod types;
 
@@ -679,39 +680,7 @@ pub struct DefaultNetworkManager {
 impl DefaultNetworkManager {
     async fn ensure_loopback_up(&self, netns: &str) -> Result<(), NetworkError> {
         let netns_path = self.namespace_manager.resolve_path(netns);
-        tokio::task::spawn_blocking(move || {
-            use std::os::fd::AsRawFd;
-            use std::os::unix::process::CommandExt;
-
-            let netns_file = std::fs::File::open(&netns_path)?;
-            let netns_fd = netns_file.as_raw_fd();
-            let mut command = StdCommand::new("ip");
-            command.args(["link", "set", "lo", "up"]);
-
-            unsafe {
-                command.pre_exec(move || {
-                    setns(netns_fd, CloneFlags::CLONE_NEWNET).map_err(|err| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("failed to enter network namespace: {err}"),
-                        )
-                    })?;
-                    Ok(())
-                });
-            }
-
-            let status = command.status()?;
-            if !status.success() {
-                return Err(NetworkError::CommandExecutionError {
-                    command: format!("ip link set lo up (netns {})", netns_path.display()),
-                    status,
-                });
-            }
-
-            Ok(())
-        })
-        .await
-        .map_err(|err| NetworkError::Other(format!("loopback setup task failed: {err}")))?
+        netlink::set_loopback_up(netns_path).await
     }
 
     /// 创建新的网络管理器实例

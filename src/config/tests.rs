@@ -1867,6 +1867,8 @@ fn validate_rejects_streaming_tls_without_cert_or_key() {
 fn env_overrides_take_precedence() {
     let _lock = env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
+    let fake_pinns_path = dir.path().join("pinns");
+    std::fs::write(&fake_pinns_path, "#!/bin/sh\n").unwrap();
     let _guard = EnvGuard::set_many(&[
         ("CRIUS_LISTEN", "unix:///tmp/env.sock"),
         (
@@ -1890,7 +1892,7 @@ fn env_overrides_take_precedence() {
         ("CRIUS_STREAM_IDLE_TIMEOUT", "3h"),
         ("CRIUS_RUNTIME_HANDLERS", "kata,runsc"),
         ("CRIUS_PAUSE_COMMAND", "/custom-pause"),
-        ("CRIUS_PINNS_PATH", "/usr/bin/pinns"),
+        ("CRIUS_PINNS_PATH", fake_pinns_path.to_str().unwrap()),
         ("CRIUS_DROP_INFRA_CTR", "false"),
         ("CRIUS_MONITOR_ENV", "PATH=/custom/bin,RUST_LOG=trace"),
         ("CRIUS_CGROUP_DRIVER", "systemd"),
@@ -2045,7 +2047,7 @@ fn env_overrides_take_precedence() {
         vec!["kata", "runsc", "runc"]
     );
     assert_eq!(config.runtime.pause_command, "/custom-pause");
-    assert_eq!(config.runtime.pinns_path, "/usr/bin/pinns");
+    assert_eq!(config.runtime.pinns_path, fake_pinns_path.to_str().unwrap());
     assert!(!config.runtime.drop_infra_ctr);
     assert_eq!(
         config.runtime.cgroup_driver,
