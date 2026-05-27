@@ -2296,7 +2296,7 @@ impl RuncRuntime {
         image_ref: &str,
         rootfs_dir: &Path,
         container_id: &str,
-    ) -> Result<()> {
+    ) -> Result<crate::image::snapshotter::MountView> {
         use crate::image::snapshotter::{FilesystemSnapshotter, SnapshotMode, Snapshotter};
 
         let mode = match self.rootfs_snapshotter {
@@ -2319,11 +2319,20 @@ impl RuncRuntime {
         );
         snapshotter.prepare(container_id, image_ref, rootfs_dir)?;
         self.ensure_minimum_rootfs_layout(image_ref, rootfs_dir)?;
+        let mount = if self.state_db_path.is_some() {
+            snapshotter.mount(container_id)?
+        } else {
+            crate::image::snapshotter::MountView {
+                key: container_id.to_string(),
+                mountpoint: rootfs_dir.to_path_buf(),
+                readonly: false,
+            }
+        };
         info!(
             "Prepared rootfs for container {} from image {} via snapshotter",
             container_id, image_ref
         );
-        Ok(())
+        Ok(mount)
     }
 
     fn spec_from_restore_template(
@@ -2626,6 +2635,8 @@ impl RuncRuntime {
                 &self
                     .rootfs_cleanup_target_from_bundle(container_id)
                     .unwrap_or_else(|| bundle_path.join("rootfs")),
+                Some(container_id),
+                Vec::new(),
             )
             .context("failed to restore shim for attach recovery")?;
         Ok(())
@@ -3411,17 +3422,27 @@ impl RuncRuntime {
     }
 
     /// 分步创建：准备 rootfs（NRI 可在后续步骤介入 spec）。
-    pub fn prepare_rootfs(&self, container_id: &str, config: &ContainerConfig) -> Result<()> {
+    fn prepare_rootfs_mount(
+        &self,
+        container_id: &str,
+        config: &ContainerConfig,
+    ) -> Result<crate::image::snapshotter::MountView> {
         let checkpoint_restore = Self::checkpoint_restore_from_annotations(&config.annotations);
         let image_ref = checkpoint_restore
             .as_ref()
             .map(|restore| restore.image_ref.as_str())
             .unwrap_or(config.image.as_str());
-        self.prepare_rootfs_from_image(image_ref, &config.rootfs, container_id)
+        let mount = self
+            .prepare_rootfs_from_image(image_ref, &config.rootfs, container_id)
             .context("Failed to prepare rootfs from image")?;
         self.ensure_mount_targets(&config.rootfs, &config.mounts)
             .context("Failed to prepare mount targets")?;
-        Ok(())
+        Ok(mount)
+    }
+
+    /// 分步创建：准备 rootfs（NRI 可在后续步骤介入 spec）。
+    pub fn prepare_rootfs(&self, container_id: &str, config: &ContainerConfig) -> Result<()> {
+        self.prepare_rootfs_mount(container_id, config).map(|_| ())
     }
 
     /// 分步创建：构建 pristine OCI spec。
@@ -3612,7 +3633,7 @@ impl ContainerRuntime for RuncRuntime {
             + std::time::Duration::from_secs(self.container_create_timeout_secs as u64);
 
         // 分步 create 链路：prepare_rootfs -> build_spec -> write_bundle。
-        self.prepare_rootfs(container_id, config)?;
+        let rootfs_mount = self.prepare_rootfs_mount(container_id, config)?;
         self.ensure_container_create_not_expired(deadline, "prepare_rootfs")?;
         let spec = self.build_spec(container_id, config)?;
         self.ensure_container_create_not_expired(deadline, "build_spec")?;
@@ -3623,7 +3644,18 @@ impl ContainerRuntime for RuncRuntime {
         info!("Container {} bundle prepared successfully", container_id);
         if let Some(ref shim_manager) = self.shim_manager {
             let bundle_path = self.bundle_path(container_id);
-            shim_manager.create_task(container_id, &bundle_path, &config.rootfs)?;
+            let mount_options = if rootfs_mount.readonly {
+                vec!["ro".to_string()]
+            } else {
+                Vec::new()
+            };
+            shim_manager.create_task(
+                container_id,
+                &bundle_path,
+                &rootfs_mount.mountpoint,
+                Some(&rootfs_mount.key),
+                mount_options,
+            )?;
         }
         Ok(container_id.to_string())
     }
@@ -3807,7 +3839,11 @@ impl ContainerRuntime for RuncRuntime {
 
         // 删除容器
         if let Some(ref shim_manager) = self.shim_manager {
-            let _ = shim_manager.delete_task(container_id);
+            let _ = shim_manager.delete_task(
+                container_id,
+                Some(container_id),
+                rootfs_cleanup_target.as_deref(),
+            );
         } else {
             let output = self.run_command_output(&["delete", container_id])?;
 
@@ -3832,14 +3868,16 @@ impl ContainerRuntime for RuncRuntime {
             std::fs::remove_dir_all(&image_volume_state_dir)
                 .context("Failed to remove image volume state directory")?;
         }
-        if let Some(container_root_dir) = rootfs_cleanup_target {
-            if container_root_dir.exists() {
-                std::fs::remove_dir_all(&container_root_dir).with_context(|| {
-                    format!(
-                        "Failed to remove container root directory {}",
-                        container_root_dir.display()
-                    )
-                })?;
+        if self.shim_manager.is_none() {
+            if let Some(container_root_dir) = rootfs_cleanup_target {
+                if container_root_dir.exists() {
+                    std::fs::remove_dir_all(&container_root_dir).with_context(|| {
+                        format!(
+                            "Failed to remove container root directory {}",
+                            container_root_dir.display()
+                        )
+                    })?;
+                }
             }
         }
         let legacy_container_root_dir = self.root.join("containers").join(container_id);
@@ -3853,7 +3891,9 @@ impl ContainerRuntime for RuncRuntime {
         }
         if let Some(mut storage) = self.ledger_storage()? {
             let _ = storage.replace_runtime_artifacts("container", container_id, &[]);
-            let _ = storage.delete_snapshot(container_id);
+            if self.shim_manager.is_none() {
+                let _ = storage.delete_snapshot(container_id);
+            }
         }
 
         info!("Container {} removed", container_id);

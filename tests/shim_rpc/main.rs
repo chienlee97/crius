@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crius::shim_rpc::{
-    ShimRpcRequest, ShimRpcResponse, StartTaskRequest, StatusRequest, StatusResponse, TaskState,
+    CreateTaskRequest, ShimRpcRequest, ShimRpcResponse, StartTaskRequest, StatusRequest,
+    StatusResponse, TaskState,
 };
 
 #[path = "../common/mod.rs"]
@@ -84,5 +85,38 @@ fn scripted_shim_handler_propagates_scripted_errors() {
     assert!(matches!(
         &requests[0],
         ShimRpcRequest::StartTask(request) if request.container_id == "container-1"
+    ));
+}
+
+#[test]
+fn create_task_request_carries_rootfs_snapshot_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler = ScriptedShimHandler::new();
+    let server =
+        FakeShimRpcServer::start(dir.path().join("task.sock"), Arc::new(handler.clone())).unwrap();
+
+    server.wait_until_ready(Duration::from_secs(2)).unwrap();
+    handler.clear_requests();
+    handler.push_response(ShimRpcResponse::Empty);
+
+    server
+        .client()
+        .request(ShimRpcRequest::CreateTask(CreateTaskRequest {
+            container_id: "container-1".to_string(),
+            rootfs_path: dir.path().join("rootfs"),
+            snapshot_key: Some("snapshot-1".to_string()),
+            mount_options: vec!["rw".to_string(), "rprivate".to_string()],
+        }))
+        .unwrap();
+
+    let requests = handler.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(
+        &requests[0],
+        ShimRpcRequest::CreateTask(request)
+            if request.container_id == "container-1"
+                && request.snapshot_key.as_deref() == Some("snapshot-1")
+                && request.rootfs_path == dir.path().join("rootfs")
+                && request.mount_options == ["rw", "rprivate"]
     ));
 }

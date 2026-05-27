@@ -1,6 +1,7 @@
 use super::*;
 use crate::services::{EventService, InternalEventSeverity};
 use crate::storage::persistence::{PersistenceConfig, PersistenceManager};
+use crate::storage::{SnapshotRecord, StorageManager};
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -19,6 +20,107 @@ fn parse_cri_log_lines(contents: &str) -> Vec<(String, String, String, String)> 
             )
         })
         .collect()
+}
+
+#[test]
+fn shim_daemon_owns_rootfs_snapshot_lifecycle() {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("state").join("crius.db");
+    let bundle_dir = temp_dir.path().join("bundle");
+    fs::create_dir_all(&bundle_dir).unwrap();
+    fs::write(
+        bundle_dir.join("config.json"),
+        serde_json::to_vec(&json!({
+            "ociVersion": "1.0.2",
+            "root": {
+                "path": "rootfs"
+            },
+            "process": {
+                "terminal": false
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let rootfs = temp_dir
+        .path()
+        .join("snapshots")
+        .join("ctr1")
+        .join("rootfs");
+    fs::create_dir_all(rootfs.join("etc")).unwrap();
+    fs::write(rootfs.join("etc/hostname"), "ctr1").unwrap();
+
+    let mut storage = StorageManager::new(&db_path).unwrap();
+    storage
+        .save_snapshot(&SnapshotRecord {
+            key: "ctr1".to_string(),
+            image_id: "sha256:test".to_string(),
+            owner_kind: "container".to_string(),
+            owner_id: "ctr1".to_string(),
+            state: "prepared".to_string(),
+            mountpoint: rootfs.display().to_string(),
+        })
+        .unwrap();
+    drop(storage);
+
+    let daemon = Daemon::new(
+        "ctr1".to_string(),
+        bundle_dir.clone(),
+        temp_dir.path().join("runtime"),
+        DaemonOptions {
+            runtime_config_path: PathBuf::new(),
+            monitor_cgroup: String::new(),
+            work_dir: temp_dir.path().join("shim"),
+            state_db_path: Some(db_path.clone()),
+            exit_code_file: None,
+            attach_socket_dir: None,
+            io_uid: 0,
+            io_gid: 0,
+            max_container_log_line_size: 4096,
+            log_to_journald: false,
+            no_sync_log: false,
+            no_pivot: false,
+            no_new_keyring: false,
+            systemd_cgroup: false,
+        },
+    );
+
+    daemon
+        .handle_request(ShimRpcRequest::CreateTask(CreateTaskRequest {
+            container_id: "ctr1".to_string(),
+            rootfs_path: rootfs.clone(),
+            snapshot_key: Some("ctr1".to_string()),
+            mount_options: vec!["rw".to_string()],
+        }))
+        .unwrap();
+
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(bundle_dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(config["root"]["path"], rootfs.display().to_string());
+    let storage = StorageManager::new(&db_path).unwrap();
+    let snapshot = storage
+        .list_snapshots()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.key == "ctr1")
+        .unwrap();
+    assert_eq!(snapshot.state, "mounted");
+    drop(storage);
+
+    daemon
+        .handle_request(ShimRpcRequest::DeleteTask(DeleteTaskRequest {
+            container_id: "ctr1".to_string(),
+            snapshot_key: None,
+            rootfs_path: None,
+        }))
+        .unwrap();
+
+    assert!(!rootfs.exists());
+    assert!(StorageManager::new(&db_path)
+        .unwrap()
+        .list_snapshots()
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

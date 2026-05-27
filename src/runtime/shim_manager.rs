@@ -612,6 +612,8 @@ impl ShimManager {
         container_id: &str,
         bundle_path: &Path,
         rootfs_path: &Path,
+        snapshot_key: Option<&str>,
+        mount_options: Vec<String>,
     ) -> Result<()> {
         self.start_shim(container_id, bundle_path)?;
         let response = self
@@ -619,6 +621,8 @@ impl ShimManager {
             .request(ShimRpcRequest::CreateTask(CreateTaskRequest {
                 container_id: container_id.to_string(),
                 rootfs_path: rootfs_path.to_path_buf(),
+                snapshot_key: snapshot_key.map(ToOwned::to_owned),
+                mount_options,
             }))?;
         ensure_empty_response("create_task", response)
     }
@@ -737,11 +741,18 @@ impl ShimManager {
         ensure_empty_response("kill_task", response)
     }
 
-    pub fn delete_task(&self, container_id: &str) -> Result<()> {
+    pub fn delete_task(
+        &self,
+        container_id: &str,
+        snapshot_key: Option<&str>,
+        rootfs_path: Option<&Path>,
+    ) -> Result<()> {
         let response = self
             .rpc_client(container_id)
             .request(ShimRpcRequest::DeleteTask(DeleteTaskRequest {
                 container_id: container_id.to_string(),
+                snapshot_key: snapshot_key.map(ToOwned::to_owned),
+                rootfs_path: rootfs_path.map(Path::to_path_buf),
             }))?;
         ensure_empty_response("delete_task", response)
     }
@@ -846,7 +857,7 @@ impl ShimManager {
     pub fn stop_shim(&self, container_id: &str) -> Result<()> {
         info!("Stopping shim for container {}", container_id);
 
-        let _ = self.delete_task(container_id);
+        let _ = self.delete_task(container_id, None, None);
 
         let mut processes = self.processes.lock().unwrap();
         let removed = processes

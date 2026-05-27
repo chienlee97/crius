@@ -39,6 +39,7 @@ use crate::shim_rpc::{
     ShimRpcRequest, ShimRpcResponse, StartTaskRequest, StatusRequest, StatusResponse, TaskState,
     UpdateResourcesRequest, WaitProcessRequest, WaitProcessResponse,
 };
+use crate::storage::StorageManager;
 
 const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";
 
@@ -161,6 +162,15 @@ pub struct Daemon {
     task_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     /// exec session 后台线程。
     exec_sessions: Arc<Mutex<HashMap<String, ExecSessionHandle>>>,
+    /// shim-owned rootfs handle from CreateTask.
+    rootfs_handle: Arc<Mutex<Option<ShimRootfsHandle>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ShimRootfsHandle {
+    snapshot_key: Option<String>,
+    rootfs_path: PathBuf,
+    mount_options: Vec<String>,
 }
 
 pub struct DaemonOptions {
@@ -229,6 +239,7 @@ impl Daemon {
             exit_code: Arc::new(Mutex::new(None)),
             task_thread: Arc::new(Mutex::new(None)),
             exec_sessions: Arc::new(Mutex::new(HashMap::new())),
+            rootfs_handle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -343,6 +354,68 @@ impl Daemon {
         );
         fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
             .with_context(|| format!("Failed to persist bundle config {}", config_path.display()))
+    }
+
+    fn record_rootfs_handle(&self, request: &CreateTaskRequest) -> Result<()> {
+        *self.rootfs_handle.lock().unwrap() = Some(ShimRootfsHandle {
+            snapshot_key: request.snapshot_key.clone(),
+            rootfs_path: request.rootfs_path.clone(),
+            mount_options: request.mount_options.clone(),
+        });
+        let Some(snapshot_key) = request.snapshot_key.as_deref() else {
+            return Ok(());
+        };
+        self.update_snapshot_state(snapshot_key, "mounted")
+    }
+
+    fn update_snapshot_state(&self, snapshot_key: &str, state: &str) -> Result<()> {
+        let Some(path) = self.state_db_path.as_ref() else {
+            return Ok(());
+        };
+        StorageManager::new(path)?.update_snapshot_state(snapshot_key, state)
+    }
+
+    fn delete_snapshot_record(&self, snapshot_key: &str) -> Result<()> {
+        let Some(path) = self.state_db_path.as_ref() else {
+            return Ok(());
+        };
+        StorageManager::new(path)?.delete_snapshot(snapshot_key)
+    }
+
+    fn cleanup_rootfs_handle(&self, request: &DeleteTaskRequest) -> Result<()> {
+        let stored = self.rootfs_handle.lock().unwrap().take();
+        let snapshot_key = request.snapshot_key.clone().or_else(|| {
+            stored
+                .as_ref()
+                .and_then(|handle| handle.snapshot_key.clone())
+        });
+        let rootfs_path = request
+            .rootfs_path
+            .clone()
+            .or_else(|| stored.as_ref().map(|handle| handle.rootfs_path.clone()));
+
+        if let Some(path) = rootfs_path.as_ref().filter(|path| path.exists()) {
+            fs::remove_dir_all(path).with_context(|| {
+                format!("Failed to remove shim-owned rootfs {}", path.display())
+            })?;
+        }
+
+        if let Some(snapshot_key) = snapshot_key.as_deref() {
+            self.update_snapshot_state(snapshot_key, "deleted")?;
+            self.delete_snapshot_record(snapshot_key)?;
+        }
+
+        if let Some(handle) = stored.as_ref() {
+            debug!(
+                "Deleted shim rootfs handle for container {} snapshot {:?} rootfs {} mount options {:?}",
+                self.container_id,
+                handle.snapshot_key,
+                handle.rootfs_path.display(),
+                handle.mount_options
+            );
+        }
+
+        Ok(())
     }
 
     fn task_status(&self) -> StatusResponse {
@@ -1336,6 +1409,7 @@ impl Daemon {
             warn!("Failed to shutdown IO manager during delete: {}", err);
         }
         self.cleanup_attach_socket_directory();
+        self.cleanup_rootfs_handle(request)?;
         self.set_task_state(DaemonTaskState::Deleted);
         Ok(())
     }
@@ -1535,11 +1609,9 @@ impl ShimRpcHandler for Daemon {
     fn handle_request(&self, request: ShimRpcRequest) -> Result<ShimRpcResponse> {
         match request {
             ShimRpcRequest::Ping => Ok(ShimRpcResponse::Empty),
-            ShimRpcRequest::CreateTask(CreateTaskRequest {
-                container_id: _,
-                rootfs_path,
-            }) => {
-                self.apply_rootfs_override(&rootfs_path)?;
+            ShimRpcRequest::CreateTask(request) => {
+                self.apply_rootfs_override(&request.rootfs_path)?;
+                self.record_rootfs_handle(&request)?;
                 self.setup_io_once()?;
                 self.set_task_state(DaemonTaskState::Created);
                 Ok(ShimRpcResponse::Empty)

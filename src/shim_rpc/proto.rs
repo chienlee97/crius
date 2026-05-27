@@ -17,6 +17,10 @@ pub enum TaskState {
 pub struct CreateTaskRequest {
     pub container_id: String,
     pub rootfs_path: PathBuf,
+    #[serde(default)]
+    pub snapshot_key: Option<String>,
+    #[serde(default)]
+    pub mount_options: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +87,10 @@ pub struct KillTaskRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteTaskRequest {
     pub container_id: String,
+    #[serde(default)]
+    pub snapshot_key: Option<String>,
+    #[serde(default)]
+    pub rootfs_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
