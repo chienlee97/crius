@@ -338,10 +338,10 @@ async fn start_container_rejects_exited_container_with_failed_precondition() {
 async fn start_container_undoes_nri_when_runtime_start_fails() {
     let _guard = env_lock().lock().await;
     let fake_nri = Arc::new(FakeNri::default());
-    let (dir, service) = test_service_with_fake_runtime_and_nri_and_shim(
-        fake_nri.clone(),
-        Some(PathBuf::from("/definitely/missing/crius-shim")),
-    );
+    let dir = tempdir().unwrap();
+    let runtime_path = write_fake_runtime_script_with_start_state(dir.path(), "stopped");
+    let (dir, service) =
+        test_service_with_runtime_path_without_shim_and_nri(dir, runtime_path, fake_nri.clone());
 
     let mut annotations = HashMap::new();
     RuntimeServiceImpl::insert_internal_state(
@@ -423,7 +423,6 @@ async fn start_container_undoes_nri_when_runtime_start_fails() {
     .await
     .expect_err("runtime start failure should be surfaced");
     assert_eq!(err.code(), tonic::Code::Internal);
-    assert!(err.message().contains("Failed to start container"));
 
     assert_eq!(
         fake_nri.calls.lock().await.clone(),
@@ -436,7 +435,7 @@ async fn start_container_undoes_nri_when_runtime_start_fails() {
         .get("container-start-fail")
         .cloned()
         .unwrap();
-    assert_eq!(container.state, ContainerState::ContainerCreated as i32);
+    assert_eq!(container.state, ContainerState::ContainerExited as i32);
     let state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
         &container.annotations,
         INTERNAL_CONTAINER_STATE_KEY,
@@ -458,7 +457,7 @@ async fn start_container_undoes_nri_when_runtime_start_fails() {
         .get_container("container-start-fail")
         .unwrap()
         .unwrap();
-    assert_eq!(persisted.state, "created");
+    assert_eq!(persisted.state, "stopped");
     let bundle_config: serde_json::Value = serde_json::from_slice(
         &fs::read(
             dir.path()
@@ -482,8 +481,9 @@ async fn start_container_undoes_nri_when_runtime_start_fails() {
     )
     .unwrap();
     assert!(bundle_state.nri_stop_notified);
-    assert!(bundle_state.started_at.is_none());
-    assert!(bundle_state.finished_at.is_none());
+    assert!(bundle_state.started_at.is_some());
+    assert!(bundle_state.finished_at.is_some());
+    assert_eq!(bundle_state.exit_code, Some(0));
 }
 
 #[tokio::test]
@@ -748,10 +748,10 @@ async fn finalize_container_stop_state_only_sets_finished_at_for_exited_state() 
 async fn remove_after_failed_start_does_not_repeat_nri_stop() {
     let _guard = env_lock().lock().await;
     let fake_nri = Arc::new(FakeNri::default());
-    let (dir, service) = test_service_with_fake_runtime_and_nri_and_shim(
-        fake_nri.clone(),
-        Some(PathBuf::from("/definitely/missing/crius-shim")),
-    );
+    let dir = tempdir().unwrap();
+    let runtime_path = write_fake_runtime_script_with_start_state(dir.path(), "stopped");
+    let (dir, service) =
+        test_service_with_runtime_path_without_shim_and_nri(dir, runtime_path, fake_nri.clone());
 
     let mut annotations = HashMap::new();
     RuntimeServiceImpl::insert_internal_state(

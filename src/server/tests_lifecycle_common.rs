@@ -1220,6 +1220,31 @@ fn test_service_with_runtime_path_and_shim_path(
     )
 }
 
+fn test_service_with_runtime_path_without_shim_and_nri(
+    dir: TempDir,
+    runtime_path: PathBuf,
+    fake_nri: Arc<dyn NriApi>,
+) -> (TempDir, RuntimeServiceImpl) {
+    let runtime_root = dir.path().join("runtime-root");
+    let (dir, service) =
+        test_service_with_runtime_path_and_shim_path(dir, runtime_path.clone(), None);
+    let mut runtime = crate::runtime::RuncRuntime::new(runtime_path, runtime_root);
+    runtime.set_state_db_path(service.config.root_dir.join("crius.db"));
+    let runtimes: HashMap<String, Arc<dyn crate::runtime::RuntimeBackend>> = HashMap::from([(
+        "runc".to_string(),
+        Arc::new(crate::runtime::RuncBackend::new(runtime)) as Arc<dyn crate::runtime::RuntimeBackend>,
+    )]);
+    let config = service.config.clone();
+    let service = RuntimeServiceImpl::new_with_shim_work_dir_and_nri_and_runtime_backends(
+        config,
+        service.nri_config.clone(),
+        service.shim_work_dir.clone(),
+        Some(fake_nri),
+        Some(runtimes),
+    );
+    (dir, service)
+}
+
 fn test_service_with_runtime_path_and_shim_path_and_configure<F>(
     dir: TempDir,
     runtime_path: PathBuf,

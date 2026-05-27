@@ -1503,6 +1503,7 @@ impl RuntimeServiceImpl {
         )
     }
 
+    #[cfg(test)]
     fn seccomp_profile_from_proto(
         profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
         deprecated_profile: &str,

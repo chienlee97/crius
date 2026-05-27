@@ -166,6 +166,7 @@ impl RecoveryStage {
     }
 }
 
+#[cfg(test)]
 pub(super) const RECOVERY_STAGE_ORDER: &[RecoveryStage] = &[
     RecoveryStage::LoadLedgerSnapshot,
     RecoveryStage::RestoreMemoryState,
@@ -1979,7 +1980,7 @@ impl RuntimeServiceImpl {
         )
     }
 
-    fn new_with_shim_work_dir_and_nri_and_runtime_backends(
+    pub(super) fn new_with_shim_work_dir_and_nri_and_runtime_backends(
         config: RuntimeConfig,
         nri_config: NriConfig,
         shim_work_dir: PathBuf,

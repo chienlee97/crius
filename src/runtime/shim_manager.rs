@@ -117,6 +117,16 @@ pub struct ShimProcess {
     pub bundle_path: PathBuf,
 }
 
+struct ShimLedgerState<'a> {
+    container_id: &'a str,
+    shim_pid: u32,
+    exit_code_file: &'a Path,
+    log_file: &'a Path,
+    socket_path: &'a Path,
+    bundle_path: &'a Path,
+    state: &'a str,
+}
+
 /// Shim管理器
 #[derive(Debug)]
 pub struct ShimManager {
@@ -180,26 +190,17 @@ impl ShimManager {
         PathBuf::from("/proc").join(pid.to_string()).exists()
     }
 
-    fn persist_shim_ledger_state(
-        &self,
-        container_id: &str,
-        shim_pid: u32,
-        exit_code_file: &Path,
-        log_file: &Path,
-        socket_path: &Path,
-        bundle_path: &Path,
-        state: &str,
-    ) -> Result<()> {
+    fn persist_shim_ledger_state(&self, state: ShimLedgerState<'_>) -> Result<()> {
         if let Some(mut storage) = self.ledger_storage()? {
             storage.save_shim_process(&ShimProcessRecord {
-                container_id: container_id.to_string(),
-                shim_pid,
+                container_id: state.container_id.to_string(),
+                shim_pid: state.shim_pid,
                 work_dir: self.config.work_dir.display().to_string(),
-                socket_path: socket_path.display().to_string(),
-                exit_code_file: exit_code_file.display().to_string(),
-                log_file: log_file.display().to_string(),
-                bundle_path: bundle_path.display().to_string(),
-                state: state.to_string(),
+                socket_path: state.socket_path.display().to_string(),
+                exit_code_file: state.exit_code_file.display().to_string(),
+                log_file: state.log_file.display().to_string(),
+                bundle_path: state.bundle_path.display().to_string(),
+                state: state.state.to_string(),
                 last_seen_at: chrono::Utc::now().timestamp(),
             })?;
         }
@@ -465,15 +466,15 @@ impl ShimManager {
         let log_file = shim_dir.join("shim.log");
         let socket_path = attach_dir.join("attach.sock");
 
-        self.persist_shim_ledger_state(
+        self.persist_shim_ledger_state(ShimLedgerState {
             container_id,
-            0,
-            &exit_code_file,
-            &log_file,
-            &socket_path,
+            shim_pid: 0,
+            exit_code_file: &exit_code_file,
+            log_file: &log_file,
+            socket_path: &socket_path,
             bundle_path,
-            "planned",
-        )?;
+            state: "planned",
+        })?;
 
         // 构建shim命令
         let mut cmd = Command::new(&self.config.shim_path);
@@ -546,15 +547,15 @@ impl ShimManager {
             .context("Failed to start shim process")?;
 
         let shim_pid = child.id();
-        self.persist_shim_ledger_state(
+        self.persist_shim_ledger_state(ShimLedgerState {
             container_id,
             shim_pid,
-            &exit_code_file,
-            &log_file,
-            &socket_path,
+            exit_code_file: &exit_code_file,
+            log_file: &log_file,
+            socket_path: &socket_path,
             bundle_path,
-            "starting",
-        )?;
+            state: "starting",
+        })?;
         self.persist_pidfile(container_id, shim_pid);
 
         // 在后台等待shim进程（避免僵尸进程）
@@ -583,15 +584,15 @@ impl ShimManager {
         drop(processes);
         self.persist_process_metadata(&process);
         self.wait_for_rpc_socket(container_id)?;
-        self.persist_shim_ledger_state(
+        self.persist_shim_ledger_state(ShimLedgerState {
             container_id,
             shim_pid,
-            &process.exit_code_file,
-            &process.log_file,
-            &process.socket_path,
-            &process.bundle_path,
-            "running",
-        )?;
+            exit_code_file: &process.exit_code_file,
+            log_file: &process.log_file,
+            socket_path: &process.socket_path,
+            bundle_path: &process.bundle_path,
+            state: "running",
+        })?;
 
         Ok(process)
     }

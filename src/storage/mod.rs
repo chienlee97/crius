@@ -115,6 +115,16 @@ pub struct ContentBlobRefRecord {
     pub ref_kind: String,
 }
 
+pub struct TypedEventInput<'a> {
+    pub event_type: &'a str,
+    pub entity_type: &'a str,
+    pub entity_id: &'a str,
+    pub old_state: Option<&'a str>,
+    pub new_state: Option<&'a str>,
+    pub details: Option<&'a str>,
+    pub timestamp: i64,
+}
+
 /// 快照记录
 #[derive(Debug, Clone)]
 pub struct SnapshotRecord {
@@ -1452,7 +1462,7 @@ impl StorageManager {
         details: Option<&str>,
     ) -> Result<()> {
         let timestamp = chrono::Utc::now().timestamp();
-        self.append_typed_event_at(
+        self.append_typed_event_at(TypedEventInput {
             event_type,
             entity_type,
             entity_id,
@@ -1460,32 +1470,23 @@ impl StorageManager {
             new_state,
             details,
             timestamp,
-        )
+        })
     }
 
-    pub fn append_typed_event_at(
-        &mut self,
-        event_type: &str,
-        entity_type: &str,
-        entity_id: &str,
-        old_state: Option<&str>,
-        new_state: Option<&str>,
-        details: Option<&str>,
-        timestamp: i64,
-    ) -> Result<()> {
+    pub fn append_typed_event_at(&mut self, input: TypedEventInput<'_>) -> Result<()> {
         self.conn
             .execute(
                 "INSERT INTO events
                  (event_type, entity_type, entity_id, old_state, new_state, timestamp, details)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
-                    event_type,
-                    entity_type,
-                    entity_id,
-                    old_state.unwrap_or(""),
-                    new_state.unwrap_or(""),
-                    timestamp,
-                    details,
+                    input.event_type,
+                    input.entity_type,
+                    input.entity_id,
+                    input.old_state.unwrap_or(""),
+                    input.new_state.unwrap_or(""),
+                    input.timestamp,
+                    input.details,
                 ],
             )
             .context("Failed to append state event")?;

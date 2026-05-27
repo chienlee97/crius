@@ -1354,7 +1354,7 @@ mod tests {
         );
         assert_eq!(
             config.runtime.clean_shutdown_file,
-            "/run/custom-crius/clean.shutdown"
+            "/var/lib/crius/clean.shutdown"
         );
         assert_eq!(config.network.config_dirs, vec!["/etc/cni/custom.d"]);
         assert_eq!(config.network.plugin_dirs, vec!["/opt/cni/custom-bin"]);

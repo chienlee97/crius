@@ -36,6 +36,27 @@ pub struct RecoveryLedgerHealthSummary {
     pub degraded_shims: usize,
 }
 
+pub struct WatcherStatusInput<'a> {
+    pub reload_watcher_active: bool,
+    pub watcher_status: serde_json::Value,
+    pub watcher_backoff_count: u32,
+    pub watcher_next_retry_unix_millis: Option<i64>,
+    pub watcher_last_error: Option<&'a str>,
+    pub reload_error: Option<&'a str>,
+    pub cni_watch_error: Option<&'a str>,
+    pub shim_reconnect_supported: bool,
+}
+
+pub struct ExtendedConditionsInput<'a> {
+    pub image_root: &'a Path,
+    pub snapshot_root: &'a Path,
+    pub shim_work_dir: &'a Path,
+    pub attempted_repair: Option<bool>,
+    pub repair_succeeded: Option<bool>,
+    pub shim_reconnect_supported: bool,
+    pub recovery_ledger_summary: Option<&'a RecoveryLedgerHealthSummary>,
+}
+
 impl RecoveryLedgerHealthSummary {
     pub fn unhealthy_object_count(&self) -> usize {
         self.broken_containers
@@ -205,26 +226,16 @@ impl HealthService {
             || error.contains("PodCIDR")
     }
 
-    pub fn watcher_status(
-        &self,
-        reload_watcher_active: bool,
-        watcher_status: serde_json::Value,
-        watcher_backoff_count: u32,
-        watcher_next_retry_unix_millis: Option<i64>,
-        watcher_last_error: Option<&str>,
-        reload_error: Option<&str>,
-        cni_watch_error: Option<&str>,
-        shim_reconnect_supported: bool,
-    ) -> serde_json::Value {
+    pub fn watcher_status(&self, input: WatcherStatusInput<'_>) -> serde_json::Value {
         serde_json::json!({
-            "reloadWatcherActive": reload_watcher_active,
-            "watcherStatus": watcher_status,
-            "watcherBackoffCount": watcher_backoff_count,
-            "watcherNextRetryUnixMillis": watcher_next_retry_unix_millis,
-            "watcherLastError": watcher_last_error,
-            "lastReloadError": reload_error,
-            "lastCniWatchError": cni_watch_error,
-            "shimReconnectSupported": shim_reconnect_supported,
+            "reloadWatcherActive": input.reload_watcher_active,
+            "watcherStatus": input.watcher_status,
+            "watcherBackoffCount": input.watcher_backoff_count,
+            "watcherNextRetryUnixMillis": input.watcher_next_retry_unix_millis,
+            "watcherLastError": input.watcher_last_error,
+            "lastReloadError": input.reload_error,
+            "lastCniWatchError": input.cni_watch_error,
+            "shimReconnectSupported": input.shim_reconnect_supported,
         })
     }
 
@@ -389,19 +400,17 @@ impl HealthService {
 
     pub fn extended_conditions(
         &self,
-        image_root: &Path,
-        snapshot_root: &Path,
-        shim_work_dir: &Path,
-        attempted_repair: Option<bool>,
-        repair_succeeded: Option<bool>,
-        shim_reconnect_supported: bool,
-        recovery_ledger_summary: Option<&RecoveryLedgerHealthSummary>,
+        input: ExtendedConditionsInput<'_>,
     ) -> Vec<InternalHealthCondition> {
         vec![
-            self.image_condition(image_root),
-            self.snapshot_condition(snapshot_root),
-            self.shim_condition(shim_work_dir, shim_reconnect_supported),
-            self.recovery_condition(attempted_repair, repair_succeeded, recovery_ledger_summary),
+            self.image_condition(input.image_root),
+            self.snapshot_condition(input.snapshot_root),
+            self.shim_condition(input.shim_work_dir, input.shim_reconnect_supported),
+            self.recovery_condition(
+                input.attempted_repair,
+                input.repair_succeeded,
+                input.recovery_ledger_summary,
+            ),
         ]
     }
 
@@ -590,15 +599,15 @@ mod tests {
         std::fs::create_dir_all(&snapshot_root).unwrap();
         std::fs::create_dir_all(&shim_work_dir).unwrap();
 
-        let conditions = service.extended_conditions(
-            &image_root,
-            &snapshot_root,
-            &shim_work_dir,
-            Some(false),
-            None,
-            true,
-            None,
-        );
+        let conditions = service.extended_conditions(ExtendedConditionsInput {
+            image_root: &image_root,
+            snapshot_root: &snapshot_root,
+            shim_work_dir: &shim_work_dir,
+            attempted_repair: Some(false),
+            repair_succeeded: None,
+            shim_reconnect_supported: true,
+            recovery_ledger_summary: None,
+        });
 
         assert_eq!(conditions.len(), 4);
         assert!(conditions.iter().all(|condition| condition.ready));
@@ -625,15 +634,16 @@ mod tests {
         std::fs::create_dir_all(&image_root).unwrap();
         std::fs::create_dir_all(&shim_work_dir).unwrap();
 
-        let conditions = service.extended_conditions(
-            &image_root,
-            &image_root.join("snapshots"),
-            &shim_work_dir,
-            Some(true),
-            Some(false),
-            true,
-            None,
-        );
+        let snapshot_root = image_root.join("snapshots");
+        let conditions = service.extended_conditions(ExtendedConditionsInput {
+            image_root: &image_root,
+            snapshot_root: &snapshot_root,
+            shim_work_dir: &shim_work_dir,
+            attempted_repair: Some(true),
+            repair_succeeded: Some(false),
+            shim_reconnect_supported: true,
+            recovery_ledger_summary: None,
+        });
 
         let snapshot = conditions
             .iter()

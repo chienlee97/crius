@@ -43,7 +43,7 @@ impl SnapshotState {
         }
     }
 
-    pub fn from_str(value: &str) -> Self {
+    pub fn parse_state(value: &str) -> Self {
         match value {
             "prepared" => Self::Prepared,
             "mounted" => Self::Mounted,
@@ -244,7 +244,7 @@ impl FilesystemSnapshotter {
         SnapshotInfo {
             key: record.key,
             image_id: record.image_id,
-            state: SnapshotState::from_str(&record.state),
+            state: SnapshotState::parse_state(&record.state),
             mountpoint: PathBuf::from(record.mountpoint),
         }
     }

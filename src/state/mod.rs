@@ -456,23 +456,9 @@ impl<'a> StateLedgerWriter<'a> {
 
     pub fn append_typed_event_at(
         &mut self,
-        event_type: &str,
-        entity_type: &str,
-        entity_id: &str,
-        old_state: Option<&str>,
-        new_state: Option<&str>,
-        details: Option<&str>,
-        timestamp: i64,
+        input: crate::storage::TypedEventInput<'_>,
     ) -> Result<()> {
-        self.persistence.storage_mut().append_typed_event_at(
-            event_type,
-            entity_type,
-            entity_id,
-            old_state,
-            new_state,
-            details,
-            timestamp,
-        )
+        self.persistence.storage_mut().append_typed_event_at(input)
     }
 }
 

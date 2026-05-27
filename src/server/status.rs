@@ -816,13 +816,15 @@ impl RuntimeServiceImpl {
                     Err(err) => (None, Some(err)),
                 };
             let mut extended_health_conditions = self.internal_services.health.extended_conditions(
-                &self.config.image_root,
-                &self.config.image_root.join("snapshots"),
-                &self.shim_work_dir,
-                self.last_startup_attempted_repair(),
-                self.last_startup_repair_succeeded(),
-                true,
-                recovery_ledger_summary.as_ref(),
+                crate::services::health::ExtendedConditionsInput {
+                    image_root: &self.config.image_root,
+                    snapshot_root: &self.config.image_root.join("snapshots"),
+                    shim_work_dir: &self.shim_work_dir,
+                    attempted_repair: self.last_startup_attempted_repair(),
+                    repair_succeeded: self.last_startup_repair_succeeded(),
+                    shim_reconnect_supported: true,
+                    recovery_ledger_summary: recovery_ledger_summary.as_ref(),
+                },
             );
             extended_health_conditions.push(
                 self.internal_services
@@ -1191,14 +1193,16 @@ impl RuntimeServiceImpl {
                         "network": network_condition.clone(),
                         "conditions": extended_health_conditions,
                         "watchers": self.internal_services.health.watcher_status(
-                            reload_state.watcher_active,
-                            serde_json::json!(reload_state.watcher_status),
-                            reload_state.watcher_backoff_count,
-                            reload_state.watcher_next_retry_unix_millis,
-                            reload_state.watcher_last_error.as_deref(),
-                            reload_state.last_reload_error.as_deref(),
-                            reload_state.last_cni_watch_error.as_deref(),
-                            true,
+                            crate::services::health::WatcherStatusInput {
+                                reload_watcher_active: reload_state.watcher_active,
+                                watcher_status: serde_json::json!(reload_state.watcher_status),
+                                watcher_backoff_count: reload_state.watcher_backoff_count,
+                                watcher_next_retry_unix_millis: reload_state.watcher_next_retry_unix_millis,
+                                watcher_last_error: reload_state.watcher_last_error.as_deref(),
+                                reload_error: reload_state.last_reload_error.as_deref(),
+                                cni_watch_error: reload_state.last_cni_watch_error.as_deref(),
+                                shim_reconnect_supported: true,
+                            }
                         ),
                     },
                 },

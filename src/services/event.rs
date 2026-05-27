@@ -124,15 +124,15 @@ impl LedgerInternalEventSink {
 
     pub fn publish(&self, event: &InternalEvent) -> anyhow::Result<()> {
         let mut storage = crate::storage::StorageManager::new(&self.db_path)?;
-        storage.append_typed_event_at(
-            &event.kind,
-            &event.subject_kind,
-            &event.subject_id,
-            None,
-            Some(event.severity.as_str()),
-            event.details_for_ledger().as_deref(),
-            event.timestamp,
-        )
+        storage.append_typed_event_at(crate::storage::TypedEventInput {
+            event_type: &event.kind,
+            entity_type: &event.subject_kind,
+            entity_id: &event.subject_id,
+            old_state: None,
+            new_state: Some(event.severity.as_str()),
+            details: event.details_for_ledger().as_deref(),
+            timestamp: event.timestamp,
+        })
     }
 }
 
@@ -225,15 +225,15 @@ impl EventService {
         };
         let mut persistence = ledger.lock().await;
         let mut ledger = crate::state::StateLedgerWriter::new(&mut persistence);
-        ledger.append_typed_event_at(
-            &event.kind,
-            &event.subject_kind,
-            &event.subject_id,
-            None,
-            Some(event.severity.as_str()),
-            event.details_for_ledger().as_deref(),
-            event.timestamp,
-        )
+        ledger.append_typed_event_at(crate::storage::TypedEventInput {
+            event_type: &event.kind,
+            entity_type: &event.subject_kind,
+            entity_id: &event.subject_id,
+            old_state: None,
+            new_state: Some(event.severity.as_str()),
+            details: event.details_for_ledger().as_deref(),
+            timestamp: event.timestamp,
+        })
     }
 
     pub fn stream(&self) -> ReceiverStream<Result<ContainerEventResponse, Status>> {

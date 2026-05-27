@@ -664,8 +664,10 @@ mod tests {
     #[test]
     fn runtime_handler_configs_include_runtime_probe_and_cni_overrides() {
         let service = IntrospectionService;
-        let mut config = RuntimeConfig::default();
-        config.config_path = None;
+        let mut config = RuntimeConfig {
+            config_path: None,
+            ..Default::default()
+        };
         config.runtime_configs.insert(
             "kata".to_string(),
             crate::config::ResolvedRuntimeHandlerConfig {
@@ -717,14 +719,15 @@ mod tests {
         }
 
         let service = IntrospectionService;
-        let mut config = RuntimeConfig::default();
-        config.image_root = PathBuf::from("/var/lib/crius/images");
-        config.image_storage_options =
-            vec!["overlay.mount_program=/usr/bin/fuse-overlayfs".to_string()];
-        config.disable_cgroup = true;
-        config.enable_criu_support = false;
-        config.internal_wipe = false;
-        config.internal_repair = true;
+        let config = RuntimeConfig {
+            image_root: PathBuf::from("/var/lib/crius/images"),
+            image_storage_options: vec!["overlay.mount_program=/usr/bin/fuse-overlayfs".to_string()],
+            disable_cgroup: true,
+            enable_criu_support: false,
+            internal_wipe: false,
+            internal_repair: true,
+            ..Default::default()
+        };
 
         let image_layout = service.image_layout(&config);
         let snapshot_model = service.image_snapshot_model(&config);
