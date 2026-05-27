@@ -33,6 +33,7 @@ struct RecoveryFixture {
     bundle_path: PathBuf,
     rootfs_path: PathBuf,
     shim_socket_path: PathBuf,
+    runtime_state_dir: PathBuf,
 }
 
 impl RecoveryFixture {
@@ -48,6 +49,7 @@ impl RecoveryFixture {
         let pod_id = "pod-a".to_string();
         let container_id = "container-a".to_string();
         let runtime_root = dir.path().join("runtime");
+        let runtime_state_dir = dir.path().join("runtime-state");
         let bundle_path = runtime_root.join(&container_id).join("bundle");
         let rootfs_path = dir
             .path()
@@ -186,6 +188,7 @@ impl RecoveryFixture {
             bundle_path,
             rootfs_path,
             shim_socket_path,
+            runtime_state_dir,
         }
     }
 
@@ -213,6 +216,46 @@ impl RecoveryFixture {
             .unwrap();
     }
 
+    fn runtime_state_path(&self, container_id: &str) -> PathBuf {
+        self.runtime_state_dir.join(format!("{container_id}.state"))
+    }
+
+    fn runtime_pid_path(&self, container_id: &str) -> PathBuf {
+        self.runtime_state_dir.join(format!("{container_id}.pid"))
+    }
+
+    fn set_live_runtime_state(&self, container_id: &str, state: &str) {
+        fs::create_dir_all(&self.runtime_state_dir).unwrap();
+        fs::write(self.runtime_state_path(container_id), state).unwrap();
+        if state == "running" {
+            fs::write(
+                self.runtime_pid_path(container_id),
+                std::process::id().to_string(),
+            )
+            .unwrap();
+        } else {
+            let _ = fs::remove_file(self.runtime_pid_path(container_id));
+        }
+    }
+
+    fn clear_live_runtime_state(&self, container_id: &str) {
+        let _ = fs::remove_file(self.runtime_state_path(container_id));
+        let _ = fs::remove_file(self.runtime_pid_path(container_id));
+    }
+
+    fn live_runtime_state(&self, container_id: &str) -> Option<String> {
+        fs::read_to_string(self.runtime_state_path(container_id))
+            .ok()
+            .map(|state| state.trim().to_string())
+            .filter(|state| !state.is_empty())
+    }
+
+    fn live_runtime_pid(&self, container_id: &str) -> Option<u32> {
+        fs::read_to_string(self.runtime_pid_path(container_id))
+            .ok()
+            .and_then(|pid| pid.trim().parse().ok())
+    }
+
     fn add_orphan_bundle_artifact(&mut self, owner_id: &str) -> PathBuf {
         let runtime_root = self
             .bundle_path
@@ -235,6 +278,12 @@ impl RecoveryFixture {
             .replace_runtime_artifacts("container", owner_id, &[artifact])
             .unwrap();
 
+        path
+    }
+
+    fn add_live_orphan_bundle_artifact(&mut self, owner_id: &str) -> PathBuf {
+        let path = self.add_orphan_bundle_artifact(owner_id);
+        self.set_live_runtime_state(owner_id, "running");
         path
     }
 }
@@ -323,6 +372,59 @@ fn recovery_fixture_can_model_orphan_bundle_artifact() {
         .any(|entry| entry.record.id == "orphan-container"));
     assert!(snapshot.runtime_artifacts.iter().any(|artifact| {
         artifact.owner_id == "orphan-container"
+            && artifact.artifact_kind == "bundle"
+            && artifact.path == orphan_path.display().to_string()
+    }));
+}
+
+#[test]
+fn recovery_fixture_can_model_fake_live_runtime_state() {
+    let fixture = RecoveryFixture::new();
+
+    fixture.set_live_runtime_state(&fixture.container_id, "running");
+    assert_eq!(
+        fixture.live_runtime_state(&fixture.container_id).as_deref(),
+        Some("running")
+    );
+    assert_eq!(
+        fixture.live_runtime_pid(&fixture.container_id),
+        Some(std::process::id())
+    );
+
+    fixture.set_live_runtime_state(&fixture.container_id, "stopped");
+    assert_eq!(
+        fixture.live_runtime_state(&fixture.container_id).as_deref(),
+        Some("stopped")
+    );
+    assert_eq!(fixture.live_runtime_pid(&fixture.container_id), None);
+
+    fixture.clear_live_runtime_state(&fixture.container_id);
+    assert_eq!(fixture.live_runtime_state(&fixture.container_id), None);
+}
+
+#[test]
+fn recovery_fixture_can_model_live_orphan_bundle_artifact() {
+    let mut fixture = RecoveryFixture::new();
+    let orphan_path = fixture.add_live_orphan_bundle_artifact("live-orphan-container");
+    let snapshot = fixture.snapshot();
+
+    assert!(orphan_path.exists());
+    assert_eq!(
+        fixture
+            .live_runtime_state("live-orphan-container")
+            .as_deref(),
+        Some("running")
+    );
+    assert_eq!(
+        fixture.live_runtime_pid("live-orphan-container"),
+        Some(std::process::id())
+    );
+    assert!(!snapshot
+        .containers
+        .iter()
+        .any(|entry| entry.record.id == "live-orphan-container"));
+    assert!(snapshot.runtime_artifacts.iter().any(|artifact| {
+        artifact.owner_id == "live-orphan-container"
             && artifact.artifact_kind == "bundle"
             && artifact.path == orphan_path.display().to_string()
     }));
