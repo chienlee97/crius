@@ -12,6 +12,18 @@ use super::health::RecoveryLedgerHealthSummary;
 #[derive(Debug, Clone, Default)]
 pub struct IntrospectionService;
 
+pub struct RecoveryStatusInput<'a, T> {
+    pub config: &'a RuntimeConfig,
+    pub last_startup_clean_shutdown: Option<bool>,
+    pub last_startup_detected_reboot: Option<bool>,
+    pub last_startup_detected_upgrade: Option<bool>,
+    pub last_startup_attempted_repair: Option<bool>,
+    pub last_startup_repair_succeeded: Option<bool>,
+    pub last_recovery_result: Option<&'a T>,
+    pub ledger_summary: Option<&'a RecoveryLedgerHealthSummary>,
+    pub ledger_summary_error: Option<&'a str>,
+}
+
 impl IntrospectionService {
     pub fn runtime_backend(&self, config: &RuntimeConfig) -> Value {
         json!({
@@ -59,6 +71,42 @@ impl IntrospectionService {
         })
     }
 
+    pub fn image_layout(&self, config: &RuntimeConfig) -> Value {
+        json!({
+            "mode": "single-store-root",
+            "root": config.image_root.display().to_string(),
+            "imageRecordPathPattern": config
+                .image_root
+                .join("images")
+                .join("<imageID>")
+                .display()
+                .to_string(),
+            "separateImageStoreSupported": false
+        })
+    }
+
+    pub fn image_snapshot_model(&self, config: &RuntimeConfig) -> Value {
+        json!({
+            "snapshotter": "internal-overlay-untar",
+            "storageDriver": config.image_driver,
+            "storageOptions": config.image_storage_options,
+            "externalSnapshotterSupported": false,
+            "runtimeSnapshotterOverrideSupported": true,
+            "snapshotAnnotationPassthrough": false,
+            "discardUnpackedLayers": false,
+            "pullOptionPassthrough": false
+        })
+    }
+
+    pub fn snapshot_stats_collection(&self, config: &RuntimeConfig) -> Value {
+        json!({
+            "strategy": "on-demand-rootfs-walk",
+            "backgroundCollector": false,
+            "containerStatsPeriodSeconds": config.stats_collection_period,
+            "podSandboxMetricsPeriodSeconds": config.pod_sandbox_metrics_collection_period
+        })
+    }
+
     pub fn rootless(&self, rootless: &EffectiveRootlessConfig) -> Value {
         let network_helper_path = match rootless.network_mode {
             crate::rootless::NetworkMode::Slirp4netns => {
@@ -90,6 +138,39 @@ impl IntrospectionService {
         })
     }
 
+    pub fn runtime_feature_flags(&self, config: &RuntimeConfig) -> Value {
+        json!({
+            "exec": true,
+            "execSync": true,
+            "attach": true,
+            "portForward": true,
+            "containerStats": true,
+            "podSandboxStats": true,
+            "podSandboxMetrics": true,
+            "containerEvents": false,
+            "podLifecycleEvents": false,
+            "reopenContainerLog": true,
+            "updateContainerResources": !config.disable_cgroup,
+            "checkpointContainer": config.enable_criu_support,
+        })
+    }
+
+    pub fn security_availability(
+        &self,
+        seccomp_notifier_dir: &Path,
+        seccomp_notifier_active_containers: Vec<String>,
+    ) -> Value {
+        let security = crate::security::SecurityManager::new();
+        json!({
+            "selinuxAvailable": security.is_selinux_available(),
+            "apparmorAvailable": security.is_apparmor_available(),
+            "seccompAvailable": security.is_seccomp_available(),
+            "seccompNotifierSupported": security.is_seccomp_available(),
+            "seccompNotifierBaseDir": seccomp_notifier_dir.display().to_string(),
+            "seccompNotifierActiveContainers": seccomp_notifier_active_containers,
+        })
+    }
+
     pub fn recovery<T: serde::Serialize>(
         &self,
         ledger_summary: Option<&RecoveryLedgerHealthSummary>,
@@ -103,6 +184,53 @@ impl IntrospectionService {
                 .map(RecoveryLedgerHealthSummary::unhealthy_object_count)
                 .unwrap_or_default(),
             "lastRecoveryResult": last_recovery_result,
+        })
+    }
+
+    pub fn recovery_status<T: serde::Serialize>(&self, input: RecoveryStatusInput<'_, T>) -> Value {
+        json!({
+            "enabled": true,
+            "startupReconcile": true,
+            "eventReplayOnRecovery": false,
+            "lastStartupWasCleanShutdown": input.last_startup_clean_shutdown,
+            "lastStartupDetectedReboot": input.last_startup_detected_reboot,
+            "lastStartupDetectedUpgrade": input.last_startup_detected_upgrade,
+            "lastStartupAttemptedRepair": input.last_startup_attempted_repair,
+            "lastStartupRepairSucceeded": input.last_startup_repair_succeeded,
+            "lastRecoveryResult": input.last_recovery_result,
+            "ledgerSummary": input.ledger_summary,
+            "ledgerSummaryError": input.ledger_summary_error,
+            "internalWipe": input.config.internal_wipe,
+            "internalRepair": input.config.internal_repair,
+            "policy": {
+                "startupInputs": [
+                    "cleanShutdownFile",
+                    "versionFile",
+                    "versionFilePersist",
+                    "internalWipe",
+                    "internalRepair",
+                ],
+                "wipeTriggers": [
+                    "unclean-shutdown",
+                    "reboot",
+                    "upgrade",
+                ],
+                "wipeScope": [
+                    "orphanRuntimeBundles",
+                    "orphanShimArtifacts",
+                    "orphanAttachArtifacts",
+                    "orphanPodWorkspaces",
+                ],
+                "repairTriggers": [
+                    "unclean-shutdown",
+                ],
+                "repairScope": "sqlite-persistence-only",
+                "repairActions": [
+                    "integrity-check",
+                    "reindex",
+                    "vacuum",
+                ],
+            },
         })
     }
 
@@ -121,6 +249,151 @@ impl IntrospectionService {
             "lastError": last_scope.and_then(|scope| scope.error.as_deref()),
             "effective": effective,
             "lastScope": last_scope,
+        })
+    }
+
+    pub fn runtime_handler_configs(
+        &self,
+        config: &RuntimeConfig,
+        runtime_detected_features: serde_json::Map<String, Value>,
+    ) -> Value {
+        config
+            .runtime_configs
+            .iter()
+            .map(|(handler, handler_config)| {
+                (
+                    handler.clone(),
+                    json!({
+                        "backend": handler_config.backend,
+                        "backendOptions": handler_config.backend_options,
+                        "runtimePath": handler_config.runtime_path,
+                        "runtimeConfigPath": handler_config.runtime_config_path,
+                        "runtimeRoot": handler_config.runtime_root,
+                        "platformRuntimePaths": handler_config.platform_runtime_paths,
+                        "monitorPath": handler_config.monitor_path,
+                        "monitorCgroup": handler_config.monitor_cgroup,
+                        "monitorEnv": handler_config.monitor_env,
+                        "streamWebsockets": handler_config.stream_websockets,
+                        "runtimeDetectedFeatures": runtime_detected_features
+                            .get(handler)
+                            .cloned()
+                            .unwrap_or_else(|| json!({
+                                "available": false,
+                                "error": "runtime feature probe was not collected",
+                            })),
+                        "allowedAnnotations": handler_config.allowed_annotations,
+                        "defaultAnnotations": handler_config.default_annotations,
+                        "privilegedWithoutHostDevices": handler_config.privileged_without_host_devices,
+                        "privilegedWithoutHostDevicesAllDevicesAllowed": handler_config
+                            .privileged_without_host_devices_all_devices_allowed,
+                        "containerCreateTimeoutSeconds": handler_config.container_create_timeout,
+                        "snapshotter": handler_config.snapshotter,
+                        "cniConfDir": config
+                            .cni_config
+                            .handler_config_dirs(handler)
+                            .and_then(|dirs| dirs.first())
+                            .map(|dir| dir.to_string_lossy().to_string()),
+                        "cniMaxConfNum": config
+                            .cni_config
+                            .handler_max_conf_num(handler)
+                            .unwrap_or(config.cni_config.max_conf_num()),
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>()
+            .into()
+    }
+
+    pub fn workloads(&self, config: &RuntimeConfig) -> Value {
+        config
+            .workloads
+            .iter()
+            .map(|(name, workload)| {
+                (
+                    name.clone(),
+                    json!({
+                        "activationAnnotation": workload.activation_annotation,
+                        "annotationPrefix": workload.annotation_prefix,
+                        "allowedAnnotations": workload.allowed_annotations,
+                        "resources": {
+                            "cpuShares": workload.resources.cpu_shares,
+                            "cpuQuota": workload.resources.cpu_quota,
+                            "cpuPeriod": workload.resources.cpu_period,
+                            "cpusetCpus": workload.resources.cpuset_cpus,
+                            "cpuLimit": workload.resources.cpu_limit,
+                        },
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>()
+            .into()
+    }
+
+    pub fn cgroup_support(
+        &self,
+        config: &RuntimeConfig,
+        active_version: &str,
+        resource_classes: crate::security::resource_classes::ResourceClassSupport,
+    ) -> Value {
+        json!({
+            "activeVersion": active_version,
+            "resourceUpdateStrategy": "runtime-update-resources",
+            "disableCgroup": config.disable_cgroup,
+            "tolerateMissingHugetlbController": config.tolerate_missing_hugetlb_controller,
+            "resourceClasses": {
+                "blockio": {
+                    "supported": resource_classes.blockio_supported,
+                    "configPath": resource_classes
+                        .blockio_config_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                    "softFailure": "drop-class-when-config-missing",
+                },
+                "rdt": {
+                    "supported": resource_classes.rdt_supported,
+                    "resctrlPath": resource_classes.rdt_resctrl_path.display().to_string(),
+                    "softFailure": "drop-class-when-resctrl-missing",
+                },
+            },
+            "drivers": {
+                "systemd": {
+                    "supported": true,
+                    "monitorCgroup": {
+                        "default": "system.slice",
+                        "acceptedValues": ["", "pod", "*.slice"],
+                    },
+                    "resourceUpdatePath": "runtime update --resources",
+                },
+                "cgroupfs": {
+                    "supported": true,
+                    "monitorCgroup": {
+                        "default": "",
+                        "acceptedValues": ["", "pod"],
+                    },
+                    "resourceUpdatePath": "runtime update --resources",
+                },
+            },
+            "versions": {
+                "v1": {
+                    "supported": true,
+                    "hierarchyMode": "legacy",
+                    "hugetlbBehavior": if config.tolerate_missing_hugetlb_controller {
+                        "best-effort"
+                    } else {
+                        "required"
+                    },
+                },
+                "v2": {
+                    "supported": true,
+                    "hierarchyMode": "unified",
+                    "hugetlbBehavior": if config.tolerate_missing_hugetlb_controller {
+                        "best-effort"
+                    } else {
+                        "required"
+                    },
+                },
+            },
         })
     }
 
@@ -256,6 +529,7 @@ fn effective_overlay_storage_options(options: &[String]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use super::*;
@@ -385,5 +659,133 @@ mod tests {
         assert_eq!(value["lastError"], "failed to create pull cgroup");
         assert_eq!(value["effective"]["mode"], "pod");
         assert_eq!(value["lastScope"]["entered"], false);
+    }
+
+    #[test]
+    fn runtime_handler_configs_include_runtime_probe_and_cni_overrides() {
+        let service = IntrospectionService;
+        let mut config = RuntimeConfig::default();
+        config.config_path = None;
+        config.runtime_configs.insert(
+            "kata".to_string(),
+            crate::config::ResolvedRuntimeHandlerConfig {
+                backend: "vm".to_string(),
+                backend_options: HashMap::from([(
+                    "sandbox_type".to_string(),
+                    "podsandbox".to_string(),
+                )]),
+                runtime_path: "/usr/bin/kata-runtime".to_string(),
+                runtime_root: "/run/kata".to_string(),
+                stream_websockets: true,
+                snapshotter: "internal-cached-rootfs".to_string(),
+                ..Default::default()
+            },
+        );
+        config
+            .cni_config
+            .set_handler_config_dirs("kata", vec![PathBuf::from("/etc/cni/kata.d")]);
+        config.cni_config.set_handler_max_conf_num("kata", 2);
+
+        let value = service.runtime_handler_configs(
+            &config,
+            serde_json::Map::from_iter([(
+                "kata".to_string(),
+                json!({
+                    "available": true,
+                    "shimRpc": true,
+                }),
+            )]),
+        );
+
+        assert_eq!(value["kata"]["backend"], "vm");
+        assert_eq!(
+            value["kata"]["backendOptions"]["sandbox_type"],
+            "podsandbox"
+        );
+        assert_eq!(value["kata"]["runtimeDetectedFeatures"]["available"], true);
+        assert_eq!(value["kata"]["cniConfDir"], "/etc/cni/kata.d");
+        assert_eq!(value["kata"]["cniMaxConfNum"], 2);
+        assert_eq!(value["kata"]["streamWebsockets"], true);
+        assert_eq!(value["kata"]["snapshotter"], "internal-cached-rootfs");
+    }
+
+    #[test]
+    fn service_reports_image_runtime_security_cgroup_and_recovery_sections() {
+        #[derive(serde::Serialize)]
+        struct RecoveryResult {
+            completed: bool,
+        }
+
+        let service = IntrospectionService;
+        let mut config = RuntimeConfig::default();
+        config.image_root = PathBuf::from("/var/lib/crius/images");
+        config.image_storage_options =
+            vec!["overlay.mount_program=/usr/bin/fuse-overlayfs".to_string()];
+        config.disable_cgroup = true;
+        config.enable_criu_support = false;
+        config.internal_wipe = false;
+        config.internal_repair = true;
+
+        let image_layout = service.image_layout(&config);
+        let snapshot_model = service.image_snapshot_model(&config);
+        let stats = service.snapshot_stats_collection(&config);
+        let runtime_features = service.runtime_feature_flags(&config);
+        let security = service.security_availability(
+            PathBuf::from("/run/crius/seccomp").as_path(),
+            vec!["ctr1".to_string()],
+        );
+        let cgroup = service.cgroup_support(
+            &config,
+            "v2",
+            crate::security::resource_classes::ResourceClassSupport {
+                blockio_supported: true,
+                blockio_config_path: Some(PathBuf::from("/etc/blockio.json")),
+                rdt_supported: false,
+                rdt_resctrl_path: PathBuf::from("/sys/fs/resctrl"),
+            },
+        );
+        let ledger_summary = RecoveryLedgerHealthSummary {
+            dead_shims: 1,
+            ..Default::default()
+        };
+        let recovery_result = RecoveryResult { completed: true };
+        let recovery = service.recovery_status(RecoveryStatusInput {
+            config: &config,
+            last_startup_clean_shutdown: Some(false),
+            last_startup_detected_reboot: Some(true),
+            last_startup_detected_upgrade: None,
+            last_startup_attempted_repair: Some(true),
+            last_startup_repair_succeeded: Some(false),
+            last_recovery_result: Some(&recovery_result),
+            ledger_summary: Some(&ledger_summary),
+            ledger_summary_error: Some("ledger unavailable"),
+        });
+
+        assert_eq!(image_layout["root"], "/var/lib/crius/images");
+        assert_eq!(
+            image_layout["imageRecordPathPattern"],
+            "/var/lib/crius/images/images/<imageID>"
+        );
+        assert_eq!(snapshot_model["storageDriver"], config.image_driver);
+        assert_eq!(snapshot_model["externalSnapshotterSupported"], false);
+        assert_eq!(stats["backgroundCollector"], false);
+        assert_eq!(runtime_features["updateContainerResources"], false);
+        assert_eq!(runtime_features["checkpointContainer"], false);
+        assert_eq!(security["seccompNotifierBaseDir"], "/run/crius/seccomp");
+        assert_eq!(security["seccompNotifierActiveContainers"], json!(["ctr1"]));
+        assert_eq!(cgroup["activeVersion"], "v2");
+        assert_eq!(cgroup["resourceClasses"]["blockio"]["supported"], true);
+        assert_eq!(
+            cgroup["resourceClasses"]["blockio"]["configPath"],
+            "/etc/blockio.json"
+        );
+        assert_eq!(recovery["lastStartupWasCleanShutdown"], false);
+        assert_eq!(recovery["lastStartupDetectedReboot"], true);
+        assert_eq!(recovery["lastRecoveryResult"]["completed"], true);
+        assert_eq!(recovery["ledgerSummary"]["deadShims"], 1);
+        assert_eq!(recovery["ledgerSummaryError"], "ledger unavailable");
+        assert_eq!(recovery["internalWipe"], false);
+        assert_eq!(recovery["internalRepair"], true);
+        assert_eq!(recovery["policy"]["repairScope"], "sqlite-persistence-only");
     }
 }

@@ -400,34 +400,16 @@ impl RuntimeServiceImpl {
     }
 
     pub(super) fn runtime_feature_flags(&self) -> serde_json::Value {
-        json!({
-            "exec": true,
-            "execSync": true,
-            "attach": true,
-            "portForward": true,
-            "containerStats": true,
-            "podSandboxStats": true,
-            "podSandboxMetrics": true,
-            // Until crius aligns its event stream with containerd/cri-o's
-            // exit-driven semantics, advertise polling-only readiness to kubelet.
-            "containerEvents": false,
-            "podLifecycleEvents": false,
-            "reopenContainerLog": true,
-            "updateContainerResources": !self.config.disable_cgroup,
-            "checkpointContainer": self.config.enable_criu_support,
-        })
+        self.internal_services
+            .introspection
+            .runtime_feature_flags(&self.config)
     }
 
     pub(super) fn security_availability_info(&self) -> serde_json::Value {
-        let security = crate::security::SecurityManager::new();
-        json!({
-            "selinuxAvailable": security.is_selinux_available(),
-            "apparmorAvailable": security.is_apparmor_available(),
-            "seccompAvailable": security.is_seccomp_available(),
-            "seccompNotifierSupported": security.is_seccomp_available(),
-            "seccompNotifierBaseDir": self.seccomp_notifier_dir().display().to_string(),
-            "seccompNotifierActiveContainers": self.seccomp_notifier_active_containers(),
-        })
+        self.internal_services.introspection.security_availability(
+            self.seccomp_notifier_dir(),
+            self.seccomp_notifier_active_containers(),
+        )
     }
 
     pub(super) async fn recovery_ledger_health_summary(
@@ -847,6 +829,34 @@ impl RuntimeServiceImpl {
                     .health
                     .pull_cgroup_condition(&pull_cgroup_effective, pull_cgroup_last_scope.as_ref()),
             );
+            let runtime_feature_flags = self.runtime_feature_flags();
+            let security_availability = self.security_availability_info();
+            let runtime_detected_features = self
+                .config
+                .runtime_configs
+                .keys()
+                .map(|handler| {
+                    let features =
+                        self.runtime
+                            .runtime_for_handler(handler)
+                            .map(|runtime| {
+                                serde_json::to_value(runtime.probe_runtime_features())
+                                    .unwrap_or_else(|_| {
+                                        json!({
+                                            "available": false,
+                                            "error": "failed to encode runtime feature probe"
+                                        })
+                                    })
+                            })
+                            .unwrap_or_else(|err| {
+                                json!({
+                                    "available": false,
+                                    "error": format!("failed to resolve runtime handler: {}", err),
+                                })
+                            });
+                    (handler.clone(), features)
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>();
             let payload = json!({
                 "runtimeName": self.cri_runtime_name(),
                 "runtimeVersion": self.cri_runtime_version(),
@@ -979,28 +989,11 @@ impl RuntimeServiceImpl {
                     .image_big_files_temporary_dir
                     .display()
                     .to_string(),
-                "imageLayout": {
-                    "mode": "single-store-root",
-                    "root": self.config.image_root.display().to_string(),
-                    "imageRecordPathPattern": self
-                        .config
-                        .image_root
-                        .join("images")
-                        .join("<imageID>")
-                        .display()
-                        .to_string(),
-                    "separateImageStoreSupported": false
-                },
-                "imageSnapshotModel": {
-                    "snapshotter": "internal-overlay-untar",
-                    "storageDriver": self.config.image_driver.clone(),
-                    "storageOptions": self.config.image_storage_options.clone(),
-                    "externalSnapshotterSupported": false,
-                    "runtimeSnapshotterOverrideSupported": true,
-                    "snapshotAnnotationPassthrough": false,
-                    "discardUnpackedLayers": false,
-                    "pullOptionPassthrough": false
-                },
+                "imageLayout": self.internal_services.introspection.image_layout(&self.config),
+                "imageSnapshotModel": self
+                    .internal_services
+                    .introspection
+                    .image_snapshot_model(&self.config),
                 "ociArtifactMountSupport": self.config.image_oci_artifact_mount_support,
                 "imageDecryption": {
                     "enabled": !self.config.image_decryption_keys_path.as_os_str().is_empty(),
@@ -1010,12 +1003,10 @@ impl RuntimeServiceImpl {
                         "node"
                     },
                 },
-                "snapshotStatsCollection": {
-                    "strategy": "on-demand-rootfs-walk",
-                    "backgroundCollector": false,
-                    "containerStatsPeriodSeconds": self.config.stats_collection_period,
-                    "podSandboxMetricsPeriodSeconds": self.config.pod_sandbox_metrics_collection_period
-                },
+                "snapshotStatsCollection": self
+                    .internal_services
+                    .introspection
+                    .snapshot_stats_collection(&self.config),
                 "maxContainerLogLineSize": self.config.max_container_log_line_size,
                 "pauseImage": self.config.pause_image.clone(),
                 "pauseCommand": self.config.pause_command.clone(),
@@ -1148,75 +1139,10 @@ impl RuntimeServiceImpl {
                 "hostnetworkDisableSelinux": self.config.hostnetwork_disable_selinux,
                 "runtimeHandlers": self.config.runtime_handlers.clone(),
                 "runtimeHandlerConfigs": self
-                    .config
-                    .runtime_configs
-                    .iter()
-                    .map(|(handler, config)| {
-                        (
-                            handler.clone(),
-                            json!({
-                                "backend": config.backend,
-                                "backendOptions": config.backend_options,
-                                "runtimePath": config.runtime_path,
-                                "runtimeConfigPath": config.runtime_config_path,
-                                "runtimeRoot": config.runtime_root,
-                                "platformRuntimePaths": config.platform_runtime_paths,
-                                "monitorPath": config.monitor_path,
-                                "monitorCgroup": config.monitor_cgroup,
-                                "monitorEnv": config.monitor_env,
-                                "streamWebsockets": config.stream_websockets,
-                                "runtimeDetectedFeatures": self
-                                    .runtime
-                                    .runtime_for_handler(handler)
-                                    .map(|runtime| serde_json::to_value(runtime.probe_runtime_features()).unwrap_or_else(|_| json!({"available": false, "error": "failed to encode runtime feature probe"})))
-                                    .unwrap_or_else(|err| json!({
-                                        "available": false,
-                                        "error": format!("failed to resolve runtime handler: {}", err),
-                                    })),
-                                "allowedAnnotations": config.allowed_annotations,
-                                "defaultAnnotations": config.default_annotations,
-                                "privilegedWithoutHostDevices": config.privileged_without_host_devices,
-                                "privilegedWithoutHostDevicesAllDevicesAllowed": config
-                                    .privileged_without_host_devices_all_devices_allowed,
-                                "containerCreateTimeoutSeconds": config.container_create_timeout,
-                                "snapshotter": config.snapshotter,
-                                "cniConfDir": self
-                                    .config
-                                    .cni_config
-                                    .handler_config_dirs(handler)
-                                    .and_then(|dirs| dirs.first())
-                                    .map(|dir| dir.to_string_lossy().to_string()),
-                                "cniMaxConfNum": self
-                                    .config
-                                    .cni_config
-                                    .handler_max_conf_num(handler)
-                                    .unwrap_or(self.config.cni_config.max_conf_num()),
-                            }),
-                        )
-                    })
-                    .collect::<serde_json::Map<String, serde_json::Value>>(),
-                "workloads": self
-                    .config
-                    .workloads
-                    .iter()
-                    .map(|(name, workload)| {
-                        (
-                            name.clone(),
-                            json!({
-                                "activationAnnotation": workload.activation_annotation,
-                                "annotationPrefix": workload.annotation_prefix,
-                                "allowedAnnotations": workload.allowed_annotations,
-                                "resources": {
-                                    "cpuShares": workload.resources.cpu_shares,
-                                    "cpuQuota": workload.resources.cpu_quota,
-                                    "cpuPeriod": workload.resources.cpu_period,
-                                    "cpusetCpus": workload.resources.cpuset_cpus,
-                                    "cpuLimit": workload.resources.cpu_limit,
-                                },
-                            }),
-                        )
-                    })
-                    .collect::<serde_json::Map<String, serde_json::Value>>(),
+                    .internal_services
+                    .introspection
+                    .runtime_handler_configs(&self.config, runtime_detected_features),
+                "workloads": self.internal_services.introspection.workloads(&self.config),
                 "execSyncIoDrainTimeoutMillis": self.config.exec_sync_io_drain_timeout.as_millis(),
                 "streaming": {
                     "address": self.config.streaming.address.clone(),
@@ -1238,8 +1164,8 @@ impl RuntimeServiceImpl {
                         .port_forward_idle_timeout
                         .as_secs(),
                 },
-                "runtimeFeatures": self.runtime_feature_flags(),
-                "securityAvailability": self.security_availability_info(),
+                "runtimeFeatures": runtime_feature_flags.clone(),
+                "securityAvailability": security_availability.clone(),
                 "internalServices": {
                     "events": {
                         "subscriberCount": self.internal_services.events.subscriber_count(),
@@ -1254,8 +1180,8 @@ impl RuntimeServiceImpl {
                             last_recovery_result.as_ref(),
                         ),
                         "featureFlags": self.internal_services.introspection.feature_flags(
-                            self.runtime_feature_flags(),
-                            self.security_availability_info(),
+                            runtime_feature_flags.clone(),
+                            security_availability.clone(),
                             &self.nri_config,
                             resource_class_support.clone(),
                         ),
@@ -1298,110 +1224,24 @@ impl RuntimeServiceImpl {
                 "networkReady": network_condition.ready,
                 "networkReason": network_condition.reason.clone(),
                 "cgroupDriver": self.cgroup_driver().as_str_name(),
-                "cgroupSupport": {
-                    "activeVersion": Self::detected_cgroup_version(),
-                    "resourceUpdateStrategy": "runtime-update-resources",
-                    "disableCgroup": self.config.disable_cgroup,
-                    "tolerateMissingHugetlbController": self.config.tolerate_missing_hugetlb_controller,
-                    "resourceClasses": {
-                        "blockio": {
-                            "supported": resource_class_support.blockio_supported,
-                            "configPath": resource_class_support
-                                .blockio_config_path
-                                .as_ref()
-                                .map(|path| path.display().to_string())
-                                .unwrap_or_default(),
-                            "softFailure": "drop-class-when-config-missing",
-                        },
-                        "rdt": {
-                            "supported": resource_class_support.rdt_supported,
-                            "resctrlPath": resource_class_support.rdt_resctrl_path.display().to_string(),
-                            "softFailure": "drop-class-when-resctrl-missing",
-                        },
+                "cgroupSupport": self.internal_services.introspection.cgroup_support(
+                    &self.config,
+                    Self::detected_cgroup_version(),
+                    resource_class_support,
+                ),
+                "recovery": self.internal_services.introspection.recovery_status(
+                    crate::services::introspection::RecoveryStatusInput {
+                        config: &self.config,
+                        last_startup_clean_shutdown: self.last_startup_clean_shutdown(),
+                        last_startup_detected_reboot: self.last_startup_detected_reboot(),
+                        last_startup_detected_upgrade: self.last_startup_detected_upgrade(),
+                        last_startup_attempted_repair: self.last_startup_attempted_repair(),
+                        last_startup_repair_succeeded: self.last_startup_repair_succeeded(),
+                        last_recovery_result: last_recovery_result.as_ref(),
+                        ledger_summary: recovery_ledger_summary.as_ref(),
+                        ledger_summary_error: recovery_ledger_summary_error.as_deref(),
                     },
-                    "drivers": {
-                        "systemd": {
-                            "supported": true,
-                            "monitorCgroup": {
-                                "default": "system.slice",
-                                "acceptedValues": ["", "pod", "*.slice"],
-                            },
-                            "resourceUpdatePath": "runtime update --resources",
-                        },
-                        "cgroupfs": {
-                            "supported": true,
-                            "monitorCgroup": {
-                                "default": "",
-                                "acceptedValues": ["", "pod"],
-                            },
-                            "resourceUpdatePath": "runtime update --resources",
-                        },
-                    },
-                    "versions": {
-                        "v1": {
-                            "supported": true,
-                            "hierarchyMode": "legacy",
-                            "hugetlbBehavior": if self.config.tolerate_missing_hugetlb_controller {
-                                "best-effort"
-                            } else {
-                                "required"
-                            },
-                        },
-                        "v2": {
-                            "supported": true,
-                            "hierarchyMode": "unified",
-                            "hugetlbBehavior": if self.config.tolerate_missing_hugetlb_controller {
-                                "best-effort"
-                            } else {
-                                "required"
-                            },
-                        },
-                    },
-                },
-                "recovery": {
-                    "enabled": true,
-                    "startupReconcile": true,
-                    "eventReplayOnRecovery": false,
-                    "lastStartupWasCleanShutdown": self.last_startup_clean_shutdown(),
-                    "lastStartupDetectedReboot": self.last_startup_detected_reboot(),
-                    "lastStartupDetectedUpgrade": self.last_startup_detected_upgrade(),
-                    "lastStartupAttemptedRepair": self.last_startup_attempted_repair(),
-                    "lastStartupRepairSucceeded": self.last_startup_repair_succeeded(),
-                    "lastRecoveryResult": last_recovery_result,
-                    "ledgerSummary": recovery_ledger_summary,
-                    "ledgerSummaryError": recovery_ledger_summary_error,
-                    "internalWipe": self.config.internal_wipe,
-                    "internalRepair": self.config.internal_repair,
-                    "policy": {
-                        "startupInputs": [
-                            "cleanShutdownFile",
-                            "versionFile",
-                            "versionFilePersist",
-                            "internalWipe",
-                            "internalRepair",
-                        ],
-                        "wipeTriggers": [
-                            "unclean-shutdown",
-                            "reboot",
-                            "upgrade",
-                        ],
-                        "wipeScope": [
-                            "orphanRuntimeBundles",
-                            "orphanShimArtifacts",
-                            "orphanAttachArtifacts",
-                            "orphanPodWorkspaces",
-                        ],
-                        "repairTriggers": [
-                            "unclean-shutdown",
-                        ],
-                        "repairScope": "sqlite-persistence-only",
-                        "repairActions": [
-                            "integrity-check",
-                            "reindex",
-                            "vacuum",
-                        ],
-                    },
-                },
+                ),
             });
             let mut info = HashMap::new();
             info.insert(
