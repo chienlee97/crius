@@ -756,7 +756,7 @@ impl DefaultNetworkManager {
                 .collect(),
             cni_runtime_handler_max_conf_nums: cni.runtime_handler_max_conf_nums.clone(),
             cni_default_network_name: cni.default_network_name().map(ToOwned::to_owned),
-            namespace_manager: NamespaceManager::new(cni.netns_mount_dir().to_path_buf()),
+            namespace_manager: cni.namespace_manager(),
             rootless: cni.rootless.clone(),
             rootless_processes: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -785,6 +785,18 @@ impl DefaultNetworkManager {
             interfaces: Vec::new(),
             raw_result: None,
         }
+    }
+
+    fn rootless_helper_manages_interface(&self) -> bool {
+        self.rootless
+            .as_ref()
+            .map(|rootless| {
+                matches!(
+                    rootless.mode,
+                    crate::rootless::NetworkMode::Slirp4netns | crate::rootless::NetworkMode::Pasta
+                )
+            })
+            .unwrap_or(false)
     }
 
     fn start_rootless_network_helper(
@@ -889,7 +901,9 @@ impl NetworkManager for DefaultNetworkManager {
         &self,
         request: NetworkSetupRequest<'_>,
     ) -> Result<NetworkStatus, NetworkError> {
-        self.ensure_loopback_up(request.netns).await?;
+        if !self.rootless_helper_manages_interface() {
+            self.ensure_loopback_up(request.netns).await?;
+        }
 
         if self.rootless.is_some() {
             return self.start_rootless_network_helper(request.pod_id, request.netns);

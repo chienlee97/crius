@@ -15,8 +15,10 @@ mod common;
 
 mod rootless_lifecycle {
     use std::collections::HashMap;
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use crius::config::ResolvedRuntimeHandlerConfig;
     use crius::image::{metadata_store::FilesystemImageMetadataStore, CriusImage};
@@ -24,8 +26,8 @@ mod rootless_lifecycle {
     use crius::proto::runtime::v1::{
         runtime_service_server::RuntimeService, ContainerConfig, ContainerMetadata,
         CreateContainerRequest, ImageSpec, LinuxPodSandboxConfig, LinuxSandboxSecurityContext,
-        NamespaceMode, NamespaceOption, PodSandboxConfig, PodSandboxMetadata, RunPodSandboxRequest,
-        StartContainerRequest, StopContainerRequest,
+        NamespaceMode, NamespaceOption, PodSandboxConfig, PodSandboxMetadata,
+        RemovePodSandboxRequest, RunPodSandboxRequest, StartContainerRequest, StopContainerRequest,
     };
     use crius::rootless::{EffectiveRootlessConfig, NetworkMode, RootlessConfig};
     use crius::runtime::ShimConfig;
@@ -55,7 +57,11 @@ mod rootless_lifecycle {
         }
     }
 
-    fn rootless_runtime_config(temp: &Path, rootless: EffectiveRootlessConfig) -> RuntimeConfig {
+    fn rootless_runtime_config(
+        temp: &Path,
+        rootless: EffectiveRootlessConfig,
+        namespace_helper_path: Option<PathBuf>,
+    ) -> RuntimeConfig {
         let root_dir = temp.join("state");
         let runtime_root = rootless.runtime_root.join("containers");
         let runtime_path = temp.join("missing-runc");
@@ -66,6 +72,7 @@ mod rootless_lifecycle {
         let mut cni_config = CniConfig::default();
         cni_config.set_rootless_config(Some(rootless.clone()));
         cni_config.set_netns_mount_dir(rootless.netns_dir.clone());
+        cni_config.set_namespace_helper_path(namespace_helper_path);
 
         RuntimeConfig {
             root_dir: root_dir.clone(),
@@ -112,7 +119,7 @@ mod rootless_lifecycle {
         }
     }
 
-    fn pod_request(name: &str) -> RunPodSandboxRequest {
+    fn pod_request(name: &str, network_mode: NamespaceMode) -> RunPodSandboxRequest {
         RunPodSandboxRequest {
             config: Some(PodSandboxConfig {
                 metadata: Some(PodSandboxMetadata {
@@ -125,7 +132,7 @@ mod rootless_lifecycle {
                 linux: Some(LinuxPodSandboxConfig {
                     security_context: Some(LinuxSandboxSecurityContext {
                         namespace_options: Some(NamespaceOption {
-                            network: NamespaceMode::Node as i32,
+                            network: network_mode as i32,
                             pid: NamespaceMode::Pod as i32,
                             ipc: NamespaceMode::Pod as i32,
                             target_id: String::new(),
@@ -141,7 +148,7 @@ mod rootless_lifecycle {
         }
     }
 
-    fn container_request(pod_id: &str) -> CreateContainerRequest {
+    fn container_request(pod_id: &str, sandbox_config: PodSandboxConfig) -> CreateContainerRequest {
         CreateContainerRequest {
             pod_sandbox_id: pod_id.to_string(),
             config: Some(ContainerConfig {
@@ -158,7 +165,7 @@ mod rootless_lifecycle {
                 args: vec!["1".to_string()],
                 ..Default::default()
             }),
-            sandbox_config: Some(pod_request("rootless-life").config.unwrap()),
+            sandbox_config: Some(sandbox_config),
         }
     }
 
@@ -172,6 +179,81 @@ mod rootless_lifecycle {
                 ..Default::default()
             })
             .unwrap();
+    }
+
+    fn make_executable(path: &Path) {
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        fs::set_permissions(path, perms).unwrap();
+    }
+
+    fn write_namespace_helper(path: &Path, args_path: &Path) {
+        fs::write(
+            path,
+            format!(
+                r#"#!/bin/sh
+set -eu
+dir=""
+name=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -d)
+      dir="$2"
+      shift 2
+      ;;
+    -f)
+      name="$2"
+      shift 2
+      ;;
+    --net)
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '%s\n%s\n' "$dir" "$name" > "{}"
+mkdir -p "$dir/netns"
+: > "$dir/netns/$name"
+"#,
+                args_path.display()
+            ),
+        )
+        .unwrap();
+        make_executable(path);
+    }
+
+    fn write_rootless_network_helper(path: &Path, args_path: &Path, signal_path: &Path) {
+        fs::write(
+            path,
+            format!(
+                r#"#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "{}"
+trap 'printf terminated > "{}"; exit 0' TERM INT
+while true; do sleep 1; done
+"#,
+                args_path.display(),
+                signal_path.display()
+            ),
+        )
+        .unwrap();
+        make_executable(path);
+    }
+
+    async fn wait_for_file(path: &Path) {
+        for _ in 0..50 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for {}", path.display());
     }
 
     #[tokio::test]
@@ -191,27 +273,37 @@ mod rootless_lifecycle {
         let fake_backend = Arc::new(FakeRuntimeBackend::new(&runtime_root));
         seed_pause_image(&rootless.storage_root, &temp.path().join("state/crius.db"));
         let service = RuntimeServiceImpl::new_with_runtime_backends(
-            rootless_runtime_config(temp.path(), rootless.clone()),
+            rootless_runtime_config(temp.path(), rootless.clone(), None),
             HashMap::from([(
                 "runc".to_string(),
                 fake_backend.clone() as Arc<dyn crius::runtime::RuntimeBackend>,
             )]),
         );
 
-        let pod_id =
-            RuntimeService::run_pod_sandbox(&service, Request::new(pod_request("rootless-life")))
-                .await
-                .unwrap()
-                .into_inner()
-                .pod_sandbox_id;
+        let sandbox_config = pod_request("rootless-life", NamespaceMode::Node)
+            .config
+            .unwrap();
+        let pod_id = RuntimeService::run_pod_sandbox(
+            &service,
+            Request::new(RunPodSandboxRequest {
+                config: Some(sandbox_config.clone()),
+                runtime_handler: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .pod_sandbox_id;
         assert!(!pod_id.is_empty());
 
-        let container_id =
-            RuntimeService::create_container(&service, Request::new(container_request(&pod_id)))
-                .await
-                .unwrap()
-                .into_inner()
-                .container_id;
+        let container_id = RuntimeService::create_container(
+            &service,
+            Request::new(container_request(&pod_id, sandbox_config)),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
         RuntimeService::start_container(
             &service,
             Request::new(StartContainerRequest {
@@ -263,6 +355,118 @@ mod rootless_lifecycle {
             container_id,
             timeout: Some(30)
         }));
+    }
+
+    #[tokio::test]
+    async fn rootless_slirp4netns_lifecycle_starts_and_stops_helper_under_xdg() {
+        let temp = tempfile::tempdir().unwrap();
+        let xdg_runtime_dir = temp.path().join("xdg-runtime");
+        let xdg_data_home = temp.path().join("xdg-data");
+        let helper_dir = temp.path().join("helpers");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let namespace_helper = helper_dir.join("pinns");
+        let namespace_args = temp.path().join("namespace.args");
+        let slirp_helper = helper_dir.join("slirp4netns");
+        let slirp_args = temp.path().join("slirp.args");
+        let slirp_signal = temp.path().join("slirp.signal");
+        write_namespace_helper(&namespace_helper, &namespace_args);
+        write_rootless_network_helper(&slirp_helper, &slirp_args, &slirp_signal);
+
+        let rootless = EffectiveRootlessConfig::resolve(&RootlessConfig {
+            enabled: true,
+            xdg_runtime_dir: xdg_runtime_dir.display().to_string(),
+            xdg_data_home: xdg_data_home.display().to_string(),
+            network_mode: NetworkMode::Slirp4netns,
+            slirp4netns_path: slirp_helper.display().to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let runtime_root = rootless.runtime_root.join("containers");
+        let fake_backend = Arc::new(FakeRuntimeBackend::new(&runtime_root));
+        seed_pause_image(&rootless.storage_root, &temp.path().join("state/crius.db"));
+        let service = RuntimeServiceImpl::new_with_runtime_backends(
+            rootless_runtime_config(
+                temp.path(),
+                rootless.clone(),
+                Some(namespace_helper.clone()),
+            ),
+            HashMap::from([(
+                "runc".to_string(),
+                fake_backend.clone() as Arc<dyn crius::runtime::RuntimeBackend>,
+            )]),
+        );
+
+        let sandbox_config = pod_request("rootless-slirp", NamespaceMode::Pod)
+            .config
+            .unwrap();
+        let pod_id = RuntimeService::run_pod_sandbox(
+            &service,
+            Request::new(RunPodSandboxRequest {
+                config: Some(sandbox_config.clone()),
+                runtime_handler: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .pod_sandbox_id;
+        assert!(!pod_id.is_empty());
+        wait_for_file(&slirp_args).await;
+
+        let container_id = RuntimeService::create_container(
+            &service,
+            Request::new(container_request(&pod_id, sandbox_config)),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+        RuntimeService::start_container(
+            &service,
+            Request::new(StartContainerRequest {
+                container_id: container_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        RuntimeService::stop_container(
+            &service,
+            Request::new(StopContainerRequest {
+                container_id: container_id.clone(),
+                timeout: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        RuntimeService::remove_pod_sandbox(
+            &service,
+            Request::new(RemovePodSandboxRequest {
+                pod_sandbox_id: pod_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        wait_for_file(&slirp_signal).await;
+
+        let netns_name = "crius-default-rootless-slirp";
+        assert_eq!(
+            fs::read_to_string(namespace_args).unwrap(),
+            format!("{}\n{}\n", rootless.runtime_root.display(), netns_name)
+        );
+        let slirp_args = fs::read_to_string(slirp_args).unwrap();
+        let netns_path = rootless.netns_dir.join(netns_name);
+        assert!(slirp_args.contains("--netns-type=path"));
+        assert!(slirp_args.contains("--disable-host-loopback"));
+        assert!(slirp_args.contains(&netns_path.display().to_string()));
+        assert!(netns_path.starts_with(&xdg_runtime_dir));
+        assert!(rootless.storage_root.starts_with(&xdg_data_home));
+        assert!(!rootless.netns_dir.starts_with("/var/run/netns"));
+
+        let calls = fake_backend.calls();
+        assert!(calls.contains(&FakeRuntimeCall::CreateContainer {
+            container_id: format!("pause-{pod_id}")
+        }));
+        assert!(calls.contains(&FakeRuntimeCall::StartContainer { container_id }));
     }
 }
 
