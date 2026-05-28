@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::image::snapshotter::RootfsHandle;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +22,8 @@ pub struct CreateTaskRequest {
     pub snapshot_key: Option<String>,
     #[serde(default)]
     pub mount_options: Vec<String>,
+    #[serde(default)]
+    pub rootfs: Option<RootfsHandle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

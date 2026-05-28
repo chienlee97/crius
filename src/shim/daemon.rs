@@ -171,6 +171,7 @@ struct ShimRootfsHandle {
     snapshot_key: Option<String>,
     rootfs_path: PathBuf,
     mount_options: Vec<String>,
+    rootfs: Option<crate::image::snapshotter::RootfsHandle>,
 }
 
 pub struct DaemonOptions {
@@ -361,6 +362,7 @@ impl Daemon {
             snapshot_key: request.snapshot_key.clone(),
             rootfs_path: request.rootfs_path.clone(),
             mount_options: request.mount_options.clone(),
+            rootfs: request.rootfs.clone(),
         });
         let Some(snapshot_key) = request.snapshot_key.as_deref() else {
             return Ok(());
@@ -407,11 +409,12 @@ impl Daemon {
 
         if let Some(handle) = stored.as_ref() {
             debug!(
-                "Deleted shim rootfs handle for container {} snapshot {:?} rootfs {} mount options {:?}",
+                "Deleted shim rootfs handle for container {} snapshot {:?} rootfs {} mount options {:?} rootfs {:?}",
                 self.container_id,
                 handle.snapshot_key,
                 handle.rootfs_path.display(),
-                handle.mount_options
+                handle.mount_options,
+                handle.rootfs
             );
         }
 

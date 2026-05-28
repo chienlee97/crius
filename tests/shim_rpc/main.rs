@@ -106,6 +106,13 @@ fn create_task_request_carries_rootfs_snapshot_handle() {
             rootfs_path: dir.path().join("rootfs"),
             snapshot_key: Some("snapshot-1".to_string()),
             mount_options: vec!["rw".to_string(), "rprivate".to_string()],
+            rootfs: Some(crius::image::snapshotter::RootfsHandle::internal_path(
+                "snapshot-1",
+                "container",
+                "container-1",
+                dir.path().join("rootfs"),
+                false,
+            )),
         }))
         .unwrap();
 
@@ -118,5 +125,7 @@ fn create_task_request_carries_rootfs_snapshot_handle() {
                 && request.snapshot_key.as_deref() == Some("snapshot-1")
                 && request.rootfs_path == dir.path().join("rootfs")
                 && request.mount_options == ["rw", "rprivate"]
+                && request.rootfs.as_ref().and_then(|rootfs| rootfs.rootfs_path())
+                    == Some(dir.path().join("rootfs").as_path())
     ));
 }

@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::image::snapshotter::RootfsHandle;
 use crate::proto::runtime::v1::LinuxContainerResources;
 use crate::services::{InternalEvent, InternalEventSeverity, LedgerInternalEventSink};
 use crate::shim_rpc::{
@@ -615,6 +616,7 @@ impl ShimManager {
         rootfs_path: &Path,
         snapshot_key: Option<&str>,
         mount_options: Vec<String>,
+        rootfs: RootfsHandle,
     ) -> Result<()> {
         self.start_shim(container_id, bundle_path)?;
         let response = self
@@ -624,6 +626,7 @@ impl ShimManager {
                 rootfs_path: rootfs_path.to_path_buf(),
                 snapshot_key: snapshot_key.map(ToOwned::to_owned),
                 mount_options,
+                rootfs: Some(rootfs),
             }))?;
         ensure_empty_response("create_task", response)
     }

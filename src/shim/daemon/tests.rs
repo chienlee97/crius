@@ -91,6 +91,13 @@ fn shim_daemon_owns_rootfs_snapshot_lifecycle() {
             rootfs_path: rootfs.clone(),
             snapshot_key: Some("ctr1".to_string()),
             mount_options: vec!["rw".to_string()],
+            rootfs: Some(crate::image::snapshotter::RootfsHandle::internal_path(
+                "ctr1",
+                "container",
+                "ctr1",
+                rootfs.clone(),
+                false,
+            )),
         }))
         .unwrap();
 

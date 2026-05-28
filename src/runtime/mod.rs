@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::cgroups::{to_oci_resources, CgroupManager, CpuLimit, MemoryLimit, ResourceLimits};
 use crate::config::CgroupDriverConfig;
+use crate::image::snapshotter::{RootfsHandle, RootfsHandleKind};
 use crate::oci::spec::{
     Linux, LinuxCapabilities, LinuxPids, LinuxResources, Mount, Namespace as OciNamespace, Process,
     Rlimit, Root, Spec, User,
@@ -178,17 +179,95 @@ impl ImageVolumesMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootfsSnapshotter {
     InternalOverlayUntar,
     InternalCachedRootfs,
+    External(String),
 }
 
 impl RootfsSnapshotter {
     pub fn from_config(value: &str) -> Self {
         match value.trim() {
             "internal-cached-rootfs" => Self::InternalCachedRootfs,
-            _ => Self::InternalOverlayUntar,
+            "" | "internal-overlay-untar" => Self::InternalOverlayUntar,
+            other => Self::External(other.to_string()),
+        }
+    }
+
+    pub fn as_config_name(&self) -> &str {
+        match self {
+            Self::InternalOverlayUntar => "internal-overlay-untar",
+            Self::InternalCachedRootfs => "internal-cached-rootfs",
+            Self::External(name) => name.as_str(),
+        }
+    }
+
+    pub fn is_external(&self) -> bool {
+        matches!(self, Self::External(_))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedRootfsMount {
+    pub key: String,
+    pub mountpoint: PathBuf,
+    pub readonly: bool,
+    pub handle: RootfsHandle,
+}
+
+impl From<crate::image::snapshotter::MountView> for PreparedRootfsMount {
+    fn from(value: crate::image::snapshotter::MountView) -> Self {
+        Self {
+            key: value.key,
+            mountpoint: value.mountpoint,
+            readonly: value.readonly,
+            handle: value.rootfs,
+        }
+    }
+}
+
+impl PreparedRootfsMount {
+    fn internal_path(snapshot_key: String, mountpoint: PathBuf, readonly: bool) -> Self {
+        Self {
+            key: snapshot_key.clone(),
+            mountpoint: mountpoint.clone(),
+            readonly,
+            handle: RootfsHandle::internal_path(
+                snapshot_key.clone(),
+                "container",
+                snapshot_key,
+                mountpoint,
+                readonly,
+            ),
+        }
+    }
+
+    fn rootfs_path(&self) -> Result<&Path> {
+        self.handle.rootfs_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "rootfs handle {:?} for snapshot {} has no rootfs path",
+                self.handle.kind,
+                self.key
+            )
+        })
+    }
+
+    fn mount_options(&self) -> Vec<String> {
+        match self.handle.kind {
+            RootfsHandleKind::InternalPath => {
+                if self.readonly {
+                    vec!["ro".to_string()]
+                } else {
+                    Vec::new()
+                }
+            }
+            RootfsHandleKind::ExternalMountSpec => self
+                .handle
+                .mounts
+                .iter()
+                .flat_map(|mount| mount.options.clone())
+                .collect(),
         }
     }
 }
@@ -2296,12 +2375,17 @@ impl RuncRuntime {
         image_ref: &str,
         rootfs_dir: &Path,
         container_id: &str,
-    ) -> Result<crate::image::snapshotter::MountView> {
+    ) -> Result<PreparedRootfsMount> {
         use crate::image::snapshotter::{FilesystemSnapshotter, SnapshotMode, Snapshotter};
 
-        let mode = match self.rootfs_snapshotter {
+        let mode = match &self.rootfs_snapshotter {
             RootfsSnapshotter::InternalOverlayUntar => SnapshotMode::InternalOverlayUntar,
             RootfsSnapshotter::InternalCachedRootfs => SnapshotMode::InternalCachedRootfs,
+            RootfsSnapshotter::External(name) => {
+                return Err(anyhow::anyhow!(
+                    "external snapshotter {name} has no mount spec provider attached"
+                ))
+            }
         };
         let snapshotter = FilesystemSnapshotter::new(
             mode,
@@ -2320,13 +2404,13 @@ impl RuncRuntime {
         snapshotter.prepare(container_id, image_ref, rootfs_dir)?;
         self.ensure_minimum_rootfs_layout(image_ref, rootfs_dir)?;
         let mount = if self.state_db_path.is_some() {
-            snapshotter.mount(container_id)?
+            PreparedRootfsMount::from(snapshotter.mount(container_id)?)
         } else {
-            crate::image::snapshotter::MountView {
-                key: container_id.to_string(),
-                mountpoint: rootfs_dir.to_path_buf(),
-                readonly: false,
-            }
+            PreparedRootfsMount::internal_path(
+                container_id.to_string(),
+                rootfs_dir.to_path_buf(),
+                false,
+            )
         };
         info!(
             "Prepared rootfs for container {} from image {} via snapshotter",
@@ -2627,16 +2711,24 @@ impl RuncRuntime {
                 bundle_path.display()
             ));
         }
+        let rootfs_path = self
+            .rootfs_cleanup_target_from_bundle(container_id)
+            .unwrap_or_else(|| bundle_path.join("rootfs"));
 
         shim_manager
             .create_task(
                 container_id,
                 &bundle_path,
-                &self
-                    .rootfs_cleanup_target_from_bundle(container_id)
-                    .unwrap_or_else(|| bundle_path.join("rootfs")),
+                &rootfs_path,
                 Some(container_id),
                 Vec::new(),
+                RootfsHandle::internal_path(
+                    container_id.to_string(),
+                    "container",
+                    container_id.to_string(),
+                    rootfs_path.clone(),
+                    false,
+                ),
             )
             .context("failed to restore shim for attach recovery")?;
         Ok(())
@@ -3426,7 +3518,7 @@ impl RuncRuntime {
         &self,
         container_id: &str,
         config: &ContainerConfig,
-    ) -> Result<crate::image::snapshotter::MountView> {
+    ) -> Result<PreparedRootfsMount> {
         let checkpoint_restore = Self::checkpoint_restore_from_annotations(&config.annotations);
         let image_ref = checkpoint_restore
             .as_ref()
@@ -3644,17 +3736,14 @@ impl ContainerRuntime for RuncRuntime {
         info!("Container {} bundle prepared successfully", container_id);
         if let Some(ref shim_manager) = self.shim_manager {
             let bundle_path = self.bundle_path(container_id);
-            let mount_options = if rootfs_mount.readonly {
-                vec!["ro".to_string()]
-            } else {
-                Vec::new()
-            };
+            let rootfs_path = rootfs_mount.rootfs_path()?.to_path_buf();
             shim_manager.create_task(
                 container_id,
                 &bundle_path,
-                &rootfs_mount.mountpoint,
+                &rootfs_path,
                 Some(&rootfs_mount.key),
-                mount_options,
+                rootfs_mount.mount_options(),
+                rootfs_mount.handle.clone(),
             )?;
         }
         Ok(container_id.to_string())

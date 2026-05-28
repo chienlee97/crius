@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::content_store::FsContentStore;
 use super::metadata_store::FilesystemImageMetadataStore;
@@ -205,6 +205,7 @@ pub struct MountView {
     pub key: String,
     pub mountpoint: PathBuf,
     pub readonly: bool,
+    pub rootfs: RootfsHandle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +220,87 @@ pub struct SnapshotInfo {
 pub struct SnapshotUsage {
     pub used_bytes: u64,
     pub inodes_used: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootfsHandleKind {
+    InternalPath,
+    ExternalMountSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootfsOwner {
+    pub kind: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootfsMountSpec {
+    #[serde(rename = "type")]
+    pub mount_type: String,
+    pub source: PathBuf,
+    pub target: PathBuf,
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootfsHandle {
+    pub kind: RootfsHandleKind,
+    pub snapshot_key: Option<String>,
+    pub owner: RootfsOwner,
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub mounts: Vec<RootfsMountSpec>,
+    pub readonly: bool,
+}
+
+impl RootfsHandle {
+    pub fn internal_path(
+        snapshot_key: impl Into<String>,
+        owner_kind: impl Into<String>,
+        owner_id: impl Into<String>,
+        path: impl Into<PathBuf>,
+        readonly: bool,
+    ) -> Self {
+        Self {
+            kind: RootfsHandleKind::InternalPath,
+            snapshot_key: Some(snapshot_key.into()),
+            owner: RootfsOwner {
+                kind: owner_kind.into(),
+                id: owner_id.into(),
+            },
+            path: Some(path.into()),
+            mounts: Vec::new(),
+            readonly,
+        }
+    }
+
+    pub fn external_mount_spec(
+        snapshot_key: impl Into<String>,
+        owner_kind: impl Into<String>,
+        owner_id: impl Into<String>,
+        target: impl Into<PathBuf>,
+        mounts: Vec<RootfsMountSpec>,
+        readonly: bool,
+    ) -> Self {
+        Self {
+            kind: RootfsHandleKind::ExternalMountSpec,
+            snapshot_key: Some(snapshot_key.into()),
+            owner: RootfsOwner {
+                kind: owner_kind.into(),
+                id: owner_id.into(),
+            },
+            path: Some(target.into()),
+            mounts,
+            readonly,
+        }
+    }
+
+    pub fn rootfs_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -431,11 +513,19 @@ impl Snapshotter for FilesystemSnapshotter {
                 mountpoint.display()
             ));
         }
-        self.save_snapshot_state(record, SnapshotState::Mounted)?;
+        self.save_snapshot_state(record.clone(), SnapshotState::Mounted)?;
+        let rootfs = RootfsHandle::internal_path(
+            key.to_string(),
+            record.owner_kind.clone(),
+            record.owner_id.clone(),
+            mountpoint.clone(),
+            false,
+        );
         Ok(MountView {
             key: key.to_string(),
             mountpoint,
             readonly: false,
+            rootfs,
         })
     }
 

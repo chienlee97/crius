@@ -679,6 +679,13 @@ impl Snapshotter for FakeSnapshotter {
             key: key.to_string(),
             mountpoint: snapshot.mountpoint.clone(),
             readonly: false,
+            rootfs: crius::image::snapshotter::RootfsHandle::internal_path(
+                key,
+                "container",
+                key,
+                snapshot.mountpoint.clone(),
+                false,
+            ),
         })
     }
 
