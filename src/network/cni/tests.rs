@@ -182,6 +182,47 @@ async fn load_network_configs_selects_default_network_deterministically() {
 }
 
 #[tokio::test]
+async fn load_network_configs_reports_loaded_networks_in_stable_order() {
+    let dir = tempdir().unwrap();
+    let config_dir = dir.path().join("net.d");
+    let plugin_dir = dir.path().join("bin");
+    tokio::fs::create_dir_all(&config_dir).await.unwrap();
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    tokio::fs::write(plugin_dir.join("bridge"), "#!/bin/sh\ncat >/dev/null\n")
+        .await
+        .unwrap();
+    let mut perms = std::fs::metadata(plugin_dir.join("bridge"))
+        .unwrap()
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(plugin_dir.join("bridge"), perms).unwrap();
+
+    tokio::fs::write(
+        config_dir.join("20-zeta.conf"),
+        r#"{"cniVersion":"0.4.0","name":"zeta-net","type":"bridge"}"#,
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        config_dir.join("10-alpha.conf"),
+        r#"{"cniVersion":"0.4.0","name":"alpha-net","type":"bridge"}"#,
+    )
+    .await
+    .unwrap();
+
+    let mut manager = CniManager::new(
+        vec![plugin_dir.display().to_string()],
+        vec![config_dir.display().to_string()],
+        dir.path().join("cache").display().to_string(),
+    )
+    .unwrap();
+    let status = manager.load_network_configs().await.unwrap();
+
+    assert_eq!(status.loaded_networks, vec!["alpha-net", "zeta-net"]);
+    assert_eq!(status.default_network_name.as_deref(), Some("alpha-net"));
+}
+
+#[tokio::test]
 async fn load_network_configs_honors_configured_default_network_name() {
     let dir = tempdir().unwrap();
     let config_dir = dir.path().join("net.d");

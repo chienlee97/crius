@@ -549,7 +549,13 @@ impl CniManager {
         discovered_files: Vec<String>,
         invalid_files: Vec<String>,
     ) -> CniLoadStatus {
-        let loaded_networks: Vec<String> = self.network_configs.keys().cloned().collect();
+        let loaded_networks: Vec<String> = self
+            .network_configs
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let declared_plugins: Vec<String> = self
             .network_configs
             .values()
