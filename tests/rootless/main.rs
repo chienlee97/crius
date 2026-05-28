@@ -179,6 +179,15 @@ fn rootless_baseline_keeps_runtime_storage_and_network_under_xdg() {
     assert!(!rootless.runtime_root.starts_with("/run/crius"));
 }
 
+fn parse_network_mode(value: &str) -> NetworkMode {
+    match value {
+        "none" => NetworkMode::None,
+        "slirp4netns" => NetworkMode::Slirp4netns,
+        "pasta" => NetworkMode::Pasta,
+        other => panic!("unsupported CRIUS_ROOTLESS_SOAK_NETWORK_MODE={other}"),
+    }
+}
+
 #[test]
 fn gated_rootless_soak_preflight_reports_environment_readiness() {
     if std::env::var("CRIUS_RUN_ROOTLESS_SOAK").ok().as_deref() != Some("1") {
@@ -186,43 +195,50 @@ fn gated_rootless_soak_preflight_reports_environment_readiness() {
         return;
     }
 
-    let mode = match std::env::var("CRIUS_ROOTLESS_SOAK_NETWORK_MODE")
-        .unwrap_or_else(|_| "pasta".to_string())
-        .as_str()
-    {
-        "none" => NetworkMode::None,
-        "slirp4netns" => NetworkMode::Slirp4netns,
-        "pasta" => NetworkMode::Pasta,
-        other => panic!("unsupported CRIUS_ROOTLESS_SOAK_NETWORK_MODE={other}"),
-    };
-    let config = RootlessConfig {
-        enabled: true,
-        network_mode: mode,
-        slirp4netns_path: std::env::var("CRIUS_ROOTLESS_SOAK_SLIRP4NETNS")
-            .unwrap_or_else(|_| "slirp4netns".to_string()),
-        pasta_path: std::env::var("CRIUS_ROOTLESS_SOAK_PASTA")
-            .unwrap_or_else(|_| "pasta".to_string()),
-        ..Default::default()
-    };
-    let rootless = EffectiveRootlessConfig::resolve(&config).unwrap();
-    let userns = rootless.user_namespace_status();
+    let modes = std::env::var("CRIUS_ROOTLESS_SOAK_NETWORK_MODES")
+        .unwrap_or_else(|_| "none,slirp4netns,pasta".to_string());
+    let modes = modes
+        .split(',')
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .map(parse_network_mode)
+        .collect::<Vec<_>>();
     assert!(
-        userns.ready,
-        "rootless soak requires a ready user namespace: {}",
-        userns.message
+        !modes.is_empty(),
+        "CRIUS_ROOTLESS_SOAK_NETWORK_MODES must name at least one mode"
     );
 
-    let helper = match rootless.network_mode {
-        NetworkMode::None => None,
-        NetworkMode::Slirp4netns => Some(rootless.slirp4netns_path.as_path()),
-        NetworkMode::Pasta => Some(rootless.pasta_path.as_path()),
-        NetworkMode::Rootlesskit => panic!("rootlesskit is not supported"),
-    };
-    if let Some(helper) = helper {
+    for mode in modes {
+        let config = RootlessConfig {
+            enabled: true,
+            network_mode: mode.clone(),
+            slirp4netns_path: std::env::var("CRIUS_ROOTLESS_SOAK_SLIRP4NETNS")
+                .unwrap_or_else(|_| "slirp4netns".to_string()),
+            pasta_path: std::env::var("CRIUS_ROOTLESS_SOAK_PASTA")
+                .unwrap_or_else(|_| "pasta".to_string()),
+            ..Default::default()
+        };
+        let rootless = EffectiveRootlessConfig::resolve(&config).unwrap();
+        let userns = rootless.user_namespace_status();
         assert!(
-            executable_exists(helper),
-            "rootless soak helper {} is missing or not executable",
-            helper.display()
+            userns.ready,
+            "rootless soak for {} requires a ready user namespace: {}",
+            rootless.network_mode.as_str(),
+            userns.message
         );
+
+        let helper = match rootless.network_mode {
+            NetworkMode::None => None,
+            NetworkMode::Slirp4netns => Some(rootless.slirp4netns_path.as_path()),
+            NetworkMode::Pasta => Some(rootless.pasta_path.as_path()),
+            NetworkMode::Rootlesskit => panic!("rootlesskit is not supported"),
+        };
+        if let Some(helper) = helper {
+            assert!(
+                executable_exists(helper),
+                "rootless soak helper {} is missing or not executable",
+                helper.display()
+            );
+        }
     }
 }
