@@ -1022,12 +1022,44 @@ impl RuntimeServiceImpl {
             return Ok(Response::new(StopContainerResponse {}));
         };
         self.ensure_container_loaded(&actual_container_id).await?;
-        let updated_container = self
+        self.publish_container_lifecycle_event(
+            &actual_container_id,
+            "stop_start",
+            crate::services::InternalEventSeverity::Info,
+            json!({ "timeout": timeout }),
+        )
+        .await;
+        let updated_container = match self
             .stop_container_internal(&actual_container_id, timeout)
-            .await?;
+            .await
+        {
+            Ok(container) => container,
+            Err(status) => {
+                self.publish_container_lifecycle_event(
+                    &actual_container_id,
+                    "stop_failed",
+                    crate::services::InternalEventSeverity::Error,
+                    json!({
+                        "code": format!("{:?}", status.code()),
+                        "message": status.message(),
+                    }),
+                )
+                .await;
+                return Err(status);
+            }
+        };
 
         log::info!("Container {} stopped", actual_container_id);
         if let Some(container) = updated_container {
+            self.publish_container_lifecycle_event(
+                &actual_container_id,
+                "stop_success",
+                crate::services::InternalEventSeverity::Info,
+                json!({
+                    "state": Self::runtime_state_name(container.state),
+                }),
+            )
+            .await;
             self.emit_container_event(
                 ContainerEventType::ContainerStoppedEvent,
                 &container,
@@ -1053,10 +1085,42 @@ impl RuntimeServiceImpl {
             return Ok(Response::new(RemoveContainerResponse {}));
         };
         self.ensure_container_loaded(&actual_container_id).await?;
-        let deleted_container = self.remove_container_internal(&actual_container_id).await?;
+        self.publish_container_lifecycle_event(
+            &actual_container_id,
+            "remove_start",
+            crate::services::InternalEventSeverity::Info,
+            serde_json::Value::Null,
+        )
+        .await;
+        let deleted_container = match self.remove_container_internal(&actual_container_id).await {
+            Ok(container) => container,
+            Err(status) => {
+                self.publish_container_lifecycle_event(
+                    &actual_container_id,
+                    "remove_failed",
+                    crate::services::InternalEventSeverity::Error,
+                    json!({
+                        "code": format!("{:?}", status.code()),
+                        "message": status.message(),
+                    }),
+                )
+                .await;
+                return Err(status);
+            }
+        };
 
         log::info!("Container {} removed", actual_container_id);
         if let Some(container) = deleted_container {
+            self.publish_container_lifecycle_event(
+                &actual_container_id,
+                "remove_success",
+                crate::services::InternalEventSeverity::Info,
+                json!({
+                    "podSandboxId": container.pod_sandbox_id,
+                    "previousState": Self::runtime_state_name(container.state),
+                }),
+            )
+            .await;
             self.emit_container_event(
                 ContainerEventType::ContainerDeletedEvent,
                 &container,
@@ -1469,6 +1533,17 @@ impl RuntimeServiceImpl {
         let mut container_name_guard = self
             .reserve_container_name_for_create(&container_id, &container_name_key)
             .await?;
+        self.publish_container_lifecycle_event(
+            &container_id,
+            "create_start",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "podSandboxId": pod_sandbox_id.clone(),
+                "name": container_metadata.name.clone(),
+                "attempt": container_metadata.attempt,
+            }),
+        )
+        .await;
 
         log::info!("Creating container with ID: {}", container_id);
         log::debug!("Container config: {:?}", config);
@@ -2355,6 +2430,19 @@ impl RuntimeServiceImpl {
         if let Err(err) = self.nri.post_create_container(nri_event.clone()).await {
             log::warn!("NRI PostCreateContainer failed for {}: {}", created_id, err);
         }
+        self.publish_container_lifecycle_event(
+            &created_id,
+            "create_success",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "podSandboxId": pod_sandbox_id,
+                "state": "created",
+                "runtimeHandler": runtime_handler,
+                "runtimeBackend": runtime_backend.backend_name(),
+                "imageRef": container_image_ref,
+            }),
+        )
+        .await;
         self.emit_container_event(
             ContainerEventType::ContainerCreatedEvent,
             &container,
@@ -2432,6 +2520,19 @@ impl RuntimeServiceImpl {
                 container.state,
             )
         };
+        self.publish_container_lifecycle_event(
+            &actual_container_id,
+            "start_start",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "podSandboxId": container_pod_id,
+                "previousState": Self::runtime_state_name(container_state),
+                "runtimeState": Self::runtime_state_name(Self::map_runtime_container_state(
+                    runtime_status_before_start.clone()
+                )),
+            }),
+        )
+        .await;
         if let Some(mode) = self
             .container_internal_state(&actual_container_id)
             .await
@@ -2462,10 +2563,21 @@ impl RuntimeServiceImpl {
                 }
                 runtime_state
             };
-            return Err(Self::start_container_precondition_error(
+            let status =
+                Self::start_container_precondition_error(&actual_container_id, effective_state);
+            self.publish_container_lifecycle_event(
                 &actual_container_id,
-                effective_state,
-            ));
+                "start_failed",
+                crate::services::InternalEventSeverity::Warning,
+                json!({
+                    "phase": "precondition",
+                    "state": Self::runtime_state_name(effective_state),
+                    "code": format!("{:?}", status.code()),
+                    "message": status.message(),
+                }),
+            )
+            .await;
+            return Err(status);
         }
 
         if matches!(
@@ -2484,10 +2596,21 @@ impl RuntimeServiceImpl {
                 .unwrap_or_else(|| {
                     Self::map_runtime_container_state(runtime_status_before_start.clone())
                 });
-            return Err(Self::start_container_precondition_error(
+            let status =
+                Self::start_container_precondition_error(&actual_container_id, effective_state);
+            self.publish_container_lifecycle_event(
                 &actual_container_id,
-                effective_state,
-            ));
+                "start_failed",
+                crate::services::InternalEventSeverity::Warning,
+                json!({
+                    "phase": "runtimePrecondition",
+                    "state": Self::runtime_state_name(effective_state),
+                    "code": format!("{:?}", status.code()),
+                    "message": status.message(),
+                }),
+            )
+            .await;
+            return Err(status);
         }
 
         let checkpoint_restore = {
@@ -2548,6 +2671,17 @@ impl RuntimeServiceImpl {
             let _ = self
                 .finalize_failed_container_start_state(&actual_container_id, final_runtime_status)
                 .await?;
+            self.publish_container_lifecycle_event(
+                &actual_container_id,
+                "start_failed",
+                crate::services::InternalEventSeverity::Error,
+                json!({
+                    "phase": "runtimeStart",
+                    "code": format!("{:?}", status.code()),
+                    "message": status.message(),
+                }),
+            )
+            .await;
             return Err(status);
         }
 
@@ -2586,9 +2720,20 @@ impl RuntimeServiceImpl {
             let _ = self
                 .finalize_failed_container_start_state(&actual_container_id, final_runtime_status)
                 .await?;
-            return Err(Status::internal(
-                "Container failed to reach a known runtime state after start",
-            ));
+            let status =
+                Status::internal("Container failed to reach a known runtime state after start");
+            self.publish_container_lifecycle_event(
+                &actual_container_id,
+                "start_failed",
+                crate::services::InternalEventSeverity::Error,
+                json!({
+                    "phase": "runtimeStatus",
+                    "code": format!("{:?}", status.code()),
+                    "message": status.message(),
+                }),
+            )
+            .await;
+            return Err(status);
         }
 
         if !matches!(final_runtime_status, ContainerStatus::Running) {
@@ -2610,10 +2755,22 @@ impl RuntimeServiceImpl {
                     .await;
                 }
             }
-            return Err(Status::internal(format!(
+            let status = Status::internal(format!(
                 "Container did not reach running state after start; runtime reported {}",
                 Self::runtime_state_name(Self::map_runtime_container_state(final_runtime_status))
-            )));
+            ));
+            self.publish_container_lifecycle_event(
+                &actual_container_id,
+                "start_failed",
+                crate::services::InternalEventSeverity::Error,
+                json!({
+                    "phase": "runtimeStatus",
+                    "code": format!("{:?}", status.code()),
+                    "message": status.message(),
+                }),
+            )
+            .await;
+            return Err(status);
         }
 
         {
@@ -2683,6 +2840,16 @@ impl RuntimeServiceImpl {
         }
 
         log::info!("Container {} started", container_id);
+        self.publish_container_lifecycle_event(
+            &actual_container_id,
+            "start_success",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "podSandboxId": container_pod_id,
+                "state": Self::runtime_state_name(observed_state),
+            }),
+        )
+        .await;
         if observed_state == ContainerState::ContainerCreated as i32
             || observed_state == ContainerState::ContainerRunning as i32
         {

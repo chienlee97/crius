@@ -273,6 +273,20 @@ async fn create_container_direct_task_backend_skips_oci_context() {
         .unwrap();
     assert_eq!(record.runtime_handler.as_deref(), Some("wasm"));
     assert_eq!(record.runtime_backend.as_deref(), Some("direct-task"));
+    let events = service
+        .internal_services
+        .events
+        .recent_internal_events("container", &response.container_id, 10)
+        .await
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "container.create_start"
+            && event.details["name"] == "direct-workload"));
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "container.create_success"
+            && event.details["runtimeBackend"] == "direct-task"));
 
     RuntimeService::start_container(
         &service,
@@ -1233,4 +1247,64 @@ async fn stop_and_remove_pod_are_idempotent_when_missing() {
     )
     .await;
     assert!(remove.is_ok());
+}
+
+#[tokio::test]
+async fn pod_lifecycle_internal_events_record_stop_and_remove() {
+    let (dir, service) = test_service_with_fake_runtime();
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            pause_container_id: Some("pause-lifecycle".to_string()),
+            netns_path: Some(dir.path().join("pod-lifecycle.netns").display().to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service.pod_sandboxes.lock().await.insert(
+        "pod-lifecycle".to_string(),
+        test_pod("pod-lifecycle", annotations),
+    );
+    set_fake_runtime_state(&dir, "pause-lifecycle", "running");
+
+    RuntimeService::stop_pod_sandbox(
+        &service,
+        Request::new(StopPodSandboxRequest {
+            pod_sandbox_id: "pod-lifecycle".to_string(),
+        }),
+    )
+    .await
+    .unwrap();
+    RuntimeService::remove_pod_sandbox(
+        &service,
+        Request::new(RemovePodSandboxRequest {
+            pod_sandbox_id: "pod-lifecycle".to_string(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let events = service
+        .internal_services
+        .events
+        .recent_internal_events("pod", "pod-lifecycle", 10)
+        .await
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "pod.stop_start"
+            && event.details["previousState"] == "ready"));
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "pod.stop_success"
+            && event.details["state"] == "notready"));
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "pod.remove_start"
+            && event.details["hadPod"] == true));
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "pod.remove_success"));
 }

@@ -69,6 +69,20 @@ async fn start_container_notifies_nri_before_and_after_runtime_start() {
         crate::nri_proto::api::ContainerState::CONTAINER_RUNNING
     );
     assert!(post_start_event.container.started_at > 0);
+    let events = service
+        .internal_services
+        .events
+        .recent_internal_events("container", "container-start", 10)
+        .await
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "container.start_start"
+            && event.details["previousState"] == "created"));
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "container.start_success"
+            && event.details["state"] == "running"));
 }
 
 #[tokio::test]
@@ -269,6 +283,17 @@ async fn start_container_rejects_repeated_start_for_running_container() {
         fake_nri.calls.lock().await.clone(),
         vec!["start_container", "post_start_container"]
     );
+    let events = service
+        .internal_services
+        .events
+        .recent_internal_events("container", "container-start-repeat", 10)
+        .await
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "container.start_failed"
+            && event.details["phase"] == "precondition"
+            && event.details["state"] == "running"));
 }
 
 #[tokio::test]
