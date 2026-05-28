@@ -1149,6 +1149,17 @@ impl<'a> StateLedgerWriter<'a> {
         self.persistence.storage_mut().append_typed_event_at(input)
     }
 
+    pub fn prune_events_for_subject(
+        &mut self,
+        subject_kind: &str,
+        subject_id: &str,
+        keep: usize,
+    ) -> Result<usize> {
+        self.persistence
+            .storage_mut()
+            .prune_events_for_subject(subject_kind, subject_id, keep)
+    }
+
     pub fn repair(
         &mut self,
         options: LedgerRepairOptions,

@@ -4,6 +4,7 @@ use tonic::Status;
 use crate::proto::runtime::v1::ContainerEventResponse;
 
 const MAX_INTERNAL_EVENT_DETAIL_BYTES: usize = 16 * 1024;
+const DEFAULT_INTERNAL_EVENT_RETENTION_PER_SUBJECT: usize = 256;
 const INTERNAL_EVENT_PREFIXES: &[&str] = &[
     "pod.",
     "container.",
@@ -42,6 +43,7 @@ pub struct EventService {
     internal_sender: tokio::sync::broadcast::Sender<InternalEvent>,
     ledger:
         Option<std::sync::Arc<tokio::sync::Mutex<crate::storage::persistence::PersistenceManager>>>,
+    internal_retention_per_subject: usize,
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -188,6 +190,7 @@ impl EventService {
             sender,
             internal_sender,
             ledger: None,
+            internal_retention_per_subject: DEFAULT_INTERNAL_EVENT_RETENTION_PER_SUBJECT,
         }
     }
 
@@ -197,6 +200,7 @@ impl EventService {
             sender,
             internal_sender,
             ledger: None,
+            internal_retention_per_subject: DEFAULT_INTERNAL_EVENT_RETENTION_PER_SUBJECT,
         }
     }
 
@@ -205,6 +209,11 @@ impl EventService {
         ledger: std::sync::Arc<tokio::sync::Mutex<crate::storage::persistence::PersistenceManager>>,
     ) -> Self {
         self.ledger = Some(ledger);
+        self
+    }
+
+    pub fn with_internal_retention_per_subject(mut self, keep: usize) -> Self {
+        self.internal_retention_per_subject = keep.max(1);
         self
     }
 
@@ -279,7 +288,13 @@ impl EventService {
             new_state: Some(event.severity.as_str()),
             details: event.details_for_ledger().as_deref(),
             timestamp: event.timestamp,
-        })
+        })?;
+        ledger.prune_events_for_subject(
+            &event.subject_kind,
+            &event.subject_id,
+            self.internal_retention_per_subject,
+        )?;
+        Ok(())
     }
 
     pub fn stream(&self) -> ReceiverStream<Result<ContainerEventResponse, Status>> {
@@ -576,5 +591,44 @@ mod tests {
             recent[0].details["maxBytes"],
             MAX_INTERNAL_EVENT_DETAIL_BYTES
         );
+    }
+
+    #[tokio::test]
+    async fn prunes_internal_events_per_subject_after_persisting() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+        let persistence = Arc::new(tokio::sync::Mutex::new(
+            PersistenceManager::new(PersistenceConfig {
+                db_path,
+                enable_recovery: true,
+                auto_save_interval: 30,
+            })
+            .unwrap(),
+        ));
+        let events = EventService::with_capacity(16)
+            .with_ledger(persistence)
+            .with_internal_retention_per_subject(2);
+
+        for index in 0..4 {
+            events
+                .publish_internal(InternalEvent::with_timestamp(
+                    "container.state",
+                    "container",
+                    "container-retained",
+                    InternalEventSeverity::Info,
+                    100 + index,
+                    serde_json::json!({ "index": index }),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let recent = events
+            .recent_internal_events("container", "container-retained", 10)
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].details["index"], 3);
+        assert_eq!(recent[1].details["index"], 2);
     }
 }

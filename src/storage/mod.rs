@@ -1934,6 +1934,31 @@ impl StorageManager {
         Ok(events)
     }
 
+    pub fn prune_events_for_subject(
+        &mut self,
+        entity_type: &str,
+        entity_id: &str,
+        keep: usize,
+    ) -> Result<usize> {
+        let keep = i64::try_from(keep).unwrap_or(i64::MAX);
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM events
+                 WHERE entity_type = ?1
+                   AND entity_id = ?2
+                   AND id NOT IN (
+                     SELECT id FROM events
+                     WHERE entity_type = ?1 AND entity_id = ?2
+                     ORDER BY timestamp DESC, id DESC
+                     LIMIT ?3
+                   )",
+                rusqlite::params![entity_type, entity_id, keep],
+            )
+            .context("Failed to prune events for subject")?;
+        Ok(deleted)
+    }
+
     /// 关闭数据库连接
     pub fn close(self) -> Result<()> {
         self.conn
