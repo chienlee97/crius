@@ -4,8 +4,8 @@ use std::fmt;
 use crate::runtime::ContainerStatus;
 use crate::storage::persistence::PersistenceManager;
 use crate::storage::{
-    ContainerRecord, ContentTransferRecord, ImageRecord, ImageRefRecord, PodSandboxRecord,
-    RuntimeArtifactRecord, ShimProcessRecord, SnapshotRecord, StateEvent,
+    ContainerRecord, ContentGcCandidate, ContentTransferRecord, ImageRecord, ImageRefRecord,
+    PodSandboxRecord, RuntimeArtifactRecord, ShimProcessRecord, SnapshotRecord, StateEvent,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +249,10 @@ impl<'a> StateLedger<'a> {
 
     pub fn content_transfers(&self) -> Result<Vec<ContentTransferRecord>> {
         self.persistence.list_content_transfer_records()
+    }
+
+    pub fn content_gc_candidates(&self) -> Result<Vec<ContentGcCandidate>> {
+        self.persistence.list_content_gc_candidates()
     }
 
     pub fn snapshots(&self) -> Result<Vec<SnapshotRecord>> {
@@ -665,6 +669,48 @@ mod tests {
         let events = ledger.recent_events("container", 0).unwrap();
         assert!(events.iter().any(|event| event.entity_id == "container-a"
             && event.details.as_deref() == Some("state-ledger-test")));
+    }
+
+    #[test]
+    fn state_ledger_exposes_content_gc_blockers() {
+        let temp_dir = tempdir().unwrap();
+        let mut persistence = PersistenceManager::new(PersistenceConfig {
+            db_path: temp_dir.path().join("content-gc.db"),
+            enable_recovery: true,
+            auto_save_interval: 30,
+        })
+        .unwrap();
+        {
+            let storage = persistence.storage_mut();
+            storage
+                .save_content_blob(&crate::storage::ContentBlobRecord {
+                    digest: "sha256:layer".to_string(),
+                    media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                    size: 100,
+                    relative_path: "blobs/sha256/la/yer".to_string(),
+                    created_at: 1,
+                    last_used_at: 1,
+                })
+                .unwrap();
+            storage
+                .replace_content_blob_refs(
+                    "snapshot",
+                    "snapshot-a",
+                    &[crate::storage::ContentBlobRefRecord {
+                        owner_kind: "snapshot".to_string(),
+                        owner_id: "snapshot-a".to_string(),
+                        digest: "sha256:layer".to_string(),
+                        ref_kind: "lower".to_string(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let ledger = StateLedger::new(&persistence);
+        let candidates = ledger.content_gc_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].blob.digest, "sha256:layer");
+        assert_eq!(candidates[0].blockers.len(), 1);
     }
 
     #[test]

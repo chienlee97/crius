@@ -26,6 +26,15 @@ fn content_blob_ref_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conten
     })
 }
 
+fn transfer_source_matches_blob(
+    transfer: &ContentTransferRecord,
+    blob: &ContentBlobRecord,
+) -> bool {
+    transfer.source == blob.digest
+        || transfer.source.contains(&blob.digest)
+        || (!blob.relative_path.is_empty() && transfer.source.contains(&blob.relative_path))
+}
+
 /// 容器记录
 #[derive(Debug, Clone)]
 pub struct ContainerRecord {
@@ -104,6 +113,25 @@ pub struct ContentBlobRecord {
     pub relative_path: String,
     pub created_at: i64,
     pub last_used_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentGcBlocker {
+    ContentRef {
+        owner_kind: String,
+        owner_id: String,
+        ref_kind: String,
+    },
+    ActiveTransfer {
+        transfer_id: String,
+        source: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ContentGcCandidate {
+    pub blob: ContentBlobRecord,
+    pub blockers: Vec<ContentGcBlocker>,
 }
 
 /// 内容 blob 引用记录
@@ -1255,6 +1283,58 @@ impl StorageManager {
         Ok(records)
     }
 
+    pub fn list_content_blobs(&self) -> Result<Vec<ContentBlobRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT digest, media_type, size, relative_path, created_at, last_used_at
+             FROM content_blobs",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                let size: i64 = row.get(2)?;
+                Ok(ContentBlobRecord {
+                    digest: row.get(0)?,
+                    media_type: row.get(1)?,
+                    size: size.max(0) as u64,
+                    relative_path: row.get(3)?,
+                    created_at: row.get(4)?,
+                    last_used_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list content blobs")?;
+        Ok(records)
+    }
+
+    pub fn list_content_gc_candidates(&self) -> Result<Vec<ContentGcCandidate>> {
+        let refs = self.list_content_blob_refs(None, None)?;
+        let transfers = self.list_content_transfers()?;
+        self.list_content_blobs()?
+            .into_iter()
+            .map(|blob| {
+                let mut blockers = refs
+                    .iter()
+                    .filter(|record| record.digest == blob.digest)
+                    .map(|record| ContentGcBlocker::ContentRef {
+                        owner_kind: record.owner_kind.clone(),
+                        owner_id: record.owner_id.clone(),
+                        ref_kind: record.ref_kind.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                blockers.extend(
+                    transfers
+                        .iter()
+                        .filter(|record| record.state == "running")
+                        .filter(|record| transfer_source_matches_blob(record, &blob))
+                        .map(|record| ContentGcBlocker::ActiveTransfer {
+                            transfer_id: record.id.clone(),
+                            source: record.source.clone(),
+                        }),
+                );
+                Ok(ContentGcCandidate { blob, blockers })
+            })
+            .collect()
+    }
+
     pub fn save_content_transfer(&mut self, record: &ContentTransferRecord) -> Result<()> {
         self.conn
             .execute(
@@ -2032,5 +2112,88 @@ mod tests {
             })
             .unwrap();
         assert!(manager.get_shim_process("container-1").unwrap().is_some());
+    }
+
+    #[test]
+    fn content_gc_candidates_report_refs_and_active_transfer_blockers() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let mut manager = StorageManager::new(&db_path).unwrap();
+
+        for digest in [
+            "sha256:shared",
+            "sha256:active",
+            "sha256:collectable",
+            "sha256:done",
+        ] {
+            manager
+                .save_content_blob(&ContentBlobRecord {
+                    digest: digest.to_string(),
+                    media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                    size: 10,
+                    relative_path: format!("blobs/sha256/{}", digest.trim_start_matches("sha256:")),
+                    created_at: 1,
+                    last_used_at: 1,
+                })
+                .unwrap();
+        }
+
+        manager
+            .replace_content_blob_refs(
+                "image",
+                "sha256:image-a",
+                &[ContentBlobRefRecord {
+                    owner_kind: "image".to_string(),
+                    owner_id: "sha256:image-a".to_string(),
+                    digest: "sha256:shared".to_string(),
+                    ref_kind: "layer".to_string(),
+                }],
+            )
+            .unwrap();
+        manager
+            .save_content_transfer(&ContentTransferRecord {
+                id: "transfer-active".to_string(),
+                source: "pull:sha256:active".to_string(),
+                provider: "registry".to_string(),
+                state: "running".to_string(),
+                current_stage: "downloading".to_string(),
+                bytes_total: 10,
+                bytes_completed: 5,
+                started_at: 2,
+                finished_at: None,
+                error: None,
+            })
+            .unwrap();
+        manager
+            .save_content_transfer(&ContentTransferRecord {
+                id: "transfer-done".to_string(),
+                source: "pull:sha256:done".to_string(),
+                provider: "registry".to_string(),
+                state: "succeeded".to_string(),
+                current_stage: "done".to_string(),
+                bytes_total: 10,
+                bytes_completed: 10,
+                started_at: 3,
+                finished_at: Some(4),
+                error: None,
+            })
+            .unwrap();
+
+        let candidates = manager.list_content_gc_candidates().unwrap();
+        let by_digest = candidates
+            .iter()
+            .map(|candidate| (candidate.blob.digest.as_str(), candidate))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert!(matches!(
+            by_digest["sha256:shared"].blockers.as_slice(),
+            [ContentGcBlocker::ContentRef { .. }]
+        ));
+        assert!(matches!(
+            by_digest["sha256:active"].blockers.as_slice(),
+            [ContentGcBlocker::ActiveTransfer { .. }]
+        ));
+        assert!(by_digest["sha256:collectable"].blockers.is_empty());
+        assert!(by_digest["sha256:done"].blockers.is_empty());
     }
 }

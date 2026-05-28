@@ -4,8 +4,8 @@
 
 use crate::runtime::ContainerStatus;
 use crate::storage::{
-    ContainerRecord, ContentTransferRecord, ImageRecord, ImageRefRecord, PodSandboxRecord,
-    RuntimeArtifactRecord, ShimProcessRecord, SnapshotRecord, StorageManager,
+    ContainerRecord, ContentGcCandidate, ContentTransferRecord, ImageRecord, ImageRefRecord,
+    PodSandboxRecord, RuntimeArtifactRecord, ShimProcessRecord, SnapshotRecord, StorageManager,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -299,6 +299,10 @@ impl PersistenceManager {
 
     pub fn list_content_transfer_records(&self) -> Result<Vec<ContentTransferRecord>> {
         self.storage.list_content_transfers()
+    }
+
+    pub fn list_content_gc_candidates(&self) -> Result<Vec<ContentGcCandidate>> {
+        self.storage.list_content_gc_candidates()
     }
 
     pub fn mark_running_content_transfers_interrupted(&mut self) -> Result<usize> {
