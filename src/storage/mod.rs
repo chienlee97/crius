@@ -2196,4 +2196,53 @@ mod tests {
         assert!(by_digest["sha256:collectable"].blockers.is_empty());
         assert!(by_digest["sha256:done"].blockers.is_empty());
     }
+
+    #[test]
+    fn shared_blob_stays_blocked_until_all_image_refs_are_removed() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let mut manager = StorageManager::new(&db_path).unwrap();
+        manager
+            .save_content_blob(&ContentBlobRecord {
+                digest: "sha256:shared-layer".to_string(),
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                size: 64,
+                relative_path: "blobs/sha256/shared-layer".to_string(),
+                created_at: 1,
+                last_used_at: 1,
+            })
+            .unwrap();
+        for image_id in ["sha256:image-a", "sha256:image-b"] {
+            manager
+                .replace_content_blob_refs(
+                    "image",
+                    image_id,
+                    &[ContentBlobRefRecord {
+                        owner_kind: "image".to_string(),
+                        owner_id: image_id.to_string(),
+                        digest: "sha256:shared-layer".to_string(),
+                        ref_kind: "layer".to_string(),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let blockers = |manager: &StorageManager| {
+            manager
+                .list_content_gc_candidates()
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.blob.digest == "sha256:shared-layer")
+                .unwrap()
+                .blockers
+                .len()
+        };
+        assert_eq!(blockers(&manager), 2);
+
+        manager.delete_image("sha256:image-a").unwrap();
+        assert_eq!(blockers(&manager), 1);
+
+        manager.delete_image("sha256:image-b").unwrap();
+        assert_eq!(blockers(&manager), 0);
+    }
 }

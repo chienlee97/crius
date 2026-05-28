@@ -1533,6 +1533,130 @@ async fn pull_image_persists_content_transfer_result_to_ledger() {
     assert!(transfers[0].finished_at.is_some());
 }
 
+#[tokio::test]
+async fn concurrent_pull_deduplicates_transfer_and_preserves_refs() {
+    let (_dir, service, ledger_db_path) = test_image_service_with_ledger_in_tempdir();
+    let calls = Arc::new(AtomicUsize::new(0));
+    service.set_test_pull_handler(Arc::new({
+        let calls = Arc::clone(&calls);
+        move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            Ok(TestPullResponse {
+                image_id: "sha256:concurrent-pull".to_string(),
+                size: TEST_EMPTY_LAYER_TAR_GZ.len() as u64,
+                ..Default::default()
+            })
+        }
+    }));
+
+    let request = || {
+        Request::new(PullImageRequest {
+            image: Some(ImageSpec {
+                image: "repo/concurrent-pull:latest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    };
+    let (first, second) = tokio::join!(
+        ImageService::pull_image(&service, request()),
+        ImageService::pull_image(&service, request()),
+    );
+
+    assert_eq!(
+        first.unwrap().into_inner().image_ref,
+        "sha256:concurrent-pull"
+    );
+    assert_eq!(
+        second.unwrap().into_inner().image_ref,
+        "sha256:concurrent-pull"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let storage = StorageManager::new(&ledger_db_path).unwrap();
+    let transfers = storage.list_content_transfers().unwrap();
+    assert_eq!(
+        transfers
+            .iter()
+            .filter(|record| record.state == "succeeded")
+            .count(),
+        1
+    );
+    let refs = storage
+        .list_image_refs(Some("sha256:concurrent-pull"))
+        .unwrap();
+    let unique_refs = refs
+        .iter()
+        .map(|record| {
+            (
+                record.reference.as_str(),
+                record.ref_kind.as_str(),
+                record.namespace.as_deref(),
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(refs.len(), unique_refs.len());
+    assert!(unique_refs.contains(&("docker.io/repo/concurrent-pull:latest", "tag", None)));
+}
+
+#[tokio::test]
+async fn retry_after_failed_pull_preserves_single_owner_ref_graph() {
+    let (_dir, service, ledger_db_path) = test_image_service_with_ledger_in_tempdir();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    service.set_test_pull_handler(Arc::new({
+        let attempts = Arc::clone(&attempts);
+        move |_| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Err(Status::internal("first pull failed"));
+            }
+            Ok(TestPullResponse {
+                image_id: "sha256:retry-graph".to_string(),
+                size: TEST_EMPTY_LAYER_TAR_GZ.len() as u64,
+                ..Default::default()
+            })
+        }
+    }));
+
+    let request = || {
+        Request::new(PullImageRequest {
+            image: Some(ImageSpec {
+                image: "repo/retry-graph:latest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    };
+
+    assert!(ImageService::pull_image(&service, request()).await.is_err());
+    ImageService::pull_image(&service, request()).await.unwrap();
+
+    let storage = StorageManager::new(&ledger_db_path).unwrap();
+    let transfers = storage.list_content_transfers().unwrap();
+    assert_eq!(transfers.len(), 2);
+    assert!(transfers.iter().any(|record| record.state == "failed"));
+    assert!(transfers.iter().any(|record| record.state == "succeeded"));
+
+    let refs = storage.list_image_refs(Some("sha256:retry-graph")).unwrap();
+    let unique_refs = refs
+        .iter()
+        .map(|record| {
+            (
+                record.reference.as_str(),
+                record.ref_kind.as_str(),
+                record.namespace.as_deref(),
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(refs.len(), unique_refs.len());
+    assert!(unique_refs.contains(&("docker.io/repo/retry-graph:latest", "tag", None)));
+    let blob_refs = storage
+        .list_content_blob_refs(Some("image"), Some("sha256:retry-graph"))
+        .unwrap();
+    assert_eq!(blob_refs.len(), 1);
+}
+
 #[test]
 fn image_service_marks_interrupted_transfer_on_startup() {
     let dir = tempdir().unwrap();
