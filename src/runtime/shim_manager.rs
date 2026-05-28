@@ -155,6 +155,10 @@ impl ShimManager {
         Ok(Some(StorageManager::new(&self.config.state_db_path)?))
     }
 
+    fn ledger_enabled(config: &ShimConfig) -> bool {
+        !config.state_db_path.as_os_str().is_empty()
+    }
+
     fn exit_code_file_path(&self, container_id: &str) -> PathBuf {
         self.config.container_exits_dir.join(container_id)
     }
@@ -277,7 +281,7 @@ impl ShimManager {
     }
 
     fn restore_processes_from_disk(config: &ShimConfig) -> Vec<ShimProcess> {
-        if !config.state_db_path.as_os_str().is_empty() {
+        if Self::ledger_enabled(config) {
             if let Ok(mut storage) = StorageManager::new(&config.state_db_path) {
                 if let Ok(records) = storage.list_shim_processes() {
                     let restored = records
@@ -334,6 +338,7 @@ impl ShimManager {
                     }
                 }
             }
+            return Vec::new();
         }
         let mut restored = Vec::new();
         let Ok(entries) = fs::read_dir(&config.work_dir) else {
@@ -872,7 +877,8 @@ impl ShimManager {
 
         let shim_pid = match removed.as_ref() {
             Some(process) => Some(process.shim_pid),
-            None => self.read_shim_pidfile(container_id)?,
+            None if !Self::ledger_enabled(&self.config) => self.read_shim_pidfile(container_id)?,
+            None => None,
         };
 
         if let Some(shim_pid) = shim_pid {
@@ -924,10 +930,12 @@ impl ShimManager {
                 false
             }
         } else {
-            self.read_shim_pidfile(container_id)
-                .ok()
-                .flatten()
-                .is_some_and(Self::process_exists)
+            !Self::ledger_enabled(&self.config)
+                && self
+                    .read_shim_pidfile(container_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(Self::process_exists)
         }
     }
 

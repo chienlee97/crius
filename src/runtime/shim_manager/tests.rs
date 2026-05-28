@@ -238,6 +238,93 @@ async fn test_shim_manager_restores_live_metadata_from_ledger() {
         && event.details["pidfileExists"] == false));
 }
 
+#[tokio::test]
+async fn test_shim_manager_uses_ledger_when_diagnostic_files_are_deleted() {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("crius.db");
+    let work_dir = temp_dir.path().join("shims");
+    let container_dir = work_dir.join("container-ledger-only");
+    fs::create_dir_all(&container_dir).unwrap();
+    fs::write(container_dir.join(SHIM_METADATA_FILE), "{}").unwrap();
+    fs::write(container_dir.join(SHIM_PIDFILE_NAME), "not-a-pid\n").unwrap();
+
+    let mut storage = StorageManager::new(&db_path).unwrap();
+    storage
+        .save_shim_process(&ShimProcessRecord {
+            container_id: "container-ledger-only".to_string(),
+            shim_pid: std::process::id(),
+            work_dir: work_dir.display().to_string(),
+            socket_path: temp_dir
+                .path()
+                .join("attach")
+                .join("container-ledger-only")
+                .join("attach.sock")
+                .display()
+                .to_string(),
+            exit_code_file: temp_dir
+                .path()
+                .join("exits")
+                .join("container-ledger-only")
+                .display()
+                .to_string(),
+            log_file: container_dir.join("shim.log").display().to_string(),
+            bundle_path: temp_dir.path().join("bundle").display().to_string(),
+            state: "running".to_string(),
+            last_seen_at: 1,
+        })
+        .unwrap();
+    fs::remove_file(container_dir.join(SHIM_METADATA_FILE)).unwrap();
+    fs::remove_file(container_dir.join(SHIM_PIDFILE_NAME)).unwrap();
+
+    let manager = ShimManager::new(ShimConfig {
+        work_dir,
+        attach_socket_dir: temp_dir.path().join("attach"),
+        container_exits_dir: temp_dir.path().join("exits"),
+        state_db_path: db_path,
+        ..Default::default()
+    });
+
+    let shims = manager.list_shims();
+    assert_eq!(shims.len(), 1);
+    assert_eq!(shims[0].container_id, "container-ledger-only");
+}
+
+#[test]
+fn test_shim_manager_does_not_restore_disk_metadata_when_ledger_is_configured() {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("crius.db");
+    StorageManager::new(&db_path).unwrap();
+    let work_dir = temp_dir.path().join("shims");
+    let container_dir = work_dir.join("disk-only");
+    let exits_dir = temp_dir.path().join("exits");
+    fs::create_dir_all(&container_dir).unwrap();
+    fs::create_dir_all(&exits_dir).unwrap();
+
+    let process = ShimProcess {
+        container_id: "disk-only".to_string(),
+        shim_pid: std::process::id(),
+        exit_code_file: exits_dir.join("disk-only"),
+        log_file: container_dir.join("shim.log"),
+        socket_path: container_dir.join("attach.sock"),
+        bundle_path: temp_dir.path().join("bundle"),
+    };
+    fs::write(
+        container_dir.join(SHIM_METADATA_FILE),
+        serde_json::to_vec_pretty(&process).unwrap(),
+    )
+    .unwrap();
+
+    let manager = ShimManager::new(ShimConfig {
+        work_dir,
+        attach_socket_dir: temp_dir.path().join("attach"),
+        container_exits_dir: exits_dir,
+        state_db_path: db_path,
+        ..Default::default()
+    });
+
+    assert!(manager.list_shims().is_empty());
+}
+
 #[test]
 fn test_start_shim_treats_pidfile_as_diagnostic_cache() {
     let temp_dir = tempdir().unwrap();
