@@ -468,6 +468,16 @@ impl RuntimeServiceImpl {
                     pod_id, netns_path
                 )));
             }
+            if self.config.rootless.enabled
+                && !std::path::Path::new(&netns_path).starts_with(&self.config.rootless.netns_dir)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "rootless port-forward for pod sandbox {} requires a network namespace under {}: {}",
+                    pod_id,
+                    self.config.rootless.netns_dir.display(),
+                    netns_path
+                )));
+            }
             netns_path
         };
 

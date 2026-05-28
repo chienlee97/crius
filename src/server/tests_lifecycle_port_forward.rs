@@ -136,6 +136,103 @@ async fn port_forward_requires_existing_netns_and_returns_stream_url() {
 }
 
 #[tokio::test]
+async fn rootless_port_forward_requires_rootless_netns_path() {
+    let dir = tempdir().unwrap();
+    let rootless_netns_dir = dir.path().join("xdg-runtime").join("crius").join("netns");
+    fs::create_dir_all(&rootless_netns_dir).unwrap();
+    let mut config = test_runtime_config(dir.path().join("state"));
+    config.rootless = crate::rootless::EffectiveRootlessConfig {
+        enabled: true,
+        current_uid: 1000,
+        current_gid: 1000,
+        in_user_namespace: true,
+        xdg_runtime_dir: dir.path().join("xdg-runtime"),
+        xdg_data_home: dir.path().join("xdg-data"),
+        storage_root: dir.path().join("xdg-data").join("crius").join("storage"),
+        runtime_root: dir.path().join("xdg-runtime").join("crius"),
+        netns_dir: rootless_netns_dir.clone(),
+        use_fuse_overlayfs: true,
+        network_mode: crate::rootless::NetworkMode::Pasta,
+        slirp4netns_path: PathBuf::from("slirp4netns"),
+        pasta_path: PathBuf::from("pasta"),
+        disable_cgroup: true,
+        tolerate_missing_hugetlb_controller: true,
+    };
+    config.cni_config.set_netns_mount_dir(rootless_netns_dir.clone());
+    let service = RuntimeServiceImpl::new(config);
+    service
+        .set_streaming_server(crate::streaming::StreamingServer::for_test(
+            "http://127.0.0.1:12345",
+        ))
+        .await;
+
+    let legacy_netns_dir = dir.path().join("var-run-netns");
+    fs::create_dir_all(&legacy_netns_dir).unwrap();
+    let legacy_netns_path = legacy_netns_dir.join("pod-rootless-legacy");
+    fs::write(&legacy_netns_path, "netns").unwrap();
+    let mut legacy_annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut legacy_annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            netns_path: Some(legacy_netns_path.display().to_string()),
+            runtime_handler: "runc".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service.pod_sandboxes.lock().await.insert(
+        "pod-rootless-legacy".to_string(),
+        test_pod("pod-rootless-legacy", legacy_annotations),
+    );
+
+    let err = RuntimeService::port_forward(
+        &service,
+        Request::new(PortForwardRequest {
+            pod_sandbox_id: "pod-rootless-legacy".to_string(),
+            port: vec![8080],
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("rootless port-forward"));
+    assert!(err
+        .message()
+        .contains(&rootless_netns_dir.display().to_string()));
+
+    let rootless_netns_path = rootless_netns_dir.join("pod-rootless-ready");
+    fs::write(&rootless_netns_path, "netns").unwrap();
+    let mut ready_annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut ready_annotations,
+        INTERNAL_POD_STATE_KEY,
+        &StoredPodState {
+            netns_path: Some(rootless_netns_path.display().to_string()),
+            runtime_handler: "runc".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service.pod_sandboxes.lock().await.insert(
+        "pod-rootless-ready".to_string(),
+        test_pod("pod-rootless-ready", ready_annotations),
+    );
+
+    let response = RuntimeService::port_forward(
+        &service,
+        Request::new(PortForwardRequest {
+            pod_sandbox_id: "pod-rootless-ready".to_string(),
+            port: vec![8080],
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert!(response.url.contains("/portforward/"));
+}
+
+#[tokio::test]
 async fn port_forward_rejects_invalid_ports() {
     let service = test_service();
     service
@@ -565,4 +662,3 @@ async fn remove_pod_sandbox_fallback_cleans_workspace_when_pod_manager_state_mis
         .unwrap()
         .is_none());
 }
-
