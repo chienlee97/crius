@@ -1,5 +1,9 @@
 use anyhow::Result;
+use serde::Serialize;
+use serde_json::json;
+use std::collections::HashSet;
 use std::fmt;
+use std::path::Path;
 
 use crate::runtime::ContainerStatus;
 use crate::storage::persistence::PersistenceManager;
@@ -213,6 +217,522 @@ impl RecoveryLedgerSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerCheckOptions {
+    pub check_files: bool,
+}
+
+impl Default for LedgerCheckOptions {
+    fn default() -> Self {
+        Self { check_files: true }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerRepairOptions {
+    pub check_files: bool,
+}
+
+impl Default for LedgerRepairOptions {
+    fn default() -> Self {
+        Self { check_files: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerCheckIssue {
+    pub kind: String,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub severity: String,
+    pub repairable: bool,
+    pub message: String,
+    pub details: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerRepairAction {
+    pub action: String,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub dry_run: bool,
+    pub applied: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerCheckReport {
+    pub dry_run: bool,
+    pub checked_at_unix_millis: i64,
+    pub issue_count: usize,
+    pub repairable_issue_count: usize,
+    pub action_count: usize,
+    pub applied_action_count: usize,
+    pub issues: Vec<LedgerCheckIssue>,
+    pub actions: Vec<LedgerRepairAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LedgerRepairOperation {
+    MarkSnapshotBroken {
+        key: String,
+    },
+    MarkRuntimeArtifactBroken {
+        owner_kind: String,
+        owner_id: String,
+        artifact_kind: String,
+        path: String,
+    },
+    MarkShimDead {
+        container_id: String,
+    },
+    DeleteDanglingShim {
+        container_id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct LedgerCheckPlan {
+    report: LedgerCheckReport,
+    operations: Vec<LedgerRepairOperation>,
+}
+
+impl RecoveryLedgerSnapshot {
+    fn check_plan(&self, options: LedgerCheckOptions, dry_run: bool) -> LedgerCheckPlan {
+        let pod_ids: HashSet<_> = self.pods.iter().map(|pod| pod.id.as_str()).collect();
+        let container_ids: HashSet<_> = self
+            .containers
+            .iter()
+            .map(|entry| entry.record.id.as_str())
+            .collect();
+        let image_ids: HashSet<_> = self.images.iter().map(|image| image.id.as_str()).collect();
+        let snapshot_keys: HashSet<_> = self
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.key.as_str())
+            .collect();
+
+        let mut issues = Vec::new();
+        let mut operations = Vec::new();
+
+        for entry in &self.containers {
+            let container = &entry.record;
+            if !pod_ids.contains(container.pod_id.as_str()) {
+                push_issue(
+                    &mut issues,
+                    "ownerGraphBroken",
+                    "container",
+                    &container.id,
+                    false,
+                    format!(
+                        "container {} references missing pod {}",
+                        container.id, container.pod_id
+                    ),
+                    json!({ "missingOwnerKind": "pod", "missingOwnerId": container.pod_id }),
+                );
+            }
+
+            if let Some(snapshot_key) = &container.snapshot_key {
+                if !snapshot_keys.contains(snapshot_key.as_str()) {
+                    push_issue(
+                        &mut issues,
+                        "danglingRef",
+                        "container",
+                        &container.id,
+                        false,
+                        format!(
+                            "container {} references missing snapshot {}",
+                            container.id, snapshot_key
+                        ),
+                        json!({ "missingRefKind": "snapshot", "missingRefId": snapshot_key }),
+                    );
+                }
+            }
+        }
+
+        for pod in &self.pods {
+            if let Some(pause_container_id) = &pod.pause_container_id {
+                if !container_ids.contains(pause_container_id.as_str()) {
+                    push_issue(
+                        &mut issues,
+                        "danglingRef",
+                        "pod",
+                        &pod.id,
+                        false,
+                        format!(
+                            "pod {} references missing pause container {}",
+                            pod.id, pause_container_id
+                        ),
+                        json!({
+                            "missingRefKind": "container",
+                            "missingRefId": pause_container_id,
+                            "refField": "pauseContainerId",
+                        }),
+                    );
+                }
+            }
+        }
+
+        for image_ref in &self.image_refs {
+            if !image_ids.contains(image_ref.image_id.as_str()) {
+                push_issue(
+                    &mut issues,
+                    "danglingRef",
+                    "imageRef",
+                    &image_ref.reference,
+                    false,
+                    format!(
+                        "image ref {} points to missing image {}",
+                        image_ref.reference, image_ref.image_id
+                    ),
+                    json!({ "missingRefKind": "image", "missingRefId": image_ref.image_id }),
+                );
+            }
+        }
+
+        for snapshot in &self.snapshots {
+            if snapshot.state == SnapshotLedgerState::Broken.as_str() {
+                push_issue(
+                    &mut issues,
+                    "brokenSnapshot",
+                    "snapshot",
+                    &snapshot.key,
+                    false,
+                    format!("snapshot {} is marked broken", snapshot.key),
+                    json!({ "state": snapshot.state }),
+                );
+            } else if snapshot.state == SnapshotLedgerState::Stale.as_str() {
+                push_issue(
+                    &mut issues,
+                    "staleSnapshot",
+                    "snapshot",
+                    &snapshot.key,
+                    false,
+                    format!("snapshot {} is marked stale", snapshot.key),
+                    json!({ "state": snapshot.state }),
+                );
+            }
+
+            if !image_ids.contains(snapshot.image_id.as_str()) {
+                push_issue(
+                    &mut issues,
+                    "danglingRef",
+                    "snapshot",
+                    &snapshot.key,
+                    true,
+                    format!(
+                        "snapshot {} references missing image {}",
+                        snapshot.key, snapshot.image_id
+                    ),
+                    json!({ "missingRefKind": "image", "missingRefId": snapshot.image_id }),
+                );
+                operations.push(LedgerRepairOperation::MarkSnapshotBroken {
+                    key: snapshot.key.clone(),
+                });
+            }
+
+            let owner_exists = match snapshot.owner_kind.as_str() {
+                "container" => container_ids.contains(snapshot.owner_id.as_str()),
+                "pod" => pod_ids.contains(snapshot.owner_id.as_str()),
+                "image" => image_ids.contains(snapshot.owner_id.as_str()),
+                _ => false,
+            };
+            if !owner_exists {
+                push_issue(
+                    &mut issues,
+                    "ownerGraphBroken",
+                    "snapshot",
+                    &snapshot.key,
+                    snapshot.state != SnapshotLedgerState::Broken.as_str(),
+                    format!(
+                        "snapshot {} references missing {} owner {}",
+                        snapshot.key, snapshot.owner_kind, snapshot.owner_id
+                    ),
+                    json!({
+                        "missingOwnerKind": snapshot.owner_kind,
+                        "missingOwnerId": snapshot.owner_id,
+                    }),
+                );
+                if snapshot.state != SnapshotLedgerState::Broken.as_str() {
+                    operations.push(LedgerRepairOperation::MarkSnapshotBroken {
+                        key: snapshot.key.clone(),
+                    });
+                }
+            }
+        }
+
+        for artifact in &self.runtime_artifacts {
+            let owner_exists = match artifact.owner_kind.as_str() {
+                "container" => container_ids.contains(artifact.owner_id.as_str()),
+                "pod" => pod_ids.contains(artifact.owner_id.as_str()),
+                "image" => image_ids.contains(artifact.owner_id.as_str()),
+                _ => false,
+            };
+            let can_mark_broken = artifact.state != RuntimeArtifactLedgerState::Broken.as_str()
+                && artifact.state != RuntimeArtifactLedgerState::Deleted.as_str();
+
+            if !owner_exists {
+                push_issue(
+                    &mut issues,
+                    "ownerGraphBroken",
+                    "runtimeArtifact",
+                    &artifact.path,
+                    can_mark_broken,
+                    format!(
+                        "runtime artifact {} references missing {} owner {}",
+                        artifact.path, artifact.owner_kind, artifact.owner_id
+                    ),
+                    json!({
+                        "missingOwnerKind": artifact.owner_kind,
+                        "missingOwnerId": artifact.owner_id,
+                        "artifactKind": artifact.artifact_kind,
+                    }),
+                );
+                if can_mark_broken {
+                    operations.push(LedgerRepairOperation::MarkRuntimeArtifactBroken {
+                        owner_kind: artifact.owner_kind.clone(),
+                        owner_id: artifact.owner_id.clone(),
+                        artifact_kind: artifact.artifact_kind.clone(),
+                        path: artifact.path.clone(),
+                    });
+                }
+            }
+
+            if artifact.state == RuntimeArtifactLedgerState::Broken.as_str() {
+                push_issue(
+                    &mut issues,
+                    "brokenRuntimeArtifact",
+                    "runtimeArtifact",
+                    &artifact.path,
+                    false,
+                    format!("runtime artifact {} is marked broken", artifact.path),
+                    json!({
+                        "ownerKind": artifact.owner_kind,
+                        "ownerId": artifact.owner_id,
+                        "artifactKind": artifact.artifact_kind,
+                        "state": artifact.state,
+                    }),
+                );
+            } else if options.check_files
+                && can_mark_broken
+                && !artifact.path.is_empty()
+                && !Path::new(&artifact.path).exists()
+            {
+                push_issue(
+                    &mut issues,
+                    "missingArtifact",
+                    "runtimeArtifact",
+                    &artifact.path,
+                    true,
+                    format!("runtime artifact path does not exist: {}", artifact.path),
+                    json!({
+                        "ownerKind": artifact.owner_kind,
+                        "ownerId": artifact.owner_id,
+                        "artifactKind": artifact.artifact_kind,
+                        "state": artifact.state,
+                    }),
+                );
+                operations.push(LedgerRepairOperation::MarkRuntimeArtifactBroken {
+                    owner_kind: artifact.owner_kind.clone(),
+                    owner_id: artifact.owner_id.clone(),
+                    artifact_kind: artifact.artifact_kind.clone(),
+                    path: artifact.path.clone(),
+                });
+            }
+        }
+
+        for shim in &self.shim_processes {
+            if !container_ids.contains(shim.container_id.as_str()) {
+                push_issue(
+                    &mut issues,
+                    "ownerGraphBroken",
+                    "shim",
+                    &shim.container_id,
+                    true,
+                    format!(
+                        "shim process record references missing container {}",
+                        shim.container_id
+                    ),
+                    json!({ "state": shim.state, "pid": shim.shim_pid }),
+                );
+                operations.push(LedgerRepairOperation::DeleteDanglingShim {
+                    container_id: shim.container_id.clone(),
+                });
+                continue;
+            }
+
+            if shim.state == ShimLedgerState::Dead.as_str() {
+                push_issue(
+                    &mut issues,
+                    "deadShim",
+                    "shim",
+                    &shim.container_id,
+                    false,
+                    format!("shim {} is marked dead", shim.container_id),
+                    json!({ "state": shim.state, "pid": shim.shim_pid }),
+                );
+            } else if shim.state == ShimLedgerState::Broken.as_str() {
+                push_issue(
+                    &mut issues,
+                    "brokenShim",
+                    "shim",
+                    &shim.container_id,
+                    false,
+                    format!("shim {} is marked broken", shim.container_id),
+                    json!({ "state": shim.state, "pid": shim.shim_pid }),
+                );
+            } else if shim.state == ShimLedgerState::Degraded.as_str() {
+                push_issue(
+                    &mut issues,
+                    "degradedShim",
+                    "shim",
+                    &shim.container_id,
+                    true,
+                    format!("shim {} is marked degraded", shim.container_id),
+                    json!({ "state": shim.state, "pid": shim.shim_pid }),
+                );
+                operations.push(LedgerRepairOperation::MarkShimDead {
+                    container_id: shim.container_id.clone(),
+                });
+            } else if options.check_files && shim_requires_liveness_probe(&shim.state) {
+                let socket_exists =
+                    shim.socket_path.is_empty() || Path::new(&shim.socket_path).exists();
+                let process_exists = shim_process_exists(shim.shim_pid);
+                if !socket_exists || !process_exists {
+                    push_issue(
+                        &mut issues,
+                        "brokenShim",
+                        "shim",
+                        &shim.container_id,
+                        true,
+                        format!(
+                            "shim {} is not reachable: socket_exists={}, process_exists={}",
+                            shim.container_id, socket_exists, process_exists
+                        ),
+                        json!({
+                            "state": shim.state,
+                            "pid": shim.shim_pid,
+                            "socketPath": shim.socket_path,
+                            "socketExists": socket_exists,
+                            "processExists": process_exists,
+                        }),
+                    );
+                    operations.push(LedgerRepairOperation::MarkShimDead {
+                        container_id: shim.container_id.clone(),
+                    });
+                }
+            }
+        }
+
+        let mut seen_operations = HashSet::new();
+        operations.retain(|operation| seen_operations.insert(operation.clone()));
+
+        let repairable_issue_count = issues.iter().filter(|issue| issue.repairable).count();
+        let actions = operations
+            .iter()
+            .map(|operation| operation.dry_run_action())
+            .collect::<Vec<_>>();
+
+        LedgerCheckPlan {
+            report: LedgerCheckReport {
+                dry_run,
+                checked_at_unix_millis: chrono::Utc::now().timestamp_millis(),
+                issue_count: issues.len(),
+                repairable_issue_count,
+                action_count: actions.len(),
+                applied_action_count: 0,
+                issues,
+                actions,
+            },
+            operations,
+        }
+    }
+}
+
+impl LedgerRepairOperation {
+    fn dry_run_action(&self) -> LedgerRepairAction {
+        let (action, subject_kind, subject_id, message) = match self {
+            Self::MarkSnapshotBroken { key } => (
+                "markSnapshotBroken",
+                "snapshot",
+                key.as_str(),
+                format!("would mark snapshot {key} broken"),
+            ),
+            Self::MarkRuntimeArtifactBroken {
+                artifact_kind,
+                path,
+                ..
+            } => (
+                "markRuntimeArtifactBroken",
+                "runtimeArtifact",
+                path.as_str(),
+                format!("would mark {artifact_kind} runtime artifact {path} broken"),
+            ),
+            Self::MarkShimDead { container_id } => (
+                "markShimDead",
+                "shim",
+                container_id.as_str(),
+                format!("would mark shim {container_id} dead"),
+            ),
+            Self::DeleteDanglingShim { container_id } => (
+                "deleteDanglingShim",
+                "shim",
+                container_id.as_str(),
+                format!("would delete dangling shim record for {container_id}"),
+            ),
+        };
+        LedgerRepairAction {
+            action: action.to_string(),
+            subject_kind: subject_kind.to_string(),
+            subject_id: subject_id.to_string(),
+            dry_run: true,
+            applied: false,
+            message,
+        }
+    }
+}
+
+fn push_issue(
+    issues: &mut Vec<LedgerCheckIssue>,
+    kind: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    repairable: bool,
+    message: String,
+    details: serde_json::Value,
+) {
+    issues.push(LedgerCheckIssue {
+        kind: kind.to_string(),
+        subject_kind: subject_kind.to_string(),
+        subject_id: subject_id.to_string(),
+        severity: "warning".to_string(),
+        repairable,
+        message,
+        details,
+    });
+}
+
+fn shim_requires_liveness_probe(state: &str) -> bool {
+    matches!(state, "starting" | "running" | "degraded")
+}
+
+fn shim_process_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Path::new("/proc").join(pid.to_string()).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct StateLedger<'a> {
     persistence: &'a PersistenceManager,
@@ -315,6 +835,10 @@ impl<'a> StateLedger<'a> {
             runtime_artifacts,
             shim_processes,
         })
+    }
+
+    pub fn check(&self, options: LedgerCheckOptions) -> Result<LedgerCheckReport> {
+        Ok(self.recovery_snapshot()?.check_plan(options, true).report)
     }
 }
 
@@ -489,6 +1013,143 @@ impl<'a> StateLedgerWriter<'a> {
         input: crate::storage::TypedEventInput<'_>,
     ) -> Result<()> {
         self.persistence.storage_mut().append_typed_event_at(input)
+    }
+
+    pub fn repair(
+        &mut self,
+        options: LedgerRepairOptions,
+        dry_run: bool,
+    ) -> Result<LedgerCheckReport> {
+        let snapshot = StateLedger::new(self.persistence).recovery_snapshot()?;
+        let mut plan = snapshot.check_plan(
+            LedgerCheckOptions {
+                check_files: options.check_files,
+            },
+            dry_run,
+        );
+
+        if dry_run {
+            return Ok(plan.report);
+        }
+
+        let mut actions = Vec::with_capacity(plan.operations.len());
+        for operation in plan.operations {
+            actions.push(self.apply_repair_operation(operation)?);
+        }
+        plan.report.dry_run = false;
+        plan.report.action_count = actions.len();
+        plan.report.applied_action_count = actions.iter().filter(|action| action.applied).count();
+        plan.report.actions = actions;
+        Ok(plan.report)
+    }
+
+    fn apply_repair_operation(
+        &mut self,
+        operation: LedgerRepairOperation,
+    ) -> Result<LedgerRepairAction> {
+        match operation {
+            LedgerRepairOperation::MarkSnapshotBroken { key } => {
+                let mut applied = false;
+                if let Some(record) = self
+                    .persistence
+                    .list_snapshot_records()?
+                    .into_iter()
+                    .find(|record| record.key == key)
+                {
+                    if record.state != SnapshotLedgerState::Broken.as_str() {
+                        self.persistence
+                            .storage_mut()
+                            .update_snapshot_state(&key, SnapshotLedgerState::Broken.as_str())?;
+                        applied = true;
+                    }
+                }
+                Ok(LedgerRepairAction {
+                    action: "markSnapshotBroken".to_string(),
+                    subject_kind: "snapshot".to_string(),
+                    subject_id: key.clone(),
+                    dry_run: false,
+                    applied,
+                    message: format!("marked snapshot {key} broken"),
+                })
+            }
+            LedgerRepairOperation::MarkRuntimeArtifactBroken {
+                owner_kind,
+                owner_id,
+                artifact_kind,
+                path,
+            } => {
+                let mut applied = false;
+                if let Some(record) =
+                    self.persistence
+                        .list_runtime_artifacts()?
+                        .into_iter()
+                        .find(|record| {
+                            record.owner_kind == owner_kind
+                                && record.owner_id == owner_id
+                                && record.artifact_kind == artifact_kind
+                                && record.path == path
+                        })
+                {
+                    if record.state != RuntimeArtifactLedgerState::Broken.as_str() {
+                        self.persistence
+                            .storage_mut()
+                            .update_runtime_artifact_state(
+                                &owner_kind,
+                                &owner_id,
+                                &artifact_kind,
+                                &path,
+                                RuntimeArtifactLedgerState::Broken.as_str(),
+                            )?;
+                        applied = true;
+                    }
+                }
+                Ok(LedgerRepairAction {
+                    action: "markRuntimeArtifactBroken".to_string(),
+                    subject_kind: "runtimeArtifact".to_string(),
+                    subject_id: path.clone(),
+                    dry_run: false,
+                    applied,
+                    message: format!("marked {artifact_kind} runtime artifact {path} broken"),
+                })
+            }
+            LedgerRepairOperation::MarkShimDead { container_id } => {
+                let mut applied = false;
+                if let Some(record) = self.persistence.get_shim_process_record(&container_id)? {
+                    if record.state != ShimLedgerState::Dead.as_str() {
+                        self.persistence.storage_mut().update_shim_process_state(
+                            &container_id,
+                            ShimLedgerState::Dead.as_str(),
+                        )?;
+                        applied = true;
+                    }
+                }
+                Ok(LedgerRepairAction {
+                    action: "markShimDead".to_string(),
+                    subject_kind: "shim".to_string(),
+                    subject_id: container_id.clone(),
+                    dry_run: false,
+                    applied,
+                    message: format!("marked shim {container_id} dead"),
+                })
+            }
+            LedgerRepairOperation::DeleteDanglingShim { container_id } => {
+                let existed = self
+                    .persistence
+                    .get_shim_process_record(&container_id)?
+                    .is_some();
+                if existed {
+                    self.persistence.delete_shim_process_record(&container_id)?;
+                }
+                Ok(LedgerRepairAction {
+                    action: "deleteDanglingShim".to_string(),
+                    subject_kind: "shim".to_string(),
+                    subject_id: container_id.clone(),
+                    dry_run: false,
+                    applied: existed,
+                    message: format!("deleted dangling shim record for {container_id}"),
+                })
+            }
+        }
     }
 }
 
@@ -876,5 +1537,206 @@ mod tests {
                 last_seen_at: 1,
             })
             .is_err());
+    }
+
+    #[test]
+    fn ledger_check_reports_broken_graph_missing_artifact_and_dangling_shim() {
+        let temp_dir = tempdir().unwrap();
+        let mut persistence = PersistenceManager::new(PersistenceConfig {
+            db_path: temp_dir.path().join("check.db"),
+            enable_recovery: true,
+            auto_save_interval: 30,
+        })
+        .unwrap();
+
+        {
+            let mut ledger = StateLedgerWriter::new(&mut persistence);
+            ledger
+                .save_container(&ContainerRecord {
+                    id: "container-check".to_string(),
+                    pod_id: "missing-pod".to_string(),
+                    state: "running".to_string(),
+                    image: "busybox:latest".to_string(),
+                    command: "sleep 60".to_string(),
+                    created_at: 1,
+                    labels: "{}".to_string(),
+                    annotations: "{}".to_string(),
+                    exit_code: None,
+                    exit_time: None,
+                    runtime_handler: Some("runc".to_string()),
+                    runtime_backend: Some("process".to_string()),
+                    snapshot_key: Some("missing-snapshot".to_string()),
+                })
+                .unwrap();
+            ledger
+                .replace_runtime_artifacts(
+                    "container",
+                    "container-check",
+                    &[RuntimeArtifactRecord {
+                        owner_kind: "container".to_string(),
+                        owner_id: "container-check".to_string(),
+                        artifact_kind: "bundle".to_string(),
+                        path: temp_dir.path().join("missing-bundle").display().to_string(),
+                        state: RuntimeArtifactLedgerState::Active.as_str().to_string(),
+                        runtime_handler: Some("runc".to_string()),
+                        runtime_root: Some(temp_dir.path().display().to_string()),
+                    }],
+                )
+                .unwrap();
+            ledger
+                .save_shim_process(&ShimProcessRecord {
+                    container_id: "dangling-shim".to_string(),
+                    shim_pid: 123,
+                    work_dir: temp_dir.path().join("shims").display().to_string(),
+                    socket_path: temp_dir.path().join("shim.sock").display().to_string(),
+                    exit_code_file: temp_dir.path().join("exit").display().to_string(),
+                    log_file: temp_dir.path().join("shim.log").display().to_string(),
+                    bundle_path: temp_dir.path().join("bundle").display().to_string(),
+                    state: ShimLedgerState::Running.as_str().to_string(),
+                    last_seen_at: 1,
+                })
+                .unwrap();
+        }
+
+        let report = StateLedger::new(&persistence)
+            .check(LedgerCheckOptions::default())
+            .unwrap();
+
+        assert!(report.dry_run);
+        assert!(report.issue_count >= 4);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.kind == "ownerGraphBroken" && issue.subject_kind == "container"));
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.kind == "danglingRef" && issue.subject_kind == "container"));
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.kind == "missingArtifact"
+                && issue.subject_kind == "runtimeArtifact"
+                && issue.repairable));
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.kind == "ownerGraphBroken"
+                && issue.subject_kind == "shim"
+                && issue.repairable));
+        assert!(report
+            .actions
+            .iter()
+            .any(|action| action.action == "markRuntimeArtifactBroken" && action.dry_run));
+        assert!(report
+            .actions
+            .iter()
+            .any(|action| action.action == "deleteDanglingShim" && action.dry_run));
+    }
+
+    #[test]
+    fn ledger_repair_dry_run_does_not_mutate_but_repair_applies_safe_actions() {
+        let temp_dir = tempdir().unwrap();
+        let mut persistence = PersistenceManager::new(PersistenceConfig {
+            db_path: temp_dir.path().join("repair.db"),
+            enable_recovery: true,
+            auto_save_interval: 30,
+        })
+        .unwrap();
+        let missing_artifact = temp_dir.path().join("missing-artifact");
+
+        {
+            let mut ledger = StateLedgerWriter::new(&mut persistence);
+            ledger
+                .save_snapshot(&SnapshotRecord {
+                    key: "snapshot-repair".to_string(),
+                    image_id: "missing-image".to_string(),
+                    owner_kind: "container".to_string(),
+                    owner_id: "container-repair".to_string(),
+                    state: SnapshotLedgerState::Mounted.as_str().to_string(),
+                    mountpoint: temp_dir.path().join("rootfs").display().to_string(),
+                    snapshotter: "internal-overlay-untar".to_string(),
+                    runtime_managed: true,
+                })
+                .unwrap();
+            ledger
+                .replace_runtime_artifacts(
+                    "container",
+                    "container-repair",
+                    &[RuntimeArtifactRecord {
+                        owner_kind: "container".to_string(),
+                        owner_id: "container-repair".to_string(),
+                        artifact_kind: "bundle".to_string(),
+                        path: missing_artifact.display().to_string(),
+                        state: RuntimeArtifactLedgerState::Active.as_str().to_string(),
+                        runtime_handler: Some("runc".to_string()),
+                        runtime_root: Some(temp_dir.path().display().to_string()),
+                    }],
+                )
+                .unwrap();
+            ledger
+                .save_shim_process(&ShimProcessRecord {
+                    container_id: "dangling-shim".to_string(),
+                    shim_pid: 123,
+                    work_dir: temp_dir.path().join("shims").display().to_string(),
+                    socket_path: temp_dir.path().join("shim.sock").display().to_string(),
+                    exit_code_file: temp_dir.path().join("exit").display().to_string(),
+                    log_file: temp_dir.path().join("shim.log").display().to_string(),
+                    bundle_path: temp_dir.path().join("bundle").display().to_string(),
+                    state: ShimLedgerState::Running.as_str().to_string(),
+                    last_seen_at: 1,
+                })
+                .unwrap();
+        }
+
+        let dry_run = {
+            let mut ledger = StateLedgerWriter::new(&mut persistence);
+            ledger.repair(LedgerRepairOptions::default(), true).unwrap()
+        };
+        assert!(dry_run.dry_run);
+        assert_eq!(dry_run.applied_action_count, 0);
+        assert_eq!(
+            StateLedger::new(&persistence)
+                .snapshots()
+                .unwrap()
+                .into_iter()
+                .find(|snapshot| snapshot.key == "snapshot-repair")
+                .unwrap()
+                .state,
+            SnapshotLedgerState::Mounted.as_str()
+        );
+        assert!(StateLedger::new(&persistence)
+            .shim_process("dangling-shim")
+            .unwrap()
+            .is_some());
+
+        let repair = {
+            let mut ledger = StateLedgerWriter::new(&mut persistence);
+            ledger
+                .repair(LedgerRepairOptions::default(), false)
+                .unwrap()
+        };
+
+        assert!(!repair.dry_run);
+        assert_eq!(repair.action_count, repair.applied_action_count);
+        assert!(repair.applied_action_count >= 3);
+        let snapshot = StateLedger::new(&persistence)
+            .snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.key == "snapshot-repair")
+            .unwrap();
+        assert_eq!(snapshot.state, SnapshotLedgerState::Broken.as_str());
+        let artifact = StateLedger::new(&persistence)
+            .runtime_artifacts()
+            .unwrap()
+            .into_iter()
+            .find(|artifact| artifact.path == missing_artifact.display().to_string())
+            .unwrap();
+        assert_eq!(artifact.state, RuntimeArtifactLedgerState::Broken.as_str());
+        assert!(StateLedger::new(&persistence)
+            .shim_process("dangling-shim")
+            .unwrap()
+            .is_none());
     }
 }

@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::image::{PullCgroupEffectiveConfig, PullCgroupMode, PullCgroupScopeRecord};
 use crate::network::CniLoadStatus;
 use crate::proto::runtime::v1::RuntimeCondition;
+use crate::state::LedgerCheckReport;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +57,7 @@ pub struct ExtendedConditionsInput<'a> {
     pub repair_succeeded: Option<bool>,
     pub shim_reconnect_supported: bool,
     pub recovery_ledger_summary: Option<&'a RecoveryLedgerHealthSummary>,
+    pub recovery_ledger_check_report: Option<&'a LedgerCheckReport>,
 }
 
 impl RecoveryLedgerHealthSummary {
@@ -300,6 +302,7 @@ impl HealthService {
         attempted_repair: Option<bool>,
         repair_succeeded: Option<bool>,
         ledger_summary: Option<&RecoveryLedgerHealthSummary>,
+        ledger_check_report: Option<&LedgerCheckReport>,
     ) -> InternalHealthCondition {
         if let Some(summary) = ledger_summary.filter(|summary| !summary.is_healthy()) {
             return InternalHealthCondition::not_ready(
@@ -316,6 +319,17 @@ impl HealthService {
                     summary.dead_shims,
                     summary.broken_shims,
                     summary.degraded_shims
+                ),
+            );
+        }
+
+        if let Some(report) = ledger_check_report.filter(|report| report.issue_count > 0) {
+            return InternalHealthCondition::not_ready(
+                "RecoveryReady",
+                "RecoveryLedgerCheckFailed",
+                format!(
+                    "recovery ledger check found {} issue(s), {} repairable, {} planned repair action(s)",
+                    report.issue_count, report.repairable_issue_count, report.action_count
                 ),
             );
         }
@@ -413,6 +427,7 @@ impl HealthService {
                 input.attempted_repair,
                 input.repair_succeeded,
                 input.recovery_ledger_summary,
+                input.recovery_ledger_check_report,
             ),
         ]
     }
@@ -610,6 +625,7 @@ mod tests {
             repair_succeeded: None,
             shim_reconnect_supported: true,
             recovery_ledger_summary: None,
+            recovery_ledger_check_report: None,
         });
 
         assert_eq!(conditions.len(), 4);
@@ -646,6 +662,7 @@ mod tests {
             repair_succeeded: Some(false),
             shim_reconnect_supported: true,
             recovery_ledger_summary: None,
+            recovery_ledger_check_report: None,
         });
 
         let snapshot = conditions
@@ -673,7 +690,7 @@ mod tests {
             ..Default::default()
         };
 
-        let condition = service.recovery_condition(Some(false), None, Some(&summary));
+        let condition = service.recovery_condition(Some(false), None, Some(&summary), None);
 
         assert!(!condition.ready);
         assert_eq!(condition.reason, "RecoveryObjectsDegraded");
@@ -681,6 +698,28 @@ mod tests {
         assert!(condition.message.contains("2 broken runtime artifact"));
         assert!(condition.message.contains("1 dead shim"));
         assert!(condition.message.contains("1 degraded shim"));
+    }
+
+    #[test]
+    fn recovery_condition_reports_ledger_check_issues() {
+        let service = HealthService;
+        let report = LedgerCheckReport {
+            dry_run: true,
+            checked_at_unix_millis: 1,
+            issue_count: 2,
+            repairable_issue_count: 1,
+            action_count: 1,
+            applied_action_count: 0,
+            issues: Vec::new(),
+            actions: Vec::new(),
+        };
+
+        let condition = service.recovery_condition(Some(false), None, None, Some(&report));
+
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "RecoveryLedgerCheckFailed");
+        assert!(condition.message.contains("2 issue"));
+        assert!(condition.message.contains("1 repairable"));
     }
 
     #[test]

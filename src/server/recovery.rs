@@ -1648,7 +1648,7 @@ impl RuntimeServiceImpl {
         };
 
         let stage_started = Instant::now();
-        let snapshot = match self.load_recovery_ledger_snapshot().await {
+        match self.load_recovery_ledger_snapshot().await {
             Ok(snapshot) => {
                 let items = snapshot.containers.len()
                     + snapshot.pods.len()
@@ -1662,7 +1662,6 @@ impl RuntimeServiceImpl {
                     items,
                     None,
                 ));
-                snapshot
             }
             Err(status) => {
                 recovery_result.stages.push(Self::recovery_stage_summary(
@@ -1672,6 +1671,87 @@ impl RuntimeServiceImpl {
                     0,
                     Some(status.message().to_string()),
                 ));
+                recovery_result.total_duration_millis =
+                    recovery_started.elapsed().as_millis() as u64;
+                recovery_result.finished_at_unix_millis = chrono::Utc::now().timestamp_millis();
+                self.record_last_recovery_result(recovery_result);
+                return Err(status);
+            }
+        }
+
+        let stage_started = Instant::now();
+        let ledger_check = {
+            let persistence = self.persistence.lock().await;
+            crate::state::StateLedger::new(&persistence)
+                .check(crate::state::LedgerCheckOptions::default())
+        };
+        match ledger_check {
+            Ok(report) => {
+                recovery_result.stages.push(Self::recovery_stage_summary(
+                    RecoveryStage::CheckLedger,
+                    stage_started,
+                    true,
+                    report.issue_count,
+                    None,
+                ));
+            }
+            Err(err) => {
+                recovery_result.stages.push(Self::recovery_stage_summary(
+                    RecoveryStage::CheckLedger,
+                    stage_started,
+                    false,
+                    0,
+                    Some(err.to_string()),
+                ));
+                recovery_result.total_duration_millis =
+                    recovery_started.elapsed().as_millis() as u64;
+                recovery_result.finished_at_unix_millis = chrono::Utc::now().timestamp_millis();
+                self.record_last_recovery_result(recovery_result);
+                return Err(Status::internal(format!(
+                    "Failed to check recovery ledger: {err}"
+                )));
+            }
+        }
+
+        let stage_started = Instant::now();
+        let ledger_repair = {
+            let mut persistence = self.persistence.lock().await;
+            crate::state::StateLedgerWriter::new(&mut persistence).repair(
+                crate::state::LedgerRepairOptions::default(),
+                !self.config.internal_repair,
+            )
+        };
+        match ledger_repair {
+            Ok(report) => {
+                recovery_result.stages.push(Self::recovery_stage_summary(
+                    RecoveryStage::RepairLedger,
+                    stage_started,
+                    true,
+                    report.action_count,
+                    None,
+                ));
+            }
+            Err(err) => {
+                recovery_result.stages.push(Self::recovery_stage_summary(
+                    RecoveryStage::RepairLedger,
+                    stage_started,
+                    false,
+                    0,
+                    Some(err.to_string()),
+                ));
+                recovery_result.total_duration_millis =
+                    recovery_started.elapsed().as_millis() as u64;
+                recovery_result.finished_at_unix_millis = chrono::Utc::now().timestamp_millis();
+                self.record_last_recovery_result(recovery_result);
+                return Err(Status::internal(format!(
+                    "Failed to repair recovery ledger: {err}"
+                )));
+            }
+        }
+
+        let snapshot = match self.load_recovery_ledger_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(status) => {
                 recovery_result.total_duration_millis =
                     recovery_started.elapsed().as_millis() as u64;
                 recovery_result.finished_at_unix_millis = chrono::Utc::now().timestamp_millis();

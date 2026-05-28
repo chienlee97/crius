@@ -518,8 +518,12 @@ async fn status_verbose_returns_structured_config() {
     );
     assert_eq!(
         config["recovery"]["policy"]["repairScope"],
-        "sqlite-persistence-only"
+        "sqlite-persistence-and-ledger"
     );
+    assert!(config["recovery"]["ledgerCheck"]["issueCount"].is_u64());
+    assert!(config["internalServices"]["introspection"]["recovery"]["ledgerCheck"]["dryRun"]
+        .as_bool()
+        .unwrap());
     assert!(config["recovery"]["policy"]["wipeScope"]
         .as_array()
         .unwrap()
@@ -1261,6 +1265,14 @@ async fn status_verbose_reports_recovery_ledger_degraded_objects() {
         config["internalServices"]["introspection"]["recovery"]["ledgerSummary"]["deadShims"],
         serde_json::json!(1)
     );
+    assert!(
+        config["internalServices"]["introspection"]["recovery"]["ledgerCheck"]["issueCount"]
+            .as_u64()
+            .unwrap()
+            >= 4
+    );
+    assert!(config["internalServices"]["introspection"]["recovery"]["ledgerCheck"]["actionCount"]
+        .is_u64());
     assert_eq!(
         config["internalServices"]["introspection"]["recovery"]["unhealthyObjectCount"],
         serde_json::json!(4)

@@ -7,6 +7,7 @@ use crate::image::content_store::ContentTransferStatus;
 use crate::image::{PullCgroupEffectiveConfig, PullCgroupScopeRecord};
 use crate::rootless::EffectiveRootlessConfig;
 use crate::server::{RuntimeConfig, RuntimeReloadState, RuntimeReloadableConfig};
+use crate::state::LedgerCheckReport;
 use crate::storage::{ContentGcBlocker, ContentGcCandidate};
 
 use super::health::RecoveryLedgerHealthSummary;
@@ -24,6 +25,8 @@ pub struct RecoveryStatusInput<'a, T> {
     pub last_recovery_result: Option<&'a T>,
     pub ledger_summary: Option<&'a RecoveryLedgerHealthSummary>,
     pub ledger_summary_error: Option<&'a str>,
+    pub ledger_check_report: Option<&'a LedgerCheckReport>,
+    pub ledger_check_error: Option<&'a str>,
 }
 
 impl IntrospectionService {
@@ -294,11 +297,15 @@ impl IntrospectionService {
         &self,
         ledger_summary: Option<&RecoveryLedgerHealthSummary>,
         ledger_summary_error: Option<&str>,
+        ledger_check_report: Option<&LedgerCheckReport>,
+        ledger_check_error: Option<&str>,
         last_recovery_result: Option<&T>,
     ) -> Value {
         json!({
             "ledgerSummary": ledger_summary,
             "ledgerSummaryError": ledger_summary_error,
+            "ledgerCheck": ledger_check_report,
+            "ledgerCheckError": ledger_check_error,
             "unhealthyObjectCount": ledger_summary
                 .map(RecoveryLedgerHealthSummary::unhealthy_object_count)
                 .unwrap_or_default(),
@@ -319,6 +326,8 @@ impl IntrospectionService {
             "lastRecoveryResult": input.last_recovery_result,
             "ledgerSummary": input.ledger_summary,
             "ledgerSummaryError": input.ledger_summary_error,
+            "ledgerCheck": input.ledger_check_report,
+            "ledgerCheckError": input.ledger_check_error,
             "internalWipe": input.config.internal_wipe,
             "internalRepair": input.config.internal_repair,
             "policy": {
@@ -343,11 +352,15 @@ impl IntrospectionService {
                 "repairTriggers": [
                     "unclean-shutdown",
                 ],
-                "repairScope": "sqlite-persistence-only",
+                "repairScope": "sqlite-persistence-and-ledger",
                 "repairActions": [
                     "integrity-check",
                     "reindex",
                     "vacuum",
+                    "ledger-check",
+                    "mark-missing-artifact-broken",
+                    "mark-unreachable-shim-dead",
+                    "delete-dangling-shim-record",
                 ],
             },
         })
@@ -947,6 +960,16 @@ mod tests {
             dead_shims: 1,
             ..Default::default()
         };
+        let ledger_check_report = LedgerCheckReport {
+            dry_run: true,
+            checked_at_unix_millis: 1,
+            issue_count: 2,
+            repairable_issue_count: 1,
+            action_count: 1,
+            applied_action_count: 0,
+            issues: Vec::new(),
+            actions: Vec::new(),
+        };
         let recovery_result = RecoveryResult { completed: true };
         let recovery = service.recovery_status(RecoveryStatusInput {
             config: &config,
@@ -958,6 +981,8 @@ mod tests {
             last_recovery_result: Some(&recovery_result),
             ledger_summary: Some(&ledger_summary),
             ledger_summary_error: Some("ledger unavailable"),
+            ledger_check_report: Some(&ledger_check_report),
+            ledger_check_error: None,
         });
 
         assert_eq!(image_layout["root"], "/var/lib/crius/images");
@@ -983,8 +1008,12 @@ mod tests {
         assert_eq!(recovery["lastRecoveryResult"]["completed"], true);
         assert_eq!(recovery["ledgerSummary"]["deadShims"], 1);
         assert_eq!(recovery["ledgerSummaryError"], "ledger unavailable");
+        assert_eq!(recovery["ledgerCheck"]["issueCount"], 2);
         assert_eq!(recovery["internalWipe"], false);
         assert_eq!(recovery["internalRepair"], true);
-        assert_eq!(recovery["policy"]["repairScope"], "sqlite-persistence-only");
+        assert_eq!(
+            recovery["policy"]["repairScope"],
+            "sqlite-persistence-and-ledger"
+        );
     }
 }

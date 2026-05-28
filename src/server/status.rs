@@ -496,6 +496,15 @@ impl RuntimeServiceImpl {
         })
     }
 
+    pub(super) async fn recovery_ledger_check_report(
+        &self,
+    ) -> Result<crate::state::LedgerCheckReport, String> {
+        let persistence = self.persistence.lock().await;
+        crate::state::StateLedger::new(&persistence)
+            .check(crate::state::LedgerCheckOptions::default())
+            .map_err(|err| format!("failed to check recovery ledger: {err}"))
+    }
+
     pub(super) async fn probe_cni_load_status(&self) -> crate::network::CniLoadStatus {
         let cni_config = self.current_cni_config();
         if let Some(status) = cni_config.rootless_load_status() {
@@ -830,6 +839,11 @@ impl RuntimeServiceImpl {
                     Ok(summary) => (Some(summary), None),
                     Err(err) => (None, Some(err)),
                 };
+            let (recovery_ledger_check, recovery_ledger_check_error) =
+                match self.recovery_ledger_check_report().await {
+                    Ok(report) => (Some(report), None),
+                    Err(err) => (None, Some(err)),
+                };
             let mut extended_health_conditions = self.internal_services.health.extended_conditions(
                 crate::services::health::ExtendedConditionsInput {
                     image_root: &self.config.image_root,
@@ -839,6 +853,7 @@ impl RuntimeServiceImpl {
                     repair_succeeded: self.last_startup_repair_succeeded(),
                     shim_reconnect_supported: true,
                     recovery_ledger_summary: recovery_ledger_summary.as_ref(),
+                    recovery_ledger_check_report: recovery_ledger_check.as_ref(),
                 },
             );
             extended_health_conditions.push(
@@ -1212,6 +1227,8 @@ impl RuntimeServiceImpl {
                         "recovery": self.internal_services.introspection.recovery(
                             recovery_ledger_summary.as_ref(),
                             recovery_ledger_summary_error.as_deref(),
+                            recovery_ledger_check.as_ref(),
+                            recovery_ledger_check_error.as_deref(),
                             last_recovery_result.as_ref(),
                         ),
                         "featureFlags": self.internal_services.introspection.feature_flags(
@@ -1277,6 +1294,8 @@ impl RuntimeServiceImpl {
                         last_recovery_result: last_recovery_result.as_ref(),
                         ledger_summary: recovery_ledger_summary.as_ref(),
                         ledger_summary_error: recovery_ledger_summary_error.as_deref(),
+                        ledger_check_report: recovery_ledger_check.as_ref(),
+                        ledger_check_error: recovery_ledger_check_error.as_deref(),
                     },
                 ),
             });

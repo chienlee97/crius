@@ -138,6 +138,8 @@ pub struct RecoveryStageSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RecoveryStage {
     LoadLedgerSnapshot,
+    CheckLedger,
+    RepairLedger,
     RestoreMemoryState,
     ReserveRecoveredNames,
     PruneLogicalDuplicates,
@@ -153,6 +155,8 @@ impl RecoveryStage {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::LoadLedgerSnapshot => "loadLedgerSnapshot",
+            Self::CheckLedger => "checkLedger",
+            Self::RepairLedger => "repairLedger",
             Self::RestoreMemoryState => "restoreMemoryState",
             Self::ReserveRecoveredNames => "reserveRecoveredNames",
             Self::PruneLogicalDuplicates => "pruneLogicalDuplicates",
@@ -169,6 +173,8 @@ impl RecoveryStage {
 #[cfg(test)]
 pub(super) const RECOVERY_STAGE_ORDER: &[RecoveryStage] = &[
     RecoveryStage::LoadLedgerSnapshot,
+    RecoveryStage::CheckLedger,
+    RecoveryStage::RepairLedger,
     RecoveryStage::RestoreMemoryState,
     RecoveryStage::ReserveRecoveredNames,
     RecoveryStage::PruneLogicalDuplicates,
