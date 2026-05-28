@@ -3,6 +3,34 @@ use tonic::Status;
 
 use crate::proto::runtime::v1::ContainerEventResponse;
 
+const MAX_INTERNAL_EVENT_DETAIL_BYTES: usize = 16 * 1024;
+const INTERNAL_EVENT_PREFIXES: &[&str] = &[
+    "pod.",
+    "container.",
+    "image.",
+    "network.",
+    "gc.",
+    "backend.",
+    "task.",
+    "shim.",
+    "exec.",
+    "attach.",
+    "reconcile.",
+    "orphan_cleanup.",
+];
+const INTERNAL_EVENT_SUBJECT_KINDS: &[&str] = &[
+    "pod",
+    "container",
+    "image",
+    "network",
+    "gc",
+    "backend",
+    "task",
+    "shim",
+    "reconcile",
+    "orphan_cleanup",
+];
+
 #[derive(Debug, Clone)]
 pub struct LedgerInternalEventSink {
     db_path: std::path::PathBuf,
@@ -89,8 +117,23 @@ impl InternalEvent {
             subject_id: subject_id.into(),
             severity,
             timestamp,
-            details,
+            details: sanitize_details(details),
         }
+    }
+
+    pub fn validate_schema(&self) -> anyhow::Result<()> {
+        validate_internal_event_kind(&self.kind)?;
+        validate_internal_event_subject_kind(&self.subject_kind)?;
+        if self.subject_id.trim().is_empty() {
+            anyhow::bail!("internal event subject_id must not be empty");
+        }
+        if self.details.to_string().len() > MAX_INTERNAL_EVENT_DETAIL_BYTES {
+            anyhow::bail!(
+                "internal event details exceeded {} bytes after sanitization",
+                MAX_INTERNAL_EVENT_DETAIL_BYTES
+            );
+        }
+        Ok(())
     }
 
     fn from_state_event(event: crate::storage::StateEvent) -> anyhow::Result<Self> {
@@ -123,6 +166,7 @@ impl LedgerInternalEventSink {
     }
 
     pub fn publish(&self, event: &InternalEvent) -> anyhow::Result<()> {
+        event.validate_schema()?;
         let mut storage = crate::storage::StorageManager::new(&self.db_path)?;
         storage.append_typed_event_at(crate::storage::TypedEventInput {
             event_type: &event.kind,
@@ -191,6 +235,7 @@ impl EventService {
     }
 
     pub async fn publish_internal(&self, event: InternalEvent) -> anyhow::Result<()> {
+        event.validate_schema()?;
         let persist_result = self.persist_internal_event(&event).await;
         if let Err(err) = self.internal_sender.send(event) {
             log::debug!("Dropping internal event without subscribers: {}", err);
@@ -223,6 +268,7 @@ impl EventService {
         let Some(ledger) = &self.ledger else {
             return Ok(());
         };
+        event.validate_schema()?;
         let mut persistence = ledger.lock().await;
         let mut ledger = crate::state::StateLedgerWriter::new(&mut persistence);
         ledger.append_typed_event_at(crate::storage::TypedEventInput {
@@ -266,6 +312,43 @@ impl EventService {
 
         ReceiverStream::new(rx)
     }
+}
+
+fn validate_internal_event_kind(kind: &str) -> anyhow::Result<()> {
+    let kind = kind.trim();
+    if kind.is_empty() {
+        anyhow::bail!("internal event kind must not be empty");
+    }
+    if !INTERNAL_EVENT_PREFIXES
+        .iter()
+        .any(|prefix| kind.starts_with(prefix))
+    {
+        anyhow::bail!("unsupported internal event kind: {kind}");
+    }
+    Ok(())
+}
+
+fn validate_internal_event_subject_kind(subject_kind: &str) -> anyhow::Result<()> {
+    let subject_kind = subject_kind.trim();
+    if subject_kind.is_empty() {
+        anyhow::bail!("internal event subject_kind must not be empty");
+    }
+    if !INTERNAL_EVENT_SUBJECT_KINDS.contains(&subject_kind) {
+        anyhow::bail!("unsupported internal event subject_kind: {subject_kind}");
+    }
+    Ok(())
+}
+
+fn sanitize_details(details: serde_json::Value) -> serde_json::Value {
+    if details.to_string().len() <= MAX_INTERNAL_EVENT_DETAIL_BYTES {
+        return details;
+    }
+
+    serde_json::json!({
+        "truncated": true,
+        "reason": "details too large",
+        "maxBytes": MAX_INTERNAL_EVENT_DETAIL_BYTES,
+    })
 }
 
 #[cfg(test)]
@@ -423,5 +506,75 @@ mod tests {
         );
         assert_eq!(events.subscriber_count(), 0);
         assert_eq!(events.internal_subscriber_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_internal_events_outside_main_path_schema() {
+        let events = EventService::with_capacity(16);
+
+        let invalid_kind = events
+            .publish_internal(InternalEvent::with_timestamp(
+                "misc.state",
+                "container",
+                "container-1",
+                InternalEventSeverity::Info,
+                42,
+                serde_json::Value::Null,
+            ))
+            .await;
+        assert!(invalid_kind.unwrap_err().to_string().contains("kind"));
+
+        let invalid_subject = events
+            .publish_internal(InternalEvent::with_timestamp(
+                "container.state",
+                "misc",
+                "container-1",
+                InternalEventSeverity::Info,
+                42,
+                serde_json::Value::Null,
+            ))
+            .await;
+        assert!(invalid_subject
+            .unwrap_err()
+            .to_string()
+            .contains("subject_kind"));
+    }
+
+    #[tokio::test]
+    async fn truncates_large_internal_event_details_before_persisting() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("events.db");
+        let persistence = Arc::new(tokio::sync::Mutex::new(
+            PersistenceManager::new(PersistenceConfig {
+                db_path,
+                enable_recovery: true,
+                auto_save_interval: 30,
+            })
+            .unwrap(),
+        ));
+        let events = EventService::with_capacity(16).with_ledger(persistence);
+
+        events
+            .publish_internal(InternalEvent::with_timestamp(
+                "image.pull_progress",
+                "image",
+                "registry.example.test/app:latest",
+                InternalEventSeverity::Info,
+                42,
+                serde_json::json!({ "payload": "x".repeat(MAX_INTERNAL_EVENT_DETAIL_BYTES + 1) }),
+            ))
+            .await
+            .unwrap();
+
+        let recent = events
+            .recent_internal_events("image", "registry.example.test/app:latest", 10)
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].details["truncated"], true);
+        assert_eq!(
+            recent[0].details["maxBytes"],
+            MAX_INTERNAL_EVENT_DETAIL_BYTES
+        );
     }
 }
