@@ -817,6 +817,13 @@ impl RuntimeServiceImpl {
             let pull_cgroup_effective = self.image_service.pull_cgroup_effective_config();
             let pull_cgroup_last_scope = self.image_service.last_pull_cgroup_scope();
             let image_transfer_status = self.image_service.content_transfer_status();
+            let (content_gc_candidates, content_gc_error) = {
+                let persistence = self.persistence.lock().await;
+                match crate::state::StateLedger::new(&persistence).content_gc_candidates() {
+                    Ok(candidates) => (candidates, None),
+                    Err(err) => (Vec::new(), Some(err.to_string())),
+                }
+            };
             let last_recovery_result = self.last_recovery_result();
             let (recovery_ledger_summary, recovery_ledger_summary_error) =
                 match self.recovery_ledger_health_summary().await {
@@ -1007,6 +1014,10 @@ impl RuntimeServiceImpl {
                     .internal_services
                     .introspection
                     .image_transfers(&image_transfer_status),
+                "contentGc": self.internal_services.introspection.content_gc(
+                    &content_gc_candidates,
+                    content_gc_error.as_deref(),
+                ),
                 "imageSnapshotModel": self
                     .internal_services
                     .introspection
@@ -1192,6 +1203,10 @@ impl RuntimeServiceImpl {
                         "snapshotBackend": self.internal_services.introspection.snapshot_backend(&self.config),
                         "imageTransfers": self.internal_services.introspection.image_transfers(
                             &image_transfer_status,
+                        ),
+                        "contentGc": self.internal_services.introspection.content_gc(
+                            &content_gc_candidates,
+                            content_gc_error.as_deref(),
                         ),
                         "rootless": self.internal_services.introspection.rootless(&self.config.rootless),
                         "recovery": self.internal_services.introspection.recovery(

@@ -7,6 +7,7 @@ use crate::image::content_store::ContentTransferStatus;
 use crate::image::{PullCgroupEffectiveConfig, PullCgroupScopeRecord};
 use crate::rootless::EffectiveRootlessConfig;
 use crate::server::{RuntimeConfig, RuntimeReloadState, RuntimeReloadableConfig};
+use crate::storage::{ContentGcBlocker, ContentGcCandidate};
 
 use super::health::RecoveryLedgerHealthSummary;
 
@@ -122,6 +123,70 @@ impl IntrospectionService {
             },
             "active": status.active,
             "recent": status.recent,
+        })
+    }
+
+    pub fn content_gc(&self, candidates: &[ContentGcCandidate], error: Option<&str>) -> Value {
+        let candidate_values = candidates
+            .iter()
+            .map(|candidate| {
+                let blockers = candidate
+                    .blockers
+                    .iter()
+                    .map(|blocker| match blocker {
+                        ContentGcBlocker::ContentRef {
+                            owner_kind,
+                            owner_id,
+                            ref_kind,
+                        } => json!({
+                            "reason": "referenced",
+                            "ownerKind": owner_kind,
+                            "ownerId": owner_id,
+                            "refKind": ref_kind,
+                        }),
+                        ContentGcBlocker::ActiveTransfer {
+                            transfer_id,
+                            source,
+                        } => json!({
+                            "reason": "activeTransfer",
+                            "transferId": transfer_id,
+                            "source": source,
+                        }),
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "digest": candidate.blob.digest,
+                    "mediaType": candidate.blob.media_type,
+                    "size": candidate.blob.size,
+                    "relativePath": candidate.blob.relative_path,
+                    "createdAt": candidate.blob.created_at,
+                    "lastUsedAt": candidate.blob.last_used_at,
+                    "blocked": !candidate.blockers.is_empty(),
+                    "blockers": blockers,
+                })
+            })
+            .collect::<Vec<_>>();
+        let reclaimable_bytes: u64 = candidates
+            .iter()
+            .filter(|candidate| candidate.blockers.is_empty())
+            .map(|candidate| candidate.blob.size)
+            .sum();
+        json!({
+            "dryRunSupported": true,
+            "deleteSupported": false,
+            "candidateCount": candidates.len(),
+            "reclaimableCount": candidates
+                .iter()
+                .filter(|candidate| candidate.blockers.is_empty())
+                .count(),
+            "blockedCount": candidates
+                .iter()
+                .filter(|candidate| !candidate.blockers.is_empty())
+                .count(),
+            "reclaimableBytes": reclaimable_bytes,
+            "candidates": candidate_values,
+            "recentResult": serde_json::Value::Null,
+            "error": error,
         })
     }
 
@@ -796,6 +861,50 @@ mod tests {
         assert_eq!(value["snapshotter"]["available"], true);
         assert_eq!(value["snapshotter"]["capabilities"][0], "mount-spec");
         assert_eq!(value["snapshotter"]["externalSnapshotterSupported"], true);
+    }
+
+    #[test]
+    fn content_gc_reports_dry_run_candidates_and_blockers() {
+        let service = IntrospectionService;
+        let candidates = vec![
+            ContentGcCandidate {
+                blob: crate::storage::ContentBlobRecord {
+                    digest: "sha256:free".to_string(),
+                    media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                    size: 12,
+                    relative_path: "blobs/sha256/fr/ee".to_string(),
+                    created_at: 1,
+                    last_used_at: 2,
+                },
+                blockers: Vec::new(),
+            },
+            ContentGcCandidate {
+                blob: crate::storage::ContentBlobRecord {
+                    digest: "sha256:blocked".to_string(),
+                    media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                    size: 24,
+                    relative_path: "blobs/sha256/bl/ocked".to_string(),
+                    created_at: 3,
+                    last_used_at: 4,
+                },
+                blockers: vec![ContentGcBlocker::ActiveTransfer {
+                    transfer_id: "transfer-1".to_string(),
+                    source: "pull:sha256:blocked".to_string(),
+                }],
+            },
+        ];
+
+        let value = service.content_gc(&candidates, None);
+
+        assert_eq!(value["dryRunSupported"], true);
+        assert_eq!(value["candidateCount"], 2);
+        assert_eq!(value["reclaimableCount"], 1);
+        assert_eq!(value["blockedCount"], 1);
+        assert_eq!(value["reclaimableBytes"], 12);
+        assert_eq!(
+            value["candidates"][1]["blockers"][0]["reason"],
+            "activeTransfer"
+        );
     }
 
     #[test]

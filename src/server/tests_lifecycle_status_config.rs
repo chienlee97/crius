@@ -1279,6 +1279,40 @@ async fn status_verbose_reports_recovery_ledger_degraded_objects() {
         .contains("4 unhealthy object"));
 }
 
+#[tokio::test]
+async fn verbose_status_reports_content_gc_dry_run_candidates() {
+    let service = test_service();
+    {
+        let mut persistence = service.persistence.lock().await;
+        let storage = persistence.storage_mut();
+        storage
+            .save_content_blob(&crate::storage::ContentBlobRecord {
+                digest: "sha256:status-gc".to_string(),
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                size: 32,
+                relative_path: "blobs/sha256/status-gc".to_string(),
+                created_at: 1,
+                last_used_at: 1,
+            })
+            .unwrap();
+    }
+
+    let response = RuntimeService::status(&service, Request::new(StatusRequest { verbose: true }))
+        .await
+        .unwrap()
+        .into_inner();
+    let config: serde_json::Value =
+        serde_json::from_str(response.info.get("config").unwrap()).unwrap();
+
+    assert_eq!(config["contentGc"]["dryRunSupported"], true);
+    assert_eq!(config["contentGc"]["candidateCount"], 1);
+    assert_eq!(config["contentGc"]["reclaimableCount"], 1);
+    assert_eq!(
+        config["internalServices"]["introspection"]["contentGc"]["candidateCount"],
+        serde_json::json!(1)
+    );
+}
+
 #[test]
 fn runtime_registry_returns_handler_specific_create_timeout() {
     let runtime = RuntimeRegistry::new(
