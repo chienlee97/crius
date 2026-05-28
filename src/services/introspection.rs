@@ -251,6 +251,7 @@ impl IntrospectionService {
             "networkModeSupported": rootless.network_mode.is_supported(),
             "networkModeReason": rootless.network_mode.support_reason(),
             "networkHelperPath": network_helper_path,
+            "userNamespace": rootless.user_namespace_status(),
             "limitations": rootless.limitations(),
             "useFuseOverlayfs": rootless.use_fuse_overlayfs,
             "disableCgroup": rootless.disable_cgroup,
@@ -696,6 +697,11 @@ mod tests {
         assert_eq!(value["networkModeSupported"], true);
         assert_eq!(value["networkModeReason"], "RootlessSlirp4netnsSupported");
         assert_eq!(value["networkHelperPath"], "/usr/bin/slirp4netns");
+        assert_eq!(
+            value["userNamespace"]["reason"],
+            "RootlessUserNamespaceReady"
+        );
+        assert_eq!(value["userNamespace"]["ready"], true);
         assert_eq!(
             value["limitations"]["cgroup"]["reason"],
             "RootlessCgroupDisabled"

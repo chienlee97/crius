@@ -220,6 +220,19 @@ pub struct RootlessLimitations {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct RootlessUserNamespaceStatus {
+    pub enabled: bool,
+    pub supported: bool,
+    pub ready: bool,
+    pub in_user_namespace: bool,
+    pub current_uid: u32,
+    pub current_gid: u32,
+    pub reason: &'static str,
+    pub message: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RootlessLimitation {
     pub degraded: bool,
     pub reason: &'static str,
@@ -303,6 +316,75 @@ impl EffectiveRootlessConfig {
             disable_cgroup: true,
             tolerate_missing_hugetlb_controller: true,
         })
+    }
+
+    pub fn user_namespace_status(&self) -> RootlessUserNamespaceStatus {
+        self.user_namespace_status_with_support(is_rootless_supported())
+    }
+
+    fn user_namespace_status_with_support(&self, supported: bool) -> RootlessUserNamespaceStatus {
+        if !self.enabled {
+            return RootlessUserNamespaceStatus {
+                enabled: false,
+                supported,
+                ready: false,
+                in_user_namespace: self.in_user_namespace,
+                current_uid: self.current_uid,
+                current_gid: self.current_gid,
+                reason: "RootlessDisabled",
+                message: "rootless mode is disabled",
+            };
+        }
+
+        if !supported {
+            return RootlessUserNamespaceStatus {
+                enabled: true,
+                supported: false,
+                ready: false,
+                in_user_namespace: self.in_user_namespace,
+                current_uid: self.current_uid,
+                current_gid: self.current_gid,
+                reason: "RootlessUserNamespaceUnsupported",
+                message: "kernel user namespace support is not available",
+            };
+        }
+
+        if self.in_user_namespace {
+            return RootlessUserNamespaceStatus {
+                enabled: true,
+                supported: true,
+                ready: true,
+                in_user_namespace: true,
+                current_uid: self.current_uid,
+                current_gid: self.current_gid,
+                reason: "RootlessUserNamespaceReady",
+                message: "process is running inside a non-initial user namespace",
+            };
+        }
+
+        if self.current_uid == 0 {
+            return RootlessUserNamespaceStatus {
+                enabled: true,
+                supported: true,
+                ready: false,
+                in_user_namespace: false,
+                current_uid: self.current_uid,
+                current_gid: self.current_gid,
+                reason: "RootlessRunningAsHostRoot",
+                message: "rootless mode is enabled but the daemon is running as host root outside a user namespace",
+            };
+        }
+
+        RootlessUserNamespaceStatus {
+            enabled: true,
+            supported: true,
+            ready: false,
+            in_user_namespace: false,
+            current_uid: self.current_uid,
+            current_gid: self.current_gid,
+            reason: "RootlessUserNamespacePending",
+            message: "rootless mode is enabled for a non-root user but the daemon is not inside a user namespace",
+        }
     }
 
     pub fn limitations(&self) -> RootlessLimitations {
@@ -870,5 +952,95 @@ mod tests {
             limitations.devices.reason,
             "RootlessDeviceCgroupRulesDisabled"
         );
+    }
+
+    #[test]
+    fn user_namespace_status_reports_disabled_rootless() {
+        let effective = EffectiveRootlessConfig::disabled();
+
+        let status = effective.user_namespace_status_with_support(true);
+
+        assert!(!status.enabled);
+        assert!(!status.ready);
+        assert_eq!(status.reason, "RootlessDisabled");
+    }
+
+    #[test]
+    fn user_namespace_status_reports_missing_kernel_support() {
+        let effective = EffectiveRootlessConfig {
+            enabled: true,
+            current_uid: 1000,
+            current_gid: 1000,
+            in_user_namespace: false,
+            xdg_runtime_dir: PathBuf::from("/run/user/1000"),
+            xdg_data_home: PathBuf::from("/home/user/.local/share"),
+            storage_root: PathBuf::from("/home/user/.local/share/crius/storage"),
+            runtime_root: PathBuf::from("/run/user/1000/crius"),
+            netns_dir: PathBuf::from("/run/user/1000/crius/netns"),
+            use_fuse_overlayfs: true,
+            network_mode: NetworkMode::None,
+            slirp4netns_path: PathBuf::from("slirp4netns"),
+            pasta_path: PathBuf::from("pasta"),
+            disable_cgroup: true,
+            tolerate_missing_hugetlb_controller: true,
+        };
+
+        let status = effective.user_namespace_status_with_support(false);
+
+        assert!(!status.supported);
+        assert!(!status.ready);
+        assert_eq!(status.reason, "RootlessUserNamespaceUnsupported");
+    }
+
+    #[test]
+    fn user_namespace_status_reports_ready_namespace() {
+        let effective = EffectiveRootlessConfig {
+            enabled: true,
+            current_uid: 1000,
+            current_gid: 1000,
+            in_user_namespace: true,
+            xdg_runtime_dir: PathBuf::from("/run/user/1000"),
+            xdg_data_home: PathBuf::from("/home/user/.local/share"),
+            storage_root: PathBuf::from("/home/user/.local/share/crius/storage"),
+            runtime_root: PathBuf::from("/run/user/1000/crius"),
+            netns_dir: PathBuf::from("/run/user/1000/crius/netns"),
+            use_fuse_overlayfs: true,
+            network_mode: NetworkMode::None,
+            slirp4netns_path: PathBuf::from("slirp4netns"),
+            pasta_path: PathBuf::from("pasta"),
+            disable_cgroup: true,
+            tolerate_missing_hugetlb_controller: true,
+        };
+
+        let status = effective.user_namespace_status_with_support(true);
+
+        assert!(status.ready);
+        assert_eq!(status.reason, "RootlessUserNamespaceReady");
+    }
+
+    #[test]
+    fn user_namespace_status_reports_host_root_degraded() {
+        let effective = EffectiveRootlessConfig {
+            enabled: true,
+            current_uid: 0,
+            current_gid: 0,
+            in_user_namespace: false,
+            xdg_runtime_dir: PathBuf::from("/run/user/0"),
+            xdg_data_home: PathBuf::from("/root/.local/share"),
+            storage_root: PathBuf::from("/root/.local/share/crius/storage"),
+            runtime_root: PathBuf::from("/run/user/0/crius"),
+            netns_dir: PathBuf::from("/run/user/0/crius/netns"),
+            use_fuse_overlayfs: true,
+            network_mode: NetworkMode::None,
+            slirp4netns_path: PathBuf::from("slirp4netns"),
+            pasta_path: PathBuf::from("pasta"),
+            disable_cgroup: true,
+            tolerate_missing_hugetlb_controller: true,
+        };
+
+        let status = effective.user_namespace_status_with_support(true);
+
+        assert!(!status.ready);
+        assert_eq!(status.reason, "RootlessRunningAsHostRoot");
     }
 }
