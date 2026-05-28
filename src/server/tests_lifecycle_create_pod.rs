@@ -1307,4 +1307,18 @@ async fn pod_lifecycle_internal_events_record_stop_and_remove() {
     assert!(events
         .iter()
         .any(|event| event.kind == "pod.remove_success"));
+    let network_events = service
+        .internal_services
+        .events
+        .recent_internal_events("network", "pod-lifecycle", 10)
+        .await
+        .unwrap();
+    assert!(network_events
+        .iter()
+        .any(|event| event.kind == "network.teardown_success"
+            && event.details["phase"] == "fallbackStopPodSandbox"));
+    assert!(network_events
+        .iter()
+        .any(|event| event.kind == "network.teardown_success"
+            && event.details["phase"] == "fallbackRemovePodSandbox"));
 }

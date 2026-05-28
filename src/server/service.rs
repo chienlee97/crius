@@ -2508,6 +2508,25 @@ impl RuntimeServiceImpl {
                 .clone()
                 .or_else(|| (!status.ready).then(|| status.message.clone()));
         });
+        self.publish_network_internal_event(
+            "cni",
+            "reload_result",
+            if sync_error.is_none() && status.ready {
+                crate::services::InternalEventSeverity::Info
+            } else {
+                crate::services::InternalEventSeverity::Warning
+            },
+            json!({
+                "ready": status.ready,
+                "reason": status.reason,
+                "message": status.message,
+                "loadedNetworks": status.loaded_networks,
+                "declaredPlugins": status.declared_plugins,
+                "missingPluginBinaries": status.missing_plugin_binaries,
+                "syncError": sync_error,
+            }),
+        )
+        .await;
         status
     }
 

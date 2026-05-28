@@ -1053,6 +1053,17 @@ async fn reload_cni_watch_once_records_last_error() {
         .current_reload_state()
         .last_cni_watch_error
         .is_some());
+    let events = service
+        .internal_services
+        .events
+        .recent_internal_events("network", "cni", 10)
+        .await
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "network.reload_result"
+            && event.details["ready"] == false
+            && event.details["reason"] == "CNIConfigInvalid"));
 }
 
 #[test]

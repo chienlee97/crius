@@ -1058,6 +1058,19 @@ impl RuntimeServiceImpl {
             }),
         )
         .await;
+        self.publish_network_internal_event(
+            &pod_id,
+            "setup_success",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "netnsPath": netns_path,
+                "runtimeHandler": runtime_handler,
+                "ip": pod_state.ip,
+                "additionalIps": pod_state.additional_ips,
+                "managed": managed_netns,
+            }),
+        )
+        .await;
         if let Some(pause_container_id) = pod_state.pause_container_id.as_deref() {
             self.ensure_pod_exit_monitor_registered(&pod_id, pause_container_id);
         }
@@ -1315,16 +1328,38 @@ impl RuntimeServiceImpl {
             let mut pod_manager = self.pod_manager.lock().await;
             let has_entry = pod_manager.get_pod_sandbox(&pod_id).is_some();
             if has_entry {
-                pod_manager
-                    .stop_pod_sandbox(&pod_id)
-                    .await
-                    .map_err(|e| Status::internal(format!("Failed to stop pod sandbox: {}", e)))?;
+                if let Err(err) = pod_manager.stop_pod_sandbox(&pod_id).await {
+                    self.publish_network_internal_event(
+                        &pod_id,
+                        "teardown_failed",
+                        crate::services::InternalEventSeverity::Error,
+                        json!({
+                            "phase": "stopPodSandbox",
+                            "message": err.to_string(),
+                        }),
+                    )
+                    .await;
+                    return Err(Status::internal(format!(
+                        "Failed to stop pod sandbox: {}",
+                        err
+                    )));
+                }
             }
             has_entry
         };
         if !cleaned_via_manager {
             self.fallback_cleanup_pod_sandbox_resources(&pod_id, &pod, pod_state.as_ref(), false)
                 .await;
+            self.publish_network_internal_event(
+                &pod_id,
+                "teardown_success",
+                crate::services::InternalEventSeverity::Info,
+                json!({
+                    "phase": "fallbackStopPodSandbox",
+                    "cleanedViaManager": false,
+                }),
+            )
+            .await;
         }
 
         let updated_pod = {
@@ -1399,6 +1434,16 @@ impl RuntimeServiceImpl {
         }
 
         log::info!("Pod sandbox {} stopped", pod_id);
+        self.publish_network_internal_event(
+            &pod_id,
+            "teardown_success",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "phase": "stopPodSandbox",
+                "cleanedViaManager": cleaned_via_manager,
+            }),
+        )
+        .await;
         self.publish_pod_lifecycle_event(
             &pod_id,
             "stop_success",
@@ -1490,9 +1535,22 @@ impl RuntimeServiceImpl {
             let mut pod_manager = self.pod_manager.lock().await;
             let has_entry = pod_manager.get_pod_sandbox(&pod_id).is_some();
             if has_entry {
-                pod_manager.remove_pod_sandbox(&pod_id).await.map_err(|e| {
-                    Status::internal(format!("Failed to remove pod sandbox: {}", e))
-                })?;
+                if let Err(err) = pod_manager.remove_pod_sandbox(&pod_id).await {
+                    self.publish_network_internal_event(
+                        &pod_id,
+                        "teardown_failed",
+                        crate::services::InternalEventSeverity::Error,
+                        json!({
+                            "phase": "removePodSandbox",
+                            "message": err.to_string(),
+                        }),
+                    )
+                    .await;
+                    return Err(Status::internal(format!(
+                        "Failed to remove pod sandbox: {}",
+                        err
+                    )));
+                }
             }
             has_entry
         };
@@ -1501,6 +1559,16 @@ impl RuntimeServiceImpl {
             if let Some(pod) = existing_pod.as_ref() {
                 self.fallback_cleanup_pod_sandbox_resources(&pod_id, pod, pod_state.as_ref(), true)
                     .await;
+                self.publish_network_internal_event(
+                    &pod_id,
+                    "teardown_success",
+                    crate::services::InternalEventSeverity::Info,
+                    json!({
+                        "phase": "fallbackRemovePodSandbox",
+                        "cleanedViaManager": false,
+                    }),
+                )
+                .await;
             }
         }
 
@@ -1526,6 +1594,16 @@ impl RuntimeServiceImpl {
         }
 
         log::info!("Pod sandbox {} removed", pod_id);
+        self.publish_network_internal_event(
+            &pod_id,
+            "teardown_success",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "phase": "removePodSandbox",
+                "cleanedViaManager": cleaned_via_manager,
+            }),
+        )
+        .await;
         self.publish_pod_lifecycle_event(
             &pod_id,
             "remove_success",

@@ -131,6 +131,17 @@ impl RuntimeServiceImpl {
             .await;
     }
 
+    pub(super) async fn publish_network_internal_event(
+        &self,
+        pod_id: &str,
+        action: &str,
+        severity: InternalEventSeverity,
+        details: serde_json::Value,
+    ) {
+        self.publish_lifecycle_internal_event("network", pod_id, action, severity, details)
+            .await;
+    }
+
     pub(super) fn exit_code_path(&self, container_id: &str) -> PathBuf {
         self.container_exits_dir.join(container_id)
     }
