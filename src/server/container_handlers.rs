@@ -2253,6 +2253,19 @@ impl RuntimeServiceImpl {
             Some(&self.nri_config.cdi_spec_dirs),
         )
         .map_err(|e| Status::internal(format!("CDI device injection failed: {}", e)))?;
+        if !cdi_requests.is_empty() {
+            let capability_report = crate::security::SecurityManager::new().host_capability_report(
+                &self.nri_config.cdi_spec_dirs,
+                Some(&self.nri_config.blockio_config_path),
+            );
+            if !capability_report.cdi.is_available() {
+                return Err(Status::failed_precondition(format!(
+                    "CDI devices requested but host CDI capability is {}: {}",
+                    capability_state_name(capability_report.cdi.state),
+                    capability_report.cdi.reason
+                )));
+            }
+        }
         crate::security::resource_classes::apply_resource_class_request(
             &mut adjusted_spec,
             &resource_class_request,

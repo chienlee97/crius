@@ -2060,11 +2060,14 @@ impl RuntimeServiceImpl {
         let clean_shutdown_file = config.clean_shutdown_file.clone();
         let version_file = config.version_file.clone();
         let version_file_persist = config.version_file_persist.clone();
-        let runtimes: HashMap<String, Arc<dyn crate::runtime::RuntimeBackend>> =
-            if let Some(runtimes) = injected_runtimes {
-                runtimes
-            } else {
-                config
+        let runtimes: HashMap<String, Arc<dyn crate::runtime::RuntimeBackend>> = if let Some(
+            runtimes,
+        ) =
+            injected_runtimes
+        {
+            runtimes
+        } else {
+            config
                     .runtime_configs
                     .iter()
                     .map(|(handler, runtime_config)| {
@@ -2174,12 +2177,36 @@ impl RuntimeServiceImpl {
                                 });
                                 Arc::new(crate::runtime::RuncBackend::new(runtime))
                             }
-                            other => panic!("unsupported runtime backend {other}"),
+                            other => {
+                                log::warn!(
+                                    "runtime handler {} requested backend {}; falling back to runc-compatible backend construction",
+                                    handler,
+                                    other
+                                );
+                                let mut runtime = RuncRuntime::with_shim_and_image_storage(
+                                    PathBuf::from(&runtime_config.runtime_path),
+                                    PathBuf::from(&runtime_config.runtime_root),
+                                    config.image_root.clone(),
+                                    shim_config,
+                                );
+                                runtime.set_runtime_config_path(PathBuf::from(
+                                    runtime_config.runtime_config_path.as_str(),
+                                ));
+                                runtime.set_state_db_path(config.root_dir.join("crius.db"));
+                                runtime.set_rootless(config.rootless.clone());
+                                runtime.set_cgroup_driver(match config.cgroup_driver {
+                                    Some(CgroupDriver::Systemd) => {
+                                        crate::config::CgroupDriverConfig::Systemd
+                                    }
+                                    _ => crate::config::CgroupDriverConfig::Cgroupfs,
+                                });
+                                Arc::new(crate::runtime::RuncBackend::new(runtime))
+                            }
                         };
                         (handler.clone(), backend)
                     })
                     .collect()
-            };
+        };
         let runtime =
             RuntimeRegistry::new(config.runtime.clone(), runtimes, container_create_timeouts);
         let image_service = ImageServiceImpl::new_with_options(ImageServiceOptions {

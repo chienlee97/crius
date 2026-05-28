@@ -47,6 +47,7 @@ pub struct DeviceResolverInput<'a> {
 pub struct ResolvedDeviceSet {
     pub devices: Vec<OciDevice>,
     pub cgroup_rules: Vec<LinuxDeviceCgroup>,
+    pub degraded_reasons: Vec<String>,
 }
 
 pub fn ownership_from_security_context(
@@ -187,9 +188,16 @@ pub fn resolve_devices(input: DeviceResolverInput<'_>) -> Result<ResolvedDeviceS
         cgroup_rules = vec![allow_all_devices_rule()];
     }
 
+    let mut degraded_reasons = Vec::new();
+    if input.privileged && input.privileged_without_host_devices {
+        degraded_reasons
+            .push("privileged host device injection skipped by runtime handler policy".to_string());
+    }
+
     Ok(ResolvedDeviceSet {
         devices,
         cgroup_rules,
+        degraded_reasons,
     })
 }
 
@@ -378,6 +386,7 @@ mod tests {
             .iter()
             .any(|device| device.path == "/dev/null"));
         assert_all_devices_allowed(&resolved.cgroup_rules);
+        assert!(resolved.degraded_reasons.is_empty());
     }
 
     #[test]
@@ -401,6 +410,10 @@ mod tests {
 
         assert!(resolved.devices.is_empty());
         assert!(resolved.cgroup_rules.is_empty());
+        assert!(resolved
+            .degraded_reasons
+            .iter()
+            .any(|reason| reason.contains("host device injection skipped")));
     }
 
     #[test]

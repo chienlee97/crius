@@ -119,6 +119,14 @@ const NRI_MIN_MEMORY_LIMIT_ENV: &str = "CRIUS_NRI_CONTAINER_MIN_MEMORY_BYTES";
 mod state_model;
 use state_model::*;
 
+fn capability_state_name(state: crate::security::HostCapabilityState) -> &'static str {
+    match state {
+        crate::security::HostCapabilityState::Available => "available",
+        crate::security::HostCapabilityState::Degraded => "degraded",
+        crate::security::HostCapabilityState::Unavailable => "unavailable",
+    }
+}
+
 impl RuntimeServiceImpl {
     fn cgroup_support_flags() -> CgroupResourceSupport {
         Self::cgroup_support_flags_for_root(Path::new("/sys/fs/cgroup"))

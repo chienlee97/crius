@@ -6,6 +6,7 @@ use crate::config::NriConfig;
 use crate::image::content_store::ContentTransferStatus;
 use crate::image::{PullCgroupEffectiveConfig, PullCgroupScopeRecord};
 use crate::rootless::EffectiveRootlessConfig;
+use crate::security::HostCapabilityProbe;
 use crate::server::{RuntimeConfig, RuntimeReloadState, RuntimeReloadableConfig};
 use crate::state::LedgerCheckReport;
 use crate::storage::{ContentGcBlocker, ContentGcCandidate};
@@ -282,8 +283,27 @@ impl IntrospectionService {
         &self,
         seccomp_notifier_dir: &Path,
         seccomp_notifier_active_containers: Vec<String>,
+        nri_config: &NriConfig,
     ) -> Value {
         let security = crate::security::SecurityManager::new();
+        let capabilities = security.host_capability_report(
+            &nri_config.cdi_spec_dirs,
+            Some(&nri_config.blockio_config_path),
+        );
+        let degraded_capabilities = [
+            &capabilities.seccomp,
+            &capabilities.apparmor,
+            &capabilities.selinux,
+            &capabilities.cdi,
+            &capabilities.blockio,
+            &capabilities.rdt,
+            &capabilities.devices,
+            &capabilities.cgroup,
+        ]
+        .into_iter()
+        .filter(|probe| !probe.is_available())
+        .map(|probe| probe.name.clone())
+        .collect::<Vec<_>>();
         json!({
             "selinuxAvailable": security.is_selinux_available(),
             "apparmorAvailable": security.is_apparmor_available(),
@@ -291,6 +311,17 @@ impl IntrospectionService {
             "seccompNotifierSupported": security.is_seccomp_available(),
             "seccompNotifierBaseDir": seccomp_notifier_dir.display().to_string(),
             "seccompNotifierActiveContainers": seccomp_notifier_active_containers,
+            "hostCapabilities": {
+                "seccomp": host_capability_value(&capabilities.seccomp),
+                "apparmor": host_capability_value(&capabilities.apparmor),
+                "selinux": host_capability_value(&capabilities.selinux),
+                "cdi": host_capability_value(&capabilities.cdi),
+                "blockio": host_capability_value(&capabilities.blockio),
+                "rdt": host_capability_value(&capabilities.rdt),
+                "devices": host_capability_value(&capabilities.devices),
+                "cgroup": host_capability_value(&capabilities.cgroup),
+            },
+            "degradedCapabilities": degraded_capabilities,
         })
     }
 
@@ -636,6 +667,14 @@ impl IntrospectionService {
     }
 }
 
+fn host_capability_value(probe: &HostCapabilityProbe) -> Value {
+    json!({
+        "available": probe.state == crate::security::HostCapabilityState::Available,
+        "state": probe.state,
+        "reason": probe.reason,
+    })
+}
+
 fn effective_overlay_storage_options(options: &[String]) -> Value {
     let mut mount_program = None;
     let mut ignore_chown_errors = false;
@@ -951,6 +990,7 @@ mod tests {
         let security = service.security_availability(
             PathBuf::from("/run/crius/seccomp").as_path(),
             vec!["ctr1".to_string()],
+            &NriConfig::default(),
         );
         let cgroup = service.cgroup_support(
             &config,
@@ -1003,6 +1043,8 @@ mod tests {
         assert_eq!(runtime_features["checkpointContainer"], false);
         assert_eq!(security["seccompNotifierBaseDir"], "/run/crius/seccomp");
         assert_eq!(security["seccompNotifierActiveContainers"], json!(["ctr1"]));
+        assert!(security["hostCapabilities"]["seccomp"]["state"].is_string());
+        assert!(security["degradedCapabilities"].is_array());
         assert_eq!(cgroup["activeVersion"], "v2");
         assert_eq!(cgroup["resourceClasses"]["blockio"]["supported"], true);
         assert_eq!(

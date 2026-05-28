@@ -409,6 +409,7 @@ impl RuntimeServiceImpl {
         self.internal_services.introspection.security_availability(
             self.seccomp_notifier_dir(),
             self.seccomp_notifier_active_containers(),
+            &self.nri_config,
         )
     }
 
