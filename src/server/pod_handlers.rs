@@ -926,18 +926,20 @@ impl RuntimeServiceImpl {
         }
         {
             let mut persistence = self.persistence.lock().await;
-            if let Err(err) = persistence.save_pod_sandbox(
-                &pod_id,
-                state,
-                &metadata.name,
-                &metadata.namespace,
-                &metadata.uid,
-                &netns_path,
-                &current_pod.labels,
-                &current_pod.annotations,
-                pod_state.pause_container_id.as_deref(),
-                pod_state.ip.as_deref(),
-            ) {
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .save_pod_sandbox_state(
+                    &pod_id,
+                    state,
+                    &metadata.name,
+                    &metadata.namespace,
+                    &metadata.uid,
+                    &netns_path,
+                    &current_pod.labels,
+                    &current_pod.annotations,
+                    pod_state.pause_container_id.as_deref(),
+                    pod_state.ip.as_deref(),
+                )
+            {
                 drop(persistence);
                 self.rollback_failed_pod_sandbox_run(&pod_id).await;
                 return Err(Status::internal(format!(
@@ -945,7 +947,9 @@ impl RuntimeServiceImpl {
                     pod_id, err
                 )));
             }
-            if let Err(err) = persistence.replace_runtime_artifacts("pod", &pod_id, &artifacts) {
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .replace_runtime_artifacts("pod", &pod_id, &artifacts)
+            {
                 drop(persistence);
                 self.rollback_failed_pod_sandbox_run(&pod_id).await;
                 return Err(Status::internal(format!(
@@ -1107,8 +1111,8 @@ impl RuntimeServiceImpl {
         .and_then(|state| state.netns_path)
         .unwrap_or_default();
         let mut persistence = self.persistence.lock().await;
-        persistence
-            .save_pod_sandbox(
+        crate::state::StateLedgerWriter::new(&mut persistence)
+            .save_pod_sandbox_state(
                 &updated_pod.id,
                 if updated_pod.state == PodSandboxState::SandboxReady as i32 {
                     "ready"
@@ -1264,30 +1268,32 @@ impl RuntimeServiceImpl {
             )
             .and_then(|state| state.ip);
             let mut persistence = self.persistence.lock().await;
-            if let Err(err) = persistence.save_pod_sandbox(
-                &updated_pod.id,
-                "notready",
-                &updated_pod
-                    .metadata
-                    .as_ref()
-                    .map(|metadata| metadata.name.clone())
-                    .unwrap_or_default(),
-                &updated_pod
-                    .metadata
-                    .as_ref()
-                    .map(|metadata| metadata.namespace.clone())
-                    .unwrap_or_default(),
-                &updated_pod
-                    .metadata
-                    .as_ref()
-                    .map(|metadata| metadata.uid.clone())
-                    .unwrap_or_default(),
-                &netns_path,
-                &updated_pod.labels,
-                &updated_pod.annotations,
-                pause_container_id.as_deref(),
-                ip.as_deref(),
-            ) {
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .save_pod_sandbox_state(
+                    &updated_pod.id,
+                    "notready",
+                    &updated_pod
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.name.clone())
+                        .unwrap_or_default(),
+                    &updated_pod
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.namespace.clone())
+                        .unwrap_or_default(),
+                    &updated_pod
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.uid.clone())
+                        .unwrap_or_default(),
+                    &netns_path,
+                    &updated_pod.labels,
+                    &updated_pod.annotations,
+                    pause_container_id.as_deref(),
+                    ip.as_deref(),
+                )
+            {
                 log::error!("Failed to persist stopped pod {}: {}", updated_pod.id, err);
             }
             drop(persistence);

@@ -638,10 +638,12 @@ impl RuntimeServiceImpl {
 
         {
             let mut persistence = persistence.lock().await;
-            if let Err(err) = persistence.update_container_state(
-                container_id,
-                crate::runtime::ContainerStatus::Stopped(exit_code),
-            ) {
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .update_container_state(
+                    container_id,
+                    crate::runtime::ContainerStatus::Stopped(exit_code),
+                )
+            {
                 log::warn!(
                     "Exit monitor failed to persist container {} state: {}",
                     container_id,
@@ -671,8 +673,8 @@ impl RuntimeServiceImpl {
 
         if updated_pod.is_some() {
             let mut persistence = persistence.lock().await;
-            if let Err(err) =
-                persistence.update_pod_state(&updated_container.pod_sandbox_id, "notready")
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .update_pod_state(&updated_container.pod_sandbox_id, "notready")
             {
                 log::warn!(
                     "Exit monitor failed to persist pod {} state: {}",
@@ -739,38 +741,15 @@ impl RuntimeServiceImpl {
         annotations: &HashMap<String, String>,
         persistence: &Arc<Mutex<PersistenceManager>>,
     ) {
-        let encoded_annotations = match serde_json::to_string(annotations) {
-            Ok(encoded) => encoded,
-            Err(err) => {
-                log::warn!(
-                    "Exit monitor failed to encode annotations for {}: {}",
-                    container_id,
-                    err
-                );
-                return;
-            }
-        };
-
         let mut persistence = persistence.lock().await;
-        match persistence.storage().get_container(container_id) {
-            Ok(Some(mut record)) => {
-                record.annotations = encoded_annotations;
-                if let Err(err) = persistence.storage_mut().save_container(&record) {
-                    log::warn!(
-                        "Exit monitor failed to persist annotations for {}: {}",
-                        container_id,
-                        err
-                    );
-                }
-            }
-            Ok(None) => {}
-            Err(err) => {
-                log::warn!(
-                    "Exit monitor failed to load container record {}: {}",
-                    container_id,
-                    err
-                );
-            }
+        if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+            .update_container_annotations(container_id, annotations)
+        {
+            log::warn!(
+                "Exit monitor failed to persist annotations for {}: {}",
+                container_id,
+                err
+            );
         }
     }
 
@@ -800,7 +779,9 @@ impl RuntimeServiceImpl {
 
         {
             let mut persistence = persistence.lock().await;
-            if let Err(err) = persistence.update_pod_state(pod_id, "notready") {
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .update_pod_state(pod_id, "notready")
+            {
                 log::warn!(
                     "Pause exit monitor failed to persist pod {} state: {}",
                     pod_id,
@@ -933,17 +914,19 @@ impl RuntimeServiceImpl {
 
             {
                 let mut persistence = persistence.lock().await;
-                if let Err(err) = persistence.update_container_state(
-                    &container_id,
-                    match runtime_status {
-                        ContainerStatus::Created => crate::runtime::ContainerStatus::Created,
-                        ContainerStatus::Running => crate::runtime::ContainerStatus::Running,
-                        ContainerStatus::Stopped(code) => {
-                            crate::runtime::ContainerStatus::Stopped(code)
-                        }
-                        ContainerStatus::Unknown => crate::runtime::ContainerStatus::Unknown,
-                    },
-                ) {
+                if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                    .update_container_state(
+                        &container_id,
+                        match runtime_status {
+                            ContainerStatus::Created => crate::runtime::ContainerStatus::Created,
+                            ContainerStatus::Running => crate::runtime::ContainerStatus::Running,
+                            ContainerStatus::Stopped(code) => {
+                                crate::runtime::ContainerStatus::Stopped(code)
+                            }
+                            ContainerStatus::Unknown => crate::runtime::ContainerStatus::Unknown,
+                        },
+                    )
+                {
                     log::warn!(
                         "Background state refresh failed to persist container {}: {}",
                         container_id,
@@ -1051,7 +1034,9 @@ impl RuntimeServiceImpl {
                 } else {
                     "notready"
                 };
-                if let Err(err) = persistence.update_pod_state(&pod_id, target_state) {
+                if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                    .update_pod_state(&pod_id, target_state)
+                {
                     log::warn!(
                         "Background state refresh failed to persist pod {}: {}",
                         pod_id,

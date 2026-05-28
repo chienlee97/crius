@@ -130,17 +130,14 @@ impl RuntimeServiceImpl {
         artifact_kind: &str,
         path: &str,
     ) {
-        if let Err(err) = self
-            .persistence
-            .lock()
-            .await
-            .storage_mut()
-            .update_runtime_artifact_state(
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+            .set_runtime_artifact_state(
                 owner_kind,
                 owner_id,
                 artifact_kind,
                 path,
-                RuntimeArtifactLedgerState::Broken.as_str(),
+                RuntimeArtifactLedgerState::Broken,
             )
         {
             log::warn!(
@@ -150,24 +147,18 @@ impl RuntimeServiceImpl {
     }
 
     async fn mark_snapshot_broken(&self, key: &str) {
-        if let Err(err) = self
-            .persistence
-            .lock()
-            .await
-            .storage_mut()
-            .update_snapshot_state(key, SnapshotLedgerState::Broken.as_str())
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+            .set_snapshot_state(key, SnapshotLedgerState::Broken)
         {
             log::warn!("Failed to mark snapshot {key} broken: {err}");
         }
     }
 
     async fn mark_snapshot_stale(&self, key: &str) {
-        if let Err(err) = self
-            .persistence
-            .lock()
-            .await
-            .storage_mut()
-            .update_snapshot_state(key, SnapshotLedgerState::Stale.as_str())
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+            .set_snapshot_state(key, SnapshotLedgerState::Stale)
         {
             log::warn!("Failed to mark snapshot {key} stale: {err}");
         }
@@ -181,9 +172,8 @@ impl RuntimeServiceImpl {
         details: &str,
     ) {
         let mut persistence = self.persistence.lock().await;
-        if let Err(err) = persistence
-            .storage_mut()
-            .update_shim_process_state(container_id, next_state.as_str())
+        if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+            .set_shim_state(container_id, next_state)
         {
             log::warn!("Failed to mark shim process {container_id} {next_state}: {err}");
             return;
@@ -487,7 +477,9 @@ impl RuntimeServiceImpl {
             }
 
             let mut persistence = self.persistence.lock().await;
-            if let Err(e) = persistence.update_container_state(&container_id, persistence_status) {
+            if let Err(e) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .update_container_state(&container_id, persistence_status)
+            {
                 log::warn!(
                     "Failed to reconcile container {} state in database: {}",
                     container_id,
@@ -563,7 +555,7 @@ impl RuntimeServiceImpl {
             }
 
             let mut persistence = self.persistence.lock().await;
-            if let Err(e) = persistence.update_pod_state(
+            if let Err(e) = crate::state::StateLedgerWriter::new(&mut persistence).update_pod_state(
                 &pod_id,
                 if next_state == PodSandboxState::SandboxReady as i32 {
                     "ready"
@@ -914,7 +906,9 @@ impl RuntimeServiceImpl {
         };
         let mut persistence = self.persistence.lock().await;
         if let Some(annotations) = updated_annotations {
-            if let Err(e) = persistence.update_container_annotations(container_id, &annotations) {
+            if let Err(e) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .update_container_annotations(container_id, &annotations)
+            {
                 log::warn!(
                     "Failed to persist ledger-driven annotations for container {}: {}",
                     container_id,
@@ -922,7 +916,9 @@ impl RuntimeServiceImpl {
                 );
             }
         }
-        if let Err(e) = persistence.update_container_state(container_id, persistence_status) {
+        if let Err(e) = crate::state::StateLedgerWriter::new(&mut persistence)
+            .update_container_state(container_id, persistence_status)
+        {
             log::warn!(
                 "Failed to reconcile ledger-driven container {} state in database: {}",
                 container_id,
@@ -971,10 +967,8 @@ impl RuntimeServiceImpl {
                 ContainerStatus::Unknown if has_netns => pod.state.as_str(),
                 _ => "notready",
             };
-            if let Err(err) = self
-                .persistence
-                .lock()
-                .await
+            let mut persistence = self.persistence.lock().await;
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
                 .update_pod_state(pod_id, next_state)
             {
                 log::warn!(
@@ -1717,8 +1711,8 @@ impl RuntimeServiceImpl {
         let ledger_repair = {
             let mut persistence = self.persistence.lock().await;
             crate::state::StateLedgerWriter::new(&mut persistence).repair(
-                crate::state::LedgerRepairOptions::default(),
-                !self.config.internal_repair,
+                crate::state::LedgerRepairOptions { check_files: false },
+                true,
             )
         };
         match ledger_repair {

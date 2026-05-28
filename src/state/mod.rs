@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
@@ -752,8 +752,29 @@ impl<'a> StateLedger<'a> {
             .collect())
     }
 
+    pub fn container(&self, container_id: &str) -> Result<Option<ContainerRecord>> {
+        self.persistence.storage().get_container(container_id)
+    }
+
+    pub fn container_records(&self) -> Result<Vec<ContainerRecord>> {
+        self.persistence.recover_containers().map(|records| {
+            records
+                .into_iter()
+                .map(|(_id, _status, record)| record)
+                .collect()
+        })
+    }
+
+    pub fn containers_by_pod(&self, pod_id: &str) -> Result<Vec<ContainerRecord>> {
+        self.persistence.storage().list_containers_by_pod(pod_id)
+    }
+
     pub fn pod_sandboxes(&self) -> Result<Vec<PodSandboxRecord>> {
         self.persistence.recover_pods()
+    }
+
+    pub fn pod_sandbox(&self, pod_id: &str) -> Result<Option<PodSandboxRecord>> {
+        self.persistence.storage().get_pod_sandbox(pod_id)
     }
 
     pub fn images(&self) -> Result<Vec<ImageRecord>> {
@@ -856,16 +877,104 @@ impl<'a> StateLedgerWriter<'a> {
         self.persistence.storage_mut().save_container(record)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_container_state(
+        &mut self,
+        id: &str,
+        pod_id: &str,
+        state: ContainerStatus,
+        image: &str,
+        command: &[String],
+        labels: &HashMap<String, String>,
+        annotations: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.persistence
+            .save_container(id, pod_id, state, image, command, labels, annotations)
+    }
+
     pub fn delete_container(&mut self, container_id: &str) -> Result<()> {
         self.persistence.delete_container(container_id)
+    }
+
+    pub fn update_container_state(
+        &mut self,
+        container_id: &str,
+        status: ContainerStatus,
+    ) -> Result<()> {
+        self.persistence
+            .update_container_state(container_id, status)
+    }
+
+    pub fn update_container_annotations(
+        &mut self,
+        container_id: &str,
+        annotations: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.persistence
+            .update_container_annotations(container_id, annotations)
+    }
+
+    pub fn update_container_ledger_metadata(
+        &mut self,
+        container_id: &str,
+        runtime_handler: Option<&str>,
+        runtime_backend: Option<&str>,
+        snapshot_key: Option<&str>,
+    ) -> Result<()> {
+        self.persistence.update_container_ledger_metadata(
+            container_id,
+            runtime_handler,
+            runtime_backend,
+            snapshot_key,
+        )
     }
 
     pub fn save_pod_sandbox(&mut self, record: &PodSandboxRecord) -> Result<()> {
         self.persistence.storage_mut().save_pod_sandbox(record)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_pod_sandbox_state(
+        &mut self,
+        id: &str,
+        state: &str,
+        name: &str,
+        namespace: &str,
+        uid: &str,
+        netns_path: &str,
+        labels: &HashMap<String, String>,
+        annotations: &HashMap<String, String>,
+        pause_container_id: Option<&str>,
+        ip: Option<&str>,
+    ) -> Result<()> {
+        self.persistence.save_pod_sandbox(
+            id,
+            state,
+            name,
+            namespace,
+            uid,
+            netns_path,
+            labels,
+            annotations,
+            pause_container_id,
+            ip,
+        )
+    }
+
     pub fn delete_pod_sandbox(&mut self, pod_id: &str) -> Result<()> {
         self.persistence.delete_pod_sandbox(pod_id)
+    }
+
+    pub fn update_pod_state(&mut self, pod_id: &str, state: &str) -> Result<()> {
+        self.persistence.update_pod_state(pod_id, state)
+    }
+
+    pub fn update_pod_annotations(
+        &mut self,
+        pod_id: &str,
+        annotations: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.persistence.update_pod_annotations(pod_id, annotations)
     }
 
     pub fn save_image(&mut self, record: &ImageRecord, refs: &[ImageRefRecord]) -> Result<()> {
@@ -905,6 +1014,12 @@ impl<'a> StateLedgerWriter<'a> {
         if !current.can_transition_to(next) {
             anyhow::bail!("invalid snapshot state transition: {current} -> {next}");
         }
+        self.persistence
+            .storage_mut()
+            .update_snapshot_state(key, next.as_str())
+    }
+
+    pub fn set_snapshot_state(&mut self, key: &str, next: SnapshotLedgerState) -> Result<()> {
         self.persistence
             .storage_mut()
             .update_snapshot_state(key, next.as_str())
@@ -959,6 +1074,19 @@ impl<'a> StateLedgerWriter<'a> {
             .update_runtime_artifact_state(owner_kind, owner_id, artifact_kind, path, next.as_str())
     }
 
+    pub fn set_runtime_artifact_state(
+        &mut self,
+        owner_kind: &str,
+        owner_id: &str,
+        artifact_kind: &str,
+        path: &str,
+        next: RuntimeArtifactLedgerState,
+    ) -> Result<()> {
+        self.persistence
+            .storage_mut()
+            .update_runtime_artifact_state(owner_kind, owner_id, artifact_kind, path, next.as_str())
+    }
+
     pub fn delete_runtime_artifacts(&mut self, owner_kind: &str, owner_id: &str) -> Result<()> {
         self.persistence
             .delete_runtime_artifacts(owner_kind, owner_id)
@@ -982,6 +1110,12 @@ impl<'a> StateLedgerWriter<'a> {
         if !current.can_transition_to(next) {
             anyhow::bail!("invalid shim state transition: {current} -> {next}");
         }
+        self.persistence
+            .storage_mut()
+            .update_shim_process_state(container_id, next.as_str())
+    }
+
+    pub fn set_shim_state(&mut self, container_id: &str, next: ShimLedgerState) -> Result<()> {
         self.persistence
             .storage_mut()
             .update_shim_process_state(container_id, next.as_str())

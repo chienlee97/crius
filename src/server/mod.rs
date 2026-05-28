@@ -1095,22 +1095,9 @@ impl RuntimeServiceImpl {
         container_id: &str,
         annotations: &HashMap<String, String>,
     ) -> Result<(), Status> {
-        let encoded_annotations = serde_json::to_string(annotations)
-            .map_err(|e| Status::internal(format!("Failed to encode annotations: {}", e)))?;
-
         let mut persistence = self.persistence.lock().await;
-        let Some(mut record) = persistence
-            .storage()
-            .get_container(container_id)
-            .map_err(|e| Status::internal(format!("Failed to load container record: {}", e)))?
-        else {
-            return Ok(());
-        };
-
-        record.annotations = encoded_annotations;
-        persistence
-            .storage_mut()
-            .save_container(&record)
+        crate::state::StateLedgerWriter::new(&mut persistence)
+            .update_container_annotations(container_id, annotations)
             .map_err(|e| Status::internal(format!("Failed to persist container record: {}", e)))
     }
 
@@ -2541,9 +2528,8 @@ impl RuntimeServiceImpl {
         requested_id: &str,
     ) -> Result<Option<String>, Status> {
         let persistence = self.persistence.lock().await;
-        let records = persistence
-            .storage()
-            .list_containers()
+        let records = crate::state::StateLedger::new(&persistence)
+            .container_records()
             .map_err(|e| Status::internal(format!("Failed to list containers: {}", e)))?;
         drop(persistence);
 
@@ -2850,30 +2836,9 @@ impl NriRuntimeDomain {
         container_id: &str,
         annotations: &HashMap<String, String>,
     ) -> crate::nri::Result<()> {
-        let encoded_annotations = serde_json::to_string(annotations).map_err(|e| {
-            crate::nri::NriError::Plugin(format!(
-                "failed to encode annotations for {}: {}",
-                container_id, e
-            ))
-        })?;
-
         let mut persistence = self.persistence.lock().await;
-        let Some(mut record) = persistence
-            .storage()
-            .get_container(container_id)
-            .map_err(|e| {
-                crate::nri::NriError::Plugin(format!(
-                    "failed to load container {} from persistence: {}",
-                    container_id, e
-                ))
-            })?
-        else {
-            return Ok(());
-        };
-        record.annotations = encoded_annotations;
-        persistence
-            .storage_mut()
-            .save_container(&record)
+        crate::state::StateLedgerWriter::new(&mut persistence)
+            .update_container_annotations(container_id, annotations)
             .map_err(|e| {
                 crate::nri::NriError::Plugin(format!(
                     "failed to persist container {} annotations: {}",
@@ -3006,7 +2971,7 @@ impl NriRuntimeDomain {
             .await?;
 
         let mut persistence = self.persistence.lock().await;
-        persistence
+        crate::state::StateLedgerWriter::new(&mut persistence)
             .update_container_state(
                 &container_id,
                 match runtime_status {
@@ -3104,7 +3069,7 @@ impl NriRuntimeDomain {
             .await?;
 
         let mut persistence = self.persistence.lock().await;
-        persistence
+        crate::state::StateLedgerWriter::new(&mut persistence)
             .update_container_state(
                 &container_id,
                 match exit_code {

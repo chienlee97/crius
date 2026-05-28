@@ -69,9 +69,8 @@ impl RuntimeServiceImpl {
                 let in_memory = existing_container.is_some();
                 let persisted_record = {
                     let persistence = self.persistence.lock().await;
-                    persistence
-                        .storage()
-                        .get_container(&existing_id)
+                    crate::state::StateLedger::new(&persistence)
+                        .container(&existing_id)
                         .ok()
                         .flatten()
                 };
@@ -360,9 +359,8 @@ impl RuntimeServiceImpl {
 
         let persisted = {
             let persistence = self.persistence.lock().await;
-            persistence
-                .storage()
-                .get_container(container_id)
+            crate::state::StateLedger::new(&persistence)
+                .container(container_id)
                 .map_err(|e| {
                     Status::internal(format!(
                         "Failed to load persisted container {}: {}",
@@ -547,7 +545,9 @@ impl RuntimeServiceImpl {
             },
         };
         let mut persistence = self.persistence.lock().await;
-        if let Err(err) = persistence.update_container_state(container_id, persistence_status) {
+        if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+            .update_container_state(container_id, persistence_status)
+        {
             log::error!(
                 "Failed to update container {} state in database: {}",
                 container_id,
@@ -621,7 +621,9 @@ impl RuntimeServiceImpl {
             ContainerStatus::Unknown => crate::runtime::ContainerStatus::Created,
         };
         let mut persistence = self.persistence.lock().await;
-        if let Err(err) = persistence.update_container_state(container_id, persistence_status) {
+        if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+            .update_container_state(container_id, persistence_status)
+        {
             log::error!(
                 "Failed to update failed-start container {} state in database: {}",
                 container_id,
@@ -2313,15 +2315,17 @@ impl RuntimeServiceImpl {
         };
         {
             let mut persistence = self.persistence.lock().await;
-            if let Err(err) = persistence.save_container(
-                &created_id,
-                &pod_sandbox_id,
-                state,
-                &container_image_ref,
-                &container_config.command,
-                &container.labels,
-                &container.annotations,
-            ) {
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .save_container_state(
+                    &created_id,
+                    &pod_sandbox_id,
+                    state,
+                    &container_image_ref,
+                    &container_config.command,
+                    &container.labels,
+                    &container.annotations,
+                )
+            {
                 drop(persistence);
                 self.rollback_failed_container_create(&created_id, nri_event)
                     .await;
@@ -2330,12 +2334,14 @@ impl RuntimeServiceImpl {
                     created_id, err
                 )));
             }
-            if let Err(err) = persistence.update_container_ledger_metadata(
-                &created_id,
-                Some(runtime_handler),
-                Some(runtime_backend.backend_name()),
-                Some(&created_id),
-            ) {
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .update_container_ledger_metadata(
+                    &created_id,
+                    Some(runtime_handler),
+                    Some(runtime_backend.backend_name()),
+                    Some(&created_id),
+                )
+            {
                 drop(persistence);
                 self.rollback_failed_container_create(&created_id, nri_event)
                     .await;
@@ -2649,8 +2655,8 @@ impl RuntimeServiceImpl {
         };
         {
             let mut persistence = self.persistence.lock().await;
-            if let Err(err) =
-                persistence.update_container_state(&actual_container_id, persistence_state)
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .update_container_state(&actual_container_id, persistence_state)
             {
                 log::error!(
                     "Failed to update container {} state in database: {}",
