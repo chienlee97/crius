@@ -29,7 +29,7 @@ use crate::proto::runtime::v1::{
     Int64Value, ListImagesRequest, ListImagesResponse, PullImageRequest, PullImageResponse,
     RemoveImageRequest, RemoveImageResponse, UInt64Value,
 };
-use crate::storage::StorageManager;
+use crate::storage::{ContentGcBlocker, StorageManager};
 use content_store::{
     ContentStore, ContentTransferRecord, ContentTransferStatus, ContentTransferTracker,
     FsContentStore, RemoteContentProviderKind,
@@ -39,6 +39,18 @@ pub use pull_cgroup::{
     validate_pull_cgroup_config, PullCgroupEffectiveConfig, PullCgroupExecutor, PullCgroupMode,
     PullCgroupScopeRecord,
 };
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentGcSummary {
+    pub dry_run: bool,
+    pub candidates: usize,
+    pub eligible: usize,
+    pub skipped: usize,
+    pub deleted: usize,
+    pub failed: usize,
+    pub bytes_deleted: u64,
+}
 
 /// crius镜像
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -219,6 +231,29 @@ fn parse_storage_option_bool(value: &str) -> std::result::Result<bool, String> {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
         other => Err(format!("invalid boolean value {other}")),
+    }
+}
+
+fn content_gc_blocker_detail(blocker: &ContentGcBlocker) -> serde_json::Value {
+    match blocker {
+        ContentGcBlocker::ContentRef {
+            owner_kind,
+            owner_id,
+            ref_kind,
+        } => serde_json::json!({
+            "kind": "contentRef",
+            "ownerKind": owner_kind,
+            "ownerId": owner_id,
+            "refKind": ref_kind,
+        }),
+        ContentGcBlocker::ActiveTransfer {
+            transfer_id,
+            source,
+        } => serde_json::json!({
+            "kind": "activeTransfer",
+            "transferId": transfer_id,
+            "source": source,
+        }),
     }
 }
 
@@ -473,6 +508,118 @@ impl ImageServiceImpl {
             return Ok(());
         };
         self.persist_content_transfer_record(&record)
+    }
+
+    fn publish_image_internal_event(
+        &self,
+        image_ref: &str,
+        kind: &str,
+        severity: crate::services::InternalEventSeverity,
+        details: serde_json::Value,
+    ) {
+        let Some(db_path) = self.ledger_db_path.as_ref() else {
+            return;
+        };
+        let event =
+            crate::services::InternalEvent::new(kind, "image", image_ref, severity, details);
+        if let Err(err) = crate::services::LedgerInternalEventSink::new(db_path).publish(&event) {
+            log::debug!("Failed to publish image internal event {kind} for {image_ref}: {err}");
+        }
+    }
+
+    fn publish_gc_internal_event(
+        &self,
+        subject_id: &str,
+        kind: &str,
+        severity: crate::services::InternalEventSeverity,
+        details: serde_json::Value,
+    ) {
+        let Some(db_path) = self.ledger_db_path.as_ref() else {
+            return;
+        };
+        let event = crate::services::InternalEvent::new(kind, "gc", subject_id, severity, details);
+        if let Err(err) = crate::services::LedgerInternalEventSink::new(db_path).publish(&event) {
+            log::debug!("Failed to publish GC internal event {kind} for {subject_id}: {err}");
+        }
+    }
+
+    pub fn collect_content_garbage(&self, dry_run: bool) -> Result<ContentGcSummary, Error> {
+        let Some(db_path) = self.ledger_db_path.as_ref() else {
+            return Ok(ContentGcSummary {
+                dry_run,
+                ..Default::default()
+            });
+        };
+        let storage = StorageManager::new(db_path)
+            .map_err(|err| Error::Storage(format!("failed to open content GC ledger: {err}")))?;
+        let candidates = storage.list_content_gc_candidates().map_err(|err| {
+            Error::Storage(format!("failed to list content GC candidates: {err}"))
+        })?;
+        let mut summary = ContentGcSummary {
+            dry_run,
+            candidates: candidates.len(),
+            ..Default::default()
+        };
+
+        for candidate in candidates {
+            let digest = candidate.blob.digest.clone();
+            if candidate.blockers.is_empty() {
+                self.publish_gc_internal_event(
+                    &digest,
+                    "gc.candidate",
+                    crate::services::InternalEventSeverity::Info,
+                    serde_json::json!({
+                        "digest": digest,
+                        "size": candidate.blob.size,
+                        "dryRun": dry_run,
+                    }),
+                );
+                if dry_run {
+                    summary.eligible += 1;
+                    continue;
+                }
+                match self.content_store.delete_blob(&candidate.blob.digest) {
+                    Ok(()) => {
+                        summary.deleted += 1;
+                        summary.bytes_deleted += candidate.blob.size;
+                        self.publish_gc_internal_event(
+                            &candidate.blob.digest,
+                            "gc.delete",
+                            crate::services::InternalEventSeverity::Info,
+                            serde_json::json!({
+                                "digest": candidate.blob.digest,
+                                "size": candidate.blob.size,
+                            }),
+                        );
+                    }
+                    Err(err) => {
+                        summary.failed += 1;
+                        self.publish_gc_internal_event(
+                            &candidate.blob.digest,
+                            "gc.fail",
+                            crate::services::InternalEventSeverity::Error,
+                            serde_json::json!({
+                                "digest": candidate.blob.digest,
+                                "message": err.to_string(),
+                            }),
+                        );
+                    }
+                }
+            } else {
+                summary.skipped += 1;
+                self.publish_gc_internal_event(
+                    &digest,
+                    "gc.skip",
+                    crate::services::InternalEventSeverity::Debug,
+                    serde_json::json!({
+                        "digest": digest,
+                        "blockers": candidate.blockers.iter().map(content_gc_blocker_detail).collect::<Vec<_>>(),
+                    }),
+                );
+            }
+        }
+
+        Ok(summary)
     }
 
     fn should_retry_pull_status(status: &Status) -> bool {
@@ -2994,9 +3141,31 @@ impl ImageService for ImageServiceImpl {
         let transfer_id = transfer.id().to_string();
         self.persist_content_transfer_by_id(&transfer_id)
             .map_err(|err| Status::internal(err.to_string()))?;
+        self.publish_image_internal_event(
+            &canonical_ref,
+            "image.pull_start",
+            crate::services::InternalEventSeverity::Info,
+            serde_json::json!({
+                "requestedRef": requested_ref,
+                "canonicalRef": canonical_ref,
+                "transferId": transfer_id,
+                "provider": self.transfer_provider_kind().as_str(),
+            }),
+        );
         transfer.update("pulling", 0, 0);
         self.persist_content_transfer_by_id(&transfer_id)
             .map_err(|err| Status::internal(err.to_string()))?;
+        self.publish_image_internal_event(
+            &canonical_ref,
+            "image.pull_progress",
+            crate::services::InternalEventSeverity::Info,
+            serde_json::json!({
+                "transferId": transfer_id,
+                "stage": "pulling",
+                "bytesCompleted": 0,
+                "bytesTotal": 0,
+            }),
+        );
 
         let pull_outcome = Self::execute_pull_with_retries(self.pull_retry_count, || async {
             transfer.update("attempt", 0, 0);
@@ -3045,12 +3214,31 @@ impl ImageService for ImageServiceImpl {
                 transfer.succeed();
                 self.persist_content_transfer_by_id(&transfer_id)
                     .map_err(|err| Status::internal(err.to_string()))?;
+                self.publish_image_internal_event(
+                    &canonical_ref,
+                    "image.pull_success",
+                    crate::services::InternalEventSeverity::Info,
+                    serde_json::json!({
+                        "transferId": transfer_id,
+                        "imageRef": response.get_ref().image_ref,
+                    }),
+                );
                 Ok(response)
             }
             Err(status) => {
                 transfer.fail(status.message().to_string());
                 self.persist_content_transfer_by_id(&transfer_id)
                     .map_err(|err| Status::internal(err.to_string()))?;
+                self.publish_image_internal_event(
+                    &canonical_ref,
+                    "image.pull_fail",
+                    crate::services::InternalEventSeverity::Error,
+                    serde_json::json!({
+                        "transferId": transfer_id,
+                        "code": format!("{:?}", status.code()),
+                        "message": status.message(),
+                    }),
+                );
                 Err(status)
             }
         }

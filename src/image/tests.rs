@@ -1531,6 +1531,68 @@ async fn pull_image_persists_content_transfer_result_to_ledger() {
     assert_eq!(transfers[0].source, "docker.io/repo/transfer-ledger:latest");
     assert_eq!(transfers[0].state, "succeeded");
     assert!(transfers[0].finished_at.is_some());
+    let events = crate::services::EventService::with_capacity(16).with_ledger(Arc::new(
+        tokio::sync::Mutex::new(
+            crate::storage::persistence::PersistenceManager::new(
+                crate::storage::persistence::PersistenceConfig {
+                    db_path: ledger_db_path,
+                    enable_recovery: true,
+                    auto_save_interval: 30,
+                },
+            )
+            .unwrap(),
+        ),
+    ));
+    let recent = events
+        .recent_internal_events("image", "docker.io/repo/transfer-ledger:latest", 10)
+        .await
+        .unwrap();
+    assert!(recent.iter().any(|event| event.kind == "image.pull_start"));
+    assert!(recent
+        .iter()
+        .any(|event| event.kind == "image.pull_progress" && event.details["stage"] == "pulling"));
+    assert!(recent.iter().any(|event| event.kind == "image.pull_success"
+        && event.details["imageRef"] == "sha256:transfer-ledger"));
+}
+
+#[tokio::test]
+async fn failed_pull_persists_internal_event_to_ledger() {
+    let (_dir, service, ledger_db_path) = test_image_service_with_ledger_in_tempdir();
+    service.set_test_pull_handler(Arc::new(|_| Err(Status::internal("registry failed"))));
+
+    let result = ImageService::pull_image(
+        &service,
+        Request::new(PullImageRequest {
+            image: Some(ImageSpec {
+                image: "repo/transfer-event-failure:latest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )
+    .await;
+
+    assert!(result.is_err());
+    let events = crate::services::EventService::with_capacity(16).with_ledger(Arc::new(
+        tokio::sync::Mutex::new(
+            crate::storage::persistence::PersistenceManager::new(
+                crate::storage::persistence::PersistenceConfig {
+                    db_path: ledger_db_path,
+                    enable_recovery: true,
+                    auto_save_interval: 30,
+                },
+            )
+            .unwrap(),
+        ),
+    ));
+    let recent = events
+        .recent_internal_events("image", "docker.io/repo/transfer-event-failure:latest", 10)
+        .await
+        .unwrap();
+    assert!(recent
+        .iter()
+        .any(|event| event.kind == "image.pull_fail"
+            && event.details["message"] == "registry failed"));
 }
 
 #[tokio::test]
@@ -1655,6 +1717,73 @@ async fn retry_after_failed_pull_preserves_single_owner_ref_graph() {
         .list_content_blob_refs(Some("image"), Some("sha256:retry-graph"))
         .unwrap();
     assert_eq!(blob_refs.len(), 1);
+}
+
+#[test]
+fn content_gc_publishes_candidate_skip_and_delete_events() {
+    let (_dir, service, ledger_db_path) = test_image_service_with_ledger_in_tempdir();
+    let orphan = service
+        .content_store
+        .put_blob("", "application/octet-stream", b"orphan")
+        .unwrap();
+    let referenced = service
+        .content_store
+        .put_blob("", "application/octet-stream", b"referenced")
+        .unwrap();
+    let mut storage = StorageManager::new(&ledger_db_path).unwrap();
+    storage
+        .replace_content_blob_refs(
+            "image",
+            "sha256:kept",
+            &[crate::storage::ContentBlobRefRecord {
+                owner_kind: "image".to_string(),
+                owner_id: "sha256:kept".to_string(),
+                digest: referenced.digest.clone(),
+                ref_kind: "layer".to_string(),
+            }],
+        )
+        .unwrap();
+    drop(storage);
+
+    let dry_run = service.collect_content_garbage(true).unwrap();
+    assert!(dry_run.dry_run);
+    assert_eq!(dry_run.candidates, 2);
+    assert_eq!(dry_run.eligible, 1);
+    assert_eq!(dry_run.skipped, 1);
+    assert_eq!(dry_run.deleted, 0);
+
+    let summary = service.collect_content_garbage(false).unwrap();
+    assert!(!summary.dry_run);
+    assert_eq!(summary.deleted, 1);
+    assert_eq!(summary.skipped, 1);
+    assert!(service.content_store.stat_blob(&orphan.digest).is_err());
+    assert!(service.content_store.stat_blob(&referenced.digest).is_ok());
+
+    let persistence = Arc::new(tokio::sync::Mutex::new(
+        crate::storage::persistence::PersistenceManager::new(
+            crate::storage::persistence::PersistenceConfig {
+                db_path: ledger_db_path,
+                enable_recovery: true,
+                auto_save_interval: 30,
+            },
+        )
+        .unwrap(),
+    ));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let events = crate::services::EventService::with_capacity(16).with_ledger(persistence);
+    let orphan_events = runtime
+        .block_on(events.recent_internal_events("gc", &orphan.digest, 10))
+        .unwrap();
+    assert!(orphan_events
+        .iter()
+        .any(|event| event.kind == "gc.candidate"));
+    assert!(orphan_events.iter().any(|event| event.kind == "gc.delete"));
+    let referenced_events = runtime
+        .block_on(events.recent_internal_events("gc", &referenced.digest, 10))
+        .unwrap();
+    assert!(referenced_events.iter().any(
+        |event| event.kind == "gc.skip" && event.details["blockers"][0]["kind"] == "contentRef"
+    ));
 }
 
 #[test]
