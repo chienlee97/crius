@@ -1,10 +1,12 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::storage::{ContentBlobRecord, StorageManager};
 
@@ -13,6 +15,62 @@ pub trait ContentStore: Send + Sync {
     fn get_blob(&self, digest: &str) -> Result<BlobHandle>;
     fn delete_blob(&self, digest: &str) -> Result<()>;
     fn stat_blob(&self, digest: &str) -> Result<BlobInfo>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteContentProviderKind {
+    Registry,
+    Test,
+    Local,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferState {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentTransferRecord {
+    pub id: String,
+    pub source: String,
+    pub provider: RemoteContentProviderKind,
+    pub state: TransferState,
+    pub current_stage: String,
+    pub bytes_total: u64,
+    pub bytes_completed: u64,
+    pub started_at_unix_nanos: i64,
+    pub finished_at_unix_nanos: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentTransferStatus {
+    pub active: Vec<ContentTransferRecord>,
+    pub recent: Vec<ContentTransferRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContentTransferTracker {
+    inner: Arc<Mutex<ContentTransferTrackerInner>>,
+}
+
+#[derive(Debug, Default)]
+struct ContentTransferTrackerInner {
+    active: Vec<ContentTransferRecord>,
+    recent: Vec<ContentTransferRecord>,
+}
+
+#[derive(Debug)]
+pub struct ContentTransferGuard {
+    id: String,
+    tracker: ContentTransferTracker,
+    finished: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +85,118 @@ pub struct BlobInfo {
 pub struct BlobHandle {
     pub info: BlobInfo,
     pub file: File,
+}
+
+impl Default for ContentTransferTracker {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ContentTransferTrackerInner::default())),
+        }
+    }
+}
+
+impl ContentTransferTracker {
+    const RECENT_LIMIT: usize = 16;
+
+    pub fn start(
+        &self,
+        source: impl Into<String>,
+        provider: RemoteContentProviderKind,
+        stage: impl Into<String>,
+    ) -> ContentTransferGuard {
+        let record = ContentTransferRecord {
+            id: Uuid::new_v4().to_string(),
+            source: source.into(),
+            provider,
+            state: TransferState::Running,
+            current_stage: stage.into(),
+            bytes_total: 0,
+            bytes_completed: 0,
+            started_at_unix_nanos: now_unix_nanos(),
+            finished_at_unix_nanos: None,
+            error: None,
+        };
+        let id = record.id.clone();
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.active.push(record);
+        }
+        ContentTransferGuard {
+            id,
+            tracker: self.clone(),
+            finished: false,
+        }
+    }
+
+    pub fn snapshot(&self) -> ContentTransferStatus {
+        let Ok(inner) = self.inner.lock() else {
+            return ContentTransferStatus::default();
+        };
+        ContentTransferStatus {
+            active: inner.active.clone(),
+            recent: inner.recent.clone(),
+        }
+    }
+
+    fn update(&self, id: &str, stage: impl Into<String>, bytes_completed: u64, bytes_total: u64) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if let Some(record) = inner.active.iter_mut().find(|record| record.id == id) {
+            record.current_stage = stage.into();
+            record.bytes_completed = bytes_completed;
+            record.bytes_total = bytes_total;
+        }
+    }
+
+    fn finish(&self, id: &str, state: TransferState, error: Option<String>) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let Some(index) = inner.active.iter().position(|record| record.id == id) else {
+            return;
+        };
+        let mut record = inner.active.remove(index);
+        record.state = state;
+        record.finished_at_unix_nanos = Some(now_unix_nanos());
+        record.error = error;
+        inner.recent.insert(0, record);
+        inner.recent.truncate(Self::RECENT_LIMIT);
+    }
+}
+
+impl ContentTransferGuard {
+    pub fn update(&self, stage: impl Into<String>, bytes_completed: u64, bytes_total: u64) {
+        self.tracker
+            .update(&self.id, stage, bytes_completed, bytes_total);
+    }
+
+    pub fn succeed(mut self) {
+        self.finished = true;
+        self.tracker
+            .finish(&self.id, TransferState::Succeeded, None);
+    }
+
+    pub fn fail(mut self, error: impl Into<String>) {
+        self.finished = true;
+        self.tracker
+            .finish(&self.id, TransferState::Failed, Some(error.into()));
+    }
+}
+
+impl Drop for ContentTransferGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.tracker.finish(
+                &self.id,
+                TransferState::Failed,
+                Some("transfer dropped before completion".to_string()),
+            );
+        }
+    }
+}
+
+fn now_unix_nanos() -> i64 {
+    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
 }
 
 #[derive(Debug, Clone)]
@@ -289,7 +459,10 @@ pub fn collect_path_usage(path: &Path) -> Result<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_path_usage, ContentStore, FsContentStore};
+    use super::{
+        collect_path_usage, ContentStore, ContentTransferTracker, FsContentStore,
+        RemoteContentProviderKind, TransferState,
+    };
 
     #[test]
     fn stores_blob_and_persists_metadata() {
@@ -344,5 +517,35 @@ mod tests {
         store.delete_blob(&info.digest).unwrap();
         let storage = crate::storage::StorageManager::new(&db_path).unwrap();
         assert!(storage.get_content_blob(&info.digest).unwrap().is_none());
+    }
+
+    #[test]
+    fn transfer_tracker_reports_active_and_recent_records() {
+        let tracker = ContentTransferTracker::default();
+        let transfer = tracker.start(
+            "registry.example.com/ns/image:latest",
+            RemoteContentProviderKind::Registry,
+            "resolving",
+        );
+        transfer.update("downloading", 5, 10);
+
+        let active = tracker.snapshot();
+        assert_eq!(active.active.len(), 1);
+        assert_eq!(active.recent.len(), 0);
+        assert_eq!(active.active[0].current_stage, "downloading");
+        assert_eq!(active.active[0].bytes_completed, 5);
+        assert_eq!(active.active[0].bytes_total, 10);
+
+        transfer.succeed();
+
+        let recent = tracker.snapshot();
+        assert!(recent.active.is_empty());
+        assert_eq!(recent.recent.len(), 1);
+        assert_eq!(recent.recent[0].state, TransferState::Succeeded);
+        assert_eq!(
+            recent.recent[0].provider,
+            RemoteContentProviderKind::Registry
+        );
+        assert!(recent.recent[0].finished_at_unix_nanos.is_some());
     }
 }

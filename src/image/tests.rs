@@ -1,4 +1,5 @@
 use super::*;
+use crate::image::content_store::{RemoteContentProviderKind, TransferState};
 use crate::proto::runtime::v1::{
     ImageFilter, ImageFsInfoRequest, ImageSpec, PodSandboxConfig, PodSandboxMetadata,
 };
@@ -1401,6 +1402,69 @@ async fn pull_persists_layers_into_content_store_and_metadata() {
         "expected blob-backed layer path {} to exist",
         blob_path.display()
     );
+}
+
+#[tokio::test]
+async fn pull_image_records_successful_content_transfer() {
+    let (_dir, service) = test_image_service_in_tempdir();
+    service.set_test_pull_handler(Arc::new(|_| {
+        Ok(TestPullResponse {
+            image_id: "sha256:transfer-success".to_string(),
+            size: TEST_EMPTY_LAYER_TAR_GZ.len() as u64,
+            ..Default::default()
+        })
+    }));
+
+    ImageService::pull_image(
+        &service,
+        Request::new(PullImageRequest {
+            image: Some(ImageSpec {
+                image: "repo/transfer-success:latest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let status = service.content_transfer_status();
+    assert!(status.active.is_empty());
+    assert_eq!(status.recent.len(), 1);
+    let record = &status.recent[0];
+    assert_eq!(record.source, "docker.io/repo/transfer-success:latest");
+    assert_eq!(record.provider, RemoteContentProviderKind::Test);
+    assert_eq!(record.state, TransferState::Succeeded);
+    assert!(record.finished_at_unix_nanos.is_some());
+    assert!(record.error.is_none());
+}
+
+#[tokio::test]
+async fn pull_image_records_failed_content_transfer() {
+    let (_dir, service) = test_image_service_in_tempdir();
+    service.set_test_pull_handler(Arc::new(|_| Err(Status::internal("registry failed"))));
+
+    let result = ImageService::pull_image(
+        &service,
+        Request::new(PullImageRequest {
+            image: Some(ImageSpec {
+                image: "repo/transfer-failure:latest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )
+    .await;
+
+    assert!(result.is_err());
+    let status = service.content_transfer_status();
+    assert!(status.active.is_empty());
+    assert_eq!(status.recent.len(), 1);
+    let record = &status.recent[0];
+    assert_eq!(record.source, "docker.io/repo/transfer-failure:latest");
+    assert_eq!(record.provider, RemoteContentProviderKind::Test);
+    assert_eq!(record.state, TransferState::Failed);
+    assert_eq!(record.error.as_deref(), Some("registry failed"));
 }
 
 #[tokio::test]

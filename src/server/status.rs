@@ -816,6 +816,7 @@ impl RuntimeServiceImpl {
             ));
             let pull_cgroup_effective = self.image_service.pull_cgroup_effective_config();
             let pull_cgroup_last_scope = self.image_service.last_pull_cgroup_scope();
+            let image_transfer_status = self.image_service.content_transfer_status();
             let last_recovery_result = self.last_recovery_result();
             let (recovery_ledger_summary, recovery_ledger_summary_error) =
                 match self.recovery_ledger_health_summary().await {
@@ -1002,6 +1003,10 @@ impl RuntimeServiceImpl {
                     .display()
                     .to_string(),
                 "imageLayout": self.internal_services.introspection.image_layout(&self.config),
+                "imageTransfers": self
+                    .internal_services
+                    .introspection
+                    .image_transfers(&image_transfer_status),
                 "imageSnapshotModel": self
                     .internal_services
                     .introspection
@@ -1185,6 +1190,9 @@ impl RuntimeServiceImpl {
                     "introspection": {
                         "runtimeBackend": self.internal_services.introspection.runtime_backend(&self.config),
                         "snapshotBackend": self.internal_services.introspection.snapshot_backend(&self.config),
+                        "imageTransfers": self.internal_services.introspection.image_transfers(
+                            &image_transfer_status,
+                        ),
                         "rootless": self.internal_services.introspection.rootless(&self.config.rootless),
                         "recovery": self.internal_services.introspection.recovery(
                             recovery_ledger_summary.as_ref(),

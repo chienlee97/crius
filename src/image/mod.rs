@@ -30,7 +30,10 @@ use crate::proto::runtime::v1::{
     RemoveImageRequest, RemoveImageResponse, UInt64Value,
 };
 use crate::storage::StorageManager;
-use content_store::{ContentStore, FsContentStore};
+use content_store::{
+    ContentStore, ContentTransferStatus, ContentTransferTracker, FsContentStore,
+    RemoteContentProviderKind,
+};
 use metadata_store::FilesystemImageMetadataStore;
 pub use pull_cgroup::{
     validate_pull_cgroup_config, PullCgroupEffectiveConfig, PullCgroupExecutor, PullCgroupMode,
@@ -84,6 +87,7 @@ pub struct ImageServiceImpl {
     additional_artifact_stores: Vec<PathBuf>,
     _big_files_temporary_dir: Option<PathBuf>,
     in_progress_pulls: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    transfer_tracker: ContentTransferTracker,
     #[cfg(test)]
     test_pull_handler: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<TestPullHandler>>>>,
     #[cfg(test)]
@@ -448,6 +452,10 @@ impl ImageServiceImpl {
 
     pub fn last_pull_cgroup_scope(&self) -> Option<PullCgroupScopeRecord> {
         self.pull_cgroup.last_scope()
+    }
+
+    pub fn content_transfer_status(&self) -> ContentTransferStatus {
+        self.transfer_tracker.snapshot()
     }
 
     fn should_retry_pull_status(status: &Status) -> bool {
@@ -1699,6 +1707,7 @@ impl ImageServiceImpl {
             additional_artifact_stores,
             _big_files_temporary_dir: big_files_temporary_dir,
             in_progress_pulls: Arc::new(Mutex::new(HashMap::new())),
+            transfer_tracker: ContentTransferTracker::default(),
             #[cfg(test)]
             test_pull_handler: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -1763,6 +1772,20 @@ impl ImageServiceImpl {
             .lock()
             .ok()
             .and_then(|handler| handler.clone())
+    }
+
+    #[cfg(test)]
+    fn transfer_provider_kind(&self) -> RemoteContentProviderKind {
+        if self.snapshot_test_pull_handler().is_some() {
+            RemoteContentProviderKind::Test
+        } else {
+            RemoteContentProviderKind::Registry
+        }
+    }
+
+    #[cfg(not(test))]
+    fn transfer_provider_kind(&self) -> RemoteContentProviderKind {
+        RemoteContentProviderKind::Registry
     }
 
     #[cfg(test)]
@@ -2944,8 +2967,15 @@ impl ImageService for ImageServiceImpl {
             "Local image not found, start remote pull: {}",
             canonical_ref
         );
+        let transfer = self.transfer_tracker.start(
+            canonical_ref.clone(),
+            self.transfer_provider_kind(),
+            "resolving",
+        );
+        transfer.update("pulling", 0, 0);
 
         let pull_outcome = Self::execute_pull_with_retries(self.pull_retry_count, || async {
+            transfer.update("attempt", 0, 0);
             let _pull_cgroup_scope = self
                 .pull_cgroup
                 .enter(&pull_cgroup_target)
@@ -2984,7 +3014,16 @@ impl ImageService for ImageServiceImpl {
             notify.notify_waiters();
         }
 
-        pull_outcome
+        match pull_outcome {
+            Ok(response) => {
+                transfer.succeed();
+                Ok(response)
+            }
+            Err(status) => {
+                transfer.fail(status.message().to_string());
+                Err(status)
+            }
+        }
     }
 
     // 删除镜像

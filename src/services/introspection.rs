@@ -3,6 +3,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::config::NriConfig;
+use crate::image::content_store::ContentTransferStatus;
 use crate::image::{PullCgroupEffectiveConfig, PullCgroupScopeRecord};
 use crate::rootless::EffectiveRootlessConfig;
 use crate::server::{RuntimeConfig, RuntimeReloadState, RuntimeReloadableConfig};
@@ -101,6 +102,25 @@ impl IntrospectionService {
                 .display()
                 .to_string(),
             "separateImageStoreSupported": false
+        })
+    }
+
+    pub fn image_transfers(&self, status: &ContentTransferStatus) -> Value {
+        json!({
+            "providerModel": {
+                "localBlobStore": true,
+                "remoteProviders": [
+                    "registry",
+                    "test"
+                ],
+                "transferLifecycle": [
+                    "running",
+                    "succeeded",
+                    "failed"
+                ]
+            },
+            "active": status.active,
+            "recent": status.recent,
         })
     }
 
