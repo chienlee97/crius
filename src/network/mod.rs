@@ -813,7 +813,7 @@ impl DefaultNetworkManager {
         }
         command.stdout(std::process::Stdio::null());
         command.stderr(std::process::Stdio::null());
-        let child = command.spawn().map_err(|err| {
+        let mut child = command.spawn().map_err(|err| {
             NetworkError::Other(format!(
                 "failed to start rootless network helper {} for {}: {}",
                 program.display(),
@@ -821,6 +821,22 @@ impl DefaultNetworkManager {
                 err
             ))
         })?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if let Some(status) = child.try_wait().map_err(|err| {
+            NetworkError::Other(format!(
+                "failed to inspect rootless network helper {} for {}: {}",
+                program.display(),
+                pod_id,
+                err
+            ))
+        })? {
+            return Err(NetworkError::Other(format!(
+                "rootless network helper {} for {} exited during startup: {}",
+                program.display(),
+                pod_id,
+                status
+            )));
+        }
         if let Ok(mut processes) = self.rootless_processes.lock() {
             processes.insert(pod_id.to_string(), child.id());
         }
@@ -839,6 +855,10 @@ impl DefaultNetworkManager {
                 let _ = nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(pid as i32),
                     nix::sys::signal::Signal::SIGTERM,
+                );
+                let _ = nix::sys::wait::waitpid(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                 );
             }
         }
@@ -1055,6 +1075,36 @@ mod tests {
                 if helper == "pasta" && path == &helper_path
         ));
         assert!(err.to_string().contains("RootlessNetworkHelperMissing"));
+    }
+
+    #[test]
+    fn rootless_helper_startup_exit_is_reported_as_network_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper_path = dir.path().join("pasta");
+        fs::write(&helper_path, "#!/bin/sh\nexit 42\n").unwrap();
+        let mut perms = fs::metadata(&helper_path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        fs::set_permissions(&helper_path, perms).unwrap();
+        let mut cni = CniConfig::default();
+        cni.set_rootless_config(Some(rootless_effective_config(
+            crate::rootless::NetworkMode::Pasta,
+            PathBuf::from("slirp4netns"),
+            helper_path.clone(),
+        )));
+        let manager = DefaultNetworkManager::from_cni_config(cni);
+
+        let err = manager
+            .start_rootless_network_helper("pod-1", "/tmp/nonexistent-netns")
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("exited during startup: exit status: 42"));
+        assert!(err.to_string().contains(&helper_path.display().to_string()));
     }
 
     #[tokio::test]

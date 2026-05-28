@@ -468,6 +468,110 @@ while true; do sleep 1; done
         }));
         assert!(calls.contains(&FakeRuntimeCall::StartContainer { container_id }));
     }
+
+    #[tokio::test]
+    async fn rootless_pasta_lifecycle_starts_and_stops_helper_under_xdg() {
+        let temp = tempfile::tempdir().unwrap();
+        let xdg_runtime_dir = temp.path().join("xdg-runtime");
+        let xdg_data_home = temp.path().join("xdg-data");
+        let helper_dir = temp.path().join("helpers");
+        fs::create_dir_all(&helper_dir).unwrap();
+        let namespace_helper = helper_dir.join("pinns");
+        let namespace_args = temp.path().join("namespace.args");
+        let pasta_helper = helper_dir.join("pasta");
+        let pasta_args = temp.path().join("pasta.args");
+        let pasta_signal = temp.path().join("pasta.signal");
+        write_namespace_helper(&namespace_helper, &namespace_args);
+        write_rootless_network_helper(&pasta_helper, &pasta_args, &pasta_signal);
+
+        let rootless = EffectiveRootlessConfig::resolve(&RootlessConfig {
+            enabled: true,
+            xdg_runtime_dir: xdg_runtime_dir.display().to_string(),
+            xdg_data_home: xdg_data_home.display().to_string(),
+            network_mode: NetworkMode::Pasta,
+            pasta_path: pasta_helper.display().to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        let runtime_root = rootless.runtime_root.join("containers");
+        let fake_backend = Arc::new(FakeRuntimeBackend::new(&runtime_root));
+        seed_pause_image(&rootless.storage_root, &temp.path().join("state/crius.db"));
+        let service = RuntimeServiceImpl::new_with_runtime_backends(
+            rootless_runtime_config(
+                temp.path(),
+                rootless.clone(),
+                Some(namespace_helper.clone()),
+            ),
+            HashMap::from([(
+                "runc".to_string(),
+                fake_backend.clone() as Arc<dyn crius::runtime::RuntimeBackend>,
+            )]),
+        );
+
+        let sandbox_config = pod_request("rootless-pasta", NamespaceMode::Pod)
+            .config
+            .unwrap();
+        let pod_id = RuntimeService::run_pod_sandbox(
+            &service,
+            Request::new(RunPodSandboxRequest {
+                config: Some(sandbox_config.clone()),
+                runtime_handler: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .pod_sandbox_id;
+        assert!(!pod_id.is_empty());
+        wait_for_file(&pasta_args).await;
+
+        let container_id = RuntimeService::create_container(
+            &service,
+            Request::new(container_request(&pod_id, sandbox_config)),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .container_id;
+        RuntimeService::start_container(
+            &service,
+            Request::new(StartContainerRequest {
+                container_id: container_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        RuntimeService::remove_pod_sandbox(
+            &service,
+            Request::new(RemovePodSandboxRequest {
+                pod_sandbox_id: pod_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        wait_for_file(&pasta_signal).await;
+
+        let netns_name = "crius-default-rootless-pasta";
+        assert_eq!(
+            fs::read_to_string(namespace_args).unwrap(),
+            format!("{}\n{}\n", rootless.runtime_root.display(), netns_name)
+        );
+        let pasta_args = fs::read_to_string(pasta_args).unwrap();
+        let netns_path = rootless.netns_dir.join(netns_name);
+        assert!(pasta_args.contains("--netns"));
+        assert!(pasta_args.contains("--config-net"));
+        assert!(pasta_args.contains("--quiet"));
+        assert!(pasta_args.contains(&netns_path.display().to_string()));
+        assert!(netns_path.starts_with(&xdg_runtime_dir));
+        assert!(rootless.storage_root.starts_with(&xdg_data_home));
+        assert!(!rootless.netns_dir.starts_with("/var/run/netns"));
+
+        let calls = fake_backend.calls();
+        assert!(calls.contains(&FakeRuntimeCall::CreateContainer {
+            container_id: format!("pause-{pod_id}")
+        }));
+        assert!(calls.contains(&FakeRuntimeCall::StartContainer { container_id }));
+    }
 }
 
 mod reload_watcher {
