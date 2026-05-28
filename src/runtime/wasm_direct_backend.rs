@@ -269,6 +269,31 @@ impl TaskController for WasmDirectBackend {
         Err(Self::unsupported_task("restore_attach_shim"))
     }
 
+    fn open_attach_stream(
+        &self,
+        _container_id: &str,
+        _stdin: bool,
+        _stdout: bool,
+        _stderr: bool,
+        _tty: bool,
+    ) -> Result<crate::shim_rpc::OpenAttachStreamResponse> {
+        Err(Self::unsupported_task("open_attach_stream"))
+    }
+
+    fn close_attach_stream(&self, _container_id: &str, _stream_id: &str) -> Result<()> {
+        Err(Self::unsupported_task("close_attach_stream"))
+    }
+
+    fn resize_attach_pty(
+        &self,
+        _container_id: &str,
+        _stream_id: Option<&str>,
+        _width: u16,
+        _height: u16,
+    ) -> Result<()> {
+        Err(Self::unsupported_task("resize_attach_pty"))
+    }
+
     fn shim_status(&self, _container_id: &str) -> Result<Option<crate::shim_rpc::StatusResponse>> {
         Ok(None)
     }

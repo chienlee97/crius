@@ -5,6 +5,7 @@ use anyhow::Result;
 use crate::config::CgroupDriverConfig;
 use crate::oci::spec::Spec;
 use crate::proto::runtime::v1::LinuxContainerResources;
+use crate::shim_rpc::OpenAttachStreamResponse;
 
 use super::{ContainerConfig, ContainerStatus, MountSemanticsError, RuntimeFeatureProbe};
 
@@ -29,6 +30,22 @@ pub trait TaskController: Send + Sync {
     ) -> Result<()>;
     fn is_container_paused(&self, container_id: &str) -> Result<bool>;
     fn restore_attach_shim(&self, container_id: &str) -> Result<()>;
+    fn open_attach_stream(
+        &self,
+        container_id: &str,
+        stdin: bool,
+        stdout: bool,
+        stderr: bool,
+        tty: bool,
+    ) -> Result<OpenAttachStreamResponse>;
+    fn close_attach_stream(&self, container_id: &str, stream_id: &str) -> Result<()>;
+    fn resize_attach_pty(
+        &self,
+        container_id: &str,
+        stream_id: Option<&str>,
+        width: u16,
+        height: u16,
+    ) -> Result<()>;
     fn shim_status(&self, container_id: &str) -> Result<Option<crate::shim_rpc::StatusResponse>>;
     fn restore_container_from_checkpoint(
         &self,

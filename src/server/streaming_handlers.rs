@@ -596,8 +596,40 @@ impl RuntimeServiceImpl {
                 attach_socket_path.display()
             )));
         }
+        let (attach_io_socket_path, attach_resize_socket_path) =
+            if self.task_socket_path(&req.container_id).exists() {
+                let runtime = self.runtime.clone();
+                let container_id = req.container_id.clone();
+                let stdin = req.stdin;
+                let stdout = req.stdout;
+                let stderr = req.stderr;
+                let tty = req.tty;
+                let response = tokio::task::spawn_blocking(move || {
+                    runtime.open_attach_stream(&container_id, stdin, stdout, stderr, tty)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("Failed to spawn attach stream RPC task: {}", e))
+                })?
+                .map_err(|e| {
+                    Status::failed_precondition(format!(
+                        "attach RPC stream is unavailable for container {}: {}",
+                        req.container_id, e
+                    ))
+                })?;
+                (Some(response.io_socket_path), response.resize_socket_path)
+            } else {
+                (None, None)
+            };
         let streaming = self.get_streaming_server().await?;
-        let response = streaming.get_attach(&req, websocket_enabled).await?;
+        let response = streaming
+            .get_attach(
+                &req,
+                attach_io_socket_path,
+                attach_resize_socket_path,
+                websocket_enabled,
+            )
+            .await?;
         Ok(Response::new(response))
     }
 }

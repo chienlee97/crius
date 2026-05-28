@@ -2736,6 +2736,40 @@ impl RuncRuntime {
         Ok(())
     }
 
+    pub fn open_attach_stream(
+        &self,
+        container_id: &str,
+        stdin: bool,
+        stdout: bool,
+        stderr: bool,
+        tty: bool,
+    ) -> Result<crate::shim_rpc::OpenAttachStreamResponse> {
+        self.shim_manager
+            .as_ref()
+            .context("attach RPC stream requires shim-enabled runtime")?
+            .open_attach_stream(container_id, stdin, stdout, stderr, tty)
+    }
+
+    pub fn close_attach_stream(&self, container_id: &str, stream_id: &str) -> Result<()> {
+        self.shim_manager
+            .as_ref()
+            .context("attach RPC stream requires shim-enabled runtime")?
+            .close_attach_stream(container_id, stream_id)
+    }
+
+    pub fn resize_attach_pty(
+        &self,
+        container_id: &str,
+        stream_id: Option<&str>,
+        width: u16,
+        height: u16,
+    ) -> Result<()> {
+        self.shim_manager
+            .as_ref()
+            .context("attach RPC stream requires shim-enabled runtime")?
+            .resize_attach_pty(container_id, stream_id, width, height)
+    }
+
     pub fn shim_status(
         &self,
         container_id: &str,

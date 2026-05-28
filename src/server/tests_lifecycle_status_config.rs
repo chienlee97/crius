@@ -1496,6 +1496,35 @@ impl crate::runtime::TaskController for FakeBackend {
         Ok(())
     }
 
+    fn open_attach_stream(
+        &self,
+        container_id: &str,
+        _stdin: bool,
+        _stdout: bool,
+        _stderr: bool,
+        tty: bool,
+    ) -> anyhow::Result<crate::shim_rpc::OpenAttachStreamResponse> {
+        Ok(crate::shim_rpc::OpenAttachStreamResponse {
+            stream_id: "fake-attach".to_string(),
+            io_socket_path: self.runtime_root.join(container_id).join("attach.sock"),
+            resize_socket_path: tty.then(|| self.runtime_root.join(container_id).join("resize.sock")),
+        })
+    }
+
+    fn close_attach_stream(&self, _container_id: &str, _stream_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn resize_attach_pty(
+        &self,
+        _container_id: &str,
+        _stream_id: Option<&str>,
+        _width: u16,
+        _height: u16,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn shim_status(
         &self,
         _container_id: &str,

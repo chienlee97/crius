@@ -271,6 +271,36 @@ impl TaskController for FakeRuntimeBackend {
         Ok(())
     }
 
+    fn open_attach_stream(
+        &self,
+        container_id: &str,
+        _stdin: bool,
+        _stdout: bool,
+        _stderr: bool,
+        tty: bool,
+    ) -> Result<crius::shim_rpc::OpenAttachStreamResponse> {
+        Ok(crius::shim_rpc::OpenAttachStreamResponse {
+            stream_id: "fake-attach".to_string(),
+            io_socket_path: self.runtime_root.join(container_id).join("attach.sock"),
+            resize_socket_path: tty
+                .then(|| self.runtime_root.join(container_id).join("resize.sock")),
+        })
+    }
+
+    fn close_attach_stream(&self, _container_id: &str, _stream_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn resize_attach_pty(
+        &self,
+        _container_id: &str,
+        _stream_id: Option<&str>,
+        _width: u16,
+        _height: u16,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn shim_status(&self, _container_id: &str) -> Result<Option<crius::shim_rpc::StatusResponse>> {
         Ok(None)
     }
@@ -459,6 +489,33 @@ impl TaskController for DirectTaskRuntimeBackend {
 
     fn restore_attach_shim(&self, container_id: &str) -> Result<()> {
         self.inner.restore_attach_shim(container_id)
+    }
+
+    fn open_attach_stream(
+        &self,
+        container_id: &str,
+        stdin: bool,
+        stdout: bool,
+        stderr: bool,
+        tty: bool,
+    ) -> Result<crius::shim_rpc::OpenAttachStreamResponse> {
+        self.inner
+            .open_attach_stream(container_id, stdin, stdout, stderr, tty)
+    }
+
+    fn close_attach_stream(&self, container_id: &str, stream_id: &str) -> Result<()> {
+        self.inner.close_attach_stream(container_id, stream_id)
+    }
+
+    fn resize_attach_pty(
+        &self,
+        container_id: &str,
+        stream_id: Option<&str>,
+        width: u16,
+        height: u16,
+    ) -> Result<()> {
+        self.inner
+            .resize_attach_pty(container_id, stream_id, width, height)
     }
 
     fn shim_status(&self, container_id: &str) -> Result<Option<crius::shim_rpc::StatusResponse>> {

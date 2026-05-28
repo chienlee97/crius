@@ -37,10 +37,11 @@ use crate::services::{InternalEvent, InternalEventSeverity, LedgerInternalEventS
 use crate::shim_rpc::server::{default_task_socket_path, serve, ShimRpcHandler};
 use crate::shim_rpc::{
     CheckpointTaskRequest, CreateTaskRequest, DeleteTaskRequest, ExecProcessRequest,
-    ExecProcessResponse, KillTaskRequest, OpenExecSessionRequest, OpenExecSessionResponse,
-    PauseTaskRequest, ReopenLogRequest, ResizePtyRequest, RestoreTaskRequest, ResumeTaskRequest,
-    ShimRpcRequest, ShimRpcResponse, StartTaskRequest, StatusRequest, StatusResponse, TaskState,
-    UpdateResourcesRequest, WaitProcessRequest, WaitProcessResponse,
+    ExecProcessResponse, KillTaskRequest, OpenAttachStreamRequest, OpenAttachStreamResponse,
+    OpenExecSessionRequest, OpenExecSessionResponse, PauseTaskRequest, ReopenLogRequest,
+    ResizePtyRequest, RestoreTaskRequest, ResumeTaskRequest, ShimRpcRequest, ShimRpcResponse,
+    StartTaskRequest, StatusRequest, StatusResponse, TaskState, UpdateResourcesRequest,
+    WaitProcessRequest, WaitProcessResponse,
 };
 use crate::storage::StorageManager;
 
@@ -1155,6 +1156,21 @@ impl Daemon {
         daemon.setup_io()
     }
 
+    fn open_attach_stream_internal(
+        &self,
+        request: &OpenAttachStreamRequest,
+    ) -> Result<OpenAttachStreamResponse> {
+        self.setup_io_once()?;
+        let stream_id = format!("attach-{}", request.container_id);
+        Ok(OpenAttachStreamResponse {
+            stream_id,
+            io_socket_path: self.attach_socket_container_dir().join("attach.sock"),
+            resize_socket_path: request
+                .tty
+                .then(|| self.attach_socket_container_dir().join("resize.sock")),
+        })
+    }
+
     /// 创建TTY容器
     fn create_terminal_container(&self) -> Result<Pid> {
         // 首先检查容器是否已经存在
@@ -1772,6 +1788,10 @@ impl ShimRpcHandler for Daemon {
             ShimRpcRequest::OpenExecSession(request) => Ok(ShimRpcResponse::OpenExecSession(
                 self.open_exec_session_internal(&request)?,
             )),
+            ShimRpcRequest::OpenAttachStream(request) => Ok(ShimRpcResponse::OpenAttachStream(
+                self.open_attach_stream_internal(&request)?,
+            )),
+            ShimRpcRequest::CloseAttachStream(_) => Ok(ShimRpcResponse::Empty),
             ShimRpcRequest::WaitProcess(request) => {
                 Ok(ShimRpcResponse::WaitProcess(WaitProcessResponse {
                     exit_code: self.wait_for_exit_code(&request)?,
@@ -1803,6 +1823,11 @@ impl ShimRpcHandler for Daemon {
             }
             ShimRpcRequest::ResizePty(ResizePtyRequest { width, height, .. }) => {
                 self.io_manager.apply_terminal_resize(width, height)?;
+                Ok(ShimRpcResponse::Empty)
+            }
+            ShimRpcRequest::ResizeAttachPty(request) => {
+                self.io_manager
+                    .apply_terminal_resize(request.width, request.height)?;
                 Ok(ShimRpcResponse::Empty)
             }
             ShimRpcRequest::Status(StatusRequest { .. }) => {

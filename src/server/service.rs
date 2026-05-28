@@ -1033,6 +1033,19 @@ impl RuntimeRegistry {
             .restore_attach_shim(container_id)
     }
 
+    pub(super) fn open_attach_stream(
+        &self,
+        container_id: &str,
+        stdin: bool,
+        stdout: bool,
+        stderr: bool,
+        tty: bool,
+    ) -> anyhow::Result<crate::shim_rpc::OpenAttachStreamResponse> {
+        self.runtime_for_container(container_id)?
+            .task_controller()
+            .open_attach_stream(container_id, stdin, stdout, stderr, tty)
+    }
+
     pub(super) fn shim_status(
         &self,
         container_id: &str,

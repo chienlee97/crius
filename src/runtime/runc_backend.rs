@@ -73,6 +73,33 @@ impl TaskController for RuncBackend {
         self.inner.restore_attach_shim(container_id)
     }
 
+    fn open_attach_stream(
+        &self,
+        container_id: &str,
+        stdin: bool,
+        stdout: bool,
+        stderr: bool,
+        tty: bool,
+    ) -> Result<crate::shim_rpc::OpenAttachStreamResponse> {
+        self.inner
+            .open_attach_stream(container_id, stdin, stdout, stderr, tty)
+    }
+
+    fn close_attach_stream(&self, container_id: &str, stream_id: &str) -> Result<()> {
+        self.inner.close_attach_stream(container_id, stream_id)
+    }
+
+    fn resize_attach_pty(
+        &self,
+        container_id: &str,
+        stream_id: Option<&str>,
+        width: u16,
+        height: u16,
+    ) -> Result<()> {
+        self.inner
+            .resize_attach_pty(container_id, stream_id, width, height)
+    }
+
     fn shim_status(&self, container_id: &str) -> Result<Option<crate::shim_rpc::StatusResponse>> {
         self.inner.shim_status(container_id)
     }

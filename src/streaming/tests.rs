@@ -137,7 +137,7 @@ async fn test_attach_url_generation() {
         tty: false,
     };
 
-    let response = server.get_attach(&req, true).await.unwrap();
+    let response = server.get_attach(&req, None, None, true).await.unwrap();
     assert!(response.url.contains("/attach/"));
 }
 
@@ -306,6 +306,8 @@ async fn test_attach_transport_explicitly_rejects_non_spdy_requests() {
                 stderr: true,
                 tty: false,
             },
+            attach_io_socket_path: None,
+            attach_resize_socket_path: None,
             websocket_enabled: true,
         }))
         .await;
@@ -355,6 +357,8 @@ async fn test_attach_transport_accepts_websocket_upgrade_requests() {
                 stderr: true,
                 tty: false,
             },
+            attach_io_socket_path: None,
+            attach_resize_socket_path: None,
             websocket_enabled: true,
         }))
         .await;
@@ -401,6 +405,8 @@ async fn test_attach_transport_rejects_websocket_when_disabled_for_token() {
                 stderr: true,
                 tty: false,
             },
+            attach_io_socket_path: None,
+            attach_resize_socket_path: None,
             websocket_enabled: false,
         }))
         .await;

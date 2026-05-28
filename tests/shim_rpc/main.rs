@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crius::shim_rpc::{
-    CreateTaskRequest, ShimRpcRequest, ShimRpcResponse, StartTaskRequest, StatusRequest,
-    StatusResponse, TaskState,
+    CreateTaskRequest, OpenAttachStreamRequest, OpenAttachStreamResponse, ResizeAttachPtyRequest,
+    ShimRpcRequest, ShimRpcResponse, StartTaskRequest, StatusRequest, StatusResponse, TaskState,
 };
 
 #[path = "../common/mod.rs"]
@@ -127,5 +127,68 @@ fn create_task_request_carries_rootfs_snapshot_handle() {
                 && request.mount_options == ["rw", "rprivate"]
                 && request.rootfs.as_ref().and_then(|rootfs| rootfs.rootfs_path())
                     == Some(dir.path().join("rootfs").as_path())
+    ));
+}
+
+#[test]
+fn attach_stream_rpc_round_trips_open_and_resize_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler = ScriptedShimHandler::new();
+    let server =
+        FakeShimRpcServer::start(dir.path().join("task.sock"), Arc::new(handler.clone())).unwrap();
+
+    server.wait_until_ready(Duration::from_secs(2)).unwrap();
+    handler.clear_requests();
+    handler.push_response(ShimRpcResponse::OpenAttachStream(
+        OpenAttachStreamResponse {
+            stream_id: "attach-1".to_string(),
+            io_socket_path: dir.path().join("attach.sock"),
+            resize_socket_path: Some(dir.path().join("resize.sock")),
+        },
+    ));
+    handler.push_response(ShimRpcResponse::Empty);
+
+    let response = server
+        .client()
+        .request(ShimRpcRequest::OpenAttachStream(OpenAttachStreamRequest {
+            container_id: "container-1".to_string(),
+            stdin: true,
+            stdout: true,
+            stderr: true,
+            tty: true,
+        }))
+        .unwrap();
+    assert!(matches!(
+        response,
+        ShimRpcResponse::OpenAttachStream(OpenAttachStreamResponse {
+            stream_id,
+            ..
+        }) if stream_id == "attach-1"
+    ));
+
+    server
+        .client()
+        .request(ShimRpcRequest::ResizeAttachPty(ResizeAttachPtyRequest {
+            container_id: "container-1".to_string(),
+            stream_id: Some("attach-1".to_string()),
+            width: 120,
+            height: 40,
+        }))
+        .unwrap();
+
+    let requests = handler.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(matches!(
+        &requests[0],
+        ShimRpcRequest::OpenAttachStream(request)
+            if request.container_id == "container-1" && request.tty
+    ));
+    assert!(matches!(
+        &requests[1],
+        ShimRpcRequest::ResizeAttachPty(request)
+            if request.container_id == "container-1"
+                && request.stream_id.as_deref() == Some("attach-1")
+                && request.width == 120
+                && request.height == 40
     ));
 }

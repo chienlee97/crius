@@ -75,6 +75,8 @@ struct PortForwardRequestContext {
 #[derive(Debug, Clone)]
 struct AttachRequestContext {
     req: AttachRequest,
+    attach_io_socket_path: Option<PathBuf>,
+    attach_resize_socket_path: Option<PathBuf>,
     websocket_enabled: bool,
 }
 
@@ -286,12 +288,16 @@ impl StreamingServer {
     pub async fn get_attach(
         &self,
         req: &AttachRequest,
+        attach_io_socket_path: Option<PathBuf>,
+        attach_resize_socket_path: Option<PathBuf>,
         websocket_enabled: bool,
     ) -> Result<AttachResponse, tonic::Status> {
         Self::validate_attach_request(req)?;
         let token = self
             .insert_request(StreamingRequest::Attach(AttachRequestContext {
                 req: req.clone(),
+                attach_io_socket_path,
+                attach_resize_socket_path,
                 websocket_enabled,
             }))
             .await;
@@ -557,6 +563,8 @@ async fn handle_request(
         ("attach", Some(StreamingRequest::Attach(attach_ctx))) => {
             let AttachRequestContext {
                 req: attach_req,
+                attach_io_socket_path,
+                attach_resize_socket_path,
                 websocket_enabled,
             } = attach_ctx;
             if is_websocket_upgrade_request(&req) {
@@ -576,7 +584,15 @@ async fn handle_request(
                 let response = websocket_switching_response(&req, protocol);
                 let on_upgrade = hyper::upgrade::on(req);
                 tokio::spawn(async move {
-                    if let Err(e) = serve_attach_websocket(on_upgrade, attach_req, protocol).await {
+                    if let Err(e) = serve_attach_websocket(
+                        on_upgrade,
+                        attach_req,
+                        attach_io_socket_path,
+                        attach_resize_socket_path,
+                        protocol,
+                    )
+                    .await
+                    {
                         log::error!("Attach websocket session failed: {}", e);
                     }
                 });
@@ -599,7 +615,15 @@ async fn handle_request(
 
             let on_upgrade = hyper::upgrade::on(req);
             tokio::spawn(async move {
-                if let Err(e) = serve_attach_spdy(on_upgrade, attach_req, protocol).await {
+                if let Err(e) = serve_attach_spdy(
+                    on_upgrade,
+                    attach_req,
+                    attach_io_socket_path,
+                    attach_resize_socket_path,
+                    protocol,
+                )
+                .await
+                {
                     log::error!("Attach SPDY session failed: {}", e);
                 }
             });
@@ -2921,6 +2945,8 @@ async fn serve_portforward_spdy(
 async fn serve_attach_spdy(
     on_upgrade: hyper::upgrade::OnUpgrade,
     req: AttachRequest,
+    attach_io_socket_path: Option<PathBuf>,
+    attach_resize_socket_path: Option<PathBuf>,
     _protocol: &'static str,
 ) -> anyhow::Result<()> {
     let upgraded = on_upgrade.await?;
@@ -3009,7 +3035,8 @@ async fn serve_attach_spdy(
         }
     }
 
-    let attach_socket_path = shim_socket_path(&req.container_id, "attach.sock");
+    let attach_socket_path =
+        attach_io_socket_path.unwrap_or_else(|| shim_socket_path(&req.container_id, "attach.sock"));
     let shim = match UnixStream::connect(&attach_socket_path).await {
         Ok(shim) => shim,
         Err(e) => {
@@ -3032,7 +3059,9 @@ async fn serve_attach_spdy(
     let shim_write = Arc::new(Mutex::new(shim_write));
 
     let mut resize_socket = if req.tty && resize_stream.is_some() {
-        let resize_socket_path = shim_socket_path(&req.container_id, "resize.sock");
+        let resize_socket_path = attach_resize_socket_path
+            .clone()
+            .unwrap_or_else(|| shim_socket_path(&req.container_id, "resize.sock"));
         match UnixStream::connect(&resize_socket_path).await {
             Ok(stream) => Some(stream),
             Err(e) => {
@@ -3143,7 +3172,9 @@ async fn serve_attach_spdy(
                         continue;
                     }
                     if resize_socket.is_none() && req.tty {
-                        let resize_socket_path = shim_socket_path(&req.container_id, "resize.sock");
+                        let resize_socket_path = attach_resize_socket_path
+                            .clone()
+                            .unwrap_or_else(|| shim_socket_path(&req.container_id, "resize.sock"));
                         match UnixStream::connect(&resize_socket_path).await {
                             Ok(stream) => resize_socket = Some(stream),
                             Err(e) => {
@@ -3992,13 +4023,16 @@ async fn serve_attach_log_spdy(
 async fn serve_attach_websocket(
     on_upgrade: hyper::upgrade::OnUpgrade,
     req: AttachRequest,
+    attach_io_socket_path: Option<PathBuf>,
+    attach_resize_socket_path: Option<PathBuf>,
     _protocol: &'static str,
 ) -> anyhow::Result<()> {
     let upgraded = on_upgrade.await?;
     let (mut reader, writer) = tokio::io::split(upgraded);
     let writer = Arc::new(Mutex::new(writer));
 
-    let attach_socket_path = shim_socket_path(&req.container_id, "attach.sock");
+    let attach_socket_path =
+        attach_io_socket_path.unwrap_or_else(|| shim_socket_path(&req.container_id, "attach.sock"));
     let shim = UnixStream::connect(&attach_socket_path)
         .await
         .map_err(|e| {
@@ -4012,7 +4046,9 @@ async fn serve_attach_websocket(
     let shim_write = Arc::new(Mutex::new(shim_write));
 
     let mut resize_socket = if req.tty {
-        let resize_socket_path = shim_socket_path(&req.container_id, "resize.sock");
+        let resize_socket_path = attach_resize_socket_path
+            .clone()
+            .unwrap_or_else(|| shim_socket_path(&req.container_id, "resize.sock"));
         UnixStream::connect(&resize_socket_path).await.ok()
     } else {
         None
@@ -4114,7 +4150,9 @@ async fn serve_attach_websocket(
                         }
                         if resize_socket.is_none() {
                             let resize_socket_path =
-                                shim_socket_path(&req.container_id, "resize.sock");
+                                attach_resize_socket_path.clone().unwrap_or_else(|| {
+                                    shim_socket_path(&req.container_id, "resize.sock")
+                                });
                             resize_socket = UnixStream::connect(&resize_socket_path).await.ok();
                         }
                         if let Some(socket) = resize_socket.as_mut() {

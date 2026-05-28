@@ -220,7 +220,9 @@ impl crate::shim_rpc::server::ShimRpcHandler for FakeShimRpcHandler {
                 Ok(crate::shim_rpc::ShimRpcResponse::Empty)
             }
             crate::shim_rpc::ShimRpcRequest::ReopenLog(_)
-            | crate::shim_rpc::ShimRpcRequest::ResizePty(_) => {
+            | crate::shim_rpc::ShimRpcRequest::ResizePty(_)
+            | crate::shim_rpc::ShimRpcRequest::ResizeAttachPty(_)
+            | crate::shim_rpc::ShimRpcRequest::CloseAttachStream(_) => {
                 Ok(crate::shim_rpc::ShimRpcResponse::Empty)
             }
             crate::shim_rpc::ShimRpcRequest::ExecProcess(request) => {
@@ -249,6 +251,19 @@ impl crate::shim_rpc::server::ShimRpcHandler for FakeShimRpcHandler {
                             .and_then(|name| name.to_str())
                             .unwrap_or("exec")
                             .to_string(),
+                        io_socket_path,
+                        resize_socket_path,
+                    },
+                ))
+            }
+            crate::shim_rpc::ShimRpcRequest::OpenAttachStream(request) => {
+                let attach_dir = self.root.join("attach-sessions").join(&self.id);
+                fs::create_dir_all(&attach_dir)?;
+                let io_socket_path = attach_dir.join("attach.sock");
+                let resize_socket_path = request.tty.then(|| attach_dir.join("resize.sock"));
+                Ok(crate::shim_rpc::ShimRpcResponse::OpenAttachStream(
+                    crate::shim_rpc::OpenAttachStreamResponse {
+                        stream_id: "attach".to_string(),
                         io_socket_path,
                         resize_socket_path,
                     },

@@ -70,6 +70,36 @@ pub struct OpenExecSessionResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAttachStreamRequest {
+    pub container_id: String,
+    pub stdin: bool,
+    pub stdout: bool,
+    pub stderr: bool,
+    pub tty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAttachStreamResponse {
+    pub stream_id: String,
+    pub io_socket_path: PathBuf,
+    pub resize_socket_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloseAttachStreamRequest {
+    pub container_id: String,
+    pub stream_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResizeAttachPtyRequest {
+    pub container_id: String,
+    pub stream_id: Option<String>,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WaitProcessRequest {
     pub container_id: String,
     pub timeout_ms: Option<u64>,
@@ -203,6 +233,8 @@ pub enum ShimRpcRequest {
     StartTask(StartTaskRequest),
     ExecProcess(ExecProcessRequest),
     OpenExecSession(OpenExecSessionRequest),
+    OpenAttachStream(OpenAttachStreamRequest),
+    CloseAttachStream(CloseAttachStreamRequest),
     WaitProcess(WaitProcessRequest),
     KillTask(KillTaskRequest),
     DeleteTask(DeleteTaskRequest),
@@ -211,6 +243,7 @@ pub enum ShimRpcRequest {
     RestoreTask(RestoreTaskRequest),
     ReopenLog(ReopenLogRequest),
     ResizePty(ResizePtyRequest),
+    ResizeAttachPty(ResizeAttachPtyRequest),
     Status(StatusRequest),
     PauseTask(PauseTaskRequest),
     ResumeTask(ResumeTaskRequest),
@@ -223,6 +256,7 @@ pub enum ShimRpcResponse {
     Empty,
     ExecProcess(ExecProcessResponse),
     OpenExecSession(OpenExecSessionResponse),
+    OpenAttachStream(OpenAttachStreamResponse),
     WaitProcess(WaitProcessResponse),
     Status(StatusResponse),
     ContainerPid(Option<i32>),

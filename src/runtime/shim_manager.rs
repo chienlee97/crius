@@ -16,7 +16,8 @@ use crate::proto::runtime::v1::LinuxContainerResources;
 use crate::services::{InternalEvent, InternalEventSeverity, LedgerInternalEventSink};
 use crate::shim_rpc::{
     default_task_socket_path, CheckpointTaskRequest, CreateTaskRequest, DeleteTaskRequest,
-    ExecProcessRequest, KillTaskRequest, PauseTaskRequest, ReopenLogRequest, ResizePtyRequest,
+    ExecProcessRequest, KillTaskRequest, OpenAttachStreamRequest, OpenAttachStreamResponse,
+    PauseTaskRequest, ReopenLogRequest, ResizeAttachPtyRequest, ResizePtyRequest,
     RestoreTaskRequest, ResumeTaskRequest, ShimLinuxResources, ShimRpcClient, ShimRpcRequest,
     ShimRpcResponse, StartTaskRequest, StatusRequest, StatusResponse, UpdateResourcesRequest,
     WaitProcessRequest, WaitProcessResponse,
@@ -814,6 +815,61 @@ impl ShimManager {
                 height,
             }))?;
         ensure_empty_response("resize_pty", response)
+    }
+
+    pub fn open_attach_stream(
+        &self,
+        container_id: &str,
+        stdin: bool,
+        stdout: bool,
+        stderr: bool,
+        tty: bool,
+    ) -> Result<OpenAttachStreamResponse> {
+        match self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::OpenAttachStream(OpenAttachStreamRequest {
+                container_id: container_id.to_string(),
+                stdin,
+                stdout,
+                stderr,
+                tty,
+            }))? {
+            ShimRpcResponse::OpenAttachStream(response) => Ok(response),
+            other => Err(anyhow::anyhow!(
+                "unexpected shim RPC response for open_attach_stream: {:?}",
+                other
+            )),
+        }
+    }
+
+    pub fn close_attach_stream(&self, container_id: &str, stream_id: &str) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::CloseAttachStream(
+                crate::shim_rpc::CloseAttachStreamRequest {
+                    container_id: container_id.to_string(),
+                    stream_id: stream_id.to_string(),
+                },
+            ))?;
+        ensure_empty_response("close_attach_stream", response)
+    }
+
+    pub fn resize_attach_pty(
+        &self,
+        container_id: &str,
+        stream_id: Option<&str>,
+        width: u16,
+        height: u16,
+    ) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::ResizeAttachPty(ResizeAttachPtyRequest {
+                container_id: container_id.to_string(),
+                stream_id: stream_id.map(ToOwned::to_owned),
+                width,
+                height,
+            }))?;
+        ensure_empty_response("resize_attach_pty", response)
     }
 
     pub fn status(&self, container_id: &str) -> Result<StatusResponse> {
