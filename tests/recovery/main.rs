@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crius::state::{
-    RecoveryLedgerSnapshot, RuntimeArtifactLedgerState, ShimLedgerState, SnapshotLedgerState,
-    StateLedger, StateLedgerWriter,
+    LedgerRepairOptions, RecoveryLedgerSnapshot, RuntimeArtifactLedgerState, ShimLedgerState,
+    SnapshotLedgerState, StateLedger, StateLedgerWriter,
 };
 use crius::storage::persistence::{PersistenceConfig, PersistenceManager};
 use crius::storage::{
@@ -28,19 +28,22 @@ fn recovery_suite_has_persistence_config_entrypoint() {
 struct RecoveryFixture {
     _dir: TempDir,
     persistence: PersistenceManager,
+    db_path: PathBuf,
     pod_id: String,
     container_id: String,
     bundle_path: PathBuf,
     rootfs_path: PathBuf,
     shim_socket_path: PathBuf,
+    shim_work_dir: PathBuf,
     runtime_state_dir: PathBuf,
 }
 
 impl RecoveryFixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
         let mut persistence = PersistenceManager::new(PersistenceConfig {
-            db_path: dir.path().join("state.db"),
+            db_path: db_path.clone(),
             enable_recovery: true,
             auto_save_interval: 30,
         })
@@ -185,11 +188,13 @@ impl RecoveryFixture {
         Self {
             _dir: dir,
             persistence,
+            db_path,
             pod_id,
             container_id,
             bundle_path,
             rootfs_path,
             shim_socket_path,
+            shim_work_dir,
             runtime_state_dir,
         }
     }
@@ -212,10 +217,15 @@ impl RecoveryFixture {
         fs::remove_file(&self.shim_socket_path).unwrap();
     }
 
-    fn remove_shim_metadata(&mut self) {
+    fn remove_shim_ledger_record(&mut self) {
         StateLedgerWriter::new(&mut self.persistence)
             .delete_shim_process(&self.container_id)
             .unwrap();
+    }
+
+    fn remove_shim_diagnostic_cache(&self) {
+        let _ = fs::remove_file(self.shim_work_dir.join("shim.json"));
+        let _ = fs::remove_file(self.shim_work_dir.join("shim.pid"));
     }
 
     fn runtime_state_path(&self, container_id: &str) -> PathBuf {
@@ -382,7 +392,7 @@ fn recovery_fixture_models_missing_shim_socket() {
 fn recovery_fixture_models_missing_shim_metadata() {
     let mut fixture = RecoveryFixture::new();
 
-    fixture.remove_shim_metadata();
+    fixture.remove_shim_ledger_record();
     let snapshot = fixture.snapshot();
 
     assert!(fixture.shim_socket_path.exists());
@@ -391,6 +401,111 @@ fn recovery_fixture_models_missing_shim_metadata() {
         .containers
         .iter()
         .any(|entry| entry.record.id == fixture.container_id));
+}
+
+#[test]
+fn recovery_fixture_recovers_shim_from_ledger_without_diagnostic_cache() {
+    let fixture = RecoveryFixture::new();
+    fixture.remove_shim_diagnostic_cache();
+
+    let snapshot = fixture.snapshot();
+
+    assert!(!fixture.shim_work_dir.join("shim.json").exists());
+    assert!(!fixture.shim_work_dir.join("shim.pid").exists());
+    assert_eq!(snapshot.shim_processes.len(), 1);
+    assert_eq!(
+        snapshot.shim_processes[0].container_id,
+        fixture.container_id
+    );
+    assert_eq!(
+        snapshot.shim_processes[0].socket_path,
+        fixture.shim_socket_path.display().to_string()
+    );
+}
+
+#[test]
+fn recovery_fixture_schema_migration_is_idempotent_across_reopen() {
+    let fixture = RecoveryFixture::new();
+    let db_path = fixture.db_path.clone();
+    drop(fixture);
+
+    let first = PersistenceManager::new(PersistenceConfig {
+        db_path: db_path.clone(),
+        enable_recovery: true,
+        auto_save_interval: 30,
+    })
+    .unwrap();
+    assert_eq!(StateLedger::new(&first).schema_version().unwrap(), 1);
+    let first_migration = StateLedger::new(&first)
+        .latest_schema_migration()
+        .unwrap()
+        .unwrap();
+    drop(first);
+
+    let second = PersistenceManager::new(PersistenceConfig {
+        db_path,
+        enable_recovery: true,
+        auto_save_interval: 30,
+    })
+    .unwrap();
+    let second_migration = StateLedger::new(&second)
+        .latest_schema_migration()
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_migration.version, first_migration.version);
+    assert_eq!(second_migration.applied_at, first_migration.applied_at);
+    assert_eq!(
+        second_migration.migration_name,
+        first_migration.migration_name
+    );
+}
+
+#[test]
+fn recovery_fixture_ledger_repair_dry_run_preserves_state_and_apply_marks_broken() {
+    let mut fixture = RecoveryFixture::new();
+    fixture.remove_bundle();
+    fixture.remove_rootfs();
+    fixture.remove_shim_socket();
+
+    let dry_run = StateLedgerWriter::new(&mut fixture.persistence)
+        .repair(LedgerRepairOptions::default(), true)
+        .unwrap();
+
+    assert!(dry_run.dry_run);
+    assert!(dry_run
+        .issues
+        .iter()
+        .any(|issue| issue.kind == "missingArtifact"));
+    assert!(dry_run
+        .issues
+        .iter()
+        .any(|issue| issue.kind == "brokenShim"));
+    assert_eq!(dry_run.applied_action_count, 0);
+    let after_dry_run = fixture.snapshot();
+    assert!(after_dry_run
+        .runtime_artifacts
+        .iter()
+        .all(|artifact| { artifact.state == RuntimeArtifactLedgerState::Active.as_str() }));
+    assert_eq!(
+        after_dry_run.shim_processes[0].state,
+        ShimLedgerState::Running.as_str()
+    );
+
+    let repair = StateLedgerWriter::new(&mut fixture.persistence)
+        .repair(LedgerRepairOptions::default(), false)
+        .unwrap();
+
+    assert!(!repair.dry_run);
+    assert!(repair.applied_action_count >= 3);
+    let repaired = fixture.snapshot();
+    assert!(repaired
+        .runtime_artifacts
+        .iter()
+        .all(|artifact| { artifact.state == RuntimeArtifactLedgerState::Broken.as_str() }));
+    assert_eq!(
+        repaired.shim_processes[0].state,
+        ShimLedgerState::Dead.as_str()
+    );
 }
 
 #[test]
