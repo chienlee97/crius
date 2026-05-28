@@ -4,8 +4,8 @@ use std::fmt;
 use crate::runtime::ContainerStatus;
 use crate::storage::persistence::PersistenceManager;
 use crate::storage::{
-    ContainerRecord, ImageRecord, ImageRefRecord, PodSandboxRecord, RuntimeArtifactRecord,
-    ShimProcessRecord, SnapshotRecord, StateEvent,
+    ContainerRecord, ContentTransferRecord, ImageRecord, ImageRefRecord, PodSandboxRecord,
+    RuntimeArtifactRecord, ShimProcessRecord, SnapshotRecord, StateEvent,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +247,10 @@ impl<'a> StateLedger<'a> {
         self.persistence.list_image_refs(image_id)
     }
 
+    pub fn content_transfers(&self) -> Result<Vec<ContentTransferRecord>> {
+        self.persistence.list_content_transfer_records()
+    }
+
     pub fn snapshots(&self) -> Result<Vec<SnapshotRecord>> {
         self.persistence.list_snapshot_records()
     }
@@ -329,6 +333,15 @@ impl<'a> StateLedgerWriter<'a> {
 
     pub fn save_image(&mut self, record: &ImageRecord, refs: &[ImageRefRecord]) -> Result<()> {
         self.persistence.save_image_record(record, refs)
+    }
+
+    pub fn save_content_transfer(&mut self, record: &ContentTransferRecord) -> Result<()> {
+        self.persistence.save_content_transfer_record(record)
+    }
+
+    pub fn mark_running_content_transfers_interrupted(&mut self) -> Result<usize> {
+        self.persistence
+            .mark_running_content_transfers_interrupted()
     }
 
     pub fn delete_image(&mut self, image_id: &str) -> Result<()> {

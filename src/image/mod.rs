@@ -31,8 +31,8 @@ use crate::proto::runtime::v1::{
 };
 use crate::storage::StorageManager;
 use content_store::{
-    ContentStore, ContentTransferStatus, ContentTransferTracker, FsContentStore,
-    RemoteContentProviderKind,
+    ContentStore, ContentTransferRecord, ContentTransferStatus, ContentTransferTracker,
+    FsContentStore, RemoteContentProviderKind,
 };
 use metadata_store::FilesystemImageMetadataStore;
 pub use pull_cgroup::{
@@ -95,6 +95,7 @@ pub struct ImageServiceImpl {
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<TestPullScopeObserver>>>>,
     reloadable_config: Arc<RwLock<ReloadableImageConfig>>,
     pull_cgroup: PullCgroupExecutor,
+    ledger_db_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -456,6 +457,22 @@ impl ImageServiceImpl {
 
     pub fn content_transfer_status(&self) -> ContentTransferStatus {
         self.transfer_tracker.snapshot()
+    }
+
+    fn persist_content_transfer_record(&self, record: &ContentTransferRecord) -> Result<(), Error> {
+        let Some(db_path) = self.ledger_db_path.as_ref() else {
+            return Ok(());
+        };
+        StorageManager::new(db_path)
+            .and_then(|mut storage| storage.save_content_transfer(&record.to_storage()))
+            .map_err(|err| Error::Storage(format!("failed to persist content transfer: {err}")))
+    }
+
+    fn persist_content_transfer_by_id(&self, transfer_id: &str) -> Result<(), Error> {
+        let Some(record) = self.transfer_tracker.record(transfer_id) else {
+            return Ok(());
+        };
+        self.persist_content_transfer_record(&record)
     }
 
     fn should_retry_pull_status(status: &Status) -> bool {
@@ -1685,10 +1702,11 @@ impl ImageServiceImpl {
             &storage_path,
             ledger_db_path.clone(),
         )?);
+        let transfer_tracker = ContentTransferTracker::new_with_ledger(ledger_db_path.clone())?;
         let metadata_store = Arc::new(FilesystemImageMetadataStore::new(
             &storage_path,
             additional_artifact_stores.clone(),
-            ledger_db_path,
+            ledger_db_path.clone(),
         ));
 
         Ok(Self {
@@ -1707,13 +1725,14 @@ impl ImageServiceImpl {
             additional_artifact_stores,
             _big_files_temporary_dir: big_files_temporary_dir,
             in_progress_pulls: Arc::new(Mutex::new(HashMap::new())),
-            transfer_tracker: ContentTransferTracker::default(),
+            transfer_tracker,
             #[cfg(test)]
             test_pull_handler: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             test_pull_scope_observer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             reloadable_config: Arc::new(RwLock::new(reloadable_config)),
             pull_cgroup,
+            ledger_db_path,
         })
     }
 
@@ -2972,10 +2991,17 @@ impl ImageService for ImageServiceImpl {
             self.transfer_provider_kind(),
             "resolving",
         );
+        let transfer_id = transfer.id().to_string();
+        self.persist_content_transfer_by_id(&transfer_id)
+            .map_err(|err| Status::internal(err.to_string()))?;
         transfer.update("pulling", 0, 0);
+        self.persist_content_transfer_by_id(&transfer_id)
+            .map_err(|err| Status::internal(err.to_string()))?;
 
         let pull_outcome = Self::execute_pull_with_retries(self.pull_retry_count, || async {
             transfer.update("attempt", 0, 0);
+            self.persist_content_transfer_by_id(&transfer_id)
+                .map_err(|err| Status::internal(err.to_string()))?;
             let _pull_cgroup_scope = self
                 .pull_cgroup
                 .enter(&pull_cgroup_target)
@@ -3017,10 +3043,14 @@ impl ImageService for ImageServiceImpl {
         match pull_outcome {
             Ok(response) => {
                 transfer.succeed();
+                self.persist_content_transfer_by_id(&transfer_id)
+                    .map_err(|err| Status::internal(err.to_string()))?;
                 Ok(response)
             }
             Err(status) => {
                 transfer.fail(status.message().to_string());
+                self.persist_content_transfer_by_id(&transfer_id)
+                    .map_err(|err| Status::internal(err.to_string()))?;
                 Err(status)
             }
         }

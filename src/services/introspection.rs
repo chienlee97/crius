@@ -116,7 +116,8 @@ impl IntrospectionService {
                 "transferLifecycle": [
                     "running",
                     "succeeded",
-                    "failed"
+                    "failed",
+                    "interrupted"
                 ]
             },
             "active": status.active,

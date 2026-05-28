@@ -93,6 +93,40 @@ fn test_image_service_in_tempdir() -> (TempDir, ImageServiceImpl) {
     (dir, service)
 }
 
+fn test_image_service_with_ledger_in_tempdir() -> (TempDir, ImageServiceImpl, PathBuf) {
+    let dir = tempdir().unwrap();
+    let ledger_db_path = dir.path().join("crius.db");
+    let service = ImageServiceImpl::new_with_options(ImageServiceOptions {
+        storage_path: dir.path().join("images"),
+        ledger_db_path: Some(ledger_db_path.clone()),
+        storage_driver: "overlay".to_string(),
+        storage_options: Vec::new(),
+        global_auth_file: None,
+        namespaced_auth_dir: None,
+        default_transport: "docker://".to_string(),
+        short_name_mode: "disabled".to_string(),
+        pull_progress_timeout: std::time::Duration::ZERO,
+        max_concurrent_downloads: 3,
+        pull_retry_count: 0,
+        registry_config_dir: None,
+        decryption_keys_path: None,
+        decryption_decoder_path: "ctd-decoder".to_string(),
+        decryption_keyprovider_config: None,
+        additional_artifact_stores: Vec::new(),
+        pinned_image_patterns: Vec::new(),
+        signature_policy: None,
+        signature_policy_dir: None,
+        big_files_temporary_dir: None,
+        separate_pull_cgroup: String::new(),
+        cgroup_driver: crate::config::CgroupDriverConfig::Cgroupfs,
+        rootless: crate::rootless::EffectiveRootlessConfig::disabled(),
+        disable_cgroup: false,
+        pull_cgroup_root: None,
+    })
+    .unwrap();
+    (dir, service, ledger_db_path)
+}
+
 fn test_image_service_with_pull_cgroup(
     storage_path: &Path,
     cgroup_root: &Path,
@@ -1465,6 +1499,98 @@ async fn pull_image_records_failed_content_transfer() {
     assert_eq!(record.provider, RemoteContentProviderKind::Test);
     assert_eq!(record.state, TransferState::Failed);
     assert_eq!(record.error.as_deref(), Some("registry failed"));
+}
+
+#[tokio::test]
+async fn pull_image_persists_content_transfer_result_to_ledger() {
+    let (_dir, service, ledger_db_path) = test_image_service_with_ledger_in_tempdir();
+    service.set_test_pull_handler(Arc::new(|_| {
+        Ok(TestPullResponse {
+            image_id: "sha256:transfer-ledger".to_string(),
+            size: TEST_EMPTY_LAYER_TAR_GZ.len() as u64,
+            ..Default::default()
+        })
+    }));
+
+    ImageService::pull_image(
+        &service,
+        Request::new(PullImageRequest {
+            image: Some(ImageSpec {
+                image: "repo/transfer-ledger:latest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let storage = StorageManager::new(&ledger_db_path).unwrap();
+    let transfers = storage.list_content_transfers().unwrap();
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].source, "docker.io/repo/transfer-ledger:latest");
+    assert_eq!(transfers[0].state, "succeeded");
+    assert!(transfers[0].finished_at.is_some());
+}
+
+#[test]
+fn image_service_marks_interrupted_transfer_on_startup() {
+    let dir = tempdir().unwrap();
+    let ledger_db_path = dir.path().join("crius.db");
+    let mut storage = StorageManager::new(&ledger_db_path).unwrap();
+    storage
+        .save_content_transfer(&crate::storage::ContentTransferRecord {
+            id: "startup-transfer".to_string(),
+            source: "docker.io/repo/interrupted:latest".to_string(),
+            provider: "registry".to_string(),
+            state: "running".to_string(),
+            current_stage: "downloading".to_string(),
+            bytes_total: 20,
+            bytes_completed: 8,
+            started_at: 100,
+            finished_at: None,
+            error: None,
+        })
+        .unwrap();
+    drop(storage);
+
+    let service = ImageServiceImpl::new_with_options(ImageServiceOptions {
+        storage_path: dir.path().join("images"),
+        ledger_db_path: Some(ledger_db_path.clone()),
+        storage_driver: "overlay".to_string(),
+        storage_options: Vec::new(),
+        global_auth_file: None,
+        namespaced_auth_dir: None,
+        default_transport: "docker://".to_string(),
+        short_name_mode: "disabled".to_string(),
+        pull_progress_timeout: std::time::Duration::ZERO,
+        max_concurrent_downloads: 3,
+        pull_retry_count: 0,
+        registry_config_dir: None,
+        decryption_keys_path: None,
+        decryption_decoder_path: "ctd-decoder".to_string(),
+        decryption_keyprovider_config: None,
+        additional_artifact_stores: Vec::new(),
+        pinned_image_patterns: Vec::new(),
+        signature_policy: None,
+        signature_policy_dir: None,
+        big_files_temporary_dir: None,
+        separate_pull_cgroup: String::new(),
+        cgroup_driver: crate::config::CgroupDriverConfig::Cgroupfs,
+        rootless: crate::rootless::EffectiveRootlessConfig::disabled(),
+        disable_cgroup: false,
+        pull_cgroup_root: None,
+    })
+    .unwrap();
+
+    let status = service.content_transfer_status();
+    assert!(status.active.is_empty());
+    assert_eq!(status.recent.len(), 1);
+    assert_eq!(status.recent[0].state, TransferState::Interrupted);
+
+    let storage = StorageManager::new(&ledger_db_path).unwrap();
+    let transfers = storage.list_content_transfers().unwrap();
+    assert_eq!(transfers[0].state, "interrupted");
 }
 
 #[tokio::test]

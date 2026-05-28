@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::storage::ContentTransferRecord as StoredContentTransferRecord;
 use crate::storage::{ContentBlobRecord, StorageManager};
 
 pub trait ContentStore: Send + Sync {
@@ -31,6 +32,49 @@ pub enum TransferState {
     Running,
     Succeeded,
     Failed,
+    Interrupted,
+}
+
+impl TransferState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+impl RemoteContentProviderKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Registry => "registry",
+            Self::Test => "test",
+            Self::Local => "local",
+        }
+    }
+}
+
+impl From<&str> for RemoteContentProviderKind {
+    fn from(value: &str) -> Self {
+        match value {
+            "test" => Self::Test,
+            "local" => Self::Local,
+            _ => Self::Registry,
+        }
+    }
+}
+
+impl From<&str> for TransferState {
+    fn from(value: &str) -> Self {
+        match value {
+            "succeeded" => Self::Succeeded,
+            "failed" => Self::Failed,
+            "interrupted" => Self::Interrupted,
+            _ => Self::Running,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +142,31 @@ impl Default for ContentTransferTracker {
 impl ContentTransferTracker {
     const RECENT_LIMIT: usize = 16;
 
+    pub fn new_with_ledger(ledger_db_path: Option<PathBuf>) -> Result<Self> {
+        let tracker = Self::default();
+        let Some(db_path) = ledger_db_path else {
+            return Ok(tracker);
+        };
+        let mut storage = StorageManager::new(db_path)?;
+        storage.mark_running_content_transfers_interrupted(now_unix_nanos())?;
+        let mut records = storage.list_content_transfers()?;
+        records.sort_by(|left, right| {
+            right
+                .started_at
+                .cmp(&left.started_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        if let Ok(mut inner) = tracker.inner.lock() {
+            inner.recent = records
+                .into_iter()
+                .filter_map(ContentTransferRecord::from_storage)
+                .filter(|record| record.state != TransferState::Running)
+                .take(Self::RECENT_LIMIT)
+                .collect();
+        }
+        Ok(tracker)
+    }
+
     pub fn start(
         &self,
         source: impl Into<String>,
@@ -137,6 +206,18 @@ impl ContentTransferTracker {
         }
     }
 
+    pub fn record(&self, id: &str) -> Option<ContentTransferRecord> {
+        let Ok(inner) = self.inner.lock() else {
+            return None;
+        };
+        inner
+            .active
+            .iter()
+            .chain(inner.recent.iter())
+            .find(|record| record.id == id)
+            .cloned()
+    }
+
     fn update(&self, id: &str, stage: impl Into<String>, bytes_completed: u64, bytes_total: u64) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
@@ -165,6 +246,10 @@ impl ContentTransferTracker {
 }
 
 impl ContentTransferGuard {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     pub fn update(&self, stage: impl Into<String>, bytes_completed: u64, bytes_total: u64) {
         self.tracker
             .update(&self.id, stage, bytes_completed, bytes_total);
@@ -180,6 +265,41 @@ impl ContentTransferGuard {
         self.finished = true;
         self.tracker
             .finish(&self.id, TransferState::Failed, Some(error.into()));
+    }
+}
+
+impl ContentTransferRecord {
+    pub fn to_storage(&self) -> StoredContentTransferRecord {
+        StoredContentTransferRecord {
+            id: self.id.clone(),
+            source: self.source.clone(),
+            provider: self.provider.as_str().to_string(),
+            state: self.state.as_str().to_string(),
+            current_stage: self.current_stage.clone(),
+            bytes_total: self.bytes_total,
+            bytes_completed: self.bytes_completed,
+            started_at: self.started_at_unix_nanos,
+            finished_at: self.finished_at_unix_nanos,
+            error: self.error.clone(),
+        }
+    }
+
+    fn from_storage(record: StoredContentTransferRecord) -> Option<Self> {
+        if record.id.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            id: record.id,
+            source: record.source,
+            provider: RemoteContentProviderKind::from(record.provider.as_str()),
+            state: TransferState::from(record.state.as_str()),
+            current_stage: record.current_stage,
+            bytes_total: record.bytes_total,
+            bytes_completed: record.bytes_completed,
+            started_at_unix_nanos: record.started_at,
+            finished_at_unix_nanos: record.finished_at,
+            error: record.error,
+        })
     }
 }
 
@@ -461,7 +581,7 @@ pub fn collect_path_usage(path: &Path) -> Result<(u64, u64)> {
 mod tests {
     use super::{
         collect_path_usage, ContentStore, ContentTransferTracker, FsContentStore,
-        RemoteContentProviderKind, TransferState,
+        RemoteContentProviderKind, StorageManager, StoredContentTransferRecord, TransferState,
     };
 
     #[test]
@@ -547,5 +667,42 @@ mod tests {
             RemoteContentProviderKind::Registry
         );
         assert!(recent.recent[0].finished_at_unix_nanos.is_some());
+    }
+
+    #[test]
+    fn transfer_tracker_loads_running_ledger_records_as_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("crius.db");
+        let mut storage = StorageManager::new(&db_path).unwrap();
+        storage
+            .save_content_transfer(&StoredContentTransferRecord {
+                id: "transfer-1".to_string(),
+                source: "registry.example.com/ns/image:latest".to_string(),
+                provider: "registry".to_string(),
+                state: "running".to_string(),
+                current_stage: "downloading".to_string(),
+                bytes_total: 10,
+                bytes_completed: 4,
+                started_at: 100,
+                finished_at: None,
+                error: None,
+            })
+            .unwrap();
+        drop(storage);
+
+        let tracker = ContentTransferTracker::new_with_ledger(Some(db_path.clone())).unwrap();
+
+        let status = tracker.snapshot();
+        assert!(status.active.is_empty());
+        assert_eq!(status.recent.len(), 1);
+        assert_eq!(status.recent[0].state, TransferState::Interrupted);
+        assert_eq!(
+            status.recent[0].error.as_deref(),
+            Some("daemon restarted before transfer completed")
+        );
+
+        let storage = StorageManager::new(&db_path).unwrap();
+        let stored = storage.list_content_transfers().unwrap();
+        assert_eq!(stored[0].state, "interrupted");
     }
 }

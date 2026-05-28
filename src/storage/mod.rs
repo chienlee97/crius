@@ -115,6 +115,20 @@ pub struct ContentBlobRefRecord {
     pub ref_kind: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ContentTransferRecord {
+    pub id: String,
+    pub source: String,
+    pub provider: String,
+    pub state: String,
+    pub current_stage: String,
+    pub bytes_total: u64,
+    pub bytes_completed: u64,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub error: Option<String>,
+}
+
 pub struct TypedEventInput<'a> {
     pub event_type: &'a str,
     pub entity_type: &'a str,
@@ -322,6 +336,24 @@ impl StorageManager {
 
         self.conn
             .execute(
+                "CREATE TABLE IF NOT EXISTS content_transfers (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                state TEXT NOT NULL,
+                current_stage TEXT NOT NULL,
+                bytes_total INTEGER NOT NULL DEFAULT 0,
+                bytes_completed INTEGER NOT NULL DEFAULT 0,
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                error TEXT
+            )",
+                [],
+            )
+            .context("Failed to create content_transfers table")?;
+
+        self.conn
+            .execute(
                 "CREATE TABLE IF NOT EXISTS image_refs (
                 reference TEXT NOT NULL,
                 image_id TEXT NOT NULL,
@@ -411,6 +443,10 @@ impl StorageManager {
         )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_content_blob_refs_digest ON content_blob_refs(digest)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_transfers_state ON content_transfers(state)",
             [],
         )?;
         self.conn.execute(
@@ -1217,6 +1253,85 @@ impl StorageManager {
             }
         };
         Ok(records)
+    }
+
+    pub fn save_content_transfer(&mut self, record: &ContentTransferRecord) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO content_transfers
+                 (id, source, provider, state, current_stage, bytes_total, bytes_completed, started_at, finished_at, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                   source = excluded.source,
+                   provider = excluded.provider,
+                   state = excluded.state,
+                   current_stage = excluded.current_stage,
+                   bytes_total = excluded.bytes_total,
+                   bytes_completed = excluded.bytes_completed,
+                   finished_at = excluded.finished_at,
+                   error = excluded.error",
+                rusqlite::params![
+                    &record.id,
+                    &record.source,
+                    &record.provider,
+                    &record.state,
+                    &record.current_stage,
+                    record.bytes_total as i64,
+                    record.bytes_completed as i64,
+                    record.started_at,
+                    record.finished_at,
+                    record.error.as_deref(),
+                ],
+            )
+            .context("Failed to save content transfer")?;
+        Ok(())
+    }
+
+    pub fn list_content_transfers(&self) -> Result<Vec<ContentTransferRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source, provider, state, current_stage, bytes_total, bytes_completed, started_at, finished_at, error
+             FROM content_transfers
+             ORDER BY started_at DESC, id DESC",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                let bytes_total: i64 = row.get(5)?;
+                let bytes_completed: i64 = row.get(6)?;
+                Ok(ContentTransferRecord {
+                    id: row.get(0)?,
+                    source: row.get(1)?,
+                    provider: row.get(2)?,
+                    state: row.get(3)?,
+                    current_stage: row.get(4)?,
+                    bytes_total: bytes_total.max(0) as u64,
+                    bytes_completed: bytes_completed.max(0) as u64,
+                    started_at: row.get(7)?,
+                    finished_at: row.get(8)?,
+                    error: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list content transfers")?;
+        Ok(records)
+    }
+
+    pub fn mark_running_content_transfers_interrupted(
+        &mut self,
+        finished_at: i64,
+    ) -> Result<usize> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE content_transfers
+                 SET state = 'interrupted',
+                     current_stage = 'interrupted',
+                     finished_at = ?1,
+                     error = 'daemon restarted before transfer completed'
+                 WHERE state = 'running'",
+                [finished_at],
+            )
+            .context("Failed to mark interrupted content transfers")?;
+        Ok(changed)
     }
 
     pub fn save_snapshot(&mut self, record: &SnapshotRecord) -> Result<()> {
