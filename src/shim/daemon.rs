@@ -15,9 +15,11 @@ use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs;
 use std::fs::File;
 use std::io::IoSliceMut;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
@@ -29,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::io::{IoConfig, IoManager, JournalConfig, DEFAULT_JOURNALD_SOCKET_PATH};
+use crate::image::snapshotter::{RootfsHandle, RootfsHandleKind, RootfsMountSpec};
 use crate::runtime::RuncRuntime;
 use crate::services::{InternalEvent, InternalEventSeverity, LedgerInternalEventSink};
 use crate::shim_rpc::server::{default_task_socket_path, serve, ShimRpcHandler};
@@ -42,6 +45,36 @@ use crate::shim_rpc::{
 use crate::storage::StorageManager;
 
 const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";
+
+fn parse_mount_options(options: &[String]) -> Result<(libc::c_ulong, Option<String>)> {
+    let mut flags: libc::c_ulong = 0;
+    let mut data = Vec::new();
+    for option in options {
+        match option.as_str() {
+            "" | "rw" => {}
+            "ro" => flags |= libc::MS_RDONLY as libc::c_ulong,
+            "bind" => flags |= libc::MS_BIND as libc::c_ulong,
+            "rbind" => flags |= (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
+            "rec" => flags |= libc::MS_REC as libc::c_ulong,
+            "private" => flags |= libc::MS_PRIVATE as libc::c_ulong,
+            "rprivate" => flags |= (libc::MS_PRIVATE | libc::MS_REC) as libc::c_ulong,
+            "shared" => flags |= libc::MS_SHARED as libc::c_ulong,
+            "rshared" => flags |= (libc::MS_SHARED | libc::MS_REC) as libc::c_ulong,
+            "slave" => flags |= libc::MS_SLAVE as libc::c_ulong,
+            "rslave" => flags |= (libc::MS_SLAVE | libc::MS_REC) as libc::c_ulong,
+            "nosuid" => flags |= libc::MS_NOSUID as libc::c_ulong,
+            "nodev" => flags |= libc::MS_NODEV as libc::c_ulong,
+            "noexec" => flags |= libc::MS_NOEXEC as libc::c_ulong,
+            "sync" => flags |= libc::MS_SYNCHRONOUS as libc::c_ulong,
+            "dirsync" => flags |= libc::MS_DIRSYNC as libc::c_ulong,
+            "noatime" => flags |= libc::MS_NOATIME as libc::c_ulong,
+            "nodiratime" => flags |= libc::MS_NODIRATIME as libc::c_ulong,
+            "relatime" => flags |= libc::MS_RELATIME as libc::c_ulong,
+            other => data.push(other.to_string()),
+        }
+    }
+    Ok((flags, (!data.is_empty()).then(|| data.join(","))))
+}
 
 #[derive(Debug, Deserialize, Default)]
 struct ShimBundleProcess {
@@ -171,7 +204,8 @@ struct ShimRootfsHandle {
     snapshot_key: Option<String>,
     rootfs_path: PathBuf,
     mount_options: Vec<String>,
-    rootfs: Option<crate::image::snapshotter::RootfsHandle>,
+    rootfs: Option<RootfsHandle>,
+    mounted_targets: Vec<PathBuf>,
 }
 
 pub struct DaemonOptions {
@@ -357,12 +391,113 @@ impl Daemon {
             .with_context(|| format!("Failed to persist bundle config {}", config_path.display()))
     }
 
+    fn apply_rootfs_handle_mounts(&self, rootfs: Option<&RootfsHandle>) -> Result<Vec<PathBuf>> {
+        let Some(rootfs) = rootfs else {
+            return Ok(Vec::new());
+        };
+        match rootfs.kind {
+            RootfsHandleKind::InternalPath => Ok(Vec::new()),
+            RootfsHandleKind::ExternalMountSpec => {
+                let mut mounted_targets: Vec<PathBuf> = Vec::new();
+                for mount in &rootfs.mounts {
+                    if let Err(err) = Self::mount_rootfs_spec(mount) {
+                        for target in mounted_targets.iter().rev() {
+                            let _ = Self::unmount_rootfs_target(target);
+                        }
+                        if let Some(snapshot_key) = rootfs.snapshot_key.as_deref() {
+                            let _ = self.update_snapshot_state(snapshot_key, "broken");
+                        }
+                        return Err(err);
+                    }
+                    mounted_targets.push(mount.target.clone());
+                }
+                Ok(mounted_targets)
+            }
+        }
+    }
+
+    fn mount_rootfs_spec(mount: &RootfsMountSpec) -> Result<()> {
+        if mount.mount_type.trim().is_empty() {
+            return Err(anyhow::anyhow!("rootfs mount spec type must not be empty"));
+        }
+        if mount.target.as_os_str().is_empty() {
+            return Err(anyhow::anyhow!(
+                "rootfs mount spec target must not be empty"
+            ));
+        }
+        fs::create_dir_all(&mount.target).with_context(|| {
+            format!(
+                "Failed to create rootfs mount target {}",
+                mount.target.display()
+            )
+        })?;
+        let fstype = CString::new(mount.mount_type.as_bytes())
+            .context("rootfs mount type contains interior NUL")?;
+        let source = if mount.source.as_os_str().is_empty() {
+            None
+        } else {
+            Some(
+                CString::new(mount.source.as_os_str().as_bytes())
+                    .context("rootfs mount source contains interior NUL")?,
+            )
+        };
+        let target = CString::new(mount.target.as_os_str().as_bytes())
+            .context("rootfs mount target contains interior NUL")?;
+        let (flags, data) = parse_mount_options(&mount.options)?;
+        let data_cstring = data
+            .as_ref()
+            .map(|value| CString::new(value.as_bytes()))
+            .transpose()
+            .context("rootfs mount data contains interior NUL")?;
+        let data_ptr = data_cstring
+            .as_ref()
+            .map(|value| value.as_ptr() as *const libc::c_void)
+            .unwrap_or(std::ptr::null());
+
+        let rc = unsafe {
+            libc::mount(
+                source
+                    .as_ref()
+                    .map(|value| value.as_ptr())
+                    .unwrap_or(std::ptr::null()),
+                target.as_ptr(),
+                fstype.as_ptr(),
+                flags,
+                data_ptr,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "Failed to mount rootfs {} on {} as {} with options {:?}",
+                    mount.source.display(),
+                    mount.target.display(),
+                    mount.mount_type,
+                    mount.options
+                )
+            });
+        }
+        Ok(())
+    }
+
+    fn unmount_rootfs_target(target: &Path) -> Result<()> {
+        let target = CString::new(target.as_os_str().as_bytes())
+            .context("rootfs unmount target contains interior NUL")?;
+        let rc = unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).context("Failed to unmount rootfs target");
+        }
+        Ok(())
+    }
+
     fn record_rootfs_handle(&self, request: &CreateTaskRequest) -> Result<()> {
+        let mounted_targets = self.apply_rootfs_handle_mounts(request.rootfs.as_ref())?;
         *self.rootfs_handle.lock().unwrap() = Some(ShimRootfsHandle {
             snapshot_key: request.snapshot_key.clone(),
             rootfs_path: request.rootfs_path.clone(),
             mount_options: request.mount_options.clone(),
             rootfs: request.rootfs.clone(),
+            mounted_targets,
         });
         let Some(snapshot_key) = request.snapshot_key.as_deref() else {
             return Ok(());
@@ -396,6 +531,13 @@ impl Daemon {
             .clone()
             .or_else(|| stored.as_ref().map(|handle| handle.rootfs_path.clone()));
 
+        if let Some(handle) = stored.as_ref() {
+            for target in handle.mounted_targets.iter().rev() {
+                Self::unmount_rootfs_target(target)
+                    .with_context(|| format!("Failed to unmount rootfs {}", target.display()))?;
+            }
+        }
+
         if let Some(path) = rootfs_path.as_ref().filter(|path| path.exists()) {
             fs::remove_dir_all(path).with_context(|| {
                 format!("Failed to remove shim-owned rootfs {}", path.display())
@@ -409,12 +551,13 @@ impl Daemon {
 
         if let Some(handle) = stored.as_ref() {
             debug!(
-                "Deleted shim rootfs handle for container {} snapshot {:?} rootfs {} mount options {:?} rootfs {:?}",
+                "Deleted shim rootfs handle for container {} snapshot {:?} rootfs {} mount options {:?} rootfs {:?} mounted targets {:?}",
                 self.container_id,
                 handle.snapshot_key,
                 handle.rootfs_path.display(),
                 handle.mount_options,
-                handle.rootfs
+                handle.rootfs,
+                handle.mounted_targets
             );
         }
 

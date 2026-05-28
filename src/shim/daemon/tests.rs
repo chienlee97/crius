@@ -130,6 +130,99 @@ fn shim_daemon_owns_rootfs_snapshot_lifecycle() {
         .is_empty());
 }
 
+#[test]
+fn create_task_mount_failure_marks_snapshot_broken() {
+    let temp_dir = tempdir().unwrap();
+    let db_path = temp_dir.path().join("state").join("crius.db");
+    let bundle_dir = temp_dir.path().join("bundle");
+    fs::create_dir_all(&bundle_dir).unwrap();
+    fs::write(
+        bundle_dir.join("config.json"),
+        serde_json::to_vec(&json!({
+            "ociVersion": "1.0.2",
+            "root": {
+                "path": "rootfs"
+            },
+            "process": {
+                "terminal": false
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let rootfs = temp_dir.path().join("external-rootfs");
+    let target = temp_dir.path().join("mount-target");
+
+    let mut storage = StorageManager::new(&db_path).unwrap();
+    storage
+        .save_snapshot(&SnapshotRecord {
+            key: "external-ctr".to_string(),
+            image_id: "sha256:test".to_string(),
+            owner_kind: "container".to_string(),
+            owner_id: "ctr1".to_string(),
+            state: "prepared".to_string(),
+            mountpoint: rootfs.display().to_string(),
+        })
+        .unwrap();
+    drop(storage);
+
+    let daemon = Daemon::new(
+        "ctr1".to_string(),
+        bundle_dir,
+        temp_dir.path().join("runtime"),
+        DaemonOptions {
+            runtime_config_path: PathBuf::new(),
+            monitor_cgroup: String::new(),
+            work_dir: temp_dir.path().join("shim"),
+            state_db_path: Some(db_path.clone()),
+            exit_code_file: None,
+            attach_socket_dir: None,
+            io_uid: 0,
+            io_gid: 0,
+            max_container_log_line_size: 4096,
+            log_to_journald: false,
+            no_sync_log: false,
+            no_pivot: false,
+            no_new_keyring: false,
+            systemd_cgroup: false,
+        },
+    );
+
+    let err = daemon
+        .handle_request(ShimRpcRequest::CreateTask(CreateTaskRequest {
+            container_id: "ctr1".to_string(),
+            rootfs_path: rootfs.clone(),
+            snapshot_key: Some("external-ctr".to_string()),
+            mount_options: Vec::new(),
+            rootfs: Some(
+                crate::image::snapshotter::RootfsHandle::external_mount_spec(
+                    "external-ctr",
+                    "container",
+                    "ctr1",
+                    rootfs,
+                    vec![crate::image::snapshotter::RootfsMountSpec {
+                        mount_type: "definitely-not-a-real-fs".to_string(),
+                        source: PathBuf::new(),
+                        target,
+                        options: Vec::new(),
+                    }],
+                    false,
+                ),
+            ),
+        }))
+        .unwrap_err();
+
+    assert!(err.to_string().contains("Failed to mount rootfs"));
+    let snapshot = StorageManager::new(&db_path)
+        .unwrap()
+        .list_snapshots()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.key == "external-ctr")
+        .unwrap();
+    assert_eq!(snapshot.state, "broken");
+}
+
 #[tokio::test]
 async fn shim_daemon_records_task_and_exec_internal_events() {
     let temp_dir = tempdir().unwrap();
