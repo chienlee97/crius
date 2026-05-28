@@ -288,6 +288,21 @@ impl RecoveryFixture {
         self.set_live_runtime_state(owner_id, "running");
         path
     }
+
+    fn mark_snapshot_external_stale(&mut self) {
+        let mut snapshot = self
+            .snapshot()
+            .snapshots
+            .into_iter()
+            .find(|snapshot| snapshot.key == "snapshot-a")
+            .unwrap();
+        snapshot.snapshotter = "stargz".to_string();
+        snapshot.runtime_managed = false;
+        snapshot.state = SnapshotLedgerState::Stale.as_str().to_string();
+        StateLedgerWriter::new(&mut self.persistence)
+            .save_snapshot(&snapshot)
+            .unwrap();
+    }
 }
 
 #[test]
@@ -307,6 +322,23 @@ fn recovery_fixture_builds_healthy_ledger_graph() {
     assert_eq!(snapshot.snapshots.len(), 1);
     assert_eq!(snapshot.runtime_artifacts.len(), 2);
     assert_eq!(snapshot.shim_processes.len(), 1);
+}
+
+#[test]
+fn recovery_fixture_round_trips_external_stale_snapshot_metadata() {
+    let mut fixture = RecoveryFixture::new();
+    fixture.mark_snapshot_external_stale();
+
+    let snapshot = fixture.snapshot();
+    let external = snapshot
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.key == "snapshot-a")
+        .unwrap();
+
+    assert_eq!(external.snapshotter, "stargz");
+    assert!(!external.runtime_managed);
+    assert_eq!(external.state, SnapshotLedgerState::Stale.as_str());
 }
 
 #[test]
