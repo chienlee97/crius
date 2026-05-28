@@ -5,7 +5,8 @@ use crate::runtime::ContainerStatus;
 use crate::storage::persistence::PersistenceManager;
 use crate::storage::{
     ContainerRecord, ContentGcCandidate, ContentTransferRecord, ImageRecord, ImageRefRecord,
-    PodSandboxRecord, RuntimeArtifactRecord, ShimProcessRecord, SnapshotRecord, StateEvent,
+    PodSandboxRecord, RuntimeArtifactRecord, SchemaMigrationRecord, ShimProcessRecord,
+    SnapshotRecord, StateEvent,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +254,14 @@ impl<'a> StateLedger<'a> {
 
     pub fn content_gc_candidates(&self) -> Result<Vec<ContentGcCandidate>> {
         self.persistence.list_content_gc_candidates()
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        self.persistence.schema_version()
+    }
+
+    pub fn latest_schema_migration(&self) -> Result<Option<SchemaMigrationRecord>> {
+        self.persistence.latest_schema_migration()
     }
 
     pub fn snapshots(&self) -> Result<Vec<SnapshotRecord>> {
@@ -629,6 +638,15 @@ mod tests {
         let ledger = StateLedger::new(&persistence);
         let snapshot = ledger.recovery_snapshot().unwrap();
 
+        assert_eq!(ledger.schema_version().unwrap(), 1);
+        assert_eq!(
+            ledger
+                .latest_schema_migration()
+                .unwrap()
+                .unwrap()
+                .migration_name,
+            "baseline-current-ledger-schema"
+        );
         assert_eq!(snapshot.pods.len(), 1);
         assert_eq!(snapshot.pods[0].id, pod.id);
         assert_eq!(snapshot.containers.len(), 1);

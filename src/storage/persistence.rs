@@ -5,7 +5,8 @@
 use crate::runtime::ContainerStatus;
 use crate::storage::{
     ContainerRecord, ContentGcCandidate, ContentTransferRecord, ImageRecord, ImageRefRecord,
-    PodSandboxRecord, RuntimeArtifactRecord, ShimProcessRecord, SnapshotRecord, StorageManager,
+    PodSandboxRecord, RuntimeArtifactRecord, SchemaMigrationRecord, ShimProcessRecord,
+    SnapshotRecord, StorageManager,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -154,6 +155,14 @@ impl PersistenceManager {
 
     pub fn attempt_repair(&mut self) -> Result<bool> {
         self.storage.attempt_repair()
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        self.storage.schema_version()
+    }
+
+    pub fn latest_schema_migration(&self) -> Result<Option<SchemaMigrationRecord>> {
+        self.storage.latest_schema_migration()
     }
 
     /// 保存容器状态

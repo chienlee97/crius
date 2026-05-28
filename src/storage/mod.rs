@@ -10,6 +10,8 @@ use std::path::Path;
 pub mod volume;
 pub use volume::{MountedVolume, VolumeConfig, VolumeManager, VolumeType};
 
+const CURRENT_SCHEMA_VERSION: i64 = 1;
+
 /// 存储管理器
 #[derive(Debug)]
 pub struct StorageManager {
@@ -167,6 +169,14 @@ pub struct TypedEventInput<'a> {
     pub timestamp: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct SchemaMigrationRecord {
+    pub version: i64,
+    pub migration_name: String,
+    pub dirty: bool,
+    pub applied_at: i64,
+}
+
 /// 快照记录
 #[derive(Debug, Clone)]
 pub struct SnapshotRecord {
@@ -227,6 +237,9 @@ impl StorageManager {
 
     /// 初始化数据库表
     fn init_tables(&mut self) -> Result<()> {
+        self.ensure_schema_version_table()?;
+        self.reject_unsupported_or_dirty_schema()?;
+
         // 容器表
         self.conn
             .execute(
@@ -497,8 +510,109 @@ impl StorageManager {
             "CREATE INDEX IF NOT EXISTS idx_events_time_new ON events(timestamp)",
             [],
         )?;
+        self.run_schema_migrations()?;
 
         debug!("Database tables initialized");
+        Ok(())
+    }
+
+    fn ensure_schema_version_table(&mut self) -> Result<()> {
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                migration_name TEXT NOT NULL,
+                dirty INTEGER NOT NULL DEFAULT 0,
+                applied_at INTEGER NOT NULL
+            )",
+                [],
+            )
+            .context("Failed to create schema_version table")?;
+        Ok(())
+    }
+
+    fn reject_unsupported_or_dirty_schema(&self) -> Result<()> {
+        if let Some(record) = self.latest_schema_migration()? {
+            if record.dirty {
+                anyhow::bail!(
+                    "state database schema migration {} ({}) is dirty; refusing to start",
+                    record.version,
+                    record.migration_name
+                );
+            }
+            if record.version > CURRENT_SCHEMA_VERSION {
+                anyhow::bail!(
+                    "state database schema version {} is newer than supported version {}",
+                    record.version,
+                    CURRENT_SCHEMA_VERSION
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn run_schema_migrations(&mut self) -> Result<()> {
+        let current = self.schema_version()?;
+        if current >= CURRENT_SCHEMA_VERSION {
+            return Ok(());
+        }
+        self.apply_schema_migration(1, "baseline-current-ledger-schema", |manager| {
+            manager.verify_current_schema()
+        })?;
+        Ok(())
+    }
+
+    fn apply_schema_migration<F>(&mut self, version: i64, name: &str, apply: F) -> Result<()>
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+    {
+        if self.schema_version()? >= version {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO schema_version (version, migration_name, dirty, applied_at)
+                 VALUES (?1, ?2, 1, ?3)",
+                rusqlite::params![version, name, now],
+            )
+            .with_context(|| format!("Failed to mark schema migration {version} dirty"))?;
+        apply(self).with_context(|| format!("Failed to apply schema migration {version}"))?;
+        self.conn
+            .execute(
+                "UPDATE schema_version SET dirty = 0, applied_at = ?2 WHERE version = ?1",
+                rusqlite::params![version, chrono::Utc::now().timestamp()],
+            )
+            .with_context(|| format!("Failed to mark schema migration {version} clean"))?;
+        Ok(())
+    }
+
+    fn verify_current_schema(&self) -> Result<()> {
+        for (table, required_columns) in [
+            (
+                "containers",
+                vec!["runtime_handler", "runtime_backend", "snapshot_key"],
+            ),
+            ("snapshots", vec!["snapshotter", "runtime_managed"]),
+            (
+                "runtime_artifacts",
+                vec!["state", "runtime_handler", "runtime_root"],
+            ),
+            (
+                "content_transfers",
+                vec!["state", "current_stage", "started_at", "finished_at"],
+            ),
+            ("events", vec!["event_type", "entity_type", "new_state"]),
+        ] {
+            let columns = self.table_columns(table)?;
+            for required in required_columns {
+                if !columns.iter().any(|column| column == required) {
+                    anyhow::bail!(
+                        "schema verification failed: table {table} missing column {required}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -596,6 +710,34 @@ impl StorageManager {
             .collect::<Result<Vec<_>, _>>()
             .with_context(|| format!("Failed to read {table} table columns"))?;
         Ok(columns)
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        Ok(self
+            .latest_schema_migration()?
+            .map(|record| record.version)
+            .unwrap_or(0))
+    }
+
+    pub fn latest_schema_migration(&self) -> Result<Option<SchemaMigrationRecord>> {
+        self.conn
+            .query_row(
+                "SELECT version, migration_name, dirty, applied_at
+                 FROM schema_version
+                 ORDER BY version DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok(SchemaMigrationRecord {
+                        version: row.get(0)?,
+                        migration_name: row.get(1)?,
+                        dirty: row.get::<_, i64>(2)? != 0,
+                        applied_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .context("Failed to read schema_version")
     }
 
     fn migrate_state_events_to_events(&mut self) -> Result<()> {
@@ -1829,6 +1971,64 @@ mod tests {
 
         let manager = StorageManager::new(&db_path);
         assert!(manager.is_ok());
+        let manager = manager.unwrap();
+        assert_eq!(manager.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            manager
+                .latest_schema_migration()
+                .unwrap()
+                .unwrap()
+                .migration_name,
+            "baseline-current-ledger-schema"
+        );
+    }
+
+    #[test]
+    fn schema_migration_is_idempotent_across_reopens() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        StorageManager::new(&db_path).unwrap().close().unwrap();
+        StorageManager::new(&db_path).unwrap().close().unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn schema_migration_rejects_dirty_state() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        StorageManager::new(&db_path).unwrap().close().unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("UPDATE schema_version SET dirty = 1", [])
+            .unwrap();
+        drop(conn);
+
+        let err = StorageManager::new(&db_path).unwrap_err();
+        assert!(err.to_string().contains("dirty"));
+    }
+
+    #[test]
+    fn schema_migration_rejects_future_version() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        StorageManager::new(&db_path).unwrap().close().unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version, migration_name, dirty, applied_at)
+             VALUES (?1, ?2, 0, ?3)",
+            rusqlite::params![CURRENT_SCHEMA_VERSION + 1, "future", 1_i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = StorageManager::new(&db_path).unwrap_err();
+        assert!(err.to_string().contains("newer than supported"));
     }
 
     #[test]
