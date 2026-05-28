@@ -242,6 +242,7 @@ async fn main() -> Result<(), Error> {
         image_signature_policy: PathBuf::from(&config.image.signature_policy),
         image_signature_policy_dir: PathBuf::from(&config.image.signature_policy_dir),
         image_storage_options: config.image.storage_options.clone(),
+        image_external_snapshotters: config.image.external_snapshotters.clone(),
         image_volumes: config.image.image_volumes.clone(),
         image_pinned_images: {
             let mut pinned = config.image.pinned_images.clone();
@@ -1148,6 +1149,7 @@ mod tests {
             image_signature_policy: PathBuf::new(),
             image_signature_policy_dir: PathBuf::new(),
             image_storage_options: Vec::new(),
+            image_external_snapshotters: std::collections::HashMap::new(),
             image_volumes: "mkdir".to_string(),
             image_pinned_images: Vec::new(),
             image_big_files_temporary_dir: PathBuf::new(),

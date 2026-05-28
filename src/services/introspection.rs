@@ -51,6 +51,15 @@ impl IntrospectionService {
     }
 
     pub fn snapshot_backend(&self, config: &RuntimeConfig) -> Value {
+        let requested_default = config
+            .runtime_configs
+            .get(&config.runtime)
+            .map(|runtime| runtime.snapshotter.as_str())
+            .unwrap_or("internal-overlay-untar");
+        let default_probe = crate::image::snapshotter::probe_configured_snapshotter(
+            requested_default,
+            &config.image_external_snapshotters,
+        );
         json!({
             "contentStore": {
                 "root": config.image_root.display().to_string(),
@@ -64,9 +73,19 @@ impl IntrospectionService {
                     .collect::<Vec<_>>(),
             },
             "snapshotter": {
-                "default": "internal-overlay-untar",
+                "default": default_probe.name,
+                "resolved": default_probe.resolved_name(),
+                "type": default_probe.snapshotter_type,
+                "endpoint": default_probe.endpoint,
+                "path": default_probe.path,
+                "capabilities": default_probe.capabilities,
+                "available": default_probe.available,
+                "unavailableReason": default_probe.unavailable_reason,
+                "configured": crate::image::snapshotter::probe_all_configured_snapshotters(
+                    &config.image_external_snapshotters
+                ),
                 "runtimeSnapshotterOverrideSupported": true,
-                "externalSnapshotterSupported": false,
+                "externalSnapshotterSupported": !config.image_external_snapshotters.is_empty(),
             },
         })
     }
@@ -86,11 +105,25 @@ impl IntrospectionService {
     }
 
     pub fn image_snapshot_model(&self, config: &RuntimeConfig) -> Value {
+        let requested_default = config
+            .runtime_configs
+            .get(&config.runtime)
+            .map(|runtime| runtime.snapshotter.as_str())
+            .unwrap_or("internal-overlay-untar");
+        let default_probe = crate::image::snapshotter::probe_configured_snapshotter(
+            requested_default,
+            &config.image_external_snapshotters,
+        );
         json!({
-            "snapshotter": "internal-overlay-untar",
+            "snapshotter": default_probe.name,
+            "resolvedSnapshotter": default_probe.resolved_name(),
+            "snapshotterType": default_probe.snapshotter_type,
+            "snapshotterCapabilities": default_probe.capabilities,
+            "snapshotterAvailable": default_probe.available,
+            "snapshotterUnavailableReason": default_probe.unavailable_reason,
             "storageDriver": config.image_driver,
             "storageOptions": config.image_storage_options,
-            "externalSnapshotterSupported": false,
+            "externalSnapshotterSupported": !config.image_external_snapshotters.is_empty(),
             "runtimeSnapshotterOverrideSupported": true,
             "snapshotAnnotationPassthrough": false,
             "discardUnpackedLayers": false,
@@ -709,6 +742,39 @@ mod tests {
         assert_eq!(value["kata"]["cniMaxConfNum"], 2);
         assert_eq!(value["kata"]["streamWebsockets"], true);
         assert_eq!(value["kata"]["snapshotter"], "internal-cached-rootfs");
+    }
+
+    #[test]
+    fn snapshot_backend_reports_external_snapshotter_probe() {
+        let service = IntrospectionService;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stargz.sock");
+        std::fs::write(&socket, "").unwrap();
+        let mut config = RuntimeConfig {
+            config_path: None,
+            image_external_snapshotters: HashMap::from([(
+                "stargz".to_string(),
+                crate::config::ExternalSnapshotterConfig {
+                    snapshotter_type: "proxy".to_string(),
+                    endpoint: format!("unix://{}", socket.display()),
+                    capabilities: vec!["mount-spec".to_string()],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        if let Some(default_runtime) = config.runtime_configs.get_mut("runc") {
+            default_runtime.snapshotter = "stargz".to_string();
+        }
+
+        let value = service.snapshot_backend(&config);
+
+        assert_eq!(value["snapshotter"]["default"], "stargz");
+        assert_eq!(value["snapshotter"]["resolved"], "stargz");
+        assert_eq!(value["snapshotter"]["type"], "proxy");
+        assert_eq!(value["snapshotter"]["available"], true);
+        assert_eq!(value["snapshotter"]["capabilities"][0], "mount-spec");
+        assert_eq!(value["snapshotter"]["externalSnapshotterSupported"], true);
     }
 
     #[test]

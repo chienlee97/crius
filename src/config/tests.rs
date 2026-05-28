@@ -458,6 +458,70 @@ fn runtime_handler_config_accepts_backend_options() {
 }
 
 #[test]
+fn runtime_handler_config_accepts_configured_external_snapshotter() {
+    let dir = tempdir().unwrap();
+    let socket = dir.path().join("stargz.sock");
+    std::fs::write(&socket, "").unwrap();
+    let config: Config = toml::from_str(&format!(
+        r#"
+            root = "/var/lib/crius"
+
+            [runtime]
+            runtime_type = "runc"
+            runtime_path = "/usr/bin/runc"
+            root = "/run/crius"
+            handlers = ["runc", "stargz"]
+
+            [runtime.runtimes.stargz]
+            runtime_path = "/usr/bin/runc"
+            snapshotter = "stargz"
+
+            [image.external_snapshotters.stargz]
+            type = "proxy"
+            endpoint = "unix://{}"
+            capabilities = ["mount-spec", "remote-snapshot"]
+            "#,
+        socket.display()
+    ))
+    .expect("external snapshotter config should deserialize");
+
+    config
+        .validate()
+        .expect("configured external snapshotter should be valid");
+    assert_eq!(
+        config.runtime.runtimes["stargz"].snapshotter.as_str(),
+        "stargz"
+    );
+    assert_eq!(
+        config.image.external_snapshotters["stargz"]
+            .capabilities
+            .as_slice(),
+        ["mount-spec", "remote-snapshot"]
+    );
+}
+
+#[test]
+fn validate_rejects_unconfigured_external_snapshotter() {
+    let mut config = Config::default();
+    config.runtime.handlers = vec!["stargz".to_string()];
+    config.runtime.runtimes.insert(
+        "stargz".to_string(),
+        RuntimeHandlerConfig {
+            runtime_path: "/usr/bin/runc".to_string(),
+            snapshotter: "stargz".to_string(),
+            ..Default::default()
+        },
+    );
+
+    let err = config
+        .validate()
+        .expect_err("external snapshotter must be configured before use");
+    assert!(err
+        .to_string()
+        .contains("runtime.runtimes.stargz.snapshotter"));
+}
+
+#[test]
 fn validate_rejects_unknown_runc_backend_option() {
     let mut config = Config::default();
     config.runtime.handlers = vec!["kata".to_string()];

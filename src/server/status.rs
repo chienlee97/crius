@@ -984,6 +984,9 @@ impl RuntimeServiceImpl {
                     .display()
                     .to_string(),
                 "imageStorageOptions": self.config.image_storage_options.clone(),
+                "externalSnapshotters": crate::image::snapshotter::probe_all_configured_snapshotters(
+                    &self.config.image_external_snapshotters,
+                ),
                 "imageVolumes": self.config.image_volumes.clone(),
                 "pinnedImages": self.config.image_pinned_images.clone(),
                 "imageBigFilesTemporaryDir": self

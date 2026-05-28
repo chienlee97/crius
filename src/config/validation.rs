@@ -5,7 +5,7 @@ use crate::error::Error;
 use crate::network::MainIpPreference;
 use crate::prelude::*;
 
-use super::CgroupDriverConfig;
+use super::{CgroupDriverConfig, ExternalSnapshotterConfig};
 
 pub(super) fn rewrite_default_string(
     target: &mut String,
@@ -321,16 +321,100 @@ pub(super) fn validate_metrics_collectors(values: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_runtime_snapshotter(name: &str, value: &str) -> Result<()> {
+pub(super) fn validate_configured_runtime_snapshotter(
+    name: &str,
+    value: &str,
+    external_snapshotters: &HashMap<String, ExternalSnapshotterConfig>,
+) -> Result<()> {
     let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Ok(());
-    }
-    if matches!(trimmed, "internal-overlay-untar" | "internal-cached-rootfs") {
+    if trimmed.is_empty()
+        || matches!(trimmed, "internal-overlay-untar" | "internal-cached-rootfs")
+        || external_snapshotters.contains_key(trimmed)
+    {
         return Ok(());
     }
     Err(Error::Config(format!(
-        "{name} must be empty, \"internal-overlay-untar\", or \"internal-cached-rootfs\", got {trimmed}"
+        "{name} must be empty, an internal snapshotter, or one of configured image.external_snapshotters: {trimmed}"
+    )))
+}
+
+pub(super) fn validate_external_snapshotters(
+    snapshotters: &HashMap<String, ExternalSnapshotterConfig>,
+) -> Result<()> {
+    for (name, config) in snapshotters {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            return Err(Error::Config(
+                "image.external_snapshotters keys must not be empty".to_string(),
+            ));
+        }
+        if matches!(
+            trimmed_name,
+            "internal-overlay-untar" | "internal-cached-rootfs"
+        ) {
+            return Err(Error::Config(format!(
+                "image.external_snapshotters.{trimmed_name} conflicts with a built-in snapshotter"
+            )));
+        }
+        ensure_non_empty(
+            &format!("image.external_snapshotters.{trimmed_name}.type"),
+            &config.snapshotter_type,
+        )?;
+        if config.endpoint.trim().is_empty() && config.path.trim().is_empty() {
+            return Err(Error::Config(format!(
+                "image.external_snapshotters.{trimmed_name} requires endpoint or path"
+            )));
+        }
+        if !config.path.trim().is_empty() && !Path::new(config.path.trim()).is_absolute() {
+            return Err(Error::Config(format!(
+                "image.external_snapshotters.{trimmed_name}.path must be an absolute path when set"
+            )));
+        }
+        if !config.endpoint.trim().is_empty() {
+            validate_snapshotter_endpoint(
+                &format!("image.external_snapshotters.{trimmed_name}.endpoint"),
+                &config.endpoint,
+            )?;
+        }
+        for capability in &config.capabilities {
+            if capability.trim().is_empty() {
+                return Err(Error::Config(format!(
+                    "image.external_snapshotters.{trimmed_name}.capabilities entries must not be empty"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_snapshotter_endpoint(field: &str, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.starts_with("unix://") {
+        let path = trimmed.trim_start_matches("unix://");
+        if path.is_empty() || !Path::new(path).is_absolute() {
+            return Err(Error::Config(format!(
+                "{field} must use unix:// followed by an absolute socket path"
+            )));
+        }
+        return Ok(());
+    }
+    if trimmed.contains("://") {
+        let scheme = trimmed
+            .split_once("://")
+            .map(|(scheme, _)| scheme)
+            .unwrap_or("");
+        if matches!(scheme, "tcp" | "http" | "https") {
+            return Ok(());
+        }
+        return Err(Error::Config(format!(
+            "{field} has unsupported endpoint scheme {scheme}"
+        )));
+    }
+    if Path::new(trimmed).is_absolute() {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "{field} must be unix://, tcp/http(s), or an absolute socket path"
     )))
 }
 

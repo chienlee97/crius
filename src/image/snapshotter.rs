@@ -2,10 +2,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 
 use super::content_store::FsContentStore;
 use super::metadata_store::FilesystemImageMetadataStore;
 use super::ImageMeta;
+use crate::config::ExternalSnapshotterConfig;
 use crate::storage::{SnapshotRecord, StorageManager};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +23,142 @@ pub trait Snapshotter: Send + Sync {
     fn remove(&self, key: &str) -> Result<()>;
     fn usage_for(&self, key: &str) -> Result<SnapshotUsage>;
     fn usage(&self) -> Result<SnapshotUsage>;
+}
+
+pub const INTERNAL_OVERLAY_UNTAR_SNAPSHOTTER: &str = "internal-overlay-untar";
+pub const INTERNAL_CACHED_ROOTFS_SNAPSHOTTER: &str = "internal-cached-rootfs";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SnapshotterProbe {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub snapshotter_type: String,
+    pub endpoint: Option<String>,
+    pub path: Option<String>,
+    pub capabilities: Vec<String>,
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl SnapshotterProbe {
+    pub fn internal(name: &str, capabilities: &[&str]) -> Self {
+        Self {
+            name: name.to_string(),
+            snapshotter_type: "internal".to_string(),
+            endpoint: None,
+            path: None,
+            capabilities: capabilities
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            available: true,
+            unavailable_reason: None,
+        }
+    }
+
+    pub fn external(name: &str, config: &ExternalSnapshotterConfig) -> Self {
+        let path = non_empty_value(&config.path);
+        let endpoint = non_empty_value(&config.endpoint);
+        let path_error = path.as_deref().and_then(|value| {
+            (!Path::new(value).exists()).then(|| format!("configured path does not exist: {value}"))
+        });
+        let endpoint_error = endpoint.as_deref().and_then(probe_endpoint);
+        let unavailable_reason = path_error.or(endpoint_error);
+        let mut capabilities = normalize_capabilities(&config.capabilities);
+        if capabilities.is_empty() {
+            capabilities.push("mount-spec".to_string());
+        }
+
+        Self {
+            name: name.to_string(),
+            snapshotter_type: config.snapshotter_type.trim().to_string(),
+            endpoint,
+            path,
+            capabilities,
+            available: unavailable_reason.is_none(),
+            unavailable_reason,
+        }
+    }
+
+    pub fn resolved_name(&self) -> String {
+        if self.available {
+            self.name.clone()
+        } else {
+            INTERNAL_OVERLAY_UNTAR_SNAPSHOTTER.to_string()
+        }
+    }
+}
+
+pub fn probe_configured_snapshotter(
+    requested: &str,
+    external: &std::collections::HashMap<String, ExternalSnapshotterConfig>,
+) -> SnapshotterProbe {
+    match requested.trim() {
+        "" | INTERNAL_OVERLAY_UNTAR_SNAPSHOTTER => SnapshotterProbe::internal(
+            INTERNAL_OVERLAY_UNTAR_SNAPSHOTTER,
+            &["rootfs-path", "local-untar"],
+        ),
+        INTERNAL_CACHED_ROOTFS_SNAPSHOTTER => SnapshotterProbe::internal(
+            INTERNAL_CACHED_ROOTFS_SNAPSHOTTER,
+            &["rootfs-path", "local-untar", "cached-rootfs"],
+        ),
+        name => external
+            .get(name)
+            .map(|config| SnapshotterProbe::external(name, config))
+            .unwrap_or_else(|| SnapshotterProbe {
+                name: name.to_string(),
+                snapshotter_type: "unknown".to_string(),
+                endpoint: None,
+                path: None,
+                capabilities: Vec::new(),
+                available: false,
+                unavailable_reason: Some("snapshotter is not configured".to_string()),
+            }),
+    }
+}
+
+pub fn probe_all_configured_snapshotters(
+    external: &std::collections::HashMap<String, ExternalSnapshotterConfig>,
+) -> Vec<SnapshotterProbe> {
+    let mut probes = vec![
+        probe_configured_snapshotter(INTERNAL_OVERLAY_UNTAR_SNAPSHOTTER, external),
+        probe_configured_snapshotter(INTERNAL_CACHED_ROOTFS_SNAPSHOTTER, external),
+    ];
+    let mut external_names: Vec<_> = external.keys().cloned().collect();
+    external_names.sort();
+    probes.extend(
+        external_names
+            .iter()
+            .map(|name| probe_configured_snapshotter(name, external)),
+    );
+    probes
+}
+
+fn non_empty_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn normalize_capabilities(values: &[String]) -> Vec<String> {
+    let mut capabilities = Vec::new();
+    for capability in values {
+        let trimmed = capability.trim();
+        if !trimmed.is_empty() && !capabilities.iter().any(|existing| existing == trimmed) {
+            capabilities.push(trimmed.to_string());
+        }
+    }
+    capabilities
+}
+
+fn probe_endpoint(endpoint: &str) -> Option<String> {
+    let socket_path = endpoint.strip_prefix("unix://").map(Path::new).or_else(|| {
+        Path::new(endpoint)
+            .is_absolute()
+            .then(|| Path::new(endpoint))
+    });
+    socket_path.and_then(|path| {
+        (!path.exists()).then(|| format!("configured endpoint does not exist: {}", path.display()))
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,10 +506,15 @@ fn unpack_layer_with_tar(layer_file: &Path, rootfs_dir: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilesystemSnapshotter, SnapshotMode, SnapshotState, Snapshotter};
+    use super::{
+        probe_configured_snapshotter, FilesystemSnapshotter, SnapshotMode, SnapshotState,
+        Snapshotter, INTERNAL_OVERLAY_UNTAR_SNAPSHOTTER,
+    };
+    use crate::config::ExternalSnapshotterConfig;
     use crate::image::content_store::{ContentStore, FsContentStore};
     use crate::image::metadata_store::FilesystemImageMetadataStore;
     use crate::image::{CriusImage, StoredLayerMeta};
+    use std::collections::HashMap;
     use std::process::Command;
 
     #[test]
@@ -453,5 +596,46 @@ mod tests {
         assert!(!mount.mountpoint.exists());
         let storage = crate::storage::StorageManager::new(dir.path().join("crius.db")).unwrap();
         assert!(storage.list_snapshots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn probes_external_snapshotter_endpoint_and_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("snapshotter.sock");
+        std::fs::write(&socket, "").unwrap();
+        let configured = HashMap::from([(
+            "stargz".to_string(),
+            ExternalSnapshotterConfig {
+                snapshotter_type: "proxy".to_string(),
+                endpoint: format!("unix://{}", socket.display()),
+                capabilities: vec![
+                    "mount-spec".to_string(),
+                    "remote-snapshot".to_string(),
+                    "mount-spec".to_string(),
+                ],
+                ..Default::default()
+            },
+        )]);
+
+        let probe = probe_configured_snapshotter("stargz", &configured);
+        assert_eq!(probe.name, "stargz");
+        assert_eq!(probe.snapshotter_type, "proxy");
+        assert!(probe.available);
+        assert_eq!(probe.resolved_name(), "stargz");
+        assert_eq!(
+            probe.capabilities,
+            vec!["mount-spec".to_string(), "remote-snapshot".to_string()]
+        );
+
+        let missing = probe_configured_snapshotter("missing", &configured);
+        assert!(!missing.available);
+        assert_eq!(
+            missing.resolved_name(),
+            INTERNAL_OVERLAY_UNTAR_SNAPSHOTTER.to_string()
+        );
+        assert_eq!(
+            missing.unavailable_reason.as_deref(),
+            Some("snapshotter is not configured")
+        );
     }
 }

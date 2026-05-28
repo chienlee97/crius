@@ -530,6 +530,23 @@ pub struct ImageConfig {
     pub big_files_temporary_dir: String,
     /// 是否允许把 OCI artifact 作为 CRI image volume mount 到容器中。
     pub oci_artifact_mount_support: bool,
+    /// 可选 external snapshotter 配置，key 为 runtime handler 中引用的 snapshotter 名称。
+    pub external_snapshotters: HashMap<String, ExternalSnapshotterConfig>,
+}
+
+/// External snapshotter 配置。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ExternalSnapshotterConfig {
+    /// external snapshotter 类型，例如 `proxy`、`stargz`、`nydus`。
+    #[serde(rename = "type")]
+    pub snapshotter_type: String,
+    /// snapshotter 服务 endpoint；支持 unix socket、绝对路径 socket 或 TCP 地址。
+    pub endpoint: String,
+    /// snapshotter helper 或 plugin binary 路径；为空表示只通过 endpoint 探测。
+    pub path: String,
+    /// 配置声明或探测缓存中的能力列表。
+    pub capabilities: Vec<String>,
 }
 
 /// 网络配置。
@@ -842,6 +859,7 @@ impl Default for ImageConfig {
             pinned_images: Vec::new(),
             big_files_temporary_dir: String::new(),
             oci_artifact_mount_support: true,
+            external_snapshotters: HashMap::new(),
         }
     }
 }
@@ -2117,6 +2135,7 @@ impl Config {
                 "image.big_files_temporary_dir must be an absolute path when set".to_string(),
             ));
         }
+        validate_external_snapshotters(&self.image.external_snapshotters)?;
 
         if self.metrics.enable {
             let using_socket = !self.metrics.socket_path.trim().is_empty();
@@ -2212,9 +2231,10 @@ impl Config {
                 &handler_config.backend,
                 &handler_config.backend_options,
             )?;
-            validate_runtime_snapshotter(
+            validate_configured_runtime_snapshotter(
                 &format!("runtime.runtimes.{handler}.snapshotter"),
                 &handler_config.snapshotter,
+                &self.image.external_snapshotters,
             )?;
             if !handler_config.monitor_path.trim().is_empty() {
                 ensure_non_empty(
