@@ -135,6 +135,8 @@ impl RecoveryFixture {
             owner_id: container_id.clone(),
             state: SnapshotLedgerState::Mounted.as_str().to_string(),
             mountpoint: rootfs_path.display().to_string(),
+            snapshotter: "internal-overlay-untar".to_string(),
+            runtime_managed: true,
         };
         let artifacts = vec![
             RuntimeArtifactRecord {

@@ -30,6 +30,7 @@ pub struct RecoveryLedgerHealthSummary {
     pub broken_containers: usize,
     pub broken_pods: usize,
     pub broken_snapshots: usize,
+    pub stale_snapshots: usize,
     pub broken_runtime_artifacts: usize,
     pub dead_shims: usize,
     pub broken_shims: usize,
@@ -62,6 +63,7 @@ impl RecoveryLedgerHealthSummary {
         self.broken_containers
             + self.broken_pods
             + self.broken_snapshots
+            + self.stale_snapshots
             + self.broken_runtime_artifacts
             + self.dead_shims
             + self.broken_shims
@@ -304,11 +306,12 @@ impl HealthService {
                 "RecoveryReady",
                 "RecoveryObjectsDegraded",
                 format!(
-                    "recovery ledger has {} unhealthy object(s): {} broken container(s), {} broken pod(s), {} broken snapshot(s), {} broken runtime artifact(s), {} dead shim(s), {} broken shim(s), {} degraded shim(s)",
+                    "recovery ledger has {} unhealthy object(s): {} broken container(s), {} broken pod(s), {} broken snapshot(s), {} stale snapshot(s), {} broken runtime artifact(s), {} dead shim(s), {} broken shim(s), {} degraded shim(s)",
                     summary.unhealthy_object_count(),
                     summary.broken_containers,
                     summary.broken_pods,
                     summary.broken_snapshots,
+                    summary.stale_snapshots,
                     summary.broken_runtime_artifacts,
                     summary.dead_shims,
                     summary.broken_shims,

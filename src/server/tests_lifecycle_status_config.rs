@@ -1198,6 +1198,8 @@ async fn status_verbose_reports_recovery_ledger_degraded_objects() {
                     .as_str()
                     .to_string(),
                 mountpoint: "/tmp/recovery-broken/rootfs".to_string(),
+                snapshotter: "internal-overlay-untar".to_string(),
+                runtime_managed: true,
             })
             .unwrap();
         persistence

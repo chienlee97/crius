@@ -464,6 +464,13 @@ impl RuntimeServiceImpl {
                     snapshot.state == crate::state::SnapshotLedgerState::Broken.as_str()
                 })
                 .count(),
+            stale_snapshots: snapshot
+                .snapshots
+                .iter()
+                .filter(|snapshot| {
+                    snapshot.state == crate::state::SnapshotLedgerState::Stale.as_str()
+                })
+                .count(),
             broken_runtime_artifacts: snapshot
                 .runtime_artifacts
                 .iter()

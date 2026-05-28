@@ -59,6 +59,8 @@ fn shim_daemon_owns_rootfs_snapshot_lifecycle() {
             owner_id: "ctr1".to_string(),
             state: "prepared".to_string(),
             mountpoint: rootfs.display().to_string(),
+            snapshotter: "internal-overlay-untar".to_string(),
+            runtime_managed: true,
         })
         .unwrap();
     drop(storage);
@@ -162,6 +164,8 @@ fn create_task_mount_failure_marks_snapshot_broken() {
             owner_id: "ctr1".to_string(),
             state: "prepared".to_string(),
             mountpoint: rootfs.display().to_string(),
+            snapshotter: "external-test".to_string(),
+            runtime_managed: false,
         })
         .unwrap();
     drop(storage);

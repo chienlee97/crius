@@ -161,6 +161,18 @@ impl RuntimeServiceImpl {
         }
     }
 
+    async fn mark_snapshot_stale(&self, key: &str) {
+        if let Err(err) = self
+            .persistence
+            .lock()
+            .await
+            .storage_mut()
+            .update_snapshot_state(key, SnapshotLedgerState::Stale.as_str())
+        {
+            log::warn!("Failed to mark snapshot {key} stale: {err}");
+        }
+    }
+
     async fn mark_shim_process_state(
         &self,
         container_id: &str,
@@ -793,6 +805,33 @@ impl RuntimeServiceImpl {
         }) {
             let rootfs_path = Path::new(&rootfs_artifact.path);
             if !rootfs_path.exists() {
+                let snapshot_record = record.snapshot_key.as_deref().and_then(|snapshot_key| {
+                    snapshot
+                        .snapshots
+                        .iter()
+                        .find(|snapshot| snapshot.key == snapshot_key)
+                });
+                if let Some(snapshot_record) =
+                    snapshot_record.filter(|snapshot| !snapshot.runtime_managed)
+                {
+                    self.mark_runtime_artifact_broken(
+                        "container",
+                        container_id,
+                        "rootfs",
+                        &rootfs_artifact.path,
+                    )
+                    .await;
+                    self.mark_snapshot_stale(&snapshot_record.key).await;
+                    return Some(Self::broken_state(
+                        "external_snapshot_stale",
+                        format!(
+                            "external snapshot {} from {} is not mounted at {}",
+                            snapshot_record.key,
+                            snapshot_record.snapshotter,
+                            rootfs_path.display()
+                        ),
+                    ));
+                }
                 self.mark_runtime_artifact_broken(
                     "container",
                     container_id,

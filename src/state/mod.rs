@@ -13,6 +13,7 @@ pub enum SnapshotLedgerState {
     Preparing,
     Prepared,
     Mounted,
+    Stale,
     Committed,
     Removing,
     Deleted,
@@ -25,6 +26,7 @@ impl SnapshotLedgerState {
             Self::Preparing => "preparing",
             Self::Prepared => "prepared",
             Self::Mounted => "mounted",
+            Self::Stale => "stale",
             Self::Committed => "committed",
             Self::Removing => "removing",
             Self::Deleted => "deleted",
@@ -37,6 +39,7 @@ impl SnapshotLedgerState {
             "preparing" => Ok(Self::Preparing),
             "prepared" => Ok(Self::Prepared),
             "mounted" => Ok(Self::Mounted),
+            "stale" => Ok(Self::Stale),
             "committed" => Ok(Self::Committed),
             "removing" => Ok(Self::Removing),
             "deleted" => Ok(Self::Deleted),
@@ -57,8 +60,9 @@ impl SnapshotLedgerState {
                     Self::Mounted | Self::Committed | Self::Removing | Self::Broken
                 ) | (
                     Self::Mounted,
-                    Self::Committed | Self::Removing | Self::Broken
-                ) | (Self::Committed, Self::Removing | Self::Broken)
+                    Self::Stale | Self::Committed | Self::Removing | Self::Broken
+                ) | (Self::Stale, Self::Mounted | Self::Removing | Self::Broken)
+                    | (Self::Committed, Self::Removing | Self::Broken)
                     | (Self::Removing, Self::Deleted | Self::Broken)
                     | (Self::Broken, Self::Removing | Self::Deleted)
             )
@@ -546,6 +550,8 @@ mod tests {
             owner_id: container.id.clone(),
             state: "mounted".to_string(),
             mountpoint: "/run/crius/snapshots/snapshot-a/rootfs".to_string(),
+            snapshotter: "internal-overlay-untar".to_string(),
+            runtime_managed: true,
         };
         let artifacts = vec![
             RuntimeArtifactRecord {
@@ -669,6 +675,8 @@ mod tests {
                     owner_id: "container-state".to_string(),
                     state: SnapshotLedgerState::Prepared.as_str().to_string(),
                     mountpoint: "/run/crius/snapshots/snapshot-state".to_string(),
+                    snapshotter: "internal-overlay-untar".to_string(),
+                    runtime_managed: true,
                 })
                 .unwrap();
             ledger
@@ -759,6 +767,8 @@ mod tests {
                 owner_id: "container-state".to_string(),
                 state: "half-mounted".to_string(),
                 mountpoint: "/run/crius/snapshots/bad-snapshot".to_string(),
+                snapshotter: "internal-overlay-untar".to_string(),
+                runtime_managed: true,
             })
             .is_err());
         assert!(ledger

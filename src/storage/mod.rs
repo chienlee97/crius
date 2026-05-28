@@ -134,6 +134,8 @@ pub struct SnapshotRecord {
     pub owner_id: String,
     pub state: String,
     pub mountpoint: String,
+    pub snapshotter: String,
+    pub runtime_managed: bool,
 }
 
 /// runtime工件记录
@@ -339,11 +341,14 @@ impl StorageManager {
                 owner_kind TEXT NOT NULL,
                 owner_id TEXT NOT NULL,
                 state TEXT NOT NULL,
-                mountpoint TEXT NOT NULL
+                mountpoint TEXT NOT NULL,
+                snapshotter TEXT NOT NULL DEFAULT 'internal-overlay-untar',
+                runtime_managed INTEGER NOT NULL DEFAULT 1
             )",
                 [],
             )
             .context("Failed to create snapshots table")?;
+        self.ensure_snapshot_metadata_columns()?;
 
         self.conn
             .execute(
@@ -494,6 +499,39 @@ impl StorageManager {
         }
 
         Ok(())
+    }
+
+    fn ensure_snapshot_metadata_columns(&mut self) -> Result<()> {
+        let columns = self.table_columns("snapshots")?;
+        if !columns.iter().any(|column| column == "snapshotter") {
+            self.conn
+                .execute(
+                    "ALTER TABLE snapshots ADD COLUMN snapshotter TEXT NOT NULL DEFAULT 'internal-overlay-untar'",
+                    [],
+                )
+                .context("Failed to add snapshotter column to snapshots")?;
+        }
+        if !columns.iter().any(|column| column == "runtime_managed") {
+            self.conn
+                .execute(
+                    "ALTER TABLE snapshots ADD COLUMN runtime_managed INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )
+                .context("Failed to add runtime_managed column to snapshots")?;
+        }
+        Ok(())
+    }
+
+    fn table_columns(&self, table: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .with_context(|| format!("Failed to inspect {table} table"))?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| format!("Failed to read {table} table columns"))?;
+        Ok(columns)
     }
 
     fn migrate_state_events_to_events(&mut self) -> Result<()> {
@@ -1183,8 +1221,8 @@ impl StorageManager {
 
     pub fn save_snapshot(&mut self, record: &SnapshotRecord) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO snapshots (key, image_id, owner_kind, owner_id, state, mountpoint)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO snapshots (key, image_id, owner_kind, owner_id, state, mountpoint, snapshotter, runtime_managed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 &record.key,
                 &record.image_id,
@@ -1192,6 +1230,8 @@ impl StorageManager {
                 &record.owner_id,
                 &record.state,
                 &record.mountpoint,
+                &record.snapshotter,
+                record.runtime_managed,
             ],
         ).context("Failed to save snapshot")?;
         Ok(())
@@ -1209,7 +1249,7 @@ impl StorageManager {
 
     pub fn list_snapshots(&self) -> Result<Vec<SnapshotRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT key, image_id, owner_kind, owner_id, state, mountpoint FROM snapshots",
+            "SELECT key, image_id, owner_kind, owner_id, state, mountpoint, snapshotter, runtime_managed FROM snapshots",
         )?;
         let records = stmt
             .query_map([], |row| {
@@ -1220,6 +1260,8 @@ impl StorageManager {
                     owner_id: row.get(3)?,
                     state: row.get(4)?,
                     mountpoint: row.get(5)?,
+                    snapshotter: row.get(6)?,
+                    runtime_managed: row.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -1838,6 +1880,8 @@ mod tests {
                 owner_id: "container-1".to_string(),
                 state: "prepared".to_string(),
                 mountpoint: "/tmp/rootfs".to_string(),
+                snapshotter: "internal-overlay-untar".to_string(),
+                runtime_managed: true,
             })
             .unwrap();
         assert_eq!(manager.list_snapshots().unwrap().len(), 1);

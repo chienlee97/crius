@@ -333,6 +333,13 @@ impl FilesystemSnapshotter {
         self.storage_root.join("snapshots")
     }
 
+    fn snapshotter_name(&self) -> &'static str {
+        match self.mode {
+            SnapshotMode::InternalOverlayUntar => INTERNAL_OVERLAY_UNTAR_SNAPSHOTTER,
+            SnapshotMode::InternalCachedRootfs => INTERNAL_CACHED_ROOTFS_SNAPSHOTTER,
+        }
+    }
+
     fn cached_rootfs_dir(&self, image_id: &str) -> PathBuf {
         self.snapshot_root().join(image_id).join("rootfs")
     }
@@ -494,6 +501,8 @@ impl Snapshotter for FilesystemSnapshotter {
                 owner_id: key.to_string(),
                 state: SnapshotState::Prepared.as_str().to_string(),
                 mountpoint: destination.display().to_string(),
+                snapshotter: self.snapshotter_name().to_string(),
+                runtime_managed: true,
             })?;
         }
         Ok(PreparedSnapshot {
