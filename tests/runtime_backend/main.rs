@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crius::runtime::{
     ContainerConfig, ContainerStatus, NamespacePaths, RuntimeBackend, RuntimeContextKind,
-    TaskController,
+    TaskController, WasmDirectBackend, WasmDirectBackendOptions,
 };
 
 #[path = "../common/mod.rs"]
@@ -164,4 +164,84 @@ fn direct_task_backend_advertises_non_oci_contract() {
             },
         ]
     );
+}
+
+#[test]
+fn wasm_direct_backend_lifecycle_is_persisted_without_oci_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = WasmDirectBackend::new(
+        "/bin/true",
+        dir.path().join("runtime"),
+        "",
+        WasmDirectBackendOptions::default(),
+    );
+    let config = test_container_config();
+
+    assert_eq!(backend.backend_name(), "wasm-direct");
+    assert_eq!(backend.context_kind(), RuntimeContextKind::DirectTask);
+    assert!(backend
+        .runtime_context()
+        .prepare_rootfs("wasm-1", &config)
+        .unwrap_err()
+        .to_string()
+        .contains("does not support OCI context operation"));
+
+    backend.create_container("wasm-1", &config).unwrap();
+    assert_eq!(
+        backend.container_status("wasm-1").unwrap(),
+        ContainerStatus::Created
+    );
+    backend.start_container("wasm-1").unwrap();
+    assert_eq!(
+        backend.container_status("wasm-1").unwrap(),
+        ContainerStatus::Running
+    );
+    backend.stop_container("wasm-1", Some(1)).unwrap();
+    assert_eq!(
+        backend.container_status("wasm-1").unwrap(),
+        ContainerStatus::Stopped(0)
+    );
+
+    let recovered = WasmDirectBackend::new(
+        "/bin/true",
+        dir.path().join("runtime"),
+        "",
+        WasmDirectBackendOptions::default(),
+    );
+    assert_eq!(
+        recovered.container_status("wasm-1").unwrap(),
+        ContainerStatus::Stopped(0)
+    );
+    recovered.remove_container("wasm-1").unwrap();
+    assert_eq!(
+        recovered.container_status("wasm-1").unwrap(),
+        ContainerStatus::Unknown
+    );
+}
+
+#[test]
+fn wasm_direct_backend_rejects_unsupported_features_explicitly() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = WasmDirectBackend::new(
+        "/bin/true",
+        dir.path().join("runtime"),
+        "",
+        WasmDirectBackendOptions::default(),
+    );
+    let config = test_container_config();
+
+    backend.create_container("wasm-1", &config).unwrap();
+    backend.start_container("wasm-1").unwrap();
+
+    assert!(backend
+        .exec_in_container("wasm-1", &["sh".to_string()], false)
+        .unwrap_err()
+        .to_string()
+        .contains("does not support task operation exec_in_container"));
+    assert!(backend
+        .pause_container("wasm-1")
+        .unwrap_err()
+        .to_string()
+        .contains("does not support task operation pause_container"));
+    assert_eq!(backend.container_pid("wasm-1").unwrap(), None);
 }

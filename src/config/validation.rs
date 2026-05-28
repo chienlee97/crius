@@ -271,6 +271,40 @@ pub(super) fn validate_runtime_backend_options(
                 }
             }
         }
+        "wasm-direct" => {
+            const WASM_DIRECT_OPTIONS: &[&str] =
+                &["engine", "sandboxer", "state_dir", "allow_exec"];
+            for (key, value) in options {
+                if !WASM_DIRECT_OPTIONS.iter().any(|allowed| allowed == key) {
+                    return Err(Error::Config(format!(
+                        "{field_name}: unsupported wasm-direct backend option {key}"
+                    )));
+                }
+                match key.as_str() {
+                    "engine" | "sandboxer" => {
+                        if value.trim().is_empty() {
+                            return Err(Error::Config(format!(
+                                "{field_name}.{key} must not be empty"
+                            )));
+                        }
+                    }
+                    "state_dir" => {
+                        let path = Path::new(value.trim());
+                        if !path.is_absolute() {
+                            return Err(Error::Config(format!(
+                                "{field_name}.state_dir must be an absolute path"
+                            )));
+                        }
+                    }
+                    "allow_exec" => {
+                        parse_bool(value).map_err(|err| {
+                            Error::Config(format!("{field_name}.allow_exec: {err}"))
+                        })?;
+                    }
+                    _ => {}
+                }
+            }
+        }
         _ => {}
     }
 
@@ -420,11 +454,11 @@ fn validate_snapshotter_endpoint(field: &str, value: &str) -> Result<()> {
 
 pub(super) fn validate_runtime_backend(name: &str, value: &str) -> Result<()> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed == "runc" {
+    if trimmed.is_empty() || matches!(trimmed, "runc" | "wasm-direct") {
         return Ok(());
     }
     Err(Error::Config(format!(
-        "{name} must be empty or \"runc\", got {trimmed}"
+        "{name} must be empty, \"runc\", or \"wasm-direct\", got {trimmed}"
     )))
 }
 

@@ -27,9 +27,11 @@ use crate::storage::{RuntimeArtifactRecord, StorageManager};
 pub mod backend;
 pub mod runc_backend;
 pub mod shim_manager;
+pub mod wasm_direct_backend;
 pub use backend::{RuntimeBackend, RuntimeContextKind, RuntimeContextManager, TaskController};
 pub use runc_backend::RuncBackend;
 pub use shim_manager::{default_shim_work_dir, ShimConfig, ShimManager, ShimProcess};
+pub use wasm_direct_backend::{WasmDirectBackend, WasmDirectBackendOptions};
 
 const INTERNAL_CHECKPOINT_RESTORE_KEY: &str = "io.crius.internal/checkpoint-restore";
 const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";

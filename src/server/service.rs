@@ -2071,76 +2071,99 @@ impl RuntimeServiceImpl {
                         shim_config.no_new_keyring = config.no_new_keyring;
                         shim_config.systemd_cgroup =
                             config.cgroup_driver == Some(CgroupDriver::Systemd);
-                        (handler.clone(), {
-                            let mut runtime = RuncRuntime::with_shim_and_image_storage(
-                                PathBuf::from(&runtime_config.runtime_path),
-                                PathBuf::from(&runtime_config.runtime_root),
-                                config.image_root.clone(),
-                                shim_config,
-                            );
-                            runtime.set_default_env(config.default_env.clone());
-                            runtime.set_default_capabilities(config.default_capabilities.clone());
-                            runtime.set_default_sysctls(config.default_sysctls.clone());
-                            runtime.set_default_ulimits(config.default_ulimits.clone());
-                            runtime.set_allowed_devices(config.allowed_devices.clone());
-                            runtime.set_additional_devices(config.additional_devices.clone());
-                            runtime.set_device_ownership_from_security_context(
-                                config.device_ownership_from_security_context,
-                            );
-                            runtime.set_privileged_without_host_devices(
-                                runtime_config.privileged_without_host_devices,
-                            );
-                            runtime.set_privileged_without_host_devices_all_devices_allowed(
-                                runtime_config.privileged_without_host_devices_all_devices_allowed,
-                            );
-                            runtime.set_add_inheritable_capabilities(
-                                config.add_inheritable_capabilities,
-                            );
-                            runtime.set_base_runtime_spec(config.base_runtime_spec.clone());
-                            runtime.set_default_mounts_file(config.default_mounts_file.clone());
-                            runtime.set_hooks_dirs(config.hooks_dir.clone());
-                            runtime.set_absent_mount_sources_to_reject(
-                                config.absent_mount_sources_to_reject.clone(),
-                            );
-                            runtime.set_image_volumes_mode(
-                                crate::runtime::ImageVolumesMode::from_config(
-                                    &config.image_volumes,
-                                ),
-                            );
-                            runtime.set_rootfs_snapshotter(
-                                crate::runtime::RootfsSnapshotter::from_config(
-                                    runtime_config.snapshotter.as_str(),
-                                ),
-                            );
-                            runtime.set_disable_proc_mount(config.disable_proc_mount);
-                            runtime.set_timezone(config.timezone.clone());
-                            runtime.set_runtime_config_path(PathBuf::from(
-                                runtime_config.runtime_config_path.as_str(),
-                            ));
-                            runtime.set_container_create_timeout_secs(
-                                runtime_config.container_create_timeout,
-                            );
-                            runtime.set_container_stop_timeout_secs(config.container_stop_timeout);
-                            runtime.set_state_db_path(config.root_dir.join("crius.db"));
-                            runtime.set_criu_path(config.criu_path.clone());
-                            runtime.set_restrict_oom_score_adj(config.restrict_oom_score_adj);
-                            runtime.set_bind_mount_prefix(config.bind_mount_prefix.clone());
-                            runtime.set_disable_cgroup(config.disable_cgroup);
-                            runtime.set_rootless(config.rootless.clone());
-                            runtime
-                                .set_default_seccomp_profile_path(config.seccomp_profile.clone());
-                            runtime.set_exec_cpu_affinity(config.exec_cpu_affinity.clone());
-                            runtime.set_no_pivot(config.no_pivot);
-                            runtime.set_no_new_keyring(config.no_new_keyring);
-                            runtime.set_cgroup_driver(match config.cgroup_driver {
-                                Some(CgroupDriver::Systemd) => {
-                                    crate::config::CgroupDriverConfig::Systemd
-                                }
-                                _ => crate::config::CgroupDriverConfig::Cgroupfs,
-                            });
-                            Arc::new(crate::runtime::RuncBackend::new(runtime))
-                                as Arc<dyn crate::runtime::RuntimeBackend>
-                        })
+                        let backend: Arc<dyn crate::runtime::RuntimeBackend> = match runtime_config
+                            .backend
+                            .as_str()
+                        {
+                            "wasm-direct" => {
+                                let options =
+                                    crate::runtime::WasmDirectBackendOptions::from_backend_options(
+                                        &runtime_config.backend_options,
+                                    )
+                                    .expect("validated wasm-direct backend options");
+                                Arc::new(crate::runtime::WasmDirectBackend::new(
+                                    PathBuf::from(&runtime_config.runtime_path),
+                                    PathBuf::from(&runtime_config.runtime_root),
+                                    PathBuf::from(runtime_config.runtime_config_path.as_str()),
+                                    options,
+                                ))
+                            }
+                            "" | "runc" => {
+                                let mut runtime = RuncRuntime::with_shim_and_image_storage(
+                                    PathBuf::from(&runtime_config.runtime_path),
+                                    PathBuf::from(&runtime_config.runtime_root),
+                                    config.image_root.clone(),
+                                    shim_config,
+                                );
+                                runtime.set_default_env(config.default_env.clone());
+                                runtime
+                                    .set_default_capabilities(config.default_capabilities.clone());
+                                runtime.set_default_sysctls(config.default_sysctls.clone());
+                                runtime.set_default_ulimits(config.default_ulimits.clone());
+                                runtime.set_allowed_devices(config.allowed_devices.clone());
+                                runtime.set_additional_devices(config.additional_devices.clone());
+                                runtime.set_device_ownership_from_security_context(
+                                    config.device_ownership_from_security_context,
+                                );
+                                runtime.set_privileged_without_host_devices(
+                                    runtime_config.privileged_without_host_devices,
+                                );
+                                runtime.set_privileged_without_host_devices_all_devices_allowed(
+                                    runtime_config
+                                        .privileged_without_host_devices_all_devices_allowed,
+                                );
+                                runtime.set_add_inheritable_capabilities(
+                                    config.add_inheritable_capabilities,
+                                );
+                                runtime.set_base_runtime_spec(config.base_runtime_spec.clone());
+                                runtime.set_default_mounts_file(config.default_mounts_file.clone());
+                                runtime.set_hooks_dirs(config.hooks_dir.clone());
+                                runtime.set_absent_mount_sources_to_reject(
+                                    config.absent_mount_sources_to_reject.clone(),
+                                );
+                                runtime.set_image_volumes_mode(
+                                    crate::runtime::ImageVolumesMode::from_config(
+                                        &config.image_volumes,
+                                    ),
+                                );
+                                runtime.set_rootfs_snapshotter(
+                                    crate::runtime::RootfsSnapshotter::from_config(
+                                        runtime_config.snapshotter.as_str(),
+                                    ),
+                                );
+                                runtime.set_disable_proc_mount(config.disable_proc_mount);
+                                runtime.set_timezone(config.timezone.clone());
+                                runtime.set_runtime_config_path(PathBuf::from(
+                                    runtime_config.runtime_config_path.as_str(),
+                                ));
+                                runtime.set_container_create_timeout_secs(
+                                    runtime_config.container_create_timeout,
+                                );
+                                runtime
+                                    .set_container_stop_timeout_secs(config.container_stop_timeout);
+                                runtime.set_state_db_path(config.root_dir.join("crius.db"));
+                                runtime.set_criu_path(config.criu_path.clone());
+                                runtime.set_restrict_oom_score_adj(config.restrict_oom_score_adj);
+                                runtime.set_bind_mount_prefix(config.bind_mount_prefix.clone());
+                                runtime.set_disable_cgroup(config.disable_cgroup);
+                                runtime.set_rootless(config.rootless.clone());
+                                runtime.set_default_seccomp_profile_path(
+                                    config.seccomp_profile.clone(),
+                                );
+                                runtime.set_exec_cpu_affinity(config.exec_cpu_affinity.clone());
+                                runtime.set_no_pivot(config.no_pivot);
+                                runtime.set_no_new_keyring(config.no_new_keyring);
+                                runtime.set_cgroup_driver(match config.cgroup_driver {
+                                    Some(CgroupDriver::Systemd) => {
+                                        crate::config::CgroupDriverConfig::Systemd
+                                    }
+                                    _ => crate::config::CgroupDriverConfig::Cgroupfs,
+                                });
+                                Arc::new(crate::runtime::RuncBackend::new(runtime))
+                            }
+                            other => panic!("unsupported runtime backend {other}"),
+                        };
+                        (handler.clone(), backend)
                     })
                     .collect()
             };

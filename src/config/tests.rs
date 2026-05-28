@@ -458,6 +458,63 @@ fn runtime_handler_config_accepts_backend_options() {
 }
 
 #[test]
+fn runtime_handler_config_accepts_wasm_direct_backend_options() {
+    let mut config = Config::default();
+    config.runtime.handlers = vec!["wasm".to_string()];
+    config.runtime.runtimes.insert(
+        "wasm".to_string(),
+        RuntimeHandlerConfig {
+            backend: "wasm-direct".to_string(),
+            runtime_path: "/usr/bin/wasmtime".to_string(),
+            runtime_root: "/run/crius/wasm".to_string(),
+            backend_options: HashMap::from([
+                ("engine".to_string(), "wasmtime".to_string()),
+                ("sandboxer".to_string(), "process".to_string()),
+                ("state_dir".to_string(), "/run/crius/wasm-state".to_string()),
+                ("allow_exec".to_string(), "false".to_string()),
+            ]),
+            ..Default::default()
+        },
+    );
+
+    config
+        .validate()
+        .expect("wasm-direct backend options should validate");
+    let resolved = config.runtime.resolved_runtimes().unwrap();
+    assert_eq!(resolved["wasm"].backend, "wasm-direct");
+    assert_eq!(
+        resolved["wasm"]
+            .backend_options
+            .get("state_dir")
+            .map(String::as_str),
+        Some("/run/crius/wasm-state")
+    );
+}
+
+#[test]
+fn validate_rejects_unknown_wasm_direct_backend_option() {
+    let mut config = Config::default();
+    config.runtime.handlers = vec!["wasm".to_string()];
+    config.runtime.runtimes.insert(
+        "wasm".to_string(),
+        RuntimeHandlerConfig {
+            backend: "wasm-direct".to_string(),
+            runtime_path: "/usr/bin/wasmtime".to_string(),
+            runtime_root: "/run/crius/wasm".to_string(),
+            backend_options: HashMap::from([("sandbox_type".to_string(), "vm".to_string())]),
+            ..Default::default()
+        },
+    );
+
+    let err = config
+        .validate()
+        .expect_err("unknown wasm-direct backend option must fail validation");
+    assert!(err.to_string().contains(
+        "runtime.runtimes.wasm.backend_options: unsupported wasm-direct backend option sandbox_type"
+    ));
+}
+
+#[test]
 fn runtime_handler_config_accepts_configured_external_snapshotter() {
     let dir = tempdir().unwrap();
     let socket = dir.path().join("stargz.sock");
