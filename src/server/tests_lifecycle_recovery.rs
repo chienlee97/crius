@@ -1853,6 +1853,108 @@ async fn recover_state_marks_container_broken_when_runtime_bundle_is_missing() {
 }
 
 #[tokio::test]
+async fn recover_state_reconciles_direct_task_backend_without_oci_bundle() {
+    let dir = tempdir().unwrap();
+    let runtime_root = dir.path().join("direct-runtime-root");
+    let direct_backend = Arc::new(common::DirectTaskRuntimeBackend::new(&runtime_root));
+    direct_backend.set_container_status("direct-recover", crate::runtime::ContainerStatus::Running);
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime = "wasm".to_string();
+    config.runtime_handlers = vec!["wasm".to_string()];
+    config.runtime_root = runtime_root.clone();
+    config.runtime_configs = HashMap::from([(
+        "wasm".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "wasm-direct".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: "/definitely/missing/wasm-runtime".to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/definitely/missing/crius-shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 30,
+            snapshotter: "internal-overlay-untar".to_string(),
+        },
+    )]);
+    let service = RuntimeServiceImpl::new_with_runtime_backends(
+        config,
+        HashMap::from([(
+            "wasm".to_string(),
+            direct_backend.clone() as Arc<dyn crate::runtime::RuntimeBackend>,
+        )]),
+    );
+
+    let mut annotations = HashMap::new();
+    RuntimeServiceImpl::insert_internal_state(
+        &mut annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+        &StoredContainerState {
+            metadata_name: Some("direct-recover".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .save_container(
+            "direct-recover",
+            "pod-1",
+            crate::runtime::ContainerStatus::Running,
+            "wasm:latest",
+            &Vec::new(),
+            &HashMap::new(),
+            &annotations,
+        )
+        .unwrap();
+    service
+        .persistence
+        .lock()
+        .await
+        .update_container_ledger_metadata(
+            "direct-recover",
+            Some("wasm"),
+            Some("direct-task"),
+            None,
+        )
+        .unwrap();
+
+    service.recover_state().await.unwrap();
+
+    let recovered = service
+        .containers
+        .lock()
+        .await
+        .get("direct-recover")
+        .cloned()
+        .unwrap();
+    assert_eq!(recovered.state, ContainerState::ContainerRunning as i32);
+    let internal_state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+        &recovered.annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+    )
+    .unwrap_or_default();
+    assert!(internal_state.broken.is_none());
+    let events = service
+        .internal_services
+        .events
+        .recent_internal_events("container", "direct-recover", 10)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| event.kind == "reconcile.direct_task"
+        && event.details["runtimeBackend"] == "direct-task"
+        && event.details["state"] == "running"));
+}
+
+#[tokio::test]
 async fn recover_state_marks_rootfs_artifact_and_snapshot_broken_when_rootfs_is_missing() {
     let (dir, service) = test_service_with_fake_runtime();
     set_fake_runtime_state(&dir, "broken-rootfs", "running");

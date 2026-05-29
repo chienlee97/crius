@@ -137,6 +137,12 @@ impl FakeRuntimeBackend {
         }
     }
 
+    pub fn set_container_status(&self, container_id: &str, status: ContainerStatus) {
+        if let Ok(mut state) = self.state.lock() {
+            state.statuses.insert(container_id.to_string(), status);
+        }
+    }
+
     pub fn status_snapshot(&self) -> ContainerStatus {
         self.state
             .lock()
@@ -438,6 +444,10 @@ impl DirectTaskRuntimeBackend {
 
     pub fn calls(&self) -> Vec<FakeRuntimeCall> {
         self.inner.calls()
+    }
+
+    pub fn set_container_status(&self, container_id: &str, status: ContainerStatus) {
+        self.inner.set_container_status(container_id, status);
     }
 
     fn unsupported_context(operation: &str) -> anyhow::Error {

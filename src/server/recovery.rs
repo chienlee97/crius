@@ -772,7 +772,10 @@ impl RuntimeServiceImpl {
             .and_then(|handler| self.runtime.runtime_for_handler(handler).ok())
             .or_else(|| self.runtime.runtime_for_container(container_id).ok());
 
-        if let Some(runtime) = runtime.as_ref() {
+        if let Some(runtime) = runtime
+            .as_ref()
+            .filter(|runtime| runtime.context_kind() == RuntimeContextKind::OciBundle)
+        {
             let bundle_path = runtime.runtime_context().bundle_path_for(container_id);
             if !bundle_path.exists() {
                 let bundle_path = bundle_path.display().to_string();
@@ -844,6 +847,53 @@ impl RuntimeServiceImpl {
         None
     }
 
+    async fn publish_direct_task_reconcile_event(
+        &self,
+        record: &ContainerRecord,
+        runtime_status: &ContainerStatus,
+    ) {
+        let Some(runtime_backend) = record.runtime_backend.as_deref() else {
+            return;
+        };
+        if record
+            .runtime_handler
+            .as_deref()
+            .and_then(|handler| self.runtime.runtime_for_handler(handler).ok())
+            .or_else(|| self.runtime.runtime_for_container(&record.id).ok())
+            .map(|runtime| runtime.context_kind() != RuntimeContextKind::DirectTask)
+            .unwrap_or(true)
+        {
+            return;
+        }
+
+        let (state, exit_code) = match runtime_status {
+            ContainerStatus::Created => ("created", None),
+            ContainerStatus::Running => ("running", None),
+            ContainerStatus::Stopped(code) => ("stopped", Some(*code)),
+            ContainerStatus::Unknown => ("unknown", None),
+        };
+        let pid = self.runtime_container_pid_checked(&record.id).await;
+        let severity = if matches!(runtime_status, ContainerStatus::Unknown) {
+            InternalEventSeverity::Warning
+        } else {
+            InternalEventSeverity::Info
+        };
+        self.publish_reconcile_event(InternalEvent::new(
+            "reconcile.direct_task",
+            "container",
+            &record.id,
+            severity,
+            serde_json::json!({
+                "runtimeHandler": record.runtime_handler,
+                "runtimeBackend": runtime_backend,
+                "state": state,
+                "exitCode": exit_code,
+                "pid": pid,
+            }),
+        ))
+        .await;
+    }
+
     async fn reconcile_recovered_container_from_ledger(
         &self,
         snapshot: &RecoveryLedgerSnapshot,
@@ -852,6 +902,8 @@ impl RuntimeServiceImpl {
         shim_reconnect: &RecoveryShimReconnectResult,
     ) -> Result<bool, Status> {
         let container_id = record.id.as_str();
+        self.publish_direct_task_reconcile_event(record, &runtime_status)
+            .await;
         let broken = self
             .detect_recovered_container_artifact_breakage(snapshot, record)
             .await
