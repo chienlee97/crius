@@ -18,6 +18,7 @@ pub mod devices;
 pub mod resource_classes;
 pub mod seccomp;
 pub mod selinux;
+pub mod spec_patch;
 
 /// 安全配置
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

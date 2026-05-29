@@ -15,8 +15,8 @@ use crate::cgroups::{to_oci_resources, CgroupManager, CpuLimit, MemoryLimit, Res
 use crate::config::CgroupDriverConfig;
 use crate::image::snapshotter::{RootfsHandle, RootfsHandleKind};
 use crate::oci::spec::{
-    Linux, LinuxCapabilities, LinuxPids, LinuxResources, Mount, Namespace as OciNamespace, Process,
-    Rlimit, Root, Spec, User,
+    Linux, LinuxPids, LinuxResources, Mount, Namespace as OciNamespace, Process, Rlimit, Root,
+    Spec, User,
 };
 use crate::proto::runtime::v1::{
     Capability, LinuxContainerResources, NamespaceMode, NamespaceOption,
@@ -315,7 +315,6 @@ impl MountPropagationMode {
     }
 }
 
-type ProcPaths = (Option<Vec<String>>, Option<Vec<String>>);
 type UserNamespaceMappings = (
     Option<Vec<crate::oci::spec::IdMapping>>,
     Option<Vec<crate::oci::spec::IdMapping>>,
@@ -795,139 +794,11 @@ impl RuncRuntime {
     }
 
     fn normalize_capability_name(name: &str) -> String {
-        let upper = name.trim().to_ascii_uppercase();
-        if upper.starts_with("CAP_") {
-            upper
-        } else {
-            format!("CAP_{}", upper)
-        }
+        crate::security::spec_patch::normalize_capability_name(name)
     }
 
     fn default_capabilities() -> Vec<String> {
-        vec![
-            "CAP_CHOWN".to_string(),
-            "CAP_DAC_OVERRIDE".to_string(),
-            "CAP_FSETID".to_string(),
-            "CAP_FOWNER".to_string(),
-            "CAP_MKNOD".to_string(),
-            "CAP_NET_RAW".to_string(),
-            "CAP_SETGID".to_string(),
-            "CAP_SETUID".to_string(),
-            "CAP_SETFCAP".to_string(),
-            "CAP_SETPCAP".to_string(),
-            "CAP_NET_BIND_SERVICE".to_string(),
-            "CAP_SYS_CHROOT".to_string(),
-            "CAP_KILL".to_string(),
-            "CAP_AUDIT_WRITE".to_string(),
-        ]
-    }
-
-    fn privileged_capabilities() -> Vec<String> {
-        vec![
-            "CAP_AUDIT_CONTROL".to_string(),
-            "CAP_AUDIT_READ".to_string(),
-            "CAP_AUDIT_WRITE".to_string(),
-            "CAP_BLOCK_SUSPEND".to_string(),
-            "CAP_BPF".to_string(),
-            "CAP_CHECKPOINT_RESTORE".to_string(),
-            "CAP_CHOWN".to_string(),
-            "CAP_DAC_OVERRIDE".to_string(),
-            "CAP_DAC_READ_SEARCH".to_string(),
-            "CAP_FOWNER".to_string(),
-            "CAP_FSETID".to_string(),
-            "CAP_IPC_LOCK".to_string(),
-            "CAP_IPC_OWNER".to_string(),
-            "CAP_KILL".to_string(),
-            "CAP_LEASE".to_string(),
-            "CAP_LINUX_IMMUTABLE".to_string(),
-            "CAP_MAC_ADMIN".to_string(),
-            "CAP_MAC_OVERRIDE".to_string(),
-            "CAP_MKNOD".to_string(),
-            "CAP_NET_ADMIN".to_string(),
-            "CAP_NET_BIND_SERVICE".to_string(),
-            "CAP_NET_BROADCAST".to_string(),
-            "CAP_NET_RAW".to_string(),
-            "CAP_PERFMON".to_string(),
-            "CAP_SETFCAP".to_string(),
-            "CAP_SETGID".to_string(),
-            "CAP_SETPCAP".to_string(),
-            "CAP_SETUID".to_string(),
-            "CAP_SYSLOG".to_string(),
-            "CAP_SYS_ADMIN".to_string(),
-            "CAP_SYS_BOOT".to_string(),
-            "CAP_SYS_CHROOT".to_string(),
-            "CAP_SYS_MODULE".to_string(),
-            "CAP_SYS_NICE".to_string(),
-            "CAP_SYS_PACCT".to_string(),
-            "CAP_SYS_PTRACE".to_string(),
-            "CAP_SYS_RAWIO".to_string(),
-            "CAP_SYS_RESOURCE".to_string(),
-            "CAP_SYS_TIME".to_string(),
-            "CAP_SYS_TTY_CONFIG".to_string(),
-            "CAP_WAKE_ALARM".to_string(),
-        ]
-    }
-
-    fn capability_baseline(&self, privileged: bool) -> Vec<String> {
-        if privileged {
-            Self::privileged_capabilities()
-        } else {
-            self.default_capabilities.clone()
-        }
-    }
-
-    fn apply_capability_overrides(
-        default_caps: &[String],
-        overrides: Option<&Capability>,
-        add_inheritable_capabilities: bool,
-    ) -> LinuxCapabilities {
-        let mut base = default_caps.to_vec();
-        let mut ambient = Vec::new();
-
-        if let Some(capabilities) = overrides {
-            let normalized_drops: Vec<String> = capabilities
-                .drop_capabilities
-                .iter()
-                .map(|cap| Self::normalize_capability_name(cap))
-                .collect();
-
-            if normalized_drops.iter().any(|cap| cap == "CAP_ALL") {
-                base.clear();
-            } else {
-                base.retain(|cap| !normalized_drops.iter().any(|drop| drop == cap));
-            }
-
-            for cap in &capabilities.add_capabilities {
-                let normalized = Self::normalize_capability_name(cap);
-                if !base.contains(&normalized) {
-                    base.push(normalized);
-                }
-            }
-
-            ambient = capabilities
-                .add_ambient_capabilities
-                .iter()
-                .map(|cap| Self::normalize_capability_name(cap))
-                .collect();
-
-            for cap in &ambient {
-                if !base.contains(cap) {
-                    base.push(cap.clone());
-                }
-            }
-        }
-
-        LinuxCapabilities {
-            bounding: Some(base.clone()),
-            effective: Some(base.clone()),
-            inheritable: Some(if add_inheritable_capabilities {
-                base.clone()
-            } else {
-                Vec::new()
-            }),
-            permitted: Some(base),
-            ambient: Some(ambient),
-        }
+        crate::security::spec_patch::default_capabilities()
     }
 
     fn merge_env_layers(
@@ -1012,34 +883,6 @@ impl RuncRuntime {
             .unwrap_or_else(|| Spec::new("1.0.2"))
     }
 
-    fn effective_proc_paths(
-        &self,
-        privileged: bool,
-        requested_masked_paths: &[String],
-        requested_readonly_paths: &[String],
-    ) -> Result<ProcPaths> {
-        if privileged {
-            return Ok((None, None));
-        }
-
-        if self.disable_proc_mount {
-            if !requested_masked_paths.is_empty() || !requested_readonly_paths.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "Kubernetes ProcMount support is disabled by runtime.disable_proc_mount"
-                ));
-            }
-            return Ok((
-                Some(Spec::default_masked_paths()),
-                Some(Spec::default_readonly_paths()),
-            ));
-        }
-
-        Ok((
-            Some(requested_masked_paths.to_vec()),
-            Some(requested_readonly_paths.to_vec()),
-        ))
-    }
-
     fn apply_timezone_mount(&self, mounts: &mut Vec<Mount>, env: &mut Vec<String>) -> Result<()> {
         let timezone = self.timezone.trim();
         if timezone.is_empty()
@@ -1090,6 +933,43 @@ impl RuncRuntime {
         if !self.default_ulimits.is_empty() {
             process.rlimits = Some(self.default_ulimits.clone());
         }
+    }
+
+    fn build_security_patch(
+        &self,
+        config: &ContainerConfig,
+        existing_cgroup_rules: &[crate::oci::spec::LinuxDeviceCgroup],
+        seccomp: Option<crate::oci::spec::Seccomp>,
+    ) -> Result<crate::security::spec_patch::SpecSecurityPatch> {
+        crate::security::spec_patch::SpecSecurityPatch::from_input(
+            crate::security::spec_patch::SpecPatchInput {
+                privileged: config.privileged,
+                tty: config.tty,
+                readonly_rootfs: config.readonly_rootfs,
+                no_new_privileges: config.no_new_privileges,
+                apparmor_profile: config.apparmor_profile.as_deref(),
+                selinux_label: config.selinux_label.as_deref(),
+                seccomp,
+                capabilities: config.capabilities.as_ref(),
+                default_capabilities: &self.default_capabilities,
+                add_inheritable_capabilities: self.add_inheritable_capabilities,
+                requested_devices: &config.devices,
+                additional_devices: &self.additional_devices,
+                existing_cgroup_rules,
+                allowed_devices: &self.allowed_devices,
+                device_ownership_from_security_context: self.device_ownership_from_security_context,
+                user: config.user.as_deref(),
+                run_as_group: config.run_as_group,
+                privileged_without_host_devices: self.privileged_without_host_devices,
+                privileged_without_host_devices_all_devices_allowed: self
+                    .privileged_without_host_devices_all_devices_allowed,
+                rootless: self.rootless.enabled,
+                cgroup_devices_enabled: !self.disable_cgroup,
+                disable_proc_mount: self.disable_proc_mount,
+                masked_paths: &config.masked_paths,
+                readonly_paths: &config.readonly_paths,
+            },
+        )
     }
 
     fn build_user(config: &ContainerConfig) -> Option<User> {
@@ -2433,16 +2313,12 @@ impl RuncRuntime {
 
         spec.root = Some(Root {
             path: config.rootfs.to_string_lossy().to_string(),
-            readonly: Some(config.readonly_rootfs),
+            readonly: None,
         });
         spec.hostname = config.hostname.clone().or(spec.hostname);
 
         if let Some(process) = spec.process.as_mut() {
             process.terminal = Some(config.tty);
-            process.apparmor_profile = config.apparmor_profile.clone();
-            process.selinux_label = config.selinux_label.clone();
-            process.no_new_privileges =
-                Some(config.no_new_privileges.unwrap_or(!config.privileged));
             if let Some(working_dir) = config.working_dir.as_ref() {
                 process.cwd = working_dir.to_string_lossy().to_string();
             }
@@ -2460,13 +2336,31 @@ impl RuncRuntime {
                         .collect(),
                 );
             }
-            let capability_baseline = self.capability_baseline(config.privileged);
-            process.capabilities = Some(Self::apply_capability_overrides(
-                &capability_baseline,
-                config.capabilities.as_ref(),
-                self.add_inheritable_capabilities,
-            ));
             self.apply_default_ulimits(process);
+        }
+
+        let mut existing_cgroup_rules = Vec::new();
+        if !self.disable_cgroup {
+            if let Some(resources) = config
+                .linux_resources
+                .as_ref()
+                .map(Self::linux_resources_to_oci)
+            {
+                existing_cgroup_rules = resources.devices.clone().unwrap_or_default();
+            }
+        }
+        let seccomp = self.load_seccomp_profile(
+            config.seccomp_profile.as_ref(),
+            config.seccomp_notifier.as_ref(),
+        )?;
+        let security_patch = self.build_security_patch(config, &existing_cgroup_rules, seccomp)?;
+        security_patch.apply_root(
+            spec.root
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("OCI restore spec is missing root configuration"))?,
+        );
+        if let Some(process) = spec.process.as_mut() {
+            security_patch.apply_process(process);
         }
 
         let linux = spec.linux.get_or_insert(Linux {
@@ -2491,22 +2385,10 @@ impl RuncRuntime {
         } else {
             Self::oci_cgroups_path(config.cgroup_parent.as_deref(), container_id)
         };
-        linux.seccomp = self.load_seccomp_profile(
-            config.seccomp_profile.as_ref(),
-            config.seccomp_notifier.as_ref(),
-        )?;
-        linux.mount_label = config.selinux_label.clone();
         let merged_sysctls = self.merged_sysctls(&config.sysctls);
         if !merged_sysctls.is_empty() {
             linux.sysctl = Some(merged_sysctls);
         }
-        let (masked_paths, readonly_paths) = self.effective_proc_paths(
-            config.privileged,
-            &config.masked_paths,
-            &config.readonly_paths,
-        )?;
-        linux.masked_paths = masked_paths;
-        linux.readonly_paths = readonly_paths;
         if !self.disable_cgroup {
             if let Some(resources) = config
                 .linux_resources
@@ -2532,6 +2414,7 @@ impl RuncRuntime {
                     .pids = Some(LinuxPids { limit });
             }
         }
+        security_patch.apply_linux(linux);
         self.apply_oom_score_adj_policy(&mut spec, Self::requested_oom_score_adj(config))?;
         let process_env = spec
             .process
@@ -3225,7 +3108,7 @@ impl RuncRuntime {
         // 设置root配置
         spec.root = Some(Root {
             path: config.rootfs.to_string_lossy().to_string(),
-            readonly: Some(config.readonly_rootfs),
+            readonly: None,
         });
 
         // 设置进程配置
@@ -3283,15 +3166,6 @@ impl RuncRuntime {
             .or(image_defaults.working_dir.as_ref())
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "/".to_string());
-        let capability_baseline = self.capability_baseline(config.privileged);
-        process.capabilities = Some(Self::apply_capability_overrides(
-            &capability_baseline,
-            config.capabilities.as_ref(),
-            self.add_inheritable_capabilities,
-        ));
-        process.no_new_privileges = Some(config.no_new_privileges.unwrap_or(!config.privileged));
-        process.apparmor_profile = config.apparmor_profile.clone();
-        process.selinux_label = config.selinux_label.clone();
         self.apply_default_ulimits(&mut process);
         spec.process = Some(process);
 
@@ -3340,24 +3214,25 @@ impl RuncRuntime {
             resources.pids = Some(LinuxPids { limit });
         }
 
-        let resolved_devices = crate::security::devices::resolve_devices(
-            crate::security::devices::DeviceResolverInput {
-                privileged: config.privileged,
-                tty: config.tty,
-                requested_devices: &config.devices,
-                additional_devices: &self.additional_devices,
-                existing_cgroup_rules: resources.devices.as_deref().unwrap_or(&[]),
-                allowed_devices: &self.allowed_devices,
-                device_ownership_from_security_context: self.device_ownership_from_security_context,
-                user: config.user.as_deref(),
-                run_as_group: config.run_as_group,
-                privileged_without_host_devices: self.privileged_without_host_devices,
-                privileged_without_host_devices_all_devices_allowed: self
-                    .privileged_without_host_devices_all_devices_allowed,
-                rootless: self.rootless.enabled,
-            },
+        let seccomp = self.load_seccomp_profile(
+            config.seccomp_profile.as_ref(),
+            config.seccomp_notifier.as_ref(),
         )?;
-        resources.devices = Some(resolved_devices.cgroup_rules);
+        let security_patch = self.build_security_patch(
+            config,
+            resources.devices.as_deref().unwrap_or(&[]),
+            seccomp,
+        )?;
+        security_patch.apply_root(
+            spec.root
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("OCI spec is missing root configuration"))?,
+        );
+        security_patch.apply_process(
+            spec.process
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("OCI spec is missing process configuration"))?,
+        );
 
         let mut namespaces = self.build_namespaces(config);
         let (uid_mappings, gid_mappings) = Self::build_user_namespace_mappings(config)?;
@@ -3372,11 +3247,6 @@ impl RuncRuntime {
             });
         }
 
-        let (masked_paths, readonly_paths) = self.effective_proc_paths(
-            config.privileged,
-            &config.masked_paths,
-            &config.readonly_paths,
-        )?;
         let mut linux = spec.linux.unwrap_or(Linux {
             namespaces: None,
             uid_mappings: None,
@@ -3396,7 +3266,6 @@ impl RuncRuntime {
         linux.namespaces = Some(namespaces);
         linux.uid_mappings = uid_mappings;
         linux.gid_mappings = gid_mappings;
-        linux.devices = Some(resolved_devices.devices);
         linux.cgroups_path = if self.disable_cgroup {
             None
         } else {
@@ -3407,24 +3276,18 @@ impl RuncRuntime {
         } else {
             Some(resources)
         };
-        linux.seccomp = self.load_seccomp_profile(
-            config.seccomp_profile.as_ref(),
-            config.seccomp_notifier.as_ref(),
-        )?;
         let merged_sysctls = self.merged_sysctls(&config.sysctls);
         linux.sysctl = if merged_sysctls.is_empty() {
             None
         } else {
             Some(merged_sysctls)
         };
-        linux.mount_label = config.selinux_label.clone();
         linux.rootfs_propagation = Self::merge_rootfs_propagation(
             linux.rootfs_propagation.as_deref(),
             Self::desired_rootfs_propagation(&config.mounts),
         )
         .map(ToString::to_string);
-        linux.masked_paths = masked_paths;
-        linux.readonly_paths = readonly_paths;
+        security_patch.apply_linux(&mut linux);
         spec.linux = Some(linux);
         self.apply_oom_score_adj_policy(&mut spec, Self::requested_oom_score_adj(config))?;
 
@@ -3590,22 +3453,35 @@ impl RuncRuntime {
             return Ok(());
         }
 
-        crate::security::devices::resolve_devices(crate::security::devices::DeviceResolverInput {
-            privileged: config.privileged,
-            tty: config.tty,
-            requested_devices: &config.devices,
-            additional_devices: &self.additional_devices,
-            existing_cgroup_rules: &[],
-            allowed_devices: &self.allowed_devices,
-            device_ownership_from_security_context: self.device_ownership_from_security_context,
-            user: config.user.as_deref(),
-            run_as_group: config.run_as_group,
-            privileged_without_host_devices: self.privileged_without_host_devices,
-            privileged_without_host_devices_all_devices_allowed: self
-                .privileged_without_host_devices_all_devices_allowed,
-            rootless: true,
-        })
-        .map(|_| ())
+        crate::security::spec_patch::validate_rootless_requests(
+            &crate::security::spec_patch::SpecPatchInput {
+                privileged: config.privileged,
+                tty: config.tty,
+                readonly_rootfs: config.readonly_rootfs,
+                no_new_privileges: config.no_new_privileges,
+                apparmor_profile: config.apparmor_profile.as_deref(),
+                selinux_label: config.selinux_label.as_deref(),
+                seccomp: None,
+                capabilities: config.capabilities.as_ref(),
+                default_capabilities: &self.default_capabilities,
+                add_inheritable_capabilities: self.add_inheritable_capabilities,
+                requested_devices: &config.devices,
+                additional_devices: &self.additional_devices,
+                existing_cgroup_rules: &[],
+                allowed_devices: &self.allowed_devices,
+                device_ownership_from_security_context: self.device_ownership_from_security_context,
+                user: config.user.as_deref(),
+                run_as_group: config.run_as_group,
+                privileged_without_host_devices: self.privileged_without_host_devices,
+                privileged_without_host_devices_all_devices_allowed: self
+                    .privileged_without_host_devices_all_devices_allowed,
+                rootless: true,
+                cgroup_devices_enabled: !self.disable_cgroup,
+                disable_proc_mount: self.disable_proc_mount,
+                masked_paths: &config.masked_paths,
+                readonly_paths: &config.readonly_paths,
+            },
+        )
     }
 
     pub(crate) fn validate_mount_requests(

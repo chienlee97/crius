@@ -2464,6 +2464,89 @@ fn test_restore_container_keeps_existing_rootfs_when_snapshot_absent() {
 }
 
 #[test]
+fn test_restore_template_applies_security_patch() {
+    let (runtime, temp_dir) = create_test_runtime();
+    let rootfs = temp_dir.path().join("rootfs");
+    let seccomp_profile_path = temp_dir.path().join("seccomp.json");
+    fs::write(
+        &seccomp_profile_path,
+        serde_json::to_vec(&crate::oci::spec::Seccomp {
+            default_action: "SCMP_ACT_ALLOW".to_string(),
+            default_errno_ret: None,
+            architectures: None,
+            flags: None,
+            listener_path: None,
+            listener_metadata: None,
+            syscalls: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut config = create_test_config();
+    config.rootfs = rootfs.clone();
+    config.readonly_rootfs = true;
+    config.no_new_privileges = Some(false);
+    config.apparmor_profile = Some("localhost/custom".to_string());
+    config.selinux_label = Some("system_u:system_r:container_t:s0:c1,c2".to_string());
+    config.seccomp_profile = Some(SeccompProfile::Localhost(seccomp_profile_path));
+    config.capabilities = Some(Capability {
+        add_capabilities: vec!["sys_admin".to_string()],
+        drop_capabilities: vec!["chown".to_string()],
+        add_ambient_capabilities: vec!["net_bind_service".to_string()],
+    });
+    let restore = RestoreCheckpointMetadata {
+        checkpoint_location: temp_dir.path().join("checkpoint").display().to_string(),
+        checkpoint_image_path: "checkpoint".to_string(),
+        oci_config: serde_json::json!({
+            "ociVersion": "1.0.2",
+            "process": {
+                "terminal": false,
+                "args": ["/pause"],
+                "cwd": "/",
+                "capabilities": {
+                    "bounding": ["CAP_CHOWN"]
+                }
+            },
+            "linux": {}
+        }),
+        image_ref: "checkpoint-image:latest".to_string(),
+    };
+
+    let spec = runtime
+        .spec_from_restore_template("restored-container", &config, &restore)
+        .unwrap();
+    let root = spec.root.unwrap();
+    let process = spec.process.unwrap();
+    let linux = spec.linux.unwrap();
+    let capabilities = process.capabilities.unwrap();
+    let bounding = capabilities.bounding.unwrap();
+
+    assert_eq!(root.path, rootfs.display().to_string());
+    assert_eq!(root.readonly, Some(true));
+    assert_eq!(process.no_new_privileges, Some(false));
+    assert_eq!(
+        process.apparmor_profile.as_deref(),
+        Some("localhost/custom")
+    );
+    assert_eq!(
+        process.selinux_label.as_deref(),
+        Some("system_u:system_r:container_t:s0:c1,c2")
+    );
+    assert!(!bounding.contains(&"CAP_CHOWN".to_string()));
+    assert!(bounding.contains(&"CAP_SYS_ADMIN".to_string()));
+    assert_eq!(
+        capabilities.ambient.unwrap(),
+        vec!["CAP_NET_BIND_SERVICE".to_string()]
+    );
+    assert_eq!(
+        linux.mount_label.as_deref(),
+        Some("system_u:system_r:container_t:s0:c1,c2")
+    );
+    assert!(linux.seccomp.is_some());
+}
+
+#[test]
 fn test_reopen_container_log_reports_missing_socket() {
     let temp_dir = tempdir().unwrap();
     let shim_dir = temp_dir.path().join("shims");
