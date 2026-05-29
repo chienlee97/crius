@@ -176,6 +176,8 @@ pub struct CniManager {
     default_network_name: Option<String>,
     /// 最近一次加载结果
     last_load_status: Option<CniLoadStatus>,
+    /// Optional ledger sink for diagnostic network events.
+    event_sink: Option<crate::services::LedgerInternalEventSink>,
 }
 
 struct CniPluginInvocation<'a> {
@@ -353,6 +355,7 @@ impl CniManager {
             teardown_timeout: DEFAULT_CNI_TEARDOWN_TIMEOUT,
             default_network_name: None,
             last_load_status: None,
+            event_sink: None,
         })
     }
 
@@ -378,6 +381,60 @@ impl CniManager {
 
     pub fn last_load_status(&self) -> Option<&CniLoadStatus> {
         self.last_load_status.as_ref()
+    }
+
+    pub fn set_event_sink(&mut self, event_sink: Option<crate::services::LedgerInternalEventSink>) {
+        self.event_sink = event_sink;
+    }
+
+    fn publish_network_event(
+        &self,
+        pod_id: &str,
+        action: &str,
+        severity: crate::services::InternalEventSeverity,
+        details: serde_json::Value,
+    ) {
+        let Some(sink) = self.event_sink.as_ref() else {
+            return;
+        };
+        let event = crate::services::InternalEvent::new(
+            format!("network.{action}"),
+            "network",
+            pod_id,
+            severity,
+            details,
+        );
+        if let Err(err) = sink.publish(&event) {
+            log::debug!("Failed to publish network {action} event for {pod_id}: {err}");
+        }
+    }
+
+    pub(crate) fn publish_config_load_event(
+        &self,
+        pod_id: &str,
+        runtime_handler: &str,
+        status: &CniLoadStatus,
+    ) {
+        let severity = if status.ready {
+            crate::services::InternalEventSeverity::Info
+        } else {
+            crate::services::InternalEventSeverity::Warning
+        };
+        self.publish_network_event(
+            pod_id,
+            "config_load",
+            severity,
+            json!({
+                "runtimeHandler": runtime_handler,
+                "ready": status.ready,
+                "reason": status.reason,
+                "message": status.message,
+                "loadedNetworks": status.loaded_networks,
+                "declaredPlugins": status.declared_plugins,
+                "missingPluginBinaries": status.missing_plugin_binaries,
+                "defaultNetworkName": status.default_network_name,
+            }),
+        );
     }
 
     fn plugin_chain(config_value: &Value) -> Vec<Value> {
@@ -756,7 +813,7 @@ impl CniManager {
 
         debug!("Using CNI network config: {}", config.name);
 
-        let result = self
+        let result = match self
             .exec_cni_chain(
                 config,
                 "ADD",
@@ -768,7 +825,38 @@ impl CniManager {
                 pod_uid,
                 pod_cidr,
             )
-            .await?;
+            .await
+        {
+            Ok(result) => {
+                self.publish_network_event(
+                    pod_id,
+                    "plugin_chain",
+                    crate::services::InternalEventSeverity::Info,
+                    json!({
+                        "command": "ADD",
+                        "network": config.name,
+                        "plugins": Self::cni_plugin_types(&config.config),
+                        "phase": "setup",
+                    }),
+                );
+                result
+            }
+            Err(err) => {
+                self.publish_network_event(
+                    pod_id,
+                    "plugin_chain",
+                    crate::services::InternalEventSeverity::Error,
+                    json!({
+                        "command": "ADD",
+                        "network": config.name,
+                        "plugins": Self::cni_plugin_types(&config.config),
+                        "phase": "setup",
+                        "message": err.to_string(),
+                    }),
+                );
+                return Err(err);
+            }
+        };
         let network_status = self.parse_cni_result(result.as_ref())?;
         self.write_cached_config(pod_id, config).await?;
 
@@ -800,8 +888,33 @@ impl CniManager {
                 None,
             );
             match tokio::time::timeout(self.teardown_timeout, teardown).await {
-                Ok(Ok(_)) => info!("Pod {} network teardown completed", pod_id),
+                Ok(Ok(_)) => {
+                    self.publish_network_event(
+                        pod_id,
+                        "plugin_chain",
+                        crate::services::InternalEventSeverity::Info,
+                        json!({
+                            "command": "DEL",
+                            "network": config.name,
+                            "plugins": Self::cni_plugin_types(&config.config),
+                            "phase": "teardown",
+                        }),
+                    );
+                    info!("Pod {} network teardown completed", pod_id);
+                }
                 Ok(Err(err)) => {
+                    self.publish_network_event(
+                        pod_id,
+                        "plugin_chain",
+                        crate::services::InternalEventSeverity::Error,
+                        json!({
+                            "command": "DEL",
+                            "network": config.name,
+                            "plugins": Self::cni_plugin_types(&config.config),
+                            "phase": "teardown",
+                            "message": err.to_string(),
+                        }),
+                    );
                     error!("Failed to teardown network for pod {}: {}", pod_id, err);
                     return Err(err);
                 }
@@ -810,6 +923,18 @@ impl CniManager {
                         "CNI teardown for pod {} timed out after {:?}",
                         pod_id,
                         self.teardown_timeout
+                    );
+                    self.publish_network_event(
+                        pod_id,
+                        "plugin_chain",
+                        crate::services::InternalEventSeverity::Error,
+                        json!({
+                            "command": "DEL",
+                            "network": config.name,
+                            "plugins": Self::cni_plugin_types(&config.config),
+                            "phase": "teardown",
+                            "message": err.to_string(),
+                        }),
                     );
                     error!("{err}");
                     return Err(err);

@@ -45,6 +45,7 @@ pub struct CniConfig {
     netns_mounts_under_state_dir: bool,
     namespace_helper_path: Option<PathBuf>,
     rootless: Option<RootlessNetworkConfig>,
+    event_sink: Option<crate::services::LedgerInternalEventSink>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +129,7 @@ impl Default for CniConfig {
             netns_mounts_under_state_dir: false,
             namespace_helper_path: None,
             rootless: None,
+            event_sink: None,
         }
     }
 }
@@ -162,6 +164,7 @@ impl CniConfig {
             netns_mounts_under_state_dir: false,
             namespace_helper_path: None,
             rootless: None,
+            event_sink: None,
         }
     }
 
@@ -248,6 +251,7 @@ impl CniConfig {
                 .unwrap_or(defaults.netns_mounts_under_state_dir),
             namespace_helper_path: None,
             rootless: None,
+            event_sink: None,
         }
     }
 
@@ -387,6 +391,10 @@ impl CniConfig {
         self.rootless
             .as_ref()
             .map(RootlessNetworkConfig::load_status)
+    }
+
+    pub fn set_event_sink(&mut self, event_sink: Option<crate::services::LedgerInternalEventSink>) {
+        self.event_sink = event_sink;
     }
 
     pub fn netns_path(&self, ns_name_or_path: &str) -> PathBuf {
@@ -675,9 +683,32 @@ pub struct DefaultNetworkManager {
     namespace_manager: NamespaceManager,
     rootless: Option<RootlessNetworkConfig>,
     rootless_processes: std::sync::Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    event_sink: Option<crate::services::LedgerInternalEventSink>,
 }
 
 impl DefaultNetworkManager {
+    fn publish_network_event(
+        &self,
+        pod_id: &str,
+        action: &str,
+        severity: crate::services::InternalEventSeverity,
+        details: serde_json::Value,
+    ) {
+        let Some(sink) = self.event_sink.as_ref() else {
+            return;
+        };
+        let event = crate::services::InternalEvent::new(
+            format!("network.{action}"),
+            "network",
+            pod_id,
+            severity,
+            details,
+        );
+        if let Err(err) = sink.publish(&event) {
+            log::debug!("Failed to publish network {action} event for {pod_id}: {err}");
+        }
+    }
+
     async fn ensure_loopback_up(&self, netns: &str) -> Result<(), NetworkError> {
         let netns_path = self.namespace_manager.resolve_path(netns);
         netlink::set_loopback_up(netns_path).await
@@ -728,6 +759,7 @@ impl DefaultNetworkManager {
             namespace_manager: cni.namespace_manager(),
             rootless: cni.rootless.clone(),
             rootless_processes: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            event_sink: cni.event_sink.clone(),
         }
     }
 
@@ -791,11 +823,32 @@ impl DefaultNetworkManager {
             }
         };
         if !path_is_executable(program) {
+            self.publish_network_event(
+                pod_id,
+                "rootless_helper_fail",
+                crate::services::InternalEventSeverity::Error,
+                serde_json::json!({
+                    "helper": name,
+                    "path": program.display().to_string(),
+                    "phase": "preflight",
+                    "message": "helper is missing or not executable",
+                }),
+            );
             return Err(NetworkError::RootlessNetworkHelperMissing {
                 helper: name.to_string(),
                 path: program.clone(),
             });
         }
+        self.publish_network_event(
+            pod_id,
+            "rootless_helper_start",
+            crate::services::InternalEventSeverity::Info,
+            serde_json::json!({
+                "helper": name,
+                "path": program.display().to_string(),
+                "netns": netns,
+            }),
+        );
         let mut command = StdCommand::new(program);
         match rootless.mode {
             crate::rootless::NetworkMode::Slirp4netns => {
@@ -814,6 +867,17 @@ impl DefaultNetworkManager {
         command.stdout(std::process::Stdio::null());
         command.stderr(std::process::Stdio::null());
         let mut child = command.spawn().map_err(|err| {
+            self.publish_network_event(
+                pod_id,
+                "rootless_helper_fail",
+                crate::services::InternalEventSeverity::Error,
+                serde_json::json!({
+                    "helper": name,
+                    "path": program.display().to_string(),
+                    "phase": "spawn",
+                    "message": err.to_string(),
+                }),
+            );
             NetworkError::Other(format!(
                 "failed to start rootless network helper {} for {}: {}",
                 program.display(),
@@ -823,6 +887,17 @@ impl DefaultNetworkManager {
         })?;
         std::thread::sleep(std::time::Duration::from_millis(50));
         if let Some(status) = child.try_wait().map_err(|err| {
+            self.publish_network_event(
+                pod_id,
+                "rootless_helper_fail",
+                crate::services::InternalEventSeverity::Error,
+                serde_json::json!({
+                    "helper": name,
+                    "path": program.display().to_string(),
+                    "phase": "inspect",
+                    "message": err.to_string(),
+                }),
+            );
             NetworkError::Other(format!(
                 "failed to inspect rootless network helper {} for {}: {}",
                 program.display(),
@@ -830,6 +905,17 @@ impl DefaultNetworkManager {
                 err
             ))
         })? {
+            self.publish_network_event(
+                pod_id,
+                "rootless_helper_fail",
+                crate::services::InternalEventSeverity::Error,
+                serde_json::json!({
+                    "helper": name,
+                    "path": program.display().to_string(),
+                    "phase": "startup",
+                    "message": status.to_string(),
+                }),
+            );
             return Err(NetworkError::Other(format!(
                 "rootless network helper {} for {} exited during startup: {}",
                 program.display(),
@@ -850,6 +936,14 @@ impl DefaultNetworkManager {
             .ok()
             .and_then(|mut processes| processes.remove(pod_id));
         if let Some(pid) = pid {
+            self.publish_network_event(
+                pod_id,
+                "rootless_helper_stop",
+                crate::services::InternalEventSeverity::Info,
+                serde_json::json!({
+                    "pid": pid,
+                }),
+            );
             #[cfg(unix)]
             {
                 let _ = nix::sys::signal::kill(
@@ -904,13 +998,16 @@ impl NetworkManager for DefaultNetworkManager {
             self.cni_cache_dir.clone(),
         )
         .map_err(|e| NetworkError::Other(e.to_string()))?;
+        cni.set_event_sink(self.event_sink.clone());
         cni.set_max_conf_num(self.effective_cni_max_conf_num(request.runtime_handler));
         cni.set_ip_pref(self.cni_ip_pref);
         cni.set_default_network_name(self.cni_default_network_name.clone());
         cni.set_teardown_timeout(self.cni_teardown_timeout);
-        cni.load_network_configs()
+        let load_status = cni
+            .load_network_configs()
             .await
             .map_err(|e| NetworkError::Other(e.to_string()))?;
+        cni.publish_config_load_event(request.pod_id, request.runtime_handler, &load_status);
 
         cni.setup_pod_network(
             request.pod_id,
@@ -943,13 +1040,16 @@ impl NetworkManager for DefaultNetworkManager {
             self.cni_cache_dir.clone(),
         )
         .map_err(|e| NetworkError::Other(e.to_string()))?;
+        cni.set_event_sink(self.event_sink.clone());
         cni.set_max_conf_num(self.effective_cni_max_conf_num(runtime_handler));
         cni.set_ip_pref(self.cni_ip_pref);
         cni.set_default_network_name(self.cni_default_network_name.clone());
         cni.set_teardown_timeout(self.cni_teardown_timeout);
-        cni.load_network_configs()
+        let load_status = cni
+            .load_network_configs()
             .await
             .map_err(|e| NetworkError::Other(e.to_string()))?;
+        cni.publish_config_load_event(pod_id, runtime_handler, &load_status);
         cni.teardown_pod_network(pod_id, netns, pod_namespace, pod_name, pod_uid)
             .await
             .map_err(|e| NetworkError::Other(e.to_string()))
@@ -959,6 +1059,8 @@ impl NetworkManager for DefaultNetworkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::{InternalEventSeverity, LedgerInternalEventSink};
+    use crate::storage::StorageManager;
     use std::fs;
 
     fn rootless_effective_config(
@@ -1081,6 +1183,7 @@ mod tests {
     fn rootless_helper_startup_exit_is_reported_as_network_error() {
         let dir = tempfile::tempdir().unwrap();
         let helper_path = dir.path().join("pasta");
+        let db_path = dir.path().join("state").join("crius.db");
         fs::write(&helper_path, "#!/bin/sh\nexit 42\n").unwrap();
         let mut perms = fs::metadata(&helper_path).unwrap().permissions();
         #[cfg(unix)]
@@ -1095,6 +1198,7 @@ mod tests {
             PathBuf::from("slirp4netns"),
             helper_path.clone(),
         )));
+        cni.set_event_sink(Some(LedgerInternalEventSink::new(db_path.clone())));
         let manager = DefaultNetworkManager::from_cni_config(cni);
 
         let err = manager
@@ -1105,6 +1209,38 @@ mod tests {
             .to_string()
             .contains("exited during startup: exit status: 42"));
         assert!(err.to_string().contains(&helper_path.display().to_string()));
+        let events = StorageManager::new(&db_path)
+            .unwrap()
+            .get_recent_events_for_subject("network", "pod-1", 10)
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "network.rootless_helper_fail");
+        assert_eq!(events[0].new_state, InternalEventSeverity::Error.as_str());
+        assert_eq!(events[1].event_type, "network.rootless_helper_start");
+    }
+
+    #[test]
+    fn rootless_helper_stop_event_is_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state").join("crius.db");
+        let mut cni = CniConfig::default();
+        cni.set_event_sink(Some(LedgerInternalEventSink::new(db_path.clone())));
+        let manager = DefaultNetworkManager::from_cni_config(cni);
+
+        manager
+            .rootless_processes
+            .lock()
+            .unwrap()
+            .insert("pod-1".to_string(), 9_999_999);
+        manager.stop_rootless_network_helper("pod-1");
+
+        let events = StorageManager::new(&db_path)
+            .unwrap()
+            .get_recent_events_for_subject("network", "pod-1", 10)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "network.rootless_helper_stop");
+        assert_eq!(events[0].new_state, InternalEventSeverity::Info.as_str());
     }
 
     #[tokio::test]

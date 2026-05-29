@@ -1,4 +1,6 @@
 use super::*;
+use crate::services::{InternalEventSeverity, LedgerInternalEventSink};
+use crate::storage::StorageManager;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
 
@@ -41,33 +43,6 @@ else
   printf '%s\n' '{"cniVersion":"1.0.0","ips":[{"address":"10.88.0.2/16"}]}'
 fi
 "#;
-
-struct EnvGuard {
-    key: &'static str,
-    previous: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            if let Some(previous) = self.previous.as_ref() {
-                std::env::set_var(self.key, previous);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-}
 
 #[tokio::test]
 async fn load_network_configs_includes_conflist_files() {
@@ -473,22 +448,18 @@ async fn fake_cni_plugin_fixture_can_inject_add_failure() {
     .unwrap();
 
     let plugin_path = plugin_dir.join("bridge");
-    tokio::fs::write(&plugin_path, FAKE_CNI_PLUGIN)
-        .await
-        .unwrap();
+    tokio::fs::write(
+        &plugin_path,
+        format!(
+            "#!/bin/sh\ncat > '{}'\nprintf '%s\\n' 'injected add failure' >&2\nexit 42\n",
+            record_path.display()
+        ),
+    )
+    .await
+    .unwrap();
     let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&plugin_path, perms).unwrap();
-
-    let _fail_on = EnvGuard::set("CRIUS_FAKE_CNI_PLUGIN_FAIL_ON", "ADD");
-    let _message = EnvGuard::set(
-        "CRIUS_FAKE_CNI_PLUGIN_ERROR_MESSAGE",
-        "injected add failure",
-    );
-    let _record = EnvGuard::set(
-        "CRIUS_FAKE_CNI_PLUGIN_RECORD_PATH",
-        record_path.to_str().unwrap(),
-    );
 
     let mut manager = CniManager::new(
         vec![plugin_dir.display().to_string()],
@@ -513,6 +484,65 @@ async fn fake_cni_plugin_fixture_can_inject_add_failure() {
     assert!(err.to_string().contains("injected add failure"));
     let recorded = tokio::fs::read_to_string(&record_path).await.unwrap();
     assert!(recorded.contains("\"name\":\"test-net\""));
+}
+
+#[tokio::test]
+async fn cni_config_and_plugin_chain_events_are_persisted() {
+    let dir = tempdir().unwrap();
+    let plugin_dir = dir.path().join("bin");
+    let config_dir = dir.path().join("net.d");
+    let db_path = dir.path().join("state").join("crius.db");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    tokio::fs::create_dir_all(&config_dir).await.unwrap();
+    tokio::fs::write(
+        config_dir.join("10-test.conf"),
+        r#"{"cniVersion":"1.0.0","name":"test-net","type":"bridge"}"#,
+    )
+    .await
+    .unwrap();
+
+    let plugin_path = plugin_dir.join("bridge");
+    tokio::fs::write(&plugin_path, FAKE_CNI_PLUGIN)
+        .await
+        .unwrap();
+    let mut perms = std::fs::metadata(&plugin_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&plugin_path, perms).unwrap();
+
+    let mut manager = CniManager::new(
+        vec![plugin_dir.display().to_string()],
+        vec![config_dir.display().to_string()],
+        dir.path().join("cache").display().to_string(),
+    )
+    .unwrap();
+    manager.set_event_sink(Some(LedgerInternalEventSink::new(db_path.clone())));
+    let load_status = manager.load_network_configs().await.unwrap();
+    manager.publish_config_load_event("pod-events", "runc", &load_status);
+    manager
+        .setup_pod_network(
+            "pod-events",
+            "/var/run/netns/pod-events",
+            "pod",
+            "default",
+            "uid-1",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let events = StorageManager::new(&db_path)
+        .unwrap()
+        .get_recent_events_for_subject("network", "pod-events", 10)
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event_type, "network.plugin_chain");
+    assert_eq!(events[0].new_state, InternalEventSeverity::Info.as_str());
+    assert_eq!(events[1].event_type, "network.config_load");
+    let details: serde_json::Value =
+        serde_json::from_str(events[1].details.as_ref().unwrap()).unwrap();
+    assert_eq!(details["runtimeHandler"], "runc");
+    assert_eq!(details["reason"], "CNINetworkConfigReady");
+    assert_eq!(details["declaredPlugins"], serde_json::json!(["bridge"]));
 }
 
 #[tokio::test]

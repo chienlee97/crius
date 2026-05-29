@@ -32,7 +32,7 @@ const INTERNAL_EVENT_SUBJECT_KINDS: &[&str] = &[
     "orphan_cleanup",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerInternalEventSink {
     db_path: std::path::PathBuf,
 }

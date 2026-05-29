@@ -936,6 +936,20 @@ async fn apply_reloadable_config_updates_image_security_and_network_state() {
         service.current_reload_state().last_reload_source.as_deref(),
         Some("test")
     );
+    let events = service
+        .internal_services
+        .events
+        .recent_internal_events("network", "runtime", 10)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "network.config_reload"
+            && event.details["source"] == "test"
+            && event.details["fields"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("network.config_dirs"))
+    }));
 }
 
 #[tokio::test]

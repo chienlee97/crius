@@ -2253,19 +2253,6 @@ impl RuntimeServiceImpl {
         })
         .expect("Failed to initialize image service");
 
-        let mut pod_cni_config = config.cni_config.clone();
-        pod_cni_config.set_rootless_config(Some(config.rootless.clone()));
-        if config.rootless.enabled {
-            pod_cni_config.set_netns_mount_dir(config.rootless.netns_dir.clone());
-        }
-        let pod_manager = PodSandboxManager::new(
-            runtime.clone(),
-            config.root_dir.join("pods"),
-            config.pause_image.clone(),
-            config.pause_command.clone(),
-            config.infra_ctr_cpuset.clone(),
-            pod_cni_config,
-        );
         let persistence_config = PersistenceConfig {
             db_path: config.root_dir.join("crius.db"),
             enable_recovery: true,
@@ -2278,6 +2265,22 @@ impl RuntimeServiceImpl {
         let internal_services = crate::services::InternalServices::new(
             crate::services::EventService::from_sender(events.clone())
                 .with_ledger(persistence.clone()),
+        );
+        let network_event_sink =
+            crate::services::LedgerInternalEventSink::new(config.root_dir.join("crius.db"));
+        let mut pod_cni_config = config.cni_config.clone();
+        pod_cni_config.set_rootless_config(Some(config.rootless.clone()));
+        pod_cni_config.set_event_sink(Some(network_event_sink.clone()));
+        if config.rootless.enabled {
+            pod_cni_config.set_netns_mount_dir(config.rootless.netns_dir.clone());
+        }
+        let pod_manager = PodSandboxManager::new(
+            runtime.clone(),
+            config.root_dir.join("pods"),
+            config.pause_image.clone(),
+            config.pause_command.clone(),
+            config.infra_ctr_cpuset.clone(),
+            pod_cni_config,
         );
         let nri: Arc<dyn NriApi> = injected_nri.unwrap_or_else(|| {
             if nri_manager_config.enable {
@@ -2465,6 +2468,9 @@ impl RuntimeServiceImpl {
             .current_reloadable_config()
             .with_cni_config(&self.config.cni_config);
         config.set_rootless_config(Some(self.config.rootless.clone()));
+        config.set_event_sink(Some(crate::services::LedgerInternalEventSink::new(
+            self.config.root_dir.join("crius.db"),
+        )));
         if self.config.rootless.enabled {
             config.set_netns_mount_dir(self.config.rootless.netns_dir.clone());
         }
@@ -2501,6 +2507,9 @@ impl RuntimeServiceImpl {
             let mut pod_manager = self.pod_manager.lock().await;
             let mut next_cni = next.with_cni_config(&self.config.cni_config);
             next_cni.set_rootless_config(Some(self.config.rootless.clone()));
+            next_cni.set_event_sink(Some(crate::services::LedgerInternalEventSink::new(
+                self.config.root_dir.join("crius.db"),
+            )));
             if self.config.rootless.enabled {
                 next_cni.set_netns_mount_dir(self.config.rootless.netns_dir.clone());
             }
@@ -2518,6 +2527,29 @@ impl RuntimeServiceImpl {
 
         if let Ok(mut current) = self.reloadable_config.lock() {
             *current = next.clone();
+        }
+        if changed.iter().any(|field| field.starts_with("network.")) {
+            self.publish_network_internal_event(
+                "runtime",
+                "config_reload",
+                crate::services::InternalEventSeverity::Info,
+                serde_json::json!({
+                    "source": source,
+                    "fields": changed
+                        .iter()
+                        .filter(|field| field.starts_with("network."))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    "cniConfigDirs": next
+                        .cni_config_dirs
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>(),
+                    "cniMaxConfNum": next.cni_max_conf_num,
+                    "cniDefaultNetworkName": next.cni_default_network_name,
+                }),
+            )
+            .await;
         }
         self.update_reload_state(|state| {
             state.last_reload_at_unix_millis = Some(chrono::Utc::now().timestamp_millis());
