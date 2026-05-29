@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -82,6 +83,7 @@ struct WasmTaskState {
     args: Vec<String>,
     status: WasmTaskStatus,
     exit_code: Option<i32>,
+    pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +128,10 @@ impl WasmDirectBackend {
         self.task_dir(container_id).join("state.json")
     }
 
+    fn exit_code_path(&self, container_id: &str) -> PathBuf {
+        self.task_dir(container_id).join("exit_code")
+    }
+
     fn read_state(&self, container_id: &str) -> Result<Option<WasmTaskState>> {
         let path = self.state_path(container_id);
         if !path.exists() {
@@ -163,6 +169,134 @@ impl WasmDirectBackend {
     fn unsupported_task(operation: &str) -> anyhow::Error {
         anyhow::anyhow!("wasm-direct backend does not support task operation {operation}")
     }
+
+    fn engine_command(&self, state: &WasmTaskState) -> Command {
+        let mut command = Command::new(&self.runtime_path);
+        command
+            .arg("run")
+            .arg("--id")
+            .arg(&state.id)
+            .arg("--state-dir")
+            .arg(self.task_dir(&state.id))
+            .arg("--sandboxer")
+            .arg(&self.options.sandboxer)
+            .arg(&state.image);
+        command.args(&state.command);
+        command.args(&state.args);
+        command
+    }
+
+    fn spawn_engine(&self, state: &WasmTaskState) -> Result<Child> {
+        let mut command = self.engine_command(state);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command.spawn().with_context(|| {
+            format!(
+                "failed to start wasm-direct engine {} for task {}",
+                self.runtime_path.display(),
+                state.id
+            )
+        })
+    }
+
+    fn read_exit_code_file(&self, container_id: &str) -> Result<Option<i32>> {
+        let path = self.exit_code_path(container_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(&path).with_context(|| {
+            format!(
+                "failed to read wasm-direct exit code file {}",
+                path.display()
+            )
+        })?;
+        let code = raw.trim().parse::<i32>().with_context(|| {
+            format!(
+                "failed to parse wasm-direct exit code file {}",
+                path.display()
+            )
+        })?;
+        Ok(Some(code))
+    }
+
+    fn is_pid_alive(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            let raw_pid = nix::unistd::Pid::from_raw(pid as i32);
+            match nix::sys::signal::kill(raw_pid, None) {
+                Ok(()) => true,
+                Err(nix::errno::Errno::EPERM) => true,
+                Err(nix::errno::Errno::ESRCH) => false,
+                Err(_) => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            true
+        }
+    }
+
+    fn signal_pid(pid: u32, signal: nix::sys::signal::Signal) -> Result<()> {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal)
+            .with_context(|| format!("failed to send {signal:?} to wasm-direct pid {pid}"))
+    }
+
+    fn reconcile_running_state(&self, mut state: WasmTaskState) -> Result<WasmTaskState> {
+        if state.status != WasmTaskStatus::Running {
+            return Ok(state);
+        }
+        let Some(pid) = state.pid else {
+            state.status = WasmTaskStatus::Stopped;
+            state.exit_code = Some(state.exit_code.unwrap_or(-1));
+            self.write_state(&state)?;
+            return Ok(state);
+        };
+        if Self::is_pid_alive(pid) {
+            return Ok(state);
+        }
+        state.status = WasmTaskStatus::Stopped;
+        state.exit_code = Some(self.read_exit_code_file(&state.id)?.unwrap_or(-1));
+        state.pid = None;
+        self.write_state(&state)?;
+        Ok(state)
+    }
+
+    fn wait_for_exit(
+        &self,
+        container_id: &str,
+        pid: u32,
+        timeout: Duration,
+    ) -> Result<Option<i32>> {
+        let deadline = Instant::now() + timeout;
+        let raw_pid = nix::unistd::Pid::from_raw(pid as i32);
+        while Instant::now() < deadline {
+            match nix::sys::wait::waitpid(raw_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                Ok(nix::sys::wait::WaitStatus::Exited(_, _))
+                | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => {
+                    return Ok(Some(self.read_exit_code_file(container_id)?.unwrap_or(-1)));
+                }
+                Ok(nix::sys::wait::WaitStatus::StillAlive) => {}
+                Ok(_) => {}
+                Err(nix::errno::Errno::ECHILD) => {
+                    if !Self::is_pid_alive(pid) {
+                        return Ok(Some(self.read_exit_code_file(container_id)?.unwrap_or(-1)));
+                    }
+                }
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to wait for wasm-direct pid {pid}"));
+                }
+            }
+            if !Self::is_pid_alive(pid) {
+                return Ok(Some(self.read_exit_code_file(container_id)?.unwrap_or(-1)));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(None)
+    }
 }
 
 impl TaskController for WasmDirectBackend {
@@ -177,6 +311,7 @@ impl TaskController for WasmDirectBackend {
             args: config.args.clone(),
             status: WasmTaskStatus::Created,
             exit_code: None,
+            pid: None,
         };
         self.write_state(&state)?;
         Ok(container_id.to_string())
@@ -188,8 +323,10 @@ impl TaskController for WasmDirectBackend {
             .ok_or_else(|| anyhow::anyhow!("wasm-direct task {container_id} does not exist"))?;
         match state.status {
             WasmTaskStatus::Created => {
+                let child = self.spawn_engine(&state)?;
                 state.status = WasmTaskStatus::Running;
                 state.exit_code = None;
+                state.pid = Some(child.id());
                 self.write_state(&state)
             }
             WasmTaskStatus::Running => Ok(()),
@@ -199,19 +336,42 @@ impl TaskController for WasmDirectBackend {
         }
     }
 
-    fn stop_container(&self, container_id: &str, _timeout: Option<u32>) -> Result<()> {
-        let mut state = self
+    fn stop_container(&self, container_id: &str, timeout: Option<u32>) -> Result<()> {
+        let state = self
             .read_state(container_id)?
             .ok_or_else(|| anyhow::anyhow!("wasm-direct task {container_id} does not exist"))?;
+        let mut state = self.reconcile_running_state(state)?;
         if state.status != WasmTaskStatus::Stopped {
+            if let Some(pid) = state.pid {
+                match Self::signal_pid(pid, nix::sys::signal::Signal::SIGTERM) {
+                    Ok(()) => {}
+                    Err(err) if err.to_string().contains("ESRCH") => {}
+                    Err(err) => return Err(err),
+                }
+                let timeout = Duration::from_secs(timeout.unwrap_or(10).into());
+                let exit_code = self.wait_for_exit(container_id, pid, timeout)?;
+                if exit_code.is_none() {
+                    let _ = Self::signal_pid(pid, nix::sys::signal::Signal::SIGKILL);
+                }
+                state.exit_code = Some(exit_code.unwrap_or(-1));
+            } else {
+                state.exit_code = Some(state.exit_code.unwrap_or(-1));
+            }
             state.status = WasmTaskStatus::Stopped;
-            state.exit_code = Some(0);
+            state.pid = None;
             self.write_state(&state)?;
         }
         Ok(())
     }
 
     fn remove_container(&self, container_id: &str) -> Result<()> {
+        if let Some(state) = self.read_state(container_id)? {
+            if state.status == WasmTaskStatus::Running {
+                if let Some(pid) = state.pid {
+                    let _ = Self::signal_pid(pid, nix::sys::signal::Signal::SIGKILL);
+                }
+            }
+        }
         let task_dir = self.task_dir(container_id);
         if task_dir.exists() {
             fs::remove_dir_all(&task_dir).with_context(|| {
@@ -228,6 +388,7 @@ impl TaskController for WasmDirectBackend {
         let Some(state) = self.read_state(container_id)? else {
             return Ok(ContainerStatus::Unknown);
         };
+        let state = self.reconcile_running_state(state)?;
         Ok(match state.status {
             WasmTaskStatus::Created => ContainerStatus::Created,
             WasmTaskStatus::Running => ContainerStatus::Running,
@@ -324,8 +485,15 @@ impl TaskController for WasmDirectBackend {
         Err(Self::unsupported_task("resume_container"))
     }
 
-    fn container_pid(&self, _container_id: &str) -> Result<Option<i32>> {
-        Ok(None)
+    fn container_pid(&self, container_id: &str) -> Result<Option<i32>> {
+        let Some(state) = self.read_state(container_id)? else {
+            return Ok(None);
+        };
+        let state = self.reconcile_running_state(state)?;
+        Ok(state
+            .pid
+            .filter(|_| state.status == WasmTaskStatus::Running)
+            .map(|pid| pid as i32))
     }
 }
 

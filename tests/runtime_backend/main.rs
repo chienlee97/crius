@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use crius::runtime::{
@@ -49,6 +51,69 @@ fn test_container_config() -> ContainerConfig {
         readonly_paths: Vec::new(),
         rootfs: PathBuf::from("/tmp/rootfs"),
     }
+}
+
+fn write_fake_wasm_engine(dir: &std::path::Path) -> PathBuf {
+    let engine_path = dir.join("fake-wasm-engine.sh");
+    fs::write(
+        &engine_path,
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\n' "fake-wasm-engine 1.0.0"
+  exit 0
+fi
+if [ "${1:-}" != "run" ]; then
+  printf '%s\n' "unsupported command: ${1:-}" >&2
+  exit 64
+fi
+shift
+id=""
+state_dir=""
+sandboxer=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --id)
+      id="$2"
+      shift 2
+      ;;
+    --state-dir)
+      state_dir="$2"
+      shift 2
+      ;;
+    --sandboxer)
+      sandboxer="$2"
+      shift 2
+      ;;
+    *)
+      image="$1"
+      shift
+      break
+      ;;
+  esac
+done
+mkdir -p "$state_dir"
+printf '%s\n' "$id" "$sandboxer" "$image" "$@" > "$state_dir/engine.args"
+trap 'printf "%s\n" 0 > "$state_dir/exit_code"; exit 0' TERM INT
+while :; do sleep 0.05; done
+"#,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&engine_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&engine_path, perms).unwrap();
+    engine_path
+}
+
+fn wait_for_file(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("timed out waiting for {}", path.display());
 }
 
 #[test]
@@ -169,8 +234,9 @@ fn direct_task_backend_advertises_non_oci_contract() {
 #[test]
 fn wasm_direct_backend_lifecycle_is_persisted_without_oci_context() {
     let dir = tempfile::tempdir().unwrap();
+    let engine_path = write_fake_wasm_engine(dir.path());
     let backend = WasmDirectBackend::new(
-        "/bin/true",
+        &engine_path,
         dir.path().join("runtime"),
         "",
         WasmDirectBackendOptions::default(),
@@ -196,6 +262,19 @@ fn wasm_direct_backend_lifecycle_is_persisted_without_oci_context() {
         backend.container_status("wasm-1").unwrap(),
         ContainerStatus::Running
     );
+    assert!(backend.container_pid("wasm-1").unwrap().is_some());
+    let engine_args_path = dir
+        .path()
+        .join("runtime")
+        .join("wasm-direct")
+        .join("wasm-1")
+        .join("engine.args");
+    wait_for_file(&engine_args_path);
+    let engine_args = fs::read_to_string(engine_args_path).unwrap();
+    assert_eq!(
+        engine_args.lines().collect::<Vec<_>>(),
+        ["wasm-1", "process", "image-1", "sleep", "1"]
+    );
     backend.stop_container("wasm-1", Some(1)).unwrap();
     assert_eq!(
         backend.container_status("wasm-1").unwrap(),
@@ -203,7 +282,7 @@ fn wasm_direct_backend_lifecycle_is_persisted_without_oci_context() {
     );
 
     let recovered = WasmDirectBackend::new(
-        "/bin/true",
+        &engine_path,
         dir.path().join("runtime"),
         "",
         WasmDirectBackendOptions::default(),
@@ -222,8 +301,9 @@ fn wasm_direct_backend_lifecycle_is_persisted_without_oci_context() {
 #[test]
 fn wasm_direct_backend_rejects_unsupported_features_explicitly() {
     let dir = tempfile::tempdir().unwrap();
+    let engine_path = write_fake_wasm_engine(dir.path());
     let backend = WasmDirectBackend::new(
-        "/bin/true",
+        &engine_path,
         dir.path().join("runtime"),
         "",
         WasmDirectBackendOptions::default(),
@@ -243,5 +323,6 @@ fn wasm_direct_backend_rejects_unsupported_features_explicitly() {
         .unwrap_err()
         .to_string()
         .contains("does not support task operation pause_container"));
-    assert_eq!(backend.container_pid("wasm-1").unwrap(), None);
+    assert!(backend.container_pid("wasm-1").unwrap().is_some());
+    backend.remove_container("wasm-1").unwrap();
 }
