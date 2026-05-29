@@ -166,6 +166,48 @@ while :; do sleep 1; done
     engine_path
 }
 
+fn write_self_exiting_wasm_engine(dir: &std::path::Path) -> PathBuf {
+    let engine_path = dir.join("self-exiting-wasm-engine.sh");
+    fs::write(
+        &engine_path,
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "--version" ]; then
+  exit 0
+fi
+if [ "${1:-}" != "run" ]; then
+  exit 64
+fi
+shift
+state_dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --id|--sandboxer)
+      shift 2
+      ;;
+    --state-dir)
+      state_dir="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+mkdir -p "$state_dir"
+: > "$state_dir/engine.args"
+sleep 0.1
+printf '%s\n' 7 > "$state_dir/exit_code"
+exit 7
+"#,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&engine_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&engine_path, perms).unwrap();
+    engine_path
+}
+
 fn wait_for_file(path: &std::path::Path) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
@@ -409,6 +451,47 @@ fn wasm_direct_backend_keeps_created_state_when_engine_start_fails() {
         ContainerStatus::Created
     );
     assert_eq!(backend.container_pid("wasm-fail").unwrap(), None);
+}
+
+#[test]
+fn wasm_direct_backend_marks_self_exited_engine_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine_path = write_self_exiting_wasm_engine(dir.path());
+    let backend = WasmDirectBackend::new(
+        &engine_path,
+        dir.path().join("runtime"),
+        "",
+        WasmDirectBackendOptions::default(),
+    );
+    let config = test_container_config();
+
+    backend.create_container("wasm-exit", &config).unwrap();
+    backend.start_container("wasm-exit").unwrap();
+    let engine_args_path = dir
+        .path()
+        .join("runtime")
+        .join("wasm-direct")
+        .join("wasm-exit")
+        .join("engine.args");
+    wait_for_file(&engine_args_path);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    assert_eq!(
+        backend.container_status("wasm-exit").unwrap(),
+        ContainerStatus::Stopped(7)
+    );
+    assert_eq!(backend.container_pid("wasm-exit").unwrap(), None);
+
+    let recovered = WasmDirectBackend::new(
+        &engine_path,
+        dir.path().join("runtime"),
+        "",
+        WasmDirectBackendOptions::default(),
+    );
+    assert_eq!(
+        recovered.container_status("wasm-exit").unwrap(),
+        ContainerStatus::Stopped(7)
+    );
 }
 
 #[test]

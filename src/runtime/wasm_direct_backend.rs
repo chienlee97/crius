@@ -239,6 +239,25 @@ impl WasmDirectBackend {
         }
     }
 
+    fn reap_child_exit_code(&self, container_id: &str, pid: u32) -> Result<Option<i32>> {
+        let raw_pid = nix::unistd::Pid::from_raw(pid as i32);
+        match nix::sys::wait::waitpid(raw_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            Ok(nix::sys::wait::WaitStatus::Exited(_, status)) => Ok(Some(
+                self.read_exit_code_file(container_id)?.unwrap_or(status),
+            )),
+            Ok(nix::sys::wait::WaitStatus::Signaled(_, signal, _)) => Ok(Some(
+                self.read_exit_code_file(container_id)?
+                    .unwrap_or(128 + signal as i32),
+            )),
+            Ok(nix::sys::wait::WaitStatus::StillAlive) => Ok(None),
+            Ok(_) => Ok(None),
+            Err(nix::errno::Errno::ECHILD) => Ok(None),
+            Err(err) => {
+                Err(err).with_context(|| format!("failed to inspect wasm-direct pid {pid}"))
+            }
+        }
+    }
+
     fn signal_pid(pid: u32, signal: nix::sys::signal::Signal) -> Result<()> {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal)
             .with_context(|| format!("failed to send {signal:?} to wasm-direct pid {pid}"))
@@ -254,6 +273,13 @@ impl WasmDirectBackend {
             self.write_state(&state)?;
             return Ok(state);
         };
+        if let Some(exit_code) = self.reap_child_exit_code(&state.id, pid)? {
+            state.status = WasmTaskStatus::Stopped;
+            state.exit_code = Some(exit_code);
+            state.pid = None;
+            self.write_state(&state)?;
+            return Ok(state);
+        }
         if Self::is_pid_alive(pid) {
             return Ok(state);
         }
