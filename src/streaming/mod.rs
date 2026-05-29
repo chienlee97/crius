@@ -51,7 +51,7 @@ use config::load_streaming_tls_config;
 pub use config::StreamingConfig;
 pub(crate) use config::{deserialize_duration, parse_duration, serialize_duration};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum StreamingRequest {
     Exec(ExecRequestContext),
     Attach(AttachRequestContext),
@@ -59,7 +59,7 @@ enum StreamingRequest {
     PortForward(PortForwardRequestContext),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CachedStreamingRequest {
     created_at: Instant,
     request: StreamingRequest,
@@ -72,11 +72,12 @@ struct PortForwardRequestContext {
     websocket_enabled: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct AttachRequestContext {
     req: AttachRequest,
     attach_io_socket_path: Option<PathBuf>,
     attach_resize_socket_path: Option<PathBuf>,
+    attach_stream_close: Option<AttachStreamClose>,
     websocket_enabled: bool,
 }
 
@@ -96,6 +97,47 @@ struct ExecRequestContext {
     exec_io_socket_path: Option<PathBuf>,
     exec_resize_socket_path: Option<PathBuf>,
     websocket_enabled: bool,
+}
+
+pub(crate) struct AttachStreamClose {
+    container_id: String,
+    stream_id: String,
+    close: Arc<dyn Fn(&str, &str) -> anyhow::Result<()> + Send + Sync>,
+}
+
+impl std::fmt::Debug for AttachStreamClose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachStreamClose")
+            .field("container_id", &self.container_id)
+            .field("stream_id", &self.stream_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AttachStreamClose {
+    fn drop(&mut self) {
+        if let Err(err) = self.close() {
+            log::debug!("Attach RPC stream close failed: {}", err);
+        }
+    }
+}
+
+impl AttachStreamClose {
+    pub(crate) fn new(
+        container_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        close: impl Fn(&str, &str) -> anyhow::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            container_id: container_id.into(),
+            stream_id: stream_id.into(),
+            close: Arc::new(close),
+        }
+    }
+
+    fn close(&self) -> anyhow::Result<()> {
+        (self.close)(&self.container_id, &self.stream_id)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -145,7 +187,7 @@ impl StreamingServer {
     }
 
     #[cfg(test)]
-    async fn handle_request_for_test(
+    pub(crate) async fn handle_request_for_test(
         &self,
         runtime_path: PathBuf,
         req: Request<Body>,
@@ -292,12 +334,31 @@ impl StreamingServer {
         attach_resize_socket_path: Option<PathBuf>,
         websocket_enabled: bool,
     ) -> Result<AttachResponse, tonic::Status> {
+        self.get_attach_with_close(
+            req,
+            attach_io_socket_path,
+            attach_resize_socket_path,
+            None,
+            websocket_enabled,
+        )
+        .await
+    }
+
+    pub(crate) async fn get_attach_with_close(
+        &self,
+        req: &AttachRequest,
+        attach_io_socket_path: Option<PathBuf>,
+        attach_resize_socket_path: Option<PathBuf>,
+        attach_stream_close: Option<AttachStreamClose>,
+        websocket_enabled: bool,
+    ) -> Result<AttachResponse, tonic::Status> {
         Self::validate_attach_request(req)?;
         let token = self
             .insert_request(StreamingRequest::Attach(AttachRequestContext {
                 req: req.clone(),
                 attach_io_socket_path,
                 attach_resize_socket_path,
+                attach_stream_close,
                 websocket_enabled,
             }))
             .await;
@@ -565,6 +626,7 @@ async fn handle_request(
                 req: attach_req,
                 attach_io_socket_path,
                 attach_resize_socket_path,
+                attach_stream_close,
                 websocket_enabled,
             } = attach_ctx;
             if is_websocket_upgrade_request(&req) {
@@ -589,6 +651,7 @@ async fn handle_request(
                         attach_req,
                         attach_io_socket_path,
                         attach_resize_socket_path,
+                        attach_stream_close,
                         protocol,
                     )
                     .await
@@ -620,6 +683,7 @@ async fn handle_request(
                     attach_req,
                     attach_io_socket_path,
                     attach_resize_socket_path,
+                    attach_stream_close,
                     protocol,
                 )
                 .await
@@ -2947,8 +3011,10 @@ async fn serve_attach_spdy(
     req: AttachRequest,
     attach_io_socket_path: Option<PathBuf>,
     attach_resize_socket_path: Option<PathBuf>,
+    attach_stream_close: Option<AttachStreamClose>,
     _protocol: &'static str,
 ) -> anyhow::Result<()> {
+    let _attach_stream_close = attach_stream_close;
     let upgraded = on_upgrade.await?;
     let (read_half, write_half) = tokio::io::split(upgraded);
     let writer = Arc::new(Mutex::new(spdy::AsyncSpdyWriter::new(write_half)));
@@ -4025,8 +4091,10 @@ async fn serve_attach_websocket(
     req: AttachRequest,
     attach_io_socket_path: Option<PathBuf>,
     attach_resize_socket_path: Option<PathBuf>,
+    attach_stream_close: Option<AttachStreamClose>,
     _protocol: &'static str,
 ) -> anyhow::Result<()> {
+    let _attach_stream_close = attach_stream_close;
     let upgraded = on_upgrade.await?;
     let (mut reader, writer) = tokio::io::split(upgraded);
     let writer = Arc::new(Mutex::new(writer));

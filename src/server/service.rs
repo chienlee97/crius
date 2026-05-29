@@ -1046,6 +1046,16 @@ impl RuntimeRegistry {
             .open_attach_stream(container_id, stdin, stdout, stderr, tty)
     }
 
+    pub(super) fn close_attach_stream(
+        &self,
+        container_id: &str,
+        stream_id: &str,
+    ) -> anyhow::Result<()> {
+        self.runtime_for_container(container_id)?
+            .task_controller()
+            .close_attach_stream(container_id, stream_id)
+    }
+
     pub(super) fn shim_status(
         &self,
         container_id: &str,

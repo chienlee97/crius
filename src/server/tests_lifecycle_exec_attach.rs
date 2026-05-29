@@ -1050,6 +1050,113 @@ async fn attach_returns_failed_precondition_when_rpc_stream_is_unavailable() {
 }
 
 #[tokio::test]
+async fn attach_rpc_stream_is_closed_when_stream_token_is_consumed_by_bad_request() {
+    let (dir, service) = test_service_with_fake_runtime();
+    service
+        .set_streaming_server(crate::streaming::StreamingServer::for_test(
+            "http://127.0.0.1:12345",
+        ))
+        .await;
+
+    let container_id = "container-attach-rpc-close";
+    set_fake_runtime_state_without_shim(&dir, container_id, "running");
+    service.containers.lock().await.insert(
+        container_id.to_string(),
+        test_container(container_id, "pod-1", HashMap::new()),
+    );
+
+    let attach_dir = dir.path().join("attach").join(container_id);
+    fs::create_dir_all(&attach_dir).unwrap();
+    fs::write(attach_dir.join("attach.sock"), "").unwrap();
+
+    let task_socket = dir.path().join("shims").join(container_id).join("task.sock");
+    struct AttachCloseTrackingHandler {
+        attach_socket_path: PathBuf,
+        requests: Arc<StdMutex<Vec<crate::shim_rpc::ShimRpcRequest>>>,
+    }
+
+    impl crate::shim_rpc::server::ShimRpcHandler for AttachCloseTrackingHandler {
+        fn handle_request(
+            &self,
+            request: crate::shim_rpc::ShimRpcRequest,
+        ) -> anyhow::Result<crate::shim_rpc::ShimRpcResponse> {
+            self.requests.lock().unwrap().push(request.clone());
+            match request {
+                crate::shim_rpc::ShimRpcRequest::Ping
+                | crate::shim_rpc::ShimRpcRequest::CloseAttachStream(_) => {
+                    Ok(crate::shim_rpc::ShimRpcResponse::Empty)
+                }
+                crate::shim_rpc::ShimRpcRequest::Status(_) => {
+                    Ok(crate::shim_rpc::ShimRpcResponse::Status(
+                        crate::shim_rpc::StatusResponse {
+                            state: crate::shim_rpc::TaskState::Running,
+                            pid: Some(1),
+                            exit_code: None,
+                        },
+                    ))
+                }
+                crate::shim_rpc::ShimRpcRequest::OpenAttachStream(_) => {
+                    Ok(crate::shim_rpc::ShimRpcResponse::OpenAttachStream(
+                        crate::shim_rpc::OpenAttachStreamResponse {
+                            stream_id: "stream-close-1".to_string(),
+                            io_socket_path: self.attach_socket_path.clone(),
+                            resize_socket_path: None,
+                        },
+                    ))
+                }
+                other => Err(anyhow::anyhow!("unexpected attach close request: {other:?}")),
+            }
+        }
+    }
+
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let handler = Arc::new(AttachCloseTrackingHandler {
+        attach_socket_path: attach_dir.join("attach.sock"),
+        requests: requests.clone(),
+    });
+    let server = common::FakeShimRpcServer::start(&task_socket, handler.clone()).unwrap();
+    server.wait_until_ready(Duration::from_secs(1)).unwrap();
+
+    let response = RuntimeService::attach(
+        &service,
+        Request::new(AttachRequest {
+            container_id: container_id.to_string(),
+            stdin: true,
+            stdout: true,
+            stderr: false,
+            tty: false,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    let token = response.url.rsplit('/').next().unwrap();
+    let streaming = service.get_streaming_server().await.unwrap();
+    let request = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri(format!("/attach/{}", token))
+        .body(hyper::Body::empty())
+        .unwrap();
+    let bad_response = streaming
+        .handle_request_for_test(PathBuf::from("/bin/false"), request)
+        .await;
+    assert_eq!(bad_response.status(), hyper::StatusCode::BAD_REQUEST);
+
+    let requests = requests.lock().unwrap();
+    assert!(requests.iter().any(|request| matches!(
+        request,
+        crate::shim_rpc::ShimRpcRequest::OpenAttachStream(open)
+            if open.container_id == container_id
+    )));
+    assert!(requests.iter().any(|request| matches!(
+        request,
+        crate::shim_rpc::ShimRpcRequest::CloseAttachStream(close)
+            if close.container_id == container_id && close.stream_id == "stream-close-1"
+    )));
+}
+
+#[tokio::test]
 async fn attach_uses_log_stream_fallback_for_read_only_tty_when_socket_is_missing() {
     let (dir, service) = test_service_with_fake_runtime();
     service

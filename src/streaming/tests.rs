@@ -54,6 +54,10 @@ dB0HtnAja5pmq6N9Ck79+g==
 "#;
 use std::fs;
 use std::io::Write;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 async fn response_body_string(response: Response<Body>) -> String {
     let bytes = to_bytes(response.into_body()).await.unwrap();
@@ -308,6 +312,7 @@ async fn test_attach_transport_explicitly_rejects_non_spdy_requests() {
             },
             attach_io_socket_path: None,
             attach_resize_socket_path: None,
+            attach_stream_close: None,
             websocket_enabled: true,
         }))
         .await;
@@ -359,6 +364,7 @@ async fn test_attach_transport_accepts_websocket_upgrade_requests() {
             },
             attach_io_socket_path: None,
             attach_resize_socket_path: None,
+            attach_stream_close: None,
             websocket_enabled: true,
         }))
         .await;
@@ -407,6 +413,7 @@ async fn test_attach_transport_rejects_websocket_when_disabled_for_token() {
             },
             attach_io_socket_path: None,
             attach_resize_socket_path: None,
+            attach_stream_close: None,
             websocket_enabled: false,
         }))
         .await;
@@ -428,6 +435,32 @@ async fn test_attach_transport_rejects_websocket_when_disabled_for_token() {
     assert!(response_body_string(response)
         .await
         .contains("websocket streaming is disabled"));
+}
+
+#[tokio::test]
+async fn attach_rpc_stream_close_handle_closes_once_on_drop() {
+    let close_count = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let close_count_for_guard = close_count.clone();
+    let seen_for_guard = seen.clone();
+    let close = AttachStreamClose::new("abc", "stream-1", move |container_id, stream_id| {
+        close_count_for_guard.fetch_add(1, Ordering::SeqCst);
+        seen_for_guard
+            .lock()
+            .unwrap()
+            .push((container_id.to_string(), stream_id.to_string()));
+        Ok(())
+    });
+
+    {
+        let _close = close;
+    }
+
+    assert_eq!(close_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        &[("abc".to_string(), "stream-1".to_string())]
+    );
 }
 
 #[tokio::test]

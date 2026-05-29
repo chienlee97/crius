@@ -596,7 +596,7 @@ impl RuntimeServiceImpl {
                 attach_socket_path.display()
             )));
         }
-        let (attach_io_socket_path, attach_resize_socket_path) =
+        let (attach_io_socket_path, attach_resize_socket_path, attach_stream_close) =
             if self.task_socket_path(&req.container_id).exists() {
                 let runtime = self.runtime.clone();
                 let container_id = req.container_id.clone();
@@ -617,16 +617,29 @@ impl RuntimeServiceImpl {
                         req.container_id, e
                     ))
                 })?;
-                (Some(response.io_socket_path), response.resize_socket_path)
+                let close_runtime = self.runtime.clone();
+                let close = crate::streaming::AttachStreamClose::new(
+                    req.container_id.clone(),
+                    response.stream_id,
+                    move |container_id, stream_id| {
+                        close_runtime.close_attach_stream(container_id, stream_id)
+                    },
+                );
+                (
+                    Some(response.io_socket_path),
+                    response.resize_socket_path,
+                    Some(close),
+                )
             } else {
-                (None, None)
+                (None, None, None)
             };
         let streaming = self.get_streaming_server().await?;
         let response = streaming
-            .get_attach(
+            .get_attach_with_close(
                 &req,
                 attach_io_socket_path,
                 attach_resize_socket_path,
+                attach_stream_close,
                 websocket_enabled,
             )
             .await?;
