@@ -1004,6 +1004,52 @@ async fn attach_rejects_shim_owned_container_when_attach_socket_is_missing() {
 }
 
 #[tokio::test]
+async fn attach_returns_failed_precondition_when_rpc_stream_is_unavailable() {
+    let (dir, service) = test_service_with_fake_runtime();
+    service
+        .set_streaming_server(crate::streaming::StreamingServer::for_test(
+            "http://127.0.0.1:12345",
+        ))
+        .await;
+
+    let container_id = "container-attach-rpc-unavailable";
+    set_fake_runtime_state_without_shim(&dir, container_id, "running");
+    service.containers.lock().await.insert(
+        container_id.to_string(),
+        test_container(container_id, "pod-1", HashMap::new()),
+    );
+
+    let attach_dir = dir.path().join("attach").join(container_id);
+    fs::create_dir_all(&attach_dir).unwrap();
+    fs::write(attach_dir.join("attach.sock"), "").unwrap();
+    let task_socket = dir.path().join("shims").join(container_id).join("task.sock");
+    let handler = Arc::new(common::ScriptedShimHandler::new());
+    let _server = common::FakeShimRpcServer::start(&task_socket, handler).unwrap();
+    _server.wait_until_ready(Duration::from_secs(1)).unwrap();
+
+    let err = RuntimeService::attach(
+        &service,
+        Request::new(AttachRequest {
+            container_id: container_id.to_string(),
+            stdin: true,
+            stdout: true,
+            stderr: false,
+            tty: true,
+        }),
+    )
+    .await
+    .expect_err("attach must fail when shim RPC stream cannot be opened");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("attach RPC stream is unavailable"),
+        "{}",
+        err.message()
+    );
+    assert!(err.message().contains(container_id));
+}
+
+#[tokio::test]
 async fn attach_uses_log_stream_fallback_for_read_only_tty_when_socket_is_missing() {
     let (dir, service) = test_service_with_fake_runtime();
     service
