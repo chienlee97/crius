@@ -470,6 +470,87 @@ mod tests {
     }
 
     #[test]
+    fn rootless_device_policy_matrix_rejects_unsafe_requests() {
+        let allowed = HashSet::new();
+        let devices = vec![DeviceMapping {
+            source: PathBuf::from("/dev/null"),
+            destination: PathBuf::from("/dev/null"),
+            permissions: "rwm".to_string(),
+        }];
+
+        let cases = [
+            (
+                true,
+                &[][..],
+                &[][..],
+                "privileged containers are not supported in rootless mode",
+            ),
+            (
+                false,
+                devices.as_slice(),
+                &[][..],
+                "explicit device requests are not supported in rootless mode",
+            ),
+            (
+                false,
+                &[][..],
+                devices.as_slice(),
+                "runtime.additional_devices cannot be applied in rootless mode",
+            ),
+        ];
+
+        for (privileged, requested_devices, additional_devices, expected) in cases {
+            let err = resolve_devices(DeviceResolverInput {
+                privileged,
+                tty: false,
+                requested_devices,
+                additional_devices,
+                existing_cgroup_rules: &[],
+                allowed_devices: &allowed,
+                device_ownership_from_security_context: false,
+                user: None,
+                run_as_group: None,
+                privileged_without_host_devices: false,
+                privileged_without_host_devices_all_devices_allowed: false,
+                rootless: true,
+            })
+            .expect_err("rootless unsafe device request must be rejected");
+
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rootless_device_policy_allows_default_non_privileged_devices() {
+        let allowed = HashSet::new();
+        let resolved = resolve_devices(DeviceResolverInput {
+            privileged: false,
+            tty: true,
+            requested_devices: &[],
+            additional_devices: &[],
+            existing_cgroup_rules: &[],
+            allowed_devices: &allowed,
+            device_ownership_from_security_context: false,
+            user: None,
+            run_as_group: None,
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            rootless: true,
+        })
+        .expect("rootless default non-privileged devices should be allowed");
+
+        assert!(resolved
+            .devices
+            .iter()
+            .any(|device| device.path == "/dev/null"));
+        assert_all_devices_allowed(&resolved.cgroup_rules);
+        assert!(resolved.degraded_reasons.is_empty());
+    }
+
+    #[test]
     fn resolver_preserves_existing_non_privileged_device_rules() {
         let allowed = HashSet::new();
         let existing = vec![LinuxDeviceCgroup {
