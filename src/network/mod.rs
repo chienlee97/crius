@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
+use std::process::{Child, Command as StdCommand};
 
 use async_trait::async_trait;
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
@@ -71,7 +71,7 @@ impl RootlessNetworkConfig {
         match self.mode {
             crate::rootless::NetworkMode::Slirp4netns | crate::rootless::NetworkMode::Pasta => {
                 let (helper, path) = self.helper().expect("rootless helper exists for mode");
-                if path_is_executable(path) {
+                if executable_is_available(path) {
                     CniLoadStatus::rootless_network_ready(self.mode.as_str(), Some(path))
                 } else {
                     CniLoadStatus::rootless_network_helper_missing(self.mode.as_str(), helper, path)
@@ -102,6 +102,22 @@ fn path_is_executable(path: &Path) -> bool {
     {
         true
     }
+}
+
+fn resolve_executable(path: &Path) -> Option<PathBuf> {
+    if path.components().count() > 1 || path.is_absolute() {
+        return path_is_executable(path).then(|| path.to_path_buf());
+    }
+
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(path))
+            .find(|candidate| path_is_executable(candidate))
+    })
+}
+
+fn executable_is_available(path: &Path) -> bool {
+    resolve_executable(path).is_some()
 }
 
 impl Default for CniConfig {
@@ -682,7 +698,7 @@ pub struct DefaultNetworkManager {
     cni_default_network_name: Option<String>,
     namespace_manager: NamespaceManager,
     rootless: Option<RootlessNetworkConfig>,
-    rootless_processes: std::sync::Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    rootless_processes: std::sync::Arc<std::sync::Mutex<HashMap<String, Child>>>,
     event_sink: Option<crate::services::LedgerInternalEventSink>,
 }
 
@@ -822,7 +838,7 @@ impl DefaultNetworkManager {
                 ))
             }
         };
-        if !path_is_executable(program) {
+        let Some(resolved_program) = resolve_executable(program) else {
             self.publish_network_event(
                 pod_id,
                 "rootless_helper_fail",
@@ -838,18 +854,19 @@ impl DefaultNetworkManager {
                 helper: name.to_string(),
                 path: program.clone(),
             });
-        }
+        };
         self.publish_network_event(
             pod_id,
             "rootless_helper_start",
             crate::services::InternalEventSeverity::Info,
             serde_json::json!({
                 "helper": name,
-                "path": program.display().to_string(),
+                "path": resolved_program.display().to_string(),
+                "configuredPath": program.display().to_string(),
                 "netns": netns,
             }),
         );
-        let mut command = StdCommand::new(program);
+        let mut command = StdCommand::new(&resolved_program);
         match rootless.mode {
             crate::rootless::NetworkMode::Slirp4netns => {
                 command.args([
@@ -873,14 +890,14 @@ impl DefaultNetworkManager {
                 crate::services::InternalEventSeverity::Error,
                 serde_json::json!({
                     "helper": name,
-                    "path": program.display().to_string(),
+                    "path": resolved_program.display().to_string(),
                     "phase": "spawn",
                     "message": err.to_string(),
                 }),
             );
             NetworkError::Other(format!(
                 "failed to start rootless network helper {} for {}: {}",
-                program.display(),
+                resolved_program.display(),
                 pod_id,
                 err
             ))
@@ -893,14 +910,14 @@ impl DefaultNetworkManager {
                 crate::services::InternalEventSeverity::Error,
                 serde_json::json!({
                     "helper": name,
-                    "path": program.display().to_string(),
+                    "path": resolved_program.display().to_string(),
                     "phase": "inspect",
                     "message": err.to_string(),
                 }),
             );
             NetworkError::Other(format!(
                 "failed to inspect rootless network helper {} for {}: {}",
-                program.display(),
+                resolved_program.display(),
                 pod_id,
                 err
             ))
@@ -911,31 +928,32 @@ impl DefaultNetworkManager {
                 crate::services::InternalEventSeverity::Error,
                 serde_json::json!({
                     "helper": name,
-                    "path": program.display().to_string(),
+                    "path": resolved_program.display().to_string(),
                     "phase": "startup",
                     "message": status.to_string(),
                 }),
             );
             return Err(NetworkError::Other(format!(
                 "rootless network helper {} for {} exited during startup: {}",
-                program.display(),
+                resolved_program.display(),
                 pod_id,
                 status
             )));
         }
         if let Ok(mut processes) = self.rootless_processes.lock() {
-            processes.insert(pod_id.to_string(), child.id());
+            processes.insert(pod_id.to_string(), child);
         }
         Ok(self.rootless_network_status(name))
     }
 
     fn stop_rootless_network_helper(&self, pod_id: &str) {
-        let pid = self
+        let child = self
             .rootless_processes
             .lock()
             .ok()
             .and_then(|mut processes| processes.remove(pod_id));
-        if let Some(pid) = pid {
+        if let Some(mut child) = child {
+            let pid = child.id();
             self.publish_network_event(
                 pod_id,
                 "rootless_helper_stop",
@@ -946,14 +964,29 @@ impl DefaultNetworkManager {
             );
             #[cfg(unix)]
             {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGTERM,
-                );
-                let _ = nix::sys::wait::waitpid(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-                );
+                let process = nix::unistd::Pid::from_raw(pid as i32);
+                let _ = nix::sys::signal::kill(process, nix::sys::signal::Signal::SIGTERM);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                        }
+                        Ok(None) => {
+                            let _ =
+                                nix::sys::signal::kill(process, nix::sys::signal::Signal::SIGKILL);
+                            let _ = child.wait();
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+                let _ = child.wait();
             }
         }
     }
@@ -1061,7 +1094,33 @@ mod tests {
     use super::*;
     use crate::services::{InternalEventSeverity, LedgerInternalEventSink};
     use crate::storage::StorageManager;
+    use std::ffi::OsString;
     use std::fs;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct PathEnvGuard {
+        previous: Option<OsString>,
+    }
+
+    impl PathEnvGuard {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("PATH");
+            std::env::set_var("PATH", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for PathEnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.as_ref() {
+                std::env::set_var("PATH", previous);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
 
     fn rootless_effective_config(
         mode: crate::rootless::NetworkMode,
@@ -1180,6 +1239,35 @@ mod tests {
     }
 
     #[test]
+    fn cni_config_resolves_rootless_helper_from_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let helper_path = dir.path().join("pasta");
+        fs::write(&helper_path, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut perms = fs::metadata(&helper_path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        fs::set_permissions(&helper_path, perms).unwrap();
+        let _path_guard = PathEnvGuard::set(dir.path());
+
+        let mut cni = CniConfig::default();
+        cni.set_rootless_config(Some(rootless_effective_config(
+            crate::rootless::NetworkMode::Pasta,
+            PathBuf::from("slirp4netns"),
+            PathBuf::from("pasta"),
+        )));
+
+        let status = cni.rootless_load_status().unwrap();
+
+        assert!(status.ready);
+        assert_eq!(status.reason, "RootlessNetworkReady");
+        assert_eq!(status.loaded_networks, vec!["pasta".to_string()]);
+    }
+
+    #[test]
     fn rootless_helper_startup_exit_is_reported_as_network_error() {
         let dir = tempfile::tempdir().unwrap();
         let helper_path = dir.path().join("pasta");
@@ -1227,11 +1315,14 @@ mod tests {
         cni.set_event_sink(Some(LedgerInternalEventSink::new(db_path.clone())));
         let manager = DefaultNetworkManager::from_cni_config(cni);
 
-        manager
-            .rootless_processes
-            .lock()
-            .unwrap()
-            .insert("pod-1".to_string(), 9_999_999);
+        manager.rootless_processes.lock().unwrap().insert(
+            "pod-1".to_string(),
+            StdCommand::new("sh")
+                .arg("-c")
+                .arg("sleep 30")
+                .spawn()
+                .unwrap(),
+        );
         manager.stop_rootless_network_helper("pod-1");
 
         let events = StorageManager::new(&db_path)
@@ -1241,6 +1332,12 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "network.rootless_helper_stop");
         assert_eq!(events[0].new_state, InternalEventSeverity::Info.as_str());
+        assert!(manager
+            .rootless_processes
+            .lock()
+            .unwrap()
+            .get("pod-1")
+            .is_none());
     }
 
     #[tokio::test]

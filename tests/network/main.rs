@@ -126,3 +126,58 @@ fn gated_real_cni_plugin_preflight_reports_environment_readiness() {
         plugin_dirs
     );
 }
+
+#[test]
+fn gated_real_cni_add_del_reload_has_fixed_entrypoint() {
+    if std::env::var("CRIUS_RUN_REAL_CNI_E2E").ok().as_deref() != Some("1") {
+        eprintln!("skipping real CNI e2e; set CRIUS_RUN_REAL_CNI_E2E=1 to enable");
+        return;
+    }
+
+    let config_dirs = path_list_from_env(
+        "CRIUS_REAL_CNI_CONFIG_DIRS",
+        &["/etc/cni/net.d", "/etc/kubernetes/cni/net.d"],
+    );
+    let plugin_dirs = path_list_from_env(
+        "CRIUS_REAL_CNI_PLUGIN_DIRS",
+        &["/opt/cni/bin", "/usr/lib/cni", "/usr/libexec/cni"],
+    );
+    assert!(
+        config_dirs.iter().any(|dir| has_cni_config_file(dir)),
+        "real CNI e2e requires a .conf/.json/.conflist file in {:?}",
+        config_dirs
+    );
+    assert!(
+        plugin_dirs.iter().any(|dir| dir.is_dir()),
+        "real CNI e2e requires at least one plugin dir from {:?}",
+        plugin_dirs
+    );
+
+    let command = std::env::var("CRIUS_REAL_CNI_E2E_COMMAND")
+        .unwrap_or_else(|_| "crius-real-cni-smoke --add-del --reload --multi-network".to_string());
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .env(
+            "CRIUS_REAL_CNI_CONFIG_DIRS",
+            config_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":"),
+        )
+        .env(
+            "CRIUS_REAL_CNI_PLUGIN_DIRS",
+            plugin_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":"),
+        )
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run real CNI e2e command: {err}"));
+    assert!(
+        status.success(),
+        "real CNI e2e command failed with {status}"
+    );
+}

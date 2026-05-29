@@ -15,6 +15,7 @@ use crius::{
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 fn executable_exists(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
@@ -188,6 +189,87 @@ fn parse_network_mode(value: &str) -> NetworkMode {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootlessSoakCase {
+    name: &'static str,
+    mode: NetworkMode,
+    requires_userns: bool,
+    requires_helper: bool,
+    requires_port_forward: bool,
+    requires_real_cni_reload: bool,
+    min_duration: Duration,
+}
+
+fn rootless_soak_cases() -> Vec<RootlessSoakCase> {
+    vec![
+        RootlessSoakCase {
+            name: "rootless-none-lifecycle",
+            mode: NetworkMode::None,
+            requires_userns: true,
+            requires_helper: false,
+            requires_port_forward: false,
+            requires_real_cni_reload: false,
+            min_duration: Duration::from_secs(5 * 60),
+        },
+        RootlessSoakCase {
+            name: "rootless-slirp4netns-port-forward",
+            mode: NetworkMode::Slirp4netns,
+            requires_userns: true,
+            requires_helper: true,
+            requires_port_forward: true,
+            requires_real_cni_reload: false,
+            min_duration: Duration::from_secs(10 * 60),
+        },
+        RootlessSoakCase {
+            name: "rootless-pasta-port-forward",
+            mode: NetworkMode::Pasta,
+            requires_userns: true,
+            requires_helper: true,
+            requires_port_forward: true,
+            requires_real_cni_reload: false,
+            min_duration: Duration::from_secs(10 * 60),
+        },
+        RootlessSoakCase {
+            name: "rootless-real-cni-reload",
+            mode: NetworkMode::None,
+            requires_userns: true,
+            requires_helper: false,
+            requires_port_forward: false,
+            requires_real_cni_reload: true,
+            min_duration: Duration::from_secs(10 * 60),
+        },
+    ]
+}
+
+#[test]
+fn rootless_soak_matrix_covers_nws4_axes() {
+    let cases = rootless_soak_cases();
+
+    for mode in [
+        NetworkMode::None,
+        NetworkMode::Slirp4netns,
+        NetworkMode::Pasta,
+    ] {
+        assert!(
+            cases.iter().any(|case| case.mode == mode),
+            "missing rootless soak coverage for {}",
+            mode.as_str()
+        );
+    }
+    assert!(cases.iter().all(|case| case.requires_userns));
+    assert!(cases
+        .iter()
+        .any(|case| case.mode == NetworkMode::Pasta && case.requires_helper));
+    assert!(cases
+        .iter()
+        .any(|case| case.mode == NetworkMode::Slirp4netns && case.requires_helper));
+    assert!(cases.iter().any(|case| case.requires_port_forward));
+    assert!(cases.iter().any(|case| case.requires_real_cni_reload));
+    assert!(cases
+        .iter()
+        .all(|case| case.min_duration >= Duration::from_secs(5 * 60)));
+}
+
 #[test]
 fn gated_rootless_soak_preflight_reports_environment_readiness() {
     if std::env::var("CRIUS_RUN_ROOTLESS_SOAK").ok().as_deref() != Some("1") {
@@ -240,5 +322,85 @@ fn gated_rootless_soak_preflight_reports_environment_readiness() {
                 helper.display()
             );
         }
+    }
+}
+
+#[test]
+fn gated_rootless_soak_has_fixed_entrypoint() {
+    if std::env::var("CRIUS_RUN_ROOTLESS_E2E_SOAK").ok().as_deref() != Some("1") {
+        eprintln!("skipping rootless e2e soak; set CRIUS_RUN_ROOTLESS_E2E_SOAK=1 to enable");
+        return;
+    }
+
+    let selected = std::env::var("CRIUS_ROOTLESS_E2E_CASE")
+        .unwrap_or_else(|_| "rootless-pasta-port-forward".to_string());
+    let case = rootless_soak_cases()
+        .into_iter()
+        .find(|case| case.name == selected)
+        .unwrap_or_else(|| panic!("unknown rootless e2e soak case {selected}"));
+
+    let config = RootlessConfig {
+        enabled: true,
+        network_mode: case.mode.clone(),
+        slirp4netns_path: std::env::var("CRIUS_ROOTLESS_SOAK_SLIRP4NETNS")
+            .unwrap_or_else(|_| "slirp4netns".to_string()),
+        pasta_path: std::env::var("CRIUS_ROOTLESS_SOAK_PASTA")
+            .unwrap_or_else(|_| "pasta".to_string()),
+        ..Default::default()
+    };
+    let rootless = EffectiveRootlessConfig::resolve(&config).unwrap();
+    let userns = rootless.user_namespace_status();
+    assert!(
+        !case.requires_userns || userns.ready,
+        "rootless e2e case {} requires a ready user namespace: {}",
+        case.name,
+        userns.message
+    );
+
+    if case.requires_helper {
+        let helper = match case.mode {
+            NetworkMode::Slirp4netns => rootless.slirp4netns_path.as_path(),
+            NetworkMode::Pasta => rootless.pasta_path.as_path(),
+            NetworkMode::None | NetworkMode::Rootlesskit => {
+                panic!("case {} incorrectly requires helper", case.name)
+            }
+        };
+        assert!(
+            executable_exists(helper),
+            "rootless e2e helper {} is missing or not executable",
+            helper.display()
+        );
+    }
+
+    if case.requires_port_forward {
+        let target = std::env::var("CRIUS_ROOTLESS_PORT_FORWARD_TARGET")
+            .unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+        assert!(
+            target.contains(':'),
+            "CRIUS_ROOTLESS_PORT_FORWARD_TARGET must be host:port"
+        );
+    }
+
+    if case.requires_real_cni_reload {
+        let config_dirs = std::env::var("CRIUS_REAL_CNI_CONFIG_DIRS")
+            .unwrap_or_else(|_| "/etc/cni/net.d:/etc/kubernetes/cni/net.d".to_string());
+        assert!(
+            config_dirs.split(':').any(|dir| Path::new(dir).is_dir()),
+            "rootless real CNI reload requires an existing config dir from {config_dirs}"
+        );
+    }
+
+    if let Ok(command) = std::env::var("CRIUS_ROOTLESS_E2E_COMMAND") {
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .env("CRIUS_ROOTLESS_E2E_CASE", case.name)
+            .env("CRIUS_ROOTLESS_NETWORK_MODE", case.mode.as_str())
+            .status()
+            .unwrap_or_else(|err| panic!("failed to run rootless e2e command: {err}"));
+        assert!(
+            status.success(),
+            "rootless e2e command failed with {status}"
+        );
     }
 }
