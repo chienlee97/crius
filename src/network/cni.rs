@@ -456,6 +456,14 @@ impl CniManager {
         self.cache_dir.join(format!("{}.config.json", pod_id))
     }
 
+    fn cache_key(pod_id: &str, if_name: &str) -> String {
+        if if_name == "eth0" {
+            pod_id.to_string()
+        } else {
+            format!("{pod_id}.{if_name}")
+        }
+    }
+
     async fn write_cached_result(&self, pod_id: &str, result: &Value) -> Result<()> {
         tokio::fs::create_dir_all(&self.cache_dir)
             .await
@@ -763,6 +771,10 @@ impl CniManager {
             .and_then(|name| self.network_configs.get(name))
     }
 
+    pub(crate) fn network_config(&self, name: &str) -> Option<&CniNetworkConfig> {
+        self.network_configs.get(name)
+    }
+
     /// 加载单个CNI配置文件
     async fn load_single_config(&self, path: &PathBuf) -> Result<CniNetworkConfig> {
         let content = tokio::fs::read_to_string(path)
@@ -813,13 +825,43 @@ impl CniManager {
 
         debug!("Using CNI network config: {}", config.name);
 
+        self.setup_pod_network_with_config(
+            config,
+            pod_id,
+            netns,
+            "eth0",
+            pod_name,
+            pod_namespace,
+            pod_uid,
+            pod_cidr,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn setup_pod_network_with_config(
+        &self,
+        config: &CniNetworkConfig,
+        pod_id: &str,
+        netns: &str,
+        if_name: &str,
+        pod_name: &str,
+        pod_namespace: &str,
+        pod_uid: &str,
+        pod_cidr: Option<&str>,
+    ) -> Result<NetworkStatus> {
+        debug!(
+            "Using CNI network config {} for interface {}",
+            config.name, if_name
+        );
+
         let result = match self
             .exec_cni_chain(
                 config,
                 "ADD",
                 pod_id,
                 netns,
-                "eth0",
+                if_name,
                 pod_name,
                 pod_namespace,
                 pod_uid,
@@ -858,7 +900,8 @@ impl CniManager {
             }
         };
         let network_status = self.parse_cni_result(result.as_ref())?;
-        self.write_cached_config(pod_id, config).await?;
+        let cache_key = Self::cache_key(pod_id, if_name);
+        self.write_cached_config(&cache_key, config).await?;
 
         info!("Pod {} network setup completed", pod_id);
         Ok(network_status)
@@ -876,73 +919,98 @@ impl CniManager {
         let cached_config = self.read_cached_config(pod_id).await;
         let default_config = self.default_network_config();
         if let Some(config) = cached_config.as_ref().or(default_config) {
-            let teardown = self.exec_cni_chain(
+            self.teardown_pod_network_with_config(
                 config,
-                "DEL",
                 pod_id,
                 netns,
                 "eth0",
-                pod_name,
                 pod_namespace,
+                pod_name,
                 pod_uid,
-                None,
-            );
-            match tokio::time::timeout(self.teardown_timeout, teardown).await {
-                Ok(Ok(_)) => {
-                    self.publish_network_event(
-                        pod_id,
-                        "plugin_chain",
-                        crate::services::InternalEventSeverity::Info,
-                        json!({
-                            "command": "DEL",
-                            "network": config.name,
-                            "plugins": Self::cni_plugin_types(&config.config),
-                            "phase": "teardown",
-                        }),
-                    );
-                    info!("Pod {} network teardown completed", pod_id);
-                }
-                Ok(Err(err)) => {
-                    self.publish_network_event(
-                        pod_id,
-                        "plugin_chain",
-                        crate::services::InternalEventSeverity::Error,
-                        json!({
-                            "command": "DEL",
-                            "network": config.name,
-                            "plugins": Self::cni_plugin_types(&config.config),
-                            "phase": "teardown",
-                            "message": err.to_string(),
-                        }),
-                    );
-                    error!("Failed to teardown network for pod {}: {}", pod_id, err);
-                    return Err(err);
-                }
-                Err(_) => {
-                    let err = anyhow::anyhow!(
-                        "CNI teardown for pod {} timed out after {:?}",
-                        pod_id,
-                        self.teardown_timeout
-                    );
-                    self.publish_network_event(
-                        pod_id,
-                        "plugin_chain",
-                        crate::services::InternalEventSeverity::Error,
-                        json!({
-                            "command": "DEL",
-                            "network": config.name,
-                            "plugins": Self::cni_plugin_types(&config.config),
-                            "phase": "teardown",
-                            "message": err.to_string(),
-                        }),
-                    );
-                    error!("{err}");
-                    return Err(err);
-                }
-            }
-            self.remove_cached_config(pod_id).await;
+            )
+            .await?;
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn teardown_pod_network_with_config(
+        &self,
+        config: &CniNetworkConfig,
+        pod_id: &str,
+        netns: &str,
+        if_name: &str,
+        pod_namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<()> {
+        let cache_key = Self::cache_key(pod_id, if_name);
+        let teardown = self.exec_cni_chain(
+            config,
+            "DEL",
+            pod_id,
+            netns,
+            if_name,
+            pod_name,
+            pod_namespace,
+            pod_uid,
+            None,
+        );
+        match tokio::time::timeout(self.teardown_timeout, teardown).await {
+            Ok(Ok(_)) => {
+                self.remove_cached_config(&cache_key).await;
+                self.publish_network_event(
+                    pod_id,
+                    "plugin_chain",
+                    crate::services::InternalEventSeverity::Info,
+                    json!({
+                        "command": "DEL",
+                        "network": config.name,
+                        "plugins": Self::cni_plugin_types(&config.config),
+                        "phase": "teardown",
+                    }),
+                );
+                info!("Pod {} network teardown completed", pod_id);
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                self.publish_network_event(
+                    pod_id,
+                    "plugin_chain",
+                    crate::services::InternalEventSeverity::Error,
+                    json!({
+                        "command": "DEL",
+                        "network": config.name,
+                        "plugins": Self::cni_plugin_types(&config.config),
+                        "phase": "teardown",
+                        "message": err.to_string(),
+                    }),
+                );
+                error!("Failed to teardown network for pod {}: {}", pod_id, err);
+                Err(err)
+            }
+            Err(_) => {
+                let err = anyhow::anyhow!(
+                    "CNI teardown for pod {} timed out after {:?}",
+                    pod_id,
+                    self.teardown_timeout
+                );
+                self.publish_network_event(
+                    pod_id,
+                    "plugin_chain",
+                    crate::services::InternalEventSeverity::Error,
+                    json!({
+                        "command": "DEL",
+                        "network": config.name,
+                        "plugins": Self::cni_plugin_types(&config.config),
+                        "phase": "teardown",
+                        "message": err.to_string(),
+                    }),
+                );
+                error!("{err}");
+                Err(err)
+            }
+        }
     }
 
     /// 构建CNI参数
@@ -1053,7 +1121,8 @@ impl CniManager {
         pod_cidr: Option<&str>,
     ) -> Result<Option<Value>> {
         let plugins = Self::plugin_chain(&config.config);
-        let cached_result = self.read_cached_result(pod_id).await;
+        let cache_key = Self::cache_key(pod_id, if_name);
+        let cached_result = self.read_cached_result(&cache_key).await;
 
         let plugin_sequence: Vec<&Value> = if command == "DEL" {
             plugins.iter().rev().collect()
@@ -1105,10 +1174,10 @@ impl CniManager {
 
         if command == "ADD" {
             if let Some(result) = prev_result.as_ref() {
-                self.write_cached_result(pod_id, result).await?;
+                self.write_cached_result(&cache_key, result).await?;
             }
         } else {
-            self.remove_cached_result(pod_id).await;
+            self.remove_cached_result(&cache_key).await;
         }
 
         Ok(prev_result.or(cached_result))
