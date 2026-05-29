@@ -121,6 +121,11 @@ struct ExecSessionHandle {
     join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AttachStreamHandle {
+    tty: bool,
+}
+
 impl DaemonTaskState {
     fn as_rpc_state(self) -> TaskState {
         match self {
@@ -196,6 +201,10 @@ pub struct Daemon {
     task_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     /// exec session 后台线程。
     exec_sessions: Arc<Mutex<HashMap<String, ExecSessionHandle>>>,
+    /// Active attach RPC streams keyed by stream id.
+    attach_streams: Arc<Mutex<HashMap<String, AttachStreamHandle>>>,
+    /// Monotonic attach stream sequence for deterministic ids.
+    next_attach_stream_id: Arc<Mutex<u64>>,
     /// shim-owned rootfs handle from CreateTask.
     rootfs_handle: Arc<Mutex<Option<ShimRootfsHandle>>>,
 }
@@ -275,6 +284,8 @@ impl Daemon {
             exit_code: Arc::new(Mutex::new(None)),
             task_thread: Arc::new(Mutex::new(None)),
             exec_sessions: Arc::new(Mutex::new(HashMap::new())),
+            attach_streams: Arc::new(Mutex::new(HashMap::new())),
+            next_attach_stream_id: Arc::new(Mutex::new(1)),
             rootfs_handle: Arc::new(Mutex::new(None)),
         }
     }
@@ -1160,8 +1171,24 @@ impl Daemon {
         &self,
         request: &OpenAttachStreamRequest,
     ) -> Result<OpenAttachStreamResponse> {
+        if request.container_id != self.container_id {
+            return Err(anyhow::anyhow!(
+                "attach stream request container {} does not match shim container {}",
+                request.container_id,
+                self.container_id
+            ));
+        }
         self.setup_io_once()?;
-        let stream_id = format!("attach-{}", request.container_id);
+        let stream_id = {
+            let mut next = self.next_attach_stream_id.lock().unwrap();
+            let stream_id = format!("attach-{}-{}", request.container_id, *next);
+            *next += 1;
+            stream_id
+        };
+        self.attach_streams
+            .lock()
+            .unwrap()
+            .insert(stream_id.clone(), AttachStreamHandle { tty: request.tty });
         Ok(OpenAttachStreamResponse {
             stream_id,
             io_socket_path: self.attach_socket_container_dir().join("attach.sock"),
@@ -1169,6 +1196,71 @@ impl Daemon {
                 .tty
                 .then(|| self.attach_socket_container_dir().join("resize.sock")),
         })
+    }
+
+    fn close_attach_stream_internal(
+        &self,
+        request: &crate::shim_rpc::CloseAttachStreamRequest,
+    ) -> Result<()> {
+        if request.container_id != self.container_id {
+            return Err(anyhow::anyhow!(
+                "attach stream close container {} does not match shim container {}",
+                request.container_id,
+                self.container_id
+            ));
+        }
+        let removed = self
+            .attach_streams
+            .lock()
+            .unwrap()
+            .remove(&request.stream_id);
+        if removed.is_none() {
+            return Err(anyhow::anyhow!(
+                "attach stream {} for container {} is not open",
+                request.stream_id,
+                request.container_id
+            ));
+        }
+        Ok(())
+    }
+
+    fn resize_attach_pty_internal(
+        &self,
+        request: &crate::shim_rpc::ResizeAttachPtyRequest,
+    ) -> Result<()> {
+        if request.container_id != self.container_id {
+            return Err(anyhow::anyhow!(
+                "attach resize container {} does not match shim container {}",
+                request.container_id,
+                self.container_id
+            ));
+        }
+        let stream_id = request
+            .stream_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("attach resize requires stream id"))?;
+        let stream = self
+            .attach_streams
+            .lock()
+            .unwrap()
+            .get(stream_id)
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "attach stream {} for container {} is not open",
+                    stream_id,
+                    request.container_id
+                )
+            })?;
+        if !stream.tty {
+            return Err(anyhow::anyhow!(
+                "attach stream {} for container {} is not a TTY stream",
+                stream_id,
+                request.container_id
+            ));
+        }
+        self.io_manager
+            .apply_terminal_resize(request.width, request.height)
     }
 
     /// 创建TTY容器
@@ -1791,7 +1883,10 @@ impl ShimRpcHandler for Daemon {
             ShimRpcRequest::OpenAttachStream(request) => Ok(ShimRpcResponse::OpenAttachStream(
                 self.open_attach_stream_internal(&request)?,
             )),
-            ShimRpcRequest::CloseAttachStream(_) => Ok(ShimRpcResponse::Empty),
+            ShimRpcRequest::CloseAttachStream(request) => {
+                self.close_attach_stream_internal(&request)?;
+                Ok(ShimRpcResponse::Empty)
+            }
             ShimRpcRequest::WaitProcess(request) => {
                 Ok(ShimRpcResponse::WaitProcess(WaitProcessResponse {
                     exit_code: self.wait_for_exit_code(&request)?,
@@ -1826,8 +1921,7 @@ impl ShimRpcHandler for Daemon {
                 Ok(ShimRpcResponse::Empty)
             }
             ShimRpcRequest::ResizeAttachPty(request) => {
-                self.io_manager
-                    .apply_terminal_resize(request.width, request.height)?;
+                self.resize_attach_pty_internal(&request)?;
                 Ok(ShimRpcResponse::Empty)
             }
             ShimRpcRequest::Status(StatusRequest { .. }) => {

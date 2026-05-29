@@ -22,6 +22,182 @@ fn parse_cri_log_lines(contents: &str) -> Vec<(String, String, String, String)> 
         .collect()
 }
 
+fn new_attach_test_daemon(temp_dir: &tempfile::TempDir, container_id: &str) -> Daemon {
+    let bundle_dir = temp_dir.path().join("bundle");
+    fs::create_dir_all(&bundle_dir).unwrap();
+    let daemon = Daemon::new(
+        container_id.to_string(),
+        bundle_dir,
+        temp_dir.path().join("runtime"),
+        DaemonOptions {
+            runtime_config_path: PathBuf::new(),
+            monitor_cgroup: String::new(),
+            work_dir: temp_dir.path().join("shim"),
+            state_db_path: None,
+            exit_code_file: None,
+            attach_socket_dir: None,
+            io_uid: 0,
+            io_gid: 0,
+            max_container_log_line_size: 4096,
+            log_to_journald: false,
+            no_sync_log: false,
+            no_pivot: false,
+            no_new_keyring: false,
+            systemd_cgroup: false,
+        },
+    );
+    daemon.set_task_state(DaemonTaskState::Created);
+    daemon
+}
+
+fn open_attach_stream(daemon: &Daemon, container_id: &str, tty: bool) -> OpenAttachStreamResponse {
+    daemon
+        .open_attach_stream_internal(&OpenAttachStreamRequest {
+            container_id: container_id.to_string(),
+            stdin: true,
+            stdout: true,
+            stderr: !tty,
+            tty,
+        })
+        .unwrap()
+}
+
+#[test]
+fn attach_resize_requires_open_stream_id() {
+    let temp_dir = tempdir().unwrap();
+    let daemon = new_attach_test_daemon(&temp_dir, "container-1");
+
+    let err = daemon
+        .resize_attach_pty_internal(&crate::shim_rpc::ResizeAttachPtyRequest {
+            container_id: "container-1".to_string(),
+            stream_id: Some("attach-container-1-1".to_string()),
+            width: 80,
+            height: 24,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("is not open"));
+}
+
+#[test]
+fn attach_resize_rejects_missing_stream_id() {
+    let temp_dir = tempdir().unwrap();
+    let daemon = new_attach_test_daemon(&temp_dir, "container-1");
+
+    let err = daemon
+        .resize_attach_pty_internal(&crate::shim_rpc::ResizeAttachPtyRequest {
+            container_id: "container-1".to_string(),
+            stream_id: None,
+            width: 80,
+            height: 24,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("requires stream id"));
+}
+
+#[test]
+fn attach_resize_rejects_closed_stream() {
+    let temp_dir = tempdir().unwrap();
+    let daemon = new_attach_test_daemon(&temp_dir, "container-1");
+    let stream = open_attach_stream(&daemon, "container-1", true);
+
+    daemon
+        .close_attach_stream_internal(&crate::shim_rpc::CloseAttachStreamRequest {
+            container_id: "container-1".to_string(),
+            stream_id: stream.stream_id.clone(),
+        })
+        .unwrap();
+    let err = daemon
+        .resize_attach_pty_internal(&crate::shim_rpc::ResizeAttachPtyRequest {
+            container_id: "container-1".to_string(),
+            stream_id: Some(stream.stream_id),
+            width: 80,
+            height: 24,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("is not open"));
+}
+
+#[test]
+fn attach_resize_rejects_non_tty_stream() {
+    let temp_dir = tempdir().unwrap();
+    let daemon = new_attach_test_daemon(&temp_dir, "container-1");
+    let stream = open_attach_stream(&daemon, "container-1", false);
+
+    let err = daemon
+        .resize_attach_pty_internal(&crate::shim_rpc::ResizeAttachPtyRequest {
+            container_id: "container-1".to_string(),
+            stream_id: Some(stream.stream_id),
+            width: 80,
+            height: 24,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("is not a TTY stream"));
+}
+
+#[test]
+fn attach_resize_for_open_tty_stream_reaches_io_manager() {
+    let temp_dir = tempdir().unwrap();
+    let daemon = new_attach_test_daemon(&temp_dir, "container-1");
+    let stream = open_attach_stream(&daemon, "container-1", true);
+
+    let err = daemon
+        .resize_attach_pty_internal(&crate::shim_rpc::ResizeAttachPtyRequest {
+            container_id: "container-1".to_string(),
+            stream_id: Some(stream.stream_id),
+            width: 80,
+            height: 24,
+        })
+        .unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("terminal console is not available"));
+}
+
+#[test]
+fn attach_stream_rejects_mismatched_container_id() {
+    let temp_dir = tempdir().unwrap();
+    let daemon = new_attach_test_daemon(&temp_dir, "container-1");
+
+    let err = daemon
+        .open_attach_stream_internal(&OpenAttachStreamRequest {
+            container_id: "missing-container".to_string(),
+            stdin: true,
+            stdout: true,
+            stderr: false,
+            tty: true,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("does not match shim container"));
+}
+
+#[test]
+fn attach_close_rejects_duplicate_close() {
+    let temp_dir = tempdir().unwrap();
+    let daemon = new_attach_test_daemon(&temp_dir, "container-1");
+    let stream = open_attach_stream(&daemon, "container-1", true);
+
+    daemon
+        .close_attach_stream_internal(&crate::shim_rpc::CloseAttachStreamRequest {
+            container_id: "container-1".to_string(),
+            stream_id: stream.stream_id.clone(),
+        })
+        .unwrap();
+    let err = daemon
+        .close_attach_stream_internal(&crate::shim_rpc::CloseAttachStreamRequest {
+            container_id: "container-1".to_string(),
+            stream_id: stream.stream_id,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("is not open"));
+}
+
 #[test]
 fn shim_daemon_owns_rootfs_snapshot_lifecycle() {
     let temp_dir = tempdir().unwrap();
