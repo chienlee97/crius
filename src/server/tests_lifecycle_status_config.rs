@@ -1080,6 +1080,52 @@ async fn reload_cni_watch_once_records_last_error() {
             && event.details["reason"] == "CNIConfigInvalid"));
 }
 
+#[tokio::test]
+async fn status_verbose_correlates_network_reason_reload_and_recent_events() {
+    let service = test_service();
+    let dir = tempdir().unwrap();
+    let cni_dir = dir.path().join("cni");
+    fs::create_dir_all(&cni_dir).unwrap();
+    fs::write(cni_dir.join("10-broken.conflist"), "{not-json").unwrap();
+
+    let mut next = service.current_reloadable_config();
+    next.cni_config_dirs = vec![cni_dir.clone()];
+    service.apply_reloadable_config(next, "test").await.unwrap();
+    let reload_status = service.reload_cni_watch_once().await;
+    assert_eq!(reload_status.reason, "CNIConfigInvalid");
+
+    let response = RuntimeService::status(&service, Request::new(StatusRequest { verbose: true }))
+        .await
+        .unwrap()
+        .into_inner();
+    let info: serde_json::Value =
+        serde_json::from_str(response.info.get("config").unwrap()).unwrap();
+    let diagnostics = &info["networkDiagnostics"];
+
+    assert_eq!(diagnostics["ready"], false);
+    assert_eq!(diagnostics["reason"], "CNIConfigInvalid");
+    assert_eq!(diagnostics["lastCniLoadStatus"]["reason"], "CNIConfigInvalid");
+    assert_eq!(
+        diagnostics["reload"]["lastCniWatchError"],
+        reload_status.message
+    );
+    assert!(diagnostics["recentEvents"]["runtime"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["kind"] == "network.config_reload"
+            && event["details"]["fields"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("network.config_dirs"))));
+    assert!(diagnostics["recentEvents"]["cni"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["kind"] == "network.reload_result"
+            && event["details"]["reason"] == "CNIConfigInvalid"));
+}
+
 #[test]
 fn reload_watcher_state_transitions_record_backoff_and_stop() {
     let mut state = RuntimeReloadState::default();

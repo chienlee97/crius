@@ -1,6 +1,25 @@
 use super::*;
 
+const STATUS_RECENT_NETWORK_EVENT_LIMIT: usize = 16;
+
 impl RuntimeServiceImpl {
+    async fn recent_internal_events_for_status(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+        limit: usize,
+    ) -> (Vec<crate::services::InternalEvent>, Option<String>) {
+        match self
+            .internal_services
+            .events
+            .recent_internal_events(subject_kind, subject_id, limit)
+            .await
+        {
+            Ok(events) => (events, None),
+            Err(err) => (Vec::new(), Some(err.to_string())),
+        }
+    }
+
     pub(super) fn effective_runtime_state_for_container(
         container: &Container,
         runtime_status: crate::runtime::ContainerStatus,
@@ -845,6 +864,27 @@ impl RuntimeServiceImpl {
                     Ok(report) => (Some(report), None),
                     Err(err) => (None, Some(err)),
                 };
+            let (recent_network_runtime_events, recent_network_runtime_events_error) = self
+                .recent_internal_events_for_status(
+                    "network",
+                    "runtime",
+                    STATUS_RECENT_NETWORK_EVENT_LIMIT,
+                )
+                .await;
+            let (recent_network_cni_events, recent_network_cni_events_error) = self
+                .recent_internal_events_for_status(
+                    "network",
+                    "cni",
+                    STATUS_RECENT_NETWORK_EVENT_LIMIT,
+                )
+                .await;
+            let recent_network_events = json!({
+                "limitPerSubject": STATUS_RECENT_NETWORK_EVENT_LIMIT,
+                "runtime": recent_network_runtime_events,
+                "cni": recent_network_cni_events,
+                "runtimeError": recent_network_runtime_events_error,
+                "cniError": recent_network_cni_events_error,
+            });
             let mut extended_health_conditions = self.internal_services.health.extended_conditions(
                 crate::services::health::ExtendedConditionsInput {
                     image_root: &self.config.image_root,
@@ -1256,6 +1296,18 @@ impl RuntimeServiceImpl {
                             }
                         ),
                     },
+                },
+                "networkDiagnostics": {
+                    "ready": network_condition.ready,
+                    "reason": network_condition.reason.clone(),
+                    "message": network_condition.message.clone(),
+                    "lastCniLoadStatus": cni_load_status.clone(),
+                    "reload": self.internal_services.introspection.reload(
+                        self.config.config_path.as_deref(),
+                        &reloadable_config,
+                        &reload_state,
+                    ),
+                    "recentEvents": recent_network_events.clone(),
                 },
                 "nri": {
                     "enabled": self.nri_config.enable,
