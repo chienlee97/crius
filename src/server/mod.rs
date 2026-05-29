@@ -119,14 +119,6 @@ const NRI_MIN_MEMORY_LIMIT_ENV: &str = "CRIUS_NRI_CONTAINER_MIN_MEMORY_BYTES";
 mod state_model;
 use state_model::*;
 
-fn capability_state_name(state: crate::security::HostCapabilityState) -> &'static str {
-    match state {
-        crate::security::HostCapabilityState::Available => "available",
-        crate::security::HostCapabilityState::Degraded => "degraded",
-        crate::security::HostCapabilityState::Unavailable => "unavailable",
-    }
-}
-
 impl RuntimeServiceImpl {
     fn cgroup_support_flags() -> CgroupResourceSupport {
         Self::cgroup_support_flags_for_root(Path::new("/sys/fs/cgroup"))
@@ -218,11 +210,13 @@ impl RuntimeServiceImpl {
         support: CgroupResourceSupport,
         tolerate_missing_hugetlb_controller: bool,
     ) {
-        let Some(resources) = spec
-            .linux
-            .as_mut()
-            .and_then(|linux| linux.resources.as_mut())
-        else {
+        let Some(linux) = spec.linux.as_mut() else {
+            return;
+        };
+        if !support.rdt {
+            linux.intel_rdt = None;
+        }
+        let Some(resources) = linux.resources.as_mut() else {
             return;
         };
 
@@ -263,9 +257,7 @@ impl RuntimeServiceImpl {
         }
 
         if !support.rdt {
-            if let Some(linux) = spec.linux.as_mut() {
-                linux.intel_rdt = None;
-            }
+            resources.intel_rdt = None;
         }
     }
 

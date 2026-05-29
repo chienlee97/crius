@@ -328,6 +328,44 @@ pub fn sanitize_linux_resources_for_capabilities(
     }
 }
 
+pub fn resource_class_names(
+    resources: Option<&nri_api::LinuxResources>,
+) -> (Option<String>, Option<String>) {
+    let Some(resources) = resources else {
+        return (None, None);
+    };
+
+    let blockio = resources
+        .blockio_class
+        .as_ref()
+        .map(|class| class.value.trim())
+        .filter(|class| !class.is_empty())
+        .map(ToString::to_string);
+    let rdt = resources
+        .rdt_class
+        .as_ref()
+        .map(|class| class.value.trim())
+        .filter(|class| !class.is_empty())
+        .map(ToString::to_string);
+
+    (blockio, rdt)
+}
+
+pub fn rdt_adjustment_name(rdt: Option<&nri_api::LinuxRdt>) -> Option<String> {
+    let rdt = rdt.filter(|rdt| !rdt.remove)?;
+    rdt.clos_id
+        .as_ref()
+        .map(|clos_id| clos_id.value.trim())
+        .filter(|clos_id| !clos_id.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            rdt.schemata
+                .as_ref()
+                .filter(|schemata| !schemata.value.is_empty())
+                .map(|_| "schemata".to_string())
+        })
+}
+
 pub fn validate_update_linux_resources(resources: &nri_api::LinuxResources) -> Result<()> {
     if let Some(memory) = resources.memory.as_ref() {
         validate_linux_memory(memory, None, "container update")?;

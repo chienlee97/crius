@@ -1925,7 +1925,7 @@ impl RuntimeServiceImpl {
             });
         }
 
-        let container_state = StoredContainerState {
+        let mut container_state = StoredContainerState {
             cgroup_parent: sandbox_linux
                 .and_then(|linux| {
                     (!linux.cgroup_parent.is_empty()).then(|| linux.cgroup_parent.clone())
@@ -1991,19 +1991,6 @@ impl RuntimeServiceImpl {
             container_state.cgroup_parent,
             host_network
         );
-        Self::insert_internal_state(
-            &mut stored_annotations,
-            INTERNAL_CONTAINER_STATE_KEY,
-            &container_state,
-        )?;
-        if let Some(checkpoint_restore) = checkpoint_restore.as_ref() {
-            Self::insert_internal_state(
-                &mut stored_annotations,
-                INTERNAL_CHECKPOINT_RESTORE_KEY,
-                checkpoint_restore,
-            )?;
-        }
-
         let container_config = ContainerConfig {
             name: config
                 .metadata
@@ -2236,16 +2223,69 @@ impl RuntimeServiceImpl {
             &stored_annotations,
         )
         .map_err(|e| Status::invalid_argument(format!("CDI device request failed: {}", e)))?;
+        let nri_cdi_requests = nri_create_result
+            .adjustment
+            .CDI_devices
+            .iter()
+            .map(|device| device.name.trim())
+            .filter(|name| !name.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
         let mut seen_cdi_requests: std::collections::HashSet<String> =
             cdi_requests.iter().cloned().collect();
-        for device in &nri_create_result.adjustment.CDI_devices {
-            let name = device.name.trim();
-            if !name.is_empty() && seen_cdi_requests.insert(name.to_string()) {
-                cdi_requests.push(name.to_string());
+        for name in &nri_cdi_requests {
+            if seen_cdi_requests.insert(name.clone()) {
+                cdi_requests.push(name.clone());
             }
         }
         let mut adjustment_without_cdi = nri_create_result.adjustment.clone();
         adjustment_without_cdi.CDI_devices.clear();
+        let (nri_blockio_class, nri_rdt_class) = crate::nri::resource_class_names(
+            adjustment_without_cdi
+                .linux
+                .as_ref()
+                .and_then(|linux| linux.resources.as_ref()),
+        );
+        let nri_rdt_adjustment = crate::nri::rdt_adjustment_name(
+            adjustment_without_cdi
+                .linux
+                .as_ref()
+                .and_then(|linux| linux.rdt.as_ref()),
+        );
+        let capability_report = crate::security::SecurityManager::new().host_capability_report(
+            &self.nri_config.cdi_spec_dirs,
+            Some(&self.nri_config.blockio_config_path),
+        );
+        let feature_gate =
+            capability_report.evaluate_feature_request(&crate::security::SecurityFeatureRequest {
+                cdi_devices: cdi_requests.clone(),
+                blockio_class: resource_class_request.blockio_class.clone(),
+                rdt_class: resource_class_request.rdt_class.clone(),
+                nri_cdi_devices: nri_cdi_requests,
+                nri_blockio_class,
+                nri_rdt_class,
+                nri_rdt_adjustment,
+            });
+        let security_degraded_reasons = match feature_gate {
+            crate::security::SecurityFeatureGate::Allowed => Vec::new(),
+            crate::security::SecurityFeatureGate::Degraded { reasons } => reasons,
+            crate::security::SecurityFeatureGate::Rejected { reason } => {
+                return Err(Status::failed_precondition(reason));
+            }
+        };
+        let rdt_degraded = !security_degraded_reasons.is_empty()
+            && capability_report.rdt.state != crate::security::HostCapabilityState::Available;
+        if rdt_degraded {
+            if let Some(resources) = container_state.linux_resources.as_mut() {
+                resources.rdt_class = None;
+            }
+            if let Some(linux) = adjustment_without_cdi.linux.as_mut() {
+                if let Some(resources) = linux.resources.as_mut() {
+                    resources.rdt_class = protobuf::MessageField::none();
+                }
+                linux.rdt = protobuf::MessageField::none();
+            }
+        }
         crate::security::cdi::apply_cdi_devices(
             &mut adjusted_spec,
             &cdi_requests,
@@ -2253,19 +2293,6 @@ impl RuntimeServiceImpl {
             Some(&self.nri_config.cdi_spec_dirs),
         )
         .map_err(|e| Status::internal(format!("CDI device injection failed: {}", e)))?;
-        if !cdi_requests.is_empty() {
-            let capability_report = crate::security::SecurityManager::new().host_capability_report(
-                &self.nri_config.cdi_spec_dirs,
-                Some(&self.nri_config.blockio_config_path),
-            );
-            if !capability_report.cdi.is_available() {
-                return Err(Status::failed_precondition(format!(
-                    "CDI devices requested but host CDI capability is {}: {}",
-                    capability_state_name(capability_report.cdi.state),
-                    capability_report.cdi.reason
-                )));
-            }
-        }
         crate::security::resource_classes::apply_resource_class_request(
             &mut adjusted_spec,
             &resource_class_request,
@@ -2282,6 +2309,14 @@ impl RuntimeServiceImpl {
             },
         )
         .map_err(|e| Status::internal(format!("NRI CreateContainer failed: {}", e)))?;
+        if rdt_degraded {
+            if let Some(linux) = adjusted_spec.linux.as_mut() {
+                linux.intel_rdt = None;
+                if let Some(resources) = linux.resources.as_mut() {
+                    resources.intel_rdt = None;
+                }
+            }
+        }
         let cgroup_support = Self::cgroup_support_flags();
         Self::validate_spec_hugetlb_limits_with_flags(
             &adjusted_spec,
@@ -2294,6 +2329,13 @@ impl RuntimeServiceImpl {
             cgroup_support,
             self.config.tolerate_missing_hugetlb_controller,
         );
+        if !security_degraded_reasons.is_empty() {
+            let annotations = adjusted_spec.annotations.get_or_insert_with(HashMap::new);
+            annotations.insert(
+                "io.crius.security.degraded-reasons".to_string(),
+                security_degraded_reasons.join("; "),
+            );
+        }
         if uses_oci_context {
             self.runtime
                 .enforce_oom_score_adj_policy(&container_id, &mut adjusted_spec)
@@ -2302,6 +2344,18 @@ impl RuntimeServiceImpl {
                 })?;
         }
         Self::apply_adjusted_annotations(&mut stored_annotations, &nri_create_result.adjustment);
+        Self::insert_internal_state(
+            &mut stored_annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &container_state,
+        )?;
+        if let Some(checkpoint_restore) = checkpoint_restore.as_ref() {
+            Self::insert_internal_state(
+                &mut stored_annotations,
+                INTERNAL_CHECKPOINT_RESTORE_KEY,
+                checkpoint_restore,
+            )?;
+        }
         Self::refresh_nri_event_container_from_spec(
             &mut nri_event,
             &adjusted_spec,

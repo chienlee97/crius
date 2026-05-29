@@ -885,11 +885,17 @@ impl RuntimeServiceImpl {
                 "runtimeError": recent_network_runtime_events_error,
                 "cniError": recent_network_cni_events_error,
             });
+            let security_capabilities = crate::security::SecurityManager::new()
+                .host_capability_report(
+                    &self.nri_config.cdi_spec_dirs,
+                    Some(&self.nri_config.blockio_config_path),
+                );
             let mut extended_health_conditions = self.internal_services.health.extended_conditions(
                 crate::services::health::ExtendedConditionsInput {
                     image_root: &self.config.image_root,
                     snapshot_root: &self.config.image_root.join("snapshots"),
                     shim_work_dir: &self.shim_work_dir,
+                    security_capabilities: Some(&security_capabilities),
                     attempted_repair: self.last_startup_attempted_repair(),
                     repair_succeeded: self.last_startup_repair_succeeded(),
                     shim_reconnect_supported: true,

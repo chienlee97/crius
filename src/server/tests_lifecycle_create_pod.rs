@@ -732,10 +732,17 @@ async fn create_container_applies_blockio_and_rdt_classes_from_annotations() {
     )
     .unwrap();
     assert_eq!(bundle_config["linux"]["resources"]["block_io"]["weight"], 700);
-    assert_eq!(
-        bundle_config["linux"]["intelRdt"]["closId"],
-        "container-rdt"
-    );
+    if Path::new("/sys/fs/resctrl").exists() {
+        assert_eq!(
+            bundle_config["linux"]["intelRdt"]["closId"],
+            "container-rdt"
+        );
+    } else {
+        assert!(bundle_config["linux"]["intelRdt"].is_null());
+        assert!(bundle_config["annotations"]["io.crius.security.degraded-reasons"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("RDT class requested")));
+    }
 
     let container = service
         .containers
@@ -751,7 +758,163 @@ async fn create_container_applies_blockio_and_rdt_classes_from_annotations() {
     .unwrap();
     let resources = state.linux_resources.unwrap();
     assert_eq!(resources.blockio_class.as_deref(), Some("container-gold"));
-    assert_eq!(resources.rdt_class.as_deref(), Some("container-rdt"));
+    if Path::new("/sys/fs/resctrl").exists() {
+        assert_eq!(resources.rdt_class.as_deref(), Some("container-rdt"));
+    } else {
+        assert!(resources.rdt_class.is_none());
+    }
+}
+
+#[tokio::test]
+async fn create_container_rejects_cdi_before_injection_when_host_cdi_is_degraded() {
+    let dir = tempdir().unwrap();
+    let runtime_root = dir.path().join("fake-runtime-root");
+    let fake_backend = Arc::new(common::FakeRuntimeBackend::new(&runtime_root));
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime = "fake".to_string();
+    config.runtime_handlers = vec!["fake".to_string()];
+    config.runtime_root = runtime_root.clone();
+    config.runtime_configs = HashMap::from([(
+        "fake".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "fake".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: "/fake/runtime".to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/fake/shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 30,
+            snapshotter: "internal-overlay-untar".to_string(),
+        },
+    )]);
+    let mut service = RuntimeServiceImpl::new_with_runtime_backends(
+        config,
+        HashMap::from([(
+            "fake".to_string(),
+            fake_backend as Arc<dyn crate::runtime::RuntimeBackend>,
+        )]),
+    );
+    service.nri_config.cdi_spec_dirs = vec![dir.path().join("missing-cdi").display().to_string()];
+    let mut pod = test_pod("pod-cdi-degraded", HashMap::new());
+    pod.runtime_handler = "fake".to_string();
+    service
+        .pod_sandboxes
+        .lock()
+        .await
+        .insert("pod-cdi-degraded".to_string(), pod);
+
+    let err = RuntimeService::create_container(
+        &service,
+        Request::new(CreateContainerRequest {
+            pod_sandbox_id: "pod-cdi-degraded".to_string(),
+            config: Some(crate::proto::runtime::v1::ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "workload-cdi-degraded".to_string(),
+                    attempt: 1,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:latest".to_string(),
+                    user_specified_image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }),
+                cdi_devices: vec![crate::proto::runtime::v1::CdiDevice {
+                    name: "vendor.com/device=gpu0".to_string(),
+                }],
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect_err("CDI request must be rejected when host CDI capability is degraded");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("CDI devices requested"));
+    assert!(err.message().contains("configured CDI spec directories do not exist"));
+}
+
+#[tokio::test]
+async fn create_container_rejects_blockio_class_when_host_blockio_is_degraded() {
+    let dir = tempdir().unwrap();
+    let runtime_root = dir.path().join("fake-runtime-root");
+    let fake_backend = Arc::new(common::FakeRuntimeBackend::new(&runtime_root));
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime = "fake".to_string();
+    config.runtime_handlers = vec!["fake".to_string()];
+    config.runtime_root = runtime_root.clone();
+    config.runtime_configs = HashMap::from([(
+        "fake".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "fake".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: "/fake/runtime".to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/fake/shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 30,
+            snapshotter: "internal-overlay-untar".to_string(),
+        },
+    )]);
+    let service = RuntimeServiceImpl::new_with_runtime_backends(
+        config,
+        HashMap::from([(
+            "fake".to_string(),
+            fake_backend as Arc<dyn crate::runtime::RuntimeBackend>,
+        )]),
+    );
+    let mut pod = test_pod("pod-blockio-degraded", HashMap::new());
+    pod.runtime_handler = "fake".to_string();
+    service
+        .pod_sandboxes
+        .lock()
+        .await
+        .insert("pod-blockio-degraded".to_string(), pod);
+
+    let err = RuntimeService::create_container(
+        &service,
+        Request::new(CreateContainerRequest {
+            pod_sandbox_id: "pod-blockio-degraded".to_string(),
+            config: Some(crate::proto::runtime::v1::ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "workload-blockio-degraded".to_string(),
+                    attempt: 1,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:latest".to_string(),
+                    user_specified_image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }),
+                annotations: HashMap::from([(
+                    "io.kubernetes.cri.blockio-class".to_string(),
+                    "gold".to_string(),
+                )]),
+                ..Default::default()
+            }),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect_err("blockio request must be rejected when blockio config is unavailable");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("blockio class requested"));
+    assert!(err.message().contains("no blockio config path is configured"));
 }
 
 #[tokio::test]

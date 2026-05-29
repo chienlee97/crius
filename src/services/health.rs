@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::image::{PullCgroupEffectiveConfig, PullCgroupMode, PullCgroupScopeRecord};
 use crate::network::CniLoadStatus;
 use crate::proto::runtime::v1::RuntimeCondition;
+use crate::security::HostCapabilityReport;
 use crate::state::LedgerCheckReport;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -53,6 +54,7 @@ pub struct ExtendedConditionsInput<'a> {
     pub image_root: &'a Path,
     pub snapshot_root: &'a Path,
     pub shim_work_dir: &'a Path,
+    pub security_capabilities: Option<&'a HostCapabilityReport>,
     pub attempted_repair: Option<bool>,
     pub repair_succeeded: Option<bool>,
     pub shim_reconnect_supported: bool,
@@ -363,6 +365,34 @@ impl HealthService {
         }
     }
 
+    pub fn security_condition(
+        &self,
+        capabilities: Option<&HostCapabilityReport>,
+    ) -> InternalHealthCondition {
+        let Some(capabilities) = capabilities else {
+            return InternalHealthCondition::ready(
+                "SecurityReady",
+                "SecurityStatusUnavailable",
+                "security host capability status has not been collected".to_string(),
+            );
+        };
+
+        let degraded = capabilities.degraded_reasons();
+        if degraded.is_empty() {
+            return InternalHealthCondition::ready(
+                "SecurityReady",
+                "SecurityCapabilitiesAvailable",
+                "all tracked host security capabilities are available".to_string(),
+            );
+        }
+
+        InternalHealthCondition::ready(
+            "SecurityReady",
+            "SecurityCapabilitiesDegraded",
+            degraded.join("; "),
+        )
+    }
+
     pub fn pull_cgroup_condition(
         &self,
         effective: &PullCgroupEffectiveConfig,
@@ -423,6 +453,7 @@ impl HealthService {
             self.image_condition(input.image_root),
             self.snapshot_condition(input.snapshot_root),
             self.shim_condition(input.shim_work_dir, input.shim_reconnect_supported),
+            self.security_condition(input.security_capabilities),
             self.recovery_condition(
                 input.attempted_repair,
                 input.repair_succeeded,
@@ -621,6 +652,7 @@ mod tests {
             image_root: &image_root,
             snapshot_root: &snapshot_root,
             shim_work_dir: &shim_work_dir,
+            security_capabilities: None,
             attempted_repair: Some(false),
             repair_succeeded: None,
             shim_reconnect_supported: true,
@@ -628,7 +660,7 @@ mod tests {
             recovery_ledger_check_report: None,
         });
 
-        assert_eq!(conditions.len(), 4);
+        assert_eq!(conditions.len(), 5);
         assert!(conditions.iter().all(|condition| condition.ready));
         assert!(conditions
             .iter()
@@ -639,6 +671,9 @@ mod tests {
         assert!(conditions
             .iter()
             .any(|condition| condition.condition_type == "ShimReady"));
+        assert!(conditions
+            .iter()
+            .any(|condition| condition.condition_type == "SecurityReady"));
         assert!(conditions
             .iter()
             .any(|condition| condition.condition_type == "RecoveryReady"));
@@ -658,6 +693,7 @@ mod tests {
             image_root: &image_root,
             snapshot_root: &snapshot_root,
             shim_work_dir: &shim_work_dir,
+            security_capabilities: None,
             attempted_repair: Some(true),
             repair_succeeded: Some(false),
             shim_reconnect_supported: true,
@@ -678,6 +714,31 @@ mod tests {
             .unwrap();
         assert!(!recovery.ready);
         assert_eq!(recovery.reason, "RecoveryRepairFailed");
+    }
+
+    #[test]
+    fn security_condition_reports_degraded_host_capability_reason() {
+        let service = HealthService;
+        let capabilities = HostCapabilityReport {
+            seccomp: crate::security::HostCapabilityProbe::available("seccomp", "ok"),
+            apparmor: crate::security::HostCapabilityProbe::degraded(
+                "apparmor",
+                "AppArmor securityfs is unavailable",
+            ),
+            selinux: crate::security::HostCapabilityProbe::available("selinux", "ok"),
+            cdi: crate::security::HostCapabilityProbe::available("cdi", "ok"),
+            blockio: crate::security::HostCapabilityProbe::available("blockio", "ok"),
+            rdt: crate::security::HostCapabilityProbe::available("rdt", "ok"),
+            devices: crate::security::HostCapabilityProbe::available("devices", "ok"),
+            cgroup: crate::security::HostCapabilityProbe::available("cgroup", "ok"),
+        };
+
+        let condition = service.security_condition(Some(&capabilities));
+
+        assert!(condition.ready);
+        assert_eq!(condition.condition_type, "SecurityReady");
+        assert_eq!(condition.reason, "SecurityCapabilitiesDegraded");
+        assert!(condition.message.contains("AppArmor securityfs"));
     }
 
     #[test]

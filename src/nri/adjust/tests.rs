@@ -8,10 +8,10 @@ use tempfile::tempdir;
 use super::{
     apply_container_adjustment, apply_container_adjustment_with_blockio_config,
     apply_container_adjustment_with_options, disallowed_annotation_adjustment_keys,
-    filter_annotation_adjustments_by_allowlist, resolve_rdt_class,
-    sanitize_linux_resources_for_capabilities, validate_adjustment_resources_with_min_memory,
-    validate_container_adjustment, validate_container_update, validate_update_linux_resources,
-    AdjustmentOptions, REMOVAL_PREFIX,
+    filter_annotation_adjustments_by_allowlist, rdt_adjustment_name, resolve_rdt_class,
+    resource_class_names, sanitize_linux_resources_for_capabilities,
+    validate_adjustment_resources_with_min_memory, validate_container_adjustment,
+    validate_container_update, validate_update_linux_resources, AdjustmentOptions, REMOVAL_PREFIX,
 };
 use crate::nri_proto::api as nri_api;
 use crate::oci::spec::{
@@ -843,6 +843,33 @@ fn accepts_extended_update_resources() {
     });
 
     validate_update_linux_resources(&resources).expect("extended update resources should validate");
+}
+
+#[test]
+fn extracts_security_relevant_resource_class_and_rdt_adjustment_names() {
+    let mut resources = nri_api::LinuxResources::new();
+    let mut blockio_class = nri_api::OptionalString::new();
+    blockio_class.value = " gold ".to_string();
+    resources.blockio_class = protobuf::MessageField::some(blockio_class);
+    let mut rdt_class = nri_api::OptionalString::new();
+    rdt_class.value = "silver".to_string();
+    resources.rdt_class = protobuf::MessageField::some(rdt_class);
+
+    let (blockio, rdt) = resource_class_names(Some(&resources));
+    assert_eq!(blockio.as_deref(), Some("gold"));
+    assert_eq!(rdt.as_deref(), Some("silver"));
+
+    let mut rdt_adjustment = nri_api::LinuxRdt::new();
+    let mut clos_id = nri_api::OptionalString::new();
+    clos_id.value = " latency ".to_string();
+    rdt_adjustment.clos_id = protobuf::MessageField::some(clos_id);
+    assert_eq!(
+        rdt_adjustment_name(Some(&rdt_adjustment)).as_deref(),
+        Some("latency")
+    );
+
+    rdt_adjustment.remove = true;
+    assert!(rdt_adjustment_name(Some(&rdt_adjustment)).is_none());
 }
 
 #[test]

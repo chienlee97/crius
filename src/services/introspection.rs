@@ -290,20 +290,8 @@ impl IntrospectionService {
             &nri_config.cdi_spec_dirs,
             Some(&nri_config.blockio_config_path),
         );
-        let degraded_capabilities = [
-            &capabilities.seccomp,
-            &capabilities.apparmor,
-            &capabilities.selinux,
-            &capabilities.cdi,
-            &capabilities.blockio,
-            &capabilities.rdt,
-            &capabilities.devices,
-            &capabilities.cgroup,
-        ]
-        .into_iter()
-        .filter(|probe| !probe.is_available())
-        .map(|probe| probe.name.clone())
-        .collect::<Vec<_>>();
+        let degraded_capabilities = capabilities.degraded_capability_names();
+        let degraded_reasons = capabilities.degraded_reasons();
         json!({
             "selinuxAvailable": security.is_selinux_available(),
             "apparmorAvailable": security.is_apparmor_available(),
@@ -322,6 +310,7 @@ impl IntrospectionService {
                 "cgroup": host_capability_value(&capabilities.cgroup),
             },
             "degradedCapabilities": degraded_capabilities,
+            "degradedReasons": degraded_reasons,
         })
     }
 

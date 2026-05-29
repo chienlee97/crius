@@ -225,6 +225,126 @@ impl HostCapabilityProbe {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SecurityFeatureRequest {
+    pub cdi_devices: Vec<String>,
+    pub blockio_class: Option<String>,
+    pub rdt_class: Option<String>,
+    pub nri_cdi_devices: Vec<String>,
+    pub nri_blockio_class: Option<String>,
+    pub nri_rdt_class: Option<String>,
+    pub nri_rdt_adjustment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecurityFeatureGate {
+    Allowed,
+    Rejected { reason: String },
+    Degraded { reasons: Vec<String> },
+}
+
+impl SecurityFeatureRequest {
+    pub fn is_empty(&self) -> bool {
+        self.cdi_devices.is_empty()
+            && self.blockio_class.is_none()
+            && self.rdt_class.is_none()
+            && self.nri_cdi_devices.is_empty()
+            && self.nri_blockio_class.is_none()
+            && self.nri_rdt_class.is_none()
+            && self.nri_rdt_adjustment.is_none()
+    }
+}
+
+impl SecurityFeatureGate {
+    pub fn reject(reason: impl Into<String>) -> Self {
+        Self::Rejected {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
+
+impl HostCapabilityReport {
+    pub fn degraded_probes(&self) -> Vec<&HostCapabilityProbe> {
+        [
+            &self.seccomp,
+            &self.apparmor,
+            &self.selinux,
+            &self.cdi,
+            &self.blockio,
+            &self.rdt,
+            &self.devices,
+            &self.cgroup,
+        ]
+        .into_iter()
+        .filter(|probe| !probe.is_available())
+        .collect()
+    }
+
+    pub fn degraded_capability_names(&self) -> Vec<String> {
+        self.degraded_probes()
+            .into_iter()
+            .map(|probe| probe.name.clone())
+            .collect()
+    }
+
+    pub fn degraded_reasons(&self) -> Vec<String> {
+        self.degraded_probes()
+            .into_iter()
+            .map(|probe| format!("{}: {}", probe.name, probe.reason))
+            .collect()
+    }
+
+    pub fn evaluate_feature_request(
+        &self,
+        request: &SecurityFeatureRequest,
+    ) -> SecurityFeatureGate {
+        if request.is_empty() {
+            return SecurityFeatureGate::Allowed;
+        }
+
+        if !request.cdi_devices.is_empty() || !request.nri_cdi_devices.is_empty() {
+            if !self.cdi.is_available() {
+                return SecurityFeatureGate::reject(format!(
+                    "CDI devices requested but host CDI capability is {}: {}",
+                    capability_state_name(self.cdi.state),
+                    self.cdi.reason
+                ));
+            }
+        }
+
+        if request.blockio_class.is_some() || request.nri_blockio_class.is_some() {
+            if !self.blockio.is_available() {
+                return SecurityFeatureGate::reject(format!(
+                    "blockio class requested but host blockio capability is {}: {}",
+                    capability_state_name(self.blockio.state),
+                    self.blockio.reason
+                ));
+            }
+        }
+
+        if request.rdt_class.is_some()
+            || request.nri_rdt_class.is_some()
+            || request.nri_rdt_adjustment.is_some()
+        {
+            if !self.rdt.is_available() {
+                return SecurityFeatureGate::Degraded {
+                    reasons: vec![format!(
+                        "RDT class requested but host RDT capability is {}: {}",
+                        capability_state_name(self.rdt.state),
+                        self.rdt.reason
+                    )],
+                };
+            }
+        }
+
+        SecurityFeatureGate::Allowed
+    }
+}
+
 impl SecurityManager {
     /// 创建新的安全管理器
     pub fn new() -> Self {
@@ -521,6 +641,14 @@ impl SecurityManager {
     }
 }
 
+fn capability_state_name(state: HostCapabilityState) -> &'static str {
+    match state {
+        HostCapabilityState::Available => "available",
+        HostCapabilityState::Degraded => "degraded",
+        HostCapabilityState::Unavailable => "unavailable",
+    }
+}
+
 fn probe_cdi(cdi_spec_dirs: &[String]) -> HostCapabilityProbe {
     let configured_dirs: Vec<_> = cdi_spec_dirs
         .iter()
@@ -656,5 +784,76 @@ mod tests {
 
         assert_eq!(report.cdi.state, HostCapabilityState::Available);
         assert_eq!(report.blockio.state, HostCapabilityState::Available);
+    }
+
+    #[test]
+    fn host_capability_policy_rejects_requested_cdi_when_probe_is_degraded() {
+        let manager = SecurityManager::new();
+        let report = manager.host_capability_report(&[], None);
+
+        let gate = report.evaluate_feature_request(&SecurityFeatureRequest {
+            cdi_devices: vec!["vendor.com/device=gpu0".to_string()],
+            ..Default::default()
+        });
+
+        match gate {
+            SecurityFeatureGate::Rejected { reason } => {
+                assert!(reason.contains("CDI devices requested"));
+                assert!(reason.contains("degraded"));
+            }
+            other => panic!("expected rejected gate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_capability_policy_rejects_blockio_and_degrades_rdt_without_host_support() {
+        let manager = SecurityManager::new();
+        let report = manager.host_capability_report(&["/tmp".to_string()], None);
+
+        let blockio = report.evaluate_feature_request(&SecurityFeatureRequest {
+            blockio_class: Some("gold".to_string()),
+            ..Default::default()
+        });
+        assert!(matches!(blockio, SecurityFeatureGate::Rejected { .. }));
+
+        let rdt_probe = HostCapabilityReport {
+            rdt: HostCapabilityProbe::degraded("rdt", "resctrl not mounted"),
+            ..report
+        };
+        let rdt = rdt_probe.evaluate_feature_request(&SecurityFeatureRequest {
+            nri_rdt_adjustment: Some("silver".to_string()),
+            ..Default::default()
+        });
+        match rdt {
+            SecurityFeatureGate::Degraded { reasons } => {
+                assert_eq!(reasons.len(), 1);
+                assert!(reasons[0].contains("RDT class requested"));
+                assert!(reasons[0].contains("resctrl not mounted"));
+            }
+            other => panic!("expected degraded gate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_capability_report_exposes_degraded_names_and_reasons() {
+        let report = HostCapabilityReport {
+            seccomp: HostCapabilityProbe::available("seccomp", "ok"),
+            apparmor: HostCapabilityProbe::degraded("apparmor", "missing securityfs"),
+            selinux: HostCapabilityProbe::available("selinux", "ok"),
+            cdi: HostCapabilityProbe::available("cdi", "ok"),
+            blockio: HostCapabilityProbe::available("blockio", "ok"),
+            rdt: HostCapabilityProbe::available("rdt", "ok"),
+            devices: HostCapabilityProbe::available("devices", "ok"),
+            cgroup: HostCapabilityProbe::available("cgroup", "ok"),
+        };
+
+        assert_eq!(
+            report.degraded_capability_names(),
+            vec!["apparmor".to_string()]
+        );
+        assert_eq!(
+            report.degraded_reasons(),
+            vec!["apparmor: missing securityfs".to_string()]
+        );
     }
 }
