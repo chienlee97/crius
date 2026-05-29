@@ -199,6 +199,34 @@ fn attach_close_rejects_duplicate_close() {
 }
 
 #[test]
+fn attach_streams_close_when_task_stops() {
+    let temp_dir = tempdir().unwrap();
+    let daemon = new_attach_test_daemon(&temp_dir, "container-1");
+    let stream = open_attach_stream(&daemon, "container-1", true);
+
+    daemon.close_all_attach_streams();
+    daemon.set_task_state(DaemonTaskState::Stopped);
+
+    let resize_err = daemon
+        .resize_attach_pty_internal(&crate::shim_rpc::ResizeAttachPtyRequest {
+            container_id: "container-1".to_string(),
+            stream_id: Some(stream.stream_id.clone()),
+            width: 80,
+            height: 24,
+        })
+        .unwrap_err();
+    assert!(resize_err.to_string().contains("is not open"));
+
+    let close_err = daemon
+        .close_attach_stream_internal(&crate::shim_rpc::CloseAttachStreamRequest {
+            container_id: "container-1".to_string(),
+            stream_id: stream.stream_id,
+        })
+        .unwrap_err();
+    assert!(close_err.to_string().contains("is not open"));
+}
+
+#[test]
 fn shim_daemon_owns_rootfs_snapshot_lifecycle() {
     let temp_dir = tempdir().unwrap();
     let db_path = temp_dir.path().join("state").join("crius.db");

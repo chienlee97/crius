@@ -339,6 +339,10 @@ impl Daemon {
         }
     }
 
+    fn close_all_attach_streams(&self) -> usize {
+        self.attach_streams.lock().unwrap().drain().count()
+    }
+
     fn record_task_event(
         &self,
         previous: DaemonTaskState,
@@ -632,6 +636,7 @@ impl Daemon {
                 Ok(exit_code) => {
                     *daemon.exit_code.lock().unwrap() = Some(exit_code);
                     *daemon.container_pid.lock().unwrap() = None;
+                    daemon.close_all_attach_streams();
                     daemon.set_task_state(DaemonTaskState::Stopped);
                     if let Err(err) = daemon.record_exit_code(exit_code) {
                         warn!(
@@ -644,6 +649,7 @@ impl Daemon {
                     error!("Task runner for {} failed: {}", daemon.container_id, err);
                     *daemon.exit_code.lock().unwrap() = Some(1);
                     *daemon.container_pid.lock().unwrap() = None;
+                    daemon.close_all_attach_streams();
                     daemon.set_task_state(DaemonTaskState::Stopped);
                     let _ = daemon.record_exit_code(1);
                 }
@@ -1659,6 +1665,7 @@ impl Daemon {
                 let _ = handle.join();
             }
         }
+        self.close_all_attach_streams();
         if let Err(err) = self.io_manager.shutdown() {
             warn!("Failed to shutdown IO manager during delete: {}", err);
         }
