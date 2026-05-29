@@ -323,7 +323,16 @@ impl TaskController for WasmDirectBackend {
             .ok_or_else(|| anyhow::anyhow!("wasm-direct task {container_id} does not exist"))?;
         match state.status {
             WasmTaskStatus::Created => {
-                let child = self.spawn_engine(&state)?;
+                let mut child = self.spawn_engine(&state)?;
+                std::thread::sleep(Duration::from_millis(20));
+                if let Some(status) = child.try_wait().with_context(|| {
+                    format!("failed to inspect wasm-direct task {container_id} after start")
+                })? {
+                    bail!(
+                        "wasm-direct engine {} for task {container_id} exited during startup: {status}",
+                        self.runtime_path.display()
+                    );
+                }
                 state.status = WasmTaskStatus::Running;
                 state.exit_code = None;
                 state.pid = Some(child.id());

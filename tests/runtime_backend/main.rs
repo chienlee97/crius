@@ -105,6 +105,67 @@ while :; do sleep 0.05; done
     engine_path
 }
 
+fn write_failing_wasm_engine(dir: &std::path::Path) -> PathBuf {
+    let engine_path = dir.join("failing-wasm-engine.sh");
+    fs::write(
+        &engine_path,
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "--version" ]; then
+  exit 0
+fi
+printf '%s\n' "scripted engine start failure" >&2
+exit 42
+"#,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&engine_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&engine_path, perms).unwrap();
+    engine_path
+}
+
+fn write_term_ignoring_wasm_engine(dir: &std::path::Path) -> PathBuf {
+    let engine_path = dir.join("term-ignoring-wasm-engine.sh");
+    fs::write(
+        &engine_path,
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "--version" ]; then
+  exit 0
+fi
+if [ "${1:-}" != "run" ]; then
+  exit 64
+fi
+shift
+state_dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --id|--sandboxer)
+      shift 2
+      ;;
+    --state-dir)
+      state_dir="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+mkdir -p "$state_dir"
+: > "$state_dir/engine.args"
+trap '' TERM INT
+while :; do sleep 1; done
+"#,
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&engine_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&engine_path, perms).unwrap();
+    engine_path
+}
+
 fn wait_for_file(path: &std::path::Path) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
@@ -325,4 +386,57 @@ fn wasm_direct_backend_rejects_unsupported_features_explicitly() {
         .contains("does not support task operation pause_container"));
     assert!(backend.container_pid("wasm-1").unwrap().is_some());
     backend.remove_container("wasm-1").unwrap();
+}
+
+#[test]
+fn wasm_direct_backend_keeps_created_state_when_engine_start_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine_path = write_failing_wasm_engine(dir.path());
+    let backend = WasmDirectBackend::new(
+        &engine_path,
+        dir.path().join("runtime"),
+        "",
+        WasmDirectBackendOptions::default(),
+    );
+    let config = test_container_config();
+
+    backend.create_container("wasm-fail", &config).unwrap();
+    let err = backend.start_container("wasm-fail").unwrap_err();
+
+    assert!(err.to_string().contains("exited during startup"));
+    assert_eq!(
+        backend.container_status("wasm-fail").unwrap(),
+        ContainerStatus::Created
+    );
+    assert_eq!(backend.container_pid("wasm-fail").unwrap(), None);
+}
+
+#[test]
+fn wasm_direct_backend_records_unknown_exit_when_stop_times_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine_path = write_term_ignoring_wasm_engine(dir.path());
+    let backend = WasmDirectBackend::new(
+        &engine_path,
+        dir.path().join("runtime"),
+        "",
+        WasmDirectBackendOptions::default(),
+    );
+    let config = test_container_config();
+
+    backend.create_container("wasm-timeout", &config).unwrap();
+    backend.start_container("wasm-timeout").unwrap();
+    let engine_args_path = dir
+        .path()
+        .join("runtime")
+        .join("wasm-direct")
+        .join("wasm-timeout")
+        .join("engine.args");
+    wait_for_file(&engine_args_path);
+    backend.stop_container("wasm-timeout", Some(0)).unwrap();
+
+    assert_eq!(
+        backend.container_status("wasm-timeout").unwrap(),
+        ContainerStatus::Stopped(-1)
+    );
+    assert_eq!(backend.container_pid("wasm-timeout").unwrap(), None);
 }
