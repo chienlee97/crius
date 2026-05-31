@@ -85,6 +85,32 @@ struct SoakReportSummary {
     operations: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateOutcome {
+    Pass,
+    Skip,
+    Risk,
+}
+
+impl GateOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Skip => "SKIP",
+            Self::Risk => "RISK",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseGateReportRow {
+    gate: &'static str,
+    command: String,
+    outcome: GateOutcome,
+    evidence: String,
+    risk: String,
+}
+
 fn unique_name(prefix: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -550,6 +576,84 @@ fn run_release_soak_driver(profile: &SoakProfile) -> SoakReportSummary {
     parse_soak_report(&raw)
 }
 
+fn release_report_rows() -> Vec<ReleaseGateReportRow> {
+    vec![
+        ReleaseGateReportRow {
+            gate: "cargo-fmt",
+            command: "cargo fmt --check".to_string(),
+            outcome: GateOutcome::Pass,
+            evidence: "local command output or CI artifact".to_string(),
+            risk: "none".to_string(),
+        },
+        ReleaseGateReportRow {
+            gate: "cargo-test",
+            command: "cargo test".to_string(),
+            outcome: GateOutcome::Pass,
+            evidence: "local command output or CI artifact".to_string(),
+            risk: "none".to_string(),
+        },
+        ReleaseGateReportRow {
+            gate: "integration-tests",
+            command: "cargo test --test integration --test recovery --test network --test runtime_backend".to_string(),
+            outcome: GateOutcome::Pass,
+            evidence: "test output or CI artifact".to_string(),
+            risk: "none".to_string(),
+        },
+        ReleaseGateReportRow {
+            gate: "crictl-smoke",
+            command: "CRIUS_RUN_CRICTL_SMOKE=1 cargo test --test release_gate gated_crictl_smoke_has_fixed_entrypoint -- --nocapture".to_string(),
+            outcome: GateOutcome::Pass,
+            evidence: "crictl lifecycle transcript".to_string(),
+            risk: "record skipped operation if node prerequisites are missing".to_string(),
+        },
+        ReleaseGateReportRow {
+            gate: "kubelet-smoke",
+            command: "CRIUS_RUN_KUBELET_SMOKE=1 cargo test --test release_gate gated_kubelet_smoke_has_fixed_entrypoint -- --nocapture".to_string(),
+            outcome: GateOutcome::Pass,
+            evidence: "kubectl logs/exec/stats transcript".to_string(),
+            risk: "record cluster version and any missing metrics server support".to_string(),
+        },
+        ReleaseGateReportRow {
+            gate: "fault-injection",
+            command: "CRIUS_RUN_FAULT_INJECTION=1 cargo test --test release_gate gated_fault_injection_has_fixed_entrypoint -- --nocapture".to_string(),
+            outcome: GateOutcome::Risk,
+            evidence: "driver output for each failure class".to_string(),
+            risk: "document any failure class covered only by isolated tests".to_string(),
+        },
+        ReleaseGateReportRow {
+            gate: "long-running-soak",
+            command: "CRIUS_RUN_RELEASE_SOAK=1 cargo test --test release_gate gated_release_soak_has_fixed_entrypoint -- --nocapture".to_string(),
+            outcome: GateOutcome::Risk,
+            evidence: "JSON soak report with resource growth counters".to_string(),
+            risk: "document duration, skipped operations, fd/process growth, and failure rate".to_string(),
+        },
+        ReleaseGateReportRow {
+            gate: "known-limitations",
+            command: "manual release note review".to_string(),
+            outcome: GateOutcome::Skip,
+            evidence: "release note link or issue list".to_string(),
+            risk: "record unsupported backend, snapshotter, CNI, attach, or security scope".to_string(),
+        },
+    ]
+}
+
+fn render_release_report_template(rows: &[ReleaseGateReportRow]) -> String {
+    let mut rendered = String::from(
+        "# crius release gate report\n\n| gate | command | outcome | evidence | risk |\n| --- | --- | --- | --- | --- |\n",
+    );
+    for row in rows {
+        rendered.push_str(&format!(
+            "| {} | `{}` | {} | {} | {} |\n",
+            row.gate,
+            row.command,
+            row.outcome.as_str(),
+            row.evidence,
+            row.risk
+        ));
+    }
+    rendered
+}
+
 fn release_matrix() -> Vec<ReleaseTarget> {
     vec![
         ReleaseTarget {
@@ -851,6 +955,53 @@ fn release_checklist_requires_tests_real_environment_and_risk_accounting() {
 
     for item in checklist {
         assert!(!item.trim().is_empty());
+    }
+}
+
+#[test]
+fn release_report_template_covers_each_checklist_gate() {
+    let rows = release_report_rows();
+    let template = render_release_report_template(&rows);
+    for gate in [
+        "cargo-fmt",
+        "cargo-test",
+        "integration-tests",
+        "crictl-smoke",
+        "kubelet-smoke",
+        "fault-injection",
+        "long-running-soak",
+        "known-limitations",
+    ] {
+        assert!(
+            rows.iter().any(|row| row.gate == gate),
+            "release report missing gate {gate}"
+        );
+        assert!(
+            template.contains(gate),
+            "rendered release report missing gate {gate}"
+        );
+    }
+    assert!(template.contains("| gate | command | outcome | evidence | risk |"));
+}
+
+#[test]
+fn release_report_rows_require_outcome_evidence_and_risk_text() {
+    for row in release_report_rows() {
+        assert!(
+            !row.command.trim().is_empty(),
+            "missing command for {}",
+            row.gate
+        );
+        assert!(
+            !row.evidence.trim().is_empty(),
+            "missing evidence for {}",
+            row.gate
+        );
+        assert!(!row.risk.trim().is_empty(), "missing risk for {}", row.gate);
+        assert!(matches!(
+            row.outcome,
+            GateOutcome::Pass | GateOutcome::Skip | GateOutcome::Risk
+        ));
     }
 }
 
