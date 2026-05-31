@@ -306,6 +306,136 @@ async fn create_container_direct_task_backend_skips_oci_context() {
 }
 
 #[tokio::test]
+async fn create_container_oci_backend_creates_task_after_adjusted_bundle() {
+    let dir = tempdir().unwrap();
+    let runtime_root = dir.path().join("fake-runtime-root");
+    let fake_backend = Arc::new(common::FakeRuntimeBackend::new(&runtime_root));
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime = "fake".to_string();
+    config.runtime_handlers = vec!["fake".to_string()];
+    config.runtime_root = runtime_root.clone();
+    config.runtime_configs = HashMap::from([(
+        "fake".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "fake".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: "/fake/runtime".to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/fake/shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 30,
+            snapshotter: "internal-overlay-untar".to_string(),
+        },
+    )]);
+    let service = RuntimeServiceImpl::new_with_runtime_backends(
+        config,
+        HashMap::from([(
+            "fake".to_string(),
+            fake_backend.clone() as Arc<dyn crate::runtime::RuntimeBackend>,
+        )]),
+    );
+    let mut pod = test_pod("pod-oci-task-create", HashMap::new());
+    pod.runtime_handler = "fake".to_string();
+    service
+        .pod_sandboxes
+        .lock()
+        .await
+        .insert("pod-oci-task-create".to_string(), pod);
+
+    let response = RuntimeService::create_container(
+        &service,
+        Request::new(CreateContainerRequest {
+            pod_sandbox_id: "pod-oci-task-create".to_string(),
+            config: Some(crate::proto::runtime::v1::ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "oci-workload".to_string(),
+                    attempt: 1,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:latest".to_string(),
+                    user_specified_image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }),
+                command: vec!["sh".to_string()],
+                args: vec!["-c".to_string(), "sleep 3600".to_string()],
+                log_path: "oci-workload.log".to_string(),
+                ..Default::default()
+            }),
+            sandbox_config: Some(crate::proto::runtime::v1::PodSandboxConfig {
+                log_directory: dir.path().join("logs").display().to_string(),
+                ..Default::default()
+            }),
+        }),
+    )
+    .await
+    .expect("OCI backend should prepare rootfs, write adjusted bundle, and create task")
+    .into_inner();
+
+    assert_eq!(
+        fake_backend.calls(),
+        vec![
+            common::FakeRuntimeCall::PrepareRootfs {
+                container_id: response.container_id.clone()
+            },
+            common::FakeRuntimeCall::BuildSpec {
+                container_id: response.container_id.clone()
+            },
+            common::FakeRuntimeCall::WriteBundle {
+                container_id: response.container_id.clone(),
+                rootfs: service
+                    .config
+                    .root_dir
+                    .join("containers")
+                    .join(&response.container_id)
+                    .join("rootfs"),
+            },
+            common::FakeRuntimeCall::CreateTaskFromPreparedBundle {
+                container_id: response.container_id.clone()
+            },
+        ]
+    );
+    let bundle_config = fs::read_to_string(
+        runtime_root
+            .join(&response.container_id)
+            .join("config.json"),
+    )
+    .expect("fake OCI backend should write bundle config");
+    let spec: crate::oci::spec::Spec =
+        serde_json::from_str(&bundle_config).expect("bundle config should be valid OCI JSON");
+    let annotations = spec
+        .annotations
+        .as_ref()
+        .expect("bundle annotations should be present");
+    let stored_state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+        annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+    )
+    .expect("bundle annotations should include internal container state");
+    let expected_log_path = dir.path().join("logs").join("oci-workload.log");
+    assert_eq!(
+        stored_state.log_path.as_deref(),
+        Some(expected_log_path.display().to_string().as_str())
+    );
+
+    RuntimeService::start_container(
+        &service,
+        Request::new(StartContainerRequest {
+            container_id: response.container_id.clone(),
+        }),
+    )
+    .await
+    .expect("start should find the task created during OCI create");
+}
+
+#[tokio::test]
 async fn create_container_applies_cdi_devices_without_nri_adjustment() {
     let cdi_dir = tempdir().unwrap();
     fs::write(

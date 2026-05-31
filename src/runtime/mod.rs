@@ -3432,8 +3432,12 @@ impl RuncRuntime {
     }
 
     /// 分步创建：准备 rootfs（NRI 可在后续步骤介入 spec）。
-    pub fn prepare_rootfs(&self, container_id: &str, config: &ContainerConfig) -> Result<()> {
-        self.prepare_rootfs_mount(container_id, config).map(|_| ())
+    pub fn prepare_rootfs(
+        &self,
+        container_id: &str,
+        config: &ContainerConfig,
+    ) -> Result<PreparedRootfsMount> {
+        self.prepare_rootfs_mount(container_id, config)
     }
 
     /// 分步创建：构建 pristine OCI spec。
@@ -3494,6 +3498,26 @@ impl RuncRuntime {
     /// 分步创建：落盘 bundle（config.json + bundle 目录）。
     pub fn write_bundle(&self, container_id: &str, rootfs: &Path, spec: &Spec) -> Result<()> {
         self.create_bundle(container_id, rootfs, spec)
+    }
+
+    pub fn create_task_from_prepared_bundle(
+        &self,
+        container_id: &str,
+        rootfs_mount: PreparedRootfsMount,
+    ) -> Result<()> {
+        if let Some(ref shim_manager) = self.shim_manager {
+            let bundle_path = self.bundle_path(container_id);
+            let rootfs_path = rootfs_mount.rootfs_path()?.to_path_buf();
+            shim_manager.create_task(
+                container_id,
+                &bundle_path,
+                &rootfs_path,
+                Some(&rootfs_mount.key),
+                rootfs_mount.mount_options(),
+                rootfs_mount.handle,
+            )?;
+        }
+        Ok(())
     }
 
     /// 分步创建：从 bundle 读取 OCI spec。

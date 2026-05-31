@@ -541,7 +541,11 @@ impl RuntimeContextManager for WasmDirectBackend {
         Err(Self::unsupported_context("enforce_oom_score_adj_policy"))
     }
 
-    fn prepare_rootfs(&self, _container_id: &str, _config: &ContainerConfig) -> Result<()> {
+    fn prepare_rootfs(
+        &self,
+        _container_id: &str,
+        _config: &ContainerConfig,
+    ) -> Result<super::PreparedRootfsMount> {
         Err(Self::unsupported_context("prepare_rootfs"))
     }
 
@@ -551,6 +555,16 @@ impl RuntimeContextManager for WasmDirectBackend {
 
     fn write_bundle(&self, _container_id: &str, _rootfs: &Path, _spec: &Spec) -> Result<()> {
         Err(Self::unsupported_context("write_bundle"))
+    }
+
+    fn create_task_from_prepared_bundle(
+        &self,
+        _container_id: &str,
+        _rootfs: super::PreparedRootfsMount,
+    ) -> Result<()> {
+        Err(Self::unsupported_context(
+            "create_task_from_prepared_bundle",
+        ))
     }
 
     fn load_spec(&self, _container_id: &str) -> Result<Spec> {

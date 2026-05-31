@@ -1090,7 +1090,7 @@ impl RuntimeRegistry {
         &self,
         container_id: &str,
         config: &crate::runtime::ContainerConfig,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<crate::runtime::PreparedRootfsMount> {
         let handler = self
             .handler_from_annotations(&config.annotations)
             .unwrap_or_else(|| self.default_handler.clone());
@@ -1123,6 +1123,16 @@ impl RuntimeRegistry {
         self.runtime_for_container(container_id)?
             .runtime_context()
             .write_bundle(container_id, rootfs, spec)
+    }
+
+    pub(super) fn create_task_from_prepared_bundle(
+        &self,
+        container_id: &str,
+        rootfs: crate::runtime::PreparedRootfsMount,
+    ) -> anyhow::Result<()> {
+        self.runtime_for_container(container_id)?
+            .runtime_context()
+            .create_task_from_prepared_bundle(container_id, rootfs)
     }
 
     pub(super) fn pause_container(&self, container_id: &str) -> anyhow::Result<()> {

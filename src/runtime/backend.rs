@@ -7,7 +7,9 @@ use crate::oci::spec::Spec;
 use crate::proto::runtime::v1::LinuxContainerResources;
 use crate::shim_rpc::OpenAttachStreamResponse;
 
-use super::{ContainerConfig, ContainerStatus, MountSemanticsError, RuntimeFeatureProbe};
+use super::{
+    ContainerConfig, ContainerStatus, MountSemanticsError, PreparedRootfsMount, RuntimeFeatureProbe,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeContextKind {
@@ -67,9 +69,18 @@ pub trait TaskController: Send + Sync {
 pub trait RuntimeContextManager: Send + Sync {
     fn bundle_path_for(&self, container_id: &str) -> PathBuf;
     fn enforce_oom_score_adj_policy(&self, spec: &mut Spec) -> Result<()>;
-    fn prepare_rootfs(&self, container_id: &str, config: &ContainerConfig) -> Result<()>;
+    fn prepare_rootfs(
+        &self,
+        container_id: &str,
+        config: &ContainerConfig,
+    ) -> Result<PreparedRootfsMount>;
     fn build_spec(&self, container_id: &str, config: &ContainerConfig) -> Result<Spec>;
     fn write_bundle(&self, container_id: &str, rootfs: &Path, spec: &Spec) -> Result<()>;
+    fn create_task_from_prepared_bundle(
+        &self,
+        container_id: &str,
+        rootfs: PreparedRootfsMount,
+    ) -> Result<()>;
     fn load_spec(&self, container_id: &str) -> Result<Spec>;
     fn validate_mount_requests(
         &self,

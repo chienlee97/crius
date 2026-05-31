@@ -8,8 +8,8 @@ use crate::proto::runtime::v1::LinuxContainerResources;
 
 use super::backend::{RuntimeBackend, RuntimeContextManager, TaskController};
 use super::{
-    ContainerConfig, ContainerRuntime, ContainerStatus, MountSemanticsError, RuncRuntime,
-    RuntimeFeatureProbe,
+    ContainerConfig, ContainerRuntime, ContainerStatus, MountSemanticsError, PreparedRootfsMount,
+    RuncRuntime, RuntimeFeatureProbe,
 };
 
 #[derive(Debug, Clone)]
@@ -146,7 +146,11 @@ impl RuntimeContextManager for RuncBackend {
         self.inner.enforce_oom_score_adj_policy(spec)
     }
 
-    fn prepare_rootfs(&self, container_id: &str, config: &ContainerConfig) -> Result<()> {
+    fn prepare_rootfs(
+        &self,
+        container_id: &str,
+        config: &ContainerConfig,
+    ) -> Result<PreparedRootfsMount> {
         self.inner.prepare_rootfs(container_id, config)
     }
 
@@ -156,6 +160,15 @@ impl RuntimeContextManager for RuncBackend {
 
     fn write_bundle(&self, container_id: &str, rootfs: &Path, spec: &Spec) -> Result<()> {
         self.inner.write_bundle(container_id, rootfs, spec)
+    }
+
+    fn create_task_from_prepared_bundle(
+        &self,
+        container_id: &str,
+        rootfs: PreparedRootfsMount,
+    ) -> Result<()> {
+        self.inner
+            .create_task_from_prepared_bundle(container_id, rootfs)
     }
 
     fn load_spec(&self, container_id: &str) -> Result<Spec> {

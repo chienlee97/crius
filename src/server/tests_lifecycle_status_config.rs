@@ -1639,8 +1639,19 @@ impl crate::runtime::RuntimeContextManager for FakeBackend {
         &self,
         _container_id: &str,
         _config: &crate::runtime::ContainerConfig,
-    ) -> anyhow::Result<()> {
-        Ok(())
+    ) -> anyhow::Result<crate::runtime::PreparedRootfsMount> {
+        Ok(crate::runtime::PreparedRootfsMount {
+            key: "fake".to_string(),
+            mountpoint: PathBuf::from("/tmp/fake-rootfs"),
+            readonly: false,
+            handle: crate::image::snapshotter::RootfsHandle::internal_path(
+                "fake",
+                "container",
+                "fake",
+                "/tmp/fake-rootfs",
+                false,
+            ),
+        })
     }
 
     fn build_spec(
@@ -1656,6 +1667,14 @@ impl crate::runtime::RuntimeContextManager for FakeBackend {
         _container_id: &str,
         _rootfs: &Path,
         _spec: &crate::oci::spec::Spec,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn create_task_from_prepared_bundle(
+        &self,
+        _container_id: &str,
+        _rootfs: crate::runtime::PreparedRootfsMount,
     ) -> anyhow::Result<()> {
         Ok(())
     }

@@ -893,6 +893,18 @@ impl RuntimeServiceImpl {
         }
     }
 
+    pub(super) fn sync_spec_annotations(
+        spec: &mut crate::oci::spec::Spec,
+        annotations: &HashMap<String, String>,
+    ) {
+        let spec_annotations = spec.annotations.get_or_insert_with(HashMap::new);
+        spec_annotations.extend(
+            annotations
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+
     pub(super) fn refresh_nri_event_container_from_spec(
         event: &mut NriContainerEvent,
         spec: &crate::oci::spec::Spec,
@@ -2111,20 +2123,32 @@ impl RuntimeServiceImpl {
                 .map_err(|e| e.to_status())?;
         }
         let create_deadline = self.container_create_deadline_for_handler(runtime_handler);
-        if uses_oci_context {
+        let prepared_rootfs = if uses_oci_context {
             let runtime = self.runtime.clone();
             let requested_container_id = container_id.clone();
             let container_config_clone = container_config.clone();
-            self.run_container_create_phase_until(create_deadline, "prepare_rootfs", async move {
-                tokio::task::spawn_blocking(move || {
-                    runtime.prepare_rootfs(&requested_container_id, &container_config_clone)
-                })
-                .await
-                .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-                .map_err(|e| Status::internal(format!("Failed to prepare container rootfs: {}", e)))
-            })
-            .await?;
-        }
+            Some(
+                self.run_container_create_phase_until(
+                    create_deadline,
+                    "prepare_rootfs",
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            runtime.prepare_rootfs(&requested_container_id, &container_config_clone)
+                        })
+                        .await
+                        .map_err(|e| {
+                            Status::internal(format!("Failed to spawn blocking task: {}", e))
+                        })?
+                        .map_err(|e| {
+                            Status::internal(format!("Failed to prepare container rootfs: {}", e))
+                        })
+                    },
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         let pristine_spec = if uses_oci_context {
             let runtime = self.runtime.clone();
@@ -2356,6 +2380,7 @@ impl RuntimeServiceImpl {
                 checkpoint_restore,
             )?;
         }
+        Self::sync_spec_annotations(&mut adjusted_spec, &stored_annotations);
         Self::refresh_nri_event_container_from_spec(
             &mut nri_event,
             &adjusted_spec,
@@ -2381,6 +2406,32 @@ impl RuntimeServiceImpl {
                 })
                 .await;
             if let Err(status) = write_bundle_result {
+                self.rollback_failed_container_create(&container_id, nri_event.clone())
+                    .await;
+                return Err(status);
+            }
+            let prepared_rootfs =
+                prepared_rootfs.expect("prepared rootfs exists when OCI context is used");
+            let runtime = self.runtime.clone();
+            let requested_container_id = container_id.clone();
+            let create_task_result = self
+                .run_container_create_phase_until(create_deadline, "create_task", async move {
+                    tokio::task::spawn_blocking(move || {
+                        runtime.create_task_from_prepared_bundle(
+                            &requested_container_id,
+                            prepared_rootfs,
+                        )
+                    })
+                    .await
+                    .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))
+                    .and_then(|result| {
+                        result.map_err(|e| {
+                            Status::internal(format!("Failed to create backend task: {}", e))
+                        })
+                    })
+                })
+                .await;
+            if let Err(status) = create_task_result {
                 self.rollback_failed_container_create(&container_id, nri_event.clone())
                     .await;
                 return Err(status);

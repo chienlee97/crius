@@ -74,6 +74,9 @@ pub enum FakeRuntimeCall {
         container_id: String,
         rootfs: PathBuf,
     },
+    CreateTaskFromPreparedBundle {
+        container_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -86,6 +89,7 @@ pub enum FakeRuntimeOperation {
     PrepareRootfs,
     BuildSpec,
     WriteBundle,
+    CreateTaskFromPreparedBundle,
 }
 
 impl FakeRuntimeBackend {
@@ -351,12 +355,28 @@ impl RuntimeContextManager for FakeRuntimeBackend {
         Ok(())
     }
 
-    fn prepare_rootfs(&self, container_id: &str, _config: &ContainerConfig) -> Result<()> {
+    fn prepare_rootfs(
+        &self,
+        container_id: &str,
+        _config: &ContainerConfig,
+    ) -> Result<crius::runtime::PreparedRootfsMount> {
         self.record(FakeRuntimeCall::PrepareRootfs {
             container_id: container_id.to_string(),
         })?;
         self.maybe_fail(FakeRuntimeOperation::PrepareRootfs)?;
-        Ok(())
+        let rootfs = self.runtime_root.join(container_id).join("rootfs");
+        Ok(crius::runtime::PreparedRootfsMount {
+            key: container_id.to_string(),
+            mountpoint: rootfs.clone(),
+            readonly: false,
+            handle: crius::image::snapshotter::RootfsHandle::internal_path(
+                container_id.to_string(),
+                "container",
+                container_id.to_string(),
+                rootfs,
+                false,
+            ),
+        })
     }
 
     fn build_spec(&self, container_id: &str, _config: &ContainerConfig) -> Result<Spec> {
@@ -379,6 +399,18 @@ impl RuntimeContextManager for FakeRuntimeBackend {
         std::fs::write(bundle_dir.join("config.json"), serde_json::to_vec(_spec)?)
             .with_context(|| format!("failed to write fake bundle {}", bundle_dir.display()))?;
         Ok(())
+    }
+
+    fn create_task_from_prepared_bundle(
+        &self,
+        container_id: &str,
+        _rootfs: crius::runtime::PreparedRootfsMount,
+    ) -> Result<()> {
+        self.record(FakeRuntimeCall::CreateTaskFromPreparedBundle {
+            container_id: container_id.to_string(),
+        })?;
+        self.maybe_fail(FakeRuntimeOperation::CreateTaskFromPreparedBundle)?;
+        self.transition(container_id, ContainerStatus::Created)
     }
 
     fn load_spec(&self, _container_id: &str) -> Result<Spec> {
@@ -574,7 +606,11 @@ impl RuntimeContextManager for DirectTaskRuntimeBackend {
         Err(Self::unsupported_context("enforce_oom_score_adj_policy"))
     }
 
-    fn prepare_rootfs(&self, _container_id: &str, _config: &ContainerConfig) -> Result<()> {
+    fn prepare_rootfs(
+        &self,
+        _container_id: &str,
+        _config: &ContainerConfig,
+    ) -> Result<crius::runtime::PreparedRootfsMount> {
         Err(Self::unsupported_context("prepare_rootfs"))
     }
 
@@ -584,6 +620,16 @@ impl RuntimeContextManager for DirectTaskRuntimeBackend {
 
     fn write_bundle(&self, _container_id: &str, _rootfs: &Path, _spec: &Spec) -> Result<()> {
         Err(Self::unsupported_context("write_bundle"))
+    }
+
+    fn create_task_from_prepared_bundle(
+        &self,
+        _container_id: &str,
+        _rootfs: crius::runtime::PreparedRootfsMount,
+    ) -> Result<()> {
+        Err(Self::unsupported_context(
+            "create_task_from_prepared_bundle",
+        ))
     }
 
     fn load_spec(&self, _container_id: &str) -> Result<Spec> {
