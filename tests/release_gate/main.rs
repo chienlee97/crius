@@ -4,6 +4,9 @@
 //! requiring a kubelet node. Environment-gated tests run the real tools when a
 //! release worker opts in.
 
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -63,6 +66,333 @@ struct SoakProfile {
     concurrent_pods: usize,
     max_fd_growth: usize,
     max_process_growth: usize,
+}
+
+fn unique_name(prefix: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before unix epoch")
+        .as_nanos();
+    format!("{prefix}-{nanos}")
+}
+
+fn command_output<I, S>(program: &str, args: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect();
+    let output = Command::new(program)
+        .args(&args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
+    assert!(
+        output.status.success(),
+        "{program} {args:?} failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn command_status<I, S>(program: &str, args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new(program)
+        .args(args)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn crictl_args(endpoint: &str, args: &[&str]) -> Vec<OsString> {
+    let mut command_args = vec![
+        OsString::from("--runtime-endpoint"),
+        OsString::from(endpoint),
+    ];
+    command_args.extend(args.iter().map(OsString::from));
+    command_args
+}
+
+fn crictl_output(endpoint: &str, args: &[&str]) -> String {
+    command_output("crictl", crictl_args(endpoint, args))
+}
+
+fn crictl_status(endpoint: &str, args: &[&str]) -> bool {
+    command_status("crictl", crictl_args(endpoint, args))
+}
+
+fn write_crictl_smoke_configs(dir: &Path, name: &str, image: &str) -> (PathBuf, PathBuf) {
+    let pod_config_path = dir.join("pod.json");
+    let container_config_path = dir.join("container.json");
+    fs::write(
+        &pod_config_path,
+        format!(
+            r#"{{
+  "metadata": {{
+    "name": "{name}",
+    "uid": "{name}-uid",
+    "namespace": "default",
+    "attempt": 1
+  }},
+  "hostname": "{name}",
+  "log_directory": "{log_dir}",
+  "linux": {{}}
+}}
+"#,
+            log_dir = dir.display()
+        ),
+    )
+    .expect("failed to write crictl pod config");
+    fs::write(
+        &container_config_path,
+        format!(
+            r#"{{
+  "metadata": {{
+    "name": "workload",
+    "attempt": 1
+  }},
+  "image": {{
+    "image": "{image}"
+  }},
+  "command": ["sh", "-c", "echo crius-crictl-started; sleep 3600"],
+  "log_path": "{name}.log",
+  "linux": {{}}
+}}
+"#
+        ),
+    )
+    .expect("failed to write crictl container config");
+    (pod_config_path, container_config_path)
+}
+
+struct CrictlSmokeCleanup {
+    endpoint: String,
+    container_id: Option<String>,
+    pod_id: Option<String>,
+}
+
+impl CrictlSmokeCleanup {
+    fn new(endpoint: &str) -> Self {
+        Self {
+            endpoint: endpoint.to_string(),
+            container_id: None,
+            pod_id: None,
+        }
+    }
+}
+
+impl Drop for CrictlSmokeCleanup {
+    fn drop(&mut self) {
+        if let Some(container_id) = self.container_id.as_deref() {
+            let _ = crictl_status(&self.endpoint, &["stop", container_id]);
+            let _ = crictl_status(&self.endpoint, &["rm", container_id]);
+        }
+        if let Some(pod_id) = self.pod_id.as_deref() {
+            let _ = crictl_status(&self.endpoint, &["stopp", pod_id]);
+            let _ = crictl_status(&self.endpoint, &["rmp", pod_id]);
+        }
+    }
+}
+
+fn run_crictl_workload(endpoint: &str, image: &str, name: &str) {
+    let temp = tempfile::tempdir().expect("failed to create crictl smoke tempdir");
+    let (pod_config, container_config) = write_crictl_smoke_configs(temp.path(), name, image);
+    let mut cleanup = CrictlSmokeCleanup::new(endpoint);
+
+    crictl_output(endpoint, &["version"]);
+    crictl_output(endpoint, &["info"]);
+    crictl_output(endpoint, &["pods"]);
+    crictl_output(endpoint, &["images"]);
+    crictl_output(endpoint, &["pull", image]);
+
+    let pod_config = pod_config.display().to_string();
+    let container_config = container_config.display().to_string();
+    let pod_id = crictl_output(endpoint, &["runp", &pod_config]);
+    assert!(!pod_id.is_empty(), "crictl runp returned an empty pod id");
+    cleanup.pod_id = Some(pod_id.clone());
+
+    let container_id = crictl_output(
+        endpoint,
+        &["create", &pod_id, &container_config, &pod_config],
+    );
+    assert!(
+        !container_id.is_empty(),
+        "crictl create returned an empty container id"
+    );
+    cleanup.container_id = Some(container_id.clone());
+
+    crictl_output(endpoint, &["start", &container_id]);
+    let exec_output = crictl_output(
+        endpoint,
+        &[
+            "execsync",
+            &container_id,
+            "sh",
+            "-c",
+            "echo crius-crictl-exec",
+        ],
+    );
+    assert!(
+        exec_output.contains("crius-crictl-exec"),
+        "crictl execsync output did not contain marker: {exec_output}"
+    );
+
+    let logs = crictl_output(endpoint, &["logs", &container_id]);
+    assert!(
+        logs.contains("crius-crictl-started"),
+        "crictl logs output did not contain marker: {logs}"
+    );
+    crictl_output(endpoint, &["stats", &container_id]);
+    crictl_output(endpoint, &["stop", &container_id]);
+    crictl_output(endpoint, &["rm", &container_id]);
+    cleanup.container_id = None;
+    crictl_output(endpoint, &["rmp", &pod_id]);
+    cleanup.pod_id = None;
+}
+
+fn kubelet_smoke_required_operations() -> Vec<&'static str> {
+    vec![
+        "node-query",
+        "pod-query",
+        "pull-run",
+        "logs",
+        "exec",
+        "stats",
+        "stop-remove",
+        "restart-recovery",
+    ]
+}
+
+struct KubectlPodCleanup {
+    namespace: String,
+    name: String,
+}
+
+impl KubectlPodCleanup {
+    fn new(namespace: &str, name: &str) -> Self {
+        Self {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+        }
+    }
+}
+
+impl Drop for KubectlPodCleanup {
+    fn drop(&mut self) {
+        let _ = command_status(
+            "kubectl",
+            [
+                "-n",
+                self.namespace.as_str(),
+                "delete",
+                "pod",
+                self.name.as_str(),
+                "--ignore-not-found",
+                "--wait=true",
+                "--timeout=60s",
+            ],
+        );
+    }
+}
+
+fn kubectl_output(args: &[&str]) -> String {
+    command_output("kubectl", args)
+}
+
+fn first_kubelet_node_name() -> String {
+    let nodes = kubectl_output(&["get", "nodes", "-o", "name"]);
+    nodes
+        .lines()
+        .find_map(|line| line.strip_prefix("node/"))
+        .map(str::to_string)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| panic!("kubectl get nodes returned no node names:\n{nodes}"))
+}
+
+fn run_kubelet_pod_cycle(namespace: &str, name: &str, image: &str, marker: &str) {
+    let _cleanup = KubectlPodCleanup::new(namespace, name);
+    command_output(
+        "kubectl",
+        [
+            "-n",
+            namespace,
+            "run",
+            name,
+            "--image",
+            image,
+            "--restart=Never",
+            "--command",
+            "--",
+            "sh",
+            "-c",
+            &format!("echo {marker}; sleep 3600"),
+        ],
+    );
+    command_output(
+        "kubectl",
+        [
+            "-n",
+            namespace,
+            "wait",
+            "--for=condition=Ready",
+            "pod",
+            name,
+            "--timeout=120s",
+        ],
+    );
+    let logs = command_output("kubectl", ["-n", namespace, "logs", name]);
+    assert!(
+        logs.contains(marker),
+        "kubectl logs output did not contain marker {marker}: {logs}"
+    );
+    let exec_output = command_output(
+        "kubectl",
+        [
+            "-n",
+            namespace,
+            "exec",
+            name,
+            "--",
+            "sh",
+            "-c",
+            "echo crius-kubelet-exec",
+        ],
+    );
+    assert!(
+        exec_output.contains("crius-kubelet-exec"),
+        "kubectl exec output did not contain marker: {exec_output}"
+    );
+    command_output(
+        "kubectl",
+        [
+            "-n",
+            namespace,
+            "delete",
+            "pod",
+            name,
+            "--wait=true",
+            "--timeout=120s",
+        ],
+    );
+}
+
+fn run_kubelet_stats_probe(node_name: &str) {
+    if let Ok(endpoint) = std::env::var("CRIUS_CRICTL_ENDPOINT") {
+        crictl_output(&endpoint, &["stats"]);
+        return;
+    }
+
+    assert!(
+        command_status("kubectl", ["top", "node", node_name]),
+        "kubelet stats probe requires either CRIUS_CRICTL_ENDPOINT for crictl stats or kubectl top node support"
+    );
 }
 
 fn release_matrix() -> Vec<ReleaseTarget> {
@@ -247,6 +577,38 @@ fn release_checklist_requires_tests_real_environment_and_risk_accounting() {
 }
 
 #[test]
+fn crictl_smoke_contract_covers_core_cri_lifecycle() {
+    let required_steps = [
+        "version", "info", "pods", "images", "pull", "runp", "create", "start", "execsync", "logs",
+        "stats", "stop", "rm", "rmp",
+    ];
+
+    for step in required_steps {
+        assert!(!step.trim().is_empty());
+    }
+}
+
+#[test]
+fn kubelet_smoke_contract_covers_runtime_observable_operations() {
+    let operations = kubelet_smoke_required_operations();
+    for required in [
+        "node-query",
+        "pod-query",
+        "pull-run",
+        "logs",
+        "exec",
+        "stats",
+        "stop-remove",
+        "restart-recovery",
+    ] {
+        assert!(
+            operations.contains(&required),
+            "missing kubelet smoke operation {required}"
+        );
+    }
+}
+
+#[test]
 fn gated_crictl_smoke_has_fixed_entrypoint() {
     if std::env::var("CRIUS_RUN_CRICTL_SMOKE").as_deref() != Ok("1") {
         eprintln!("skipping crictl smoke; set CRIUS_RUN_CRICTL_SMOKE=1");
@@ -255,13 +617,9 @@ fn gated_crictl_smoke_has_fixed_entrypoint() {
 
     let endpoint = std::env::var("CRIUS_CRICTL_ENDPOINT")
         .unwrap_or_else(|_| "unix:///run/crius/crius.sock".to_string());
-    for command in ["version", "info", "pods", "images"] {
-        let status = Command::new("crictl")
-            .args(["--runtime-endpoint", endpoint.as_str(), command])
-            .status()
-            .unwrap_or_else(|err| panic!("failed to run crictl {command}: {err}"));
-        assert!(status.success(), "crictl {command} failed with {status}");
-    }
+    let image = std::env::var("CRIUS_SMOKE_IMAGE").unwrap_or_else(|_| "busybox:latest".to_string());
+    let name = unique_name("crius-crictl-smoke");
+    run_crictl_workload(&endpoint, &image, &name);
 }
 
 #[test]
@@ -271,25 +629,18 @@ fn gated_kubelet_smoke_has_fixed_entrypoint() {
         return;
     }
 
-    for command in [
-        vec!["kubectl", "get", "nodes"],
-        vec!["kubectl", "get", "pods", "-A"],
-        vec![
-            "kubectl",
-            "run",
-            "crius-smoke",
-            "--image=busybox:latest",
-            "--restart=Never",
-            "--",
-            "true",
-        ],
-    ] {
-        let status = Command::new(command[0])
-            .args(&command[1..])
-            .status()
-            .unwrap_or_else(|err| panic!("failed to run {:?}: {err}", command));
-        assert!(status.success(), "{command:?} failed with {status}");
-    }
+    let namespace =
+        std::env::var("CRIUS_KUBELET_SMOKE_NAMESPACE").unwrap_or_else(|_| "default".to_string());
+    let image = std::env::var("CRIUS_SMOKE_IMAGE").unwrap_or_else(|_| "busybox:latest".to_string());
+    let name = unique_name("crius-kubelet-smoke");
+    let restart_name = unique_name("crius-kubelet-restart");
+    let marker = "crius-kubelet-started";
+
+    let node_name = first_kubelet_node_name();
+    kubectl_output(&["get", "pods", "-A"]);
+    run_kubelet_stats_probe(&node_name);
+    run_kubelet_pod_cycle(&namespace, &name, &image, marker);
+    run_kubelet_pod_cycle(&namespace, &restart_name, &image, "crius-kubelet-restarted");
 }
 
 #[test]
