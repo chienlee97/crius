@@ -3670,18 +3670,7 @@ impl ContainerRuntime for RuncRuntime {
 
         // 延迟到start阶段再调用runc，避免create阶段阻塞导致CRI超时。
         info!("Container {} bundle prepared successfully", container_id);
-        if let Some(ref shim_manager) = self.shim_manager {
-            let bundle_path = self.bundle_path(container_id);
-            let rootfs_path = rootfs_mount.rootfs_path()?.to_path_buf();
-            shim_manager.create_task(
-                container_id,
-                &bundle_path,
-                &rootfs_path,
-                Some(&rootfs_mount.key),
-                rootfs_mount.mount_options(),
-                rootfs_mount.handle.clone(),
-            )?;
-        }
+        self.create_task_from_prepared_bundle(container_id, rootfs_mount)?;
         Ok(container_id.to_string())
     }
 
