@@ -3990,7 +3990,6 @@ impl ContainerRuntime for RuncRuntime {
         if tty {
             cmd.arg("-t");
         }
-        cmd.arg("-i"); // 始终启用stdin交互
 
         // 添加容器ID
         cmd.arg(container_id);

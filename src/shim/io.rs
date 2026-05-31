@@ -95,7 +95,7 @@ pub struct JournalConfig {
 /// IO管理器
 #[derive(Clone)]
 pub struct IoManager {
-    config: IoConfig,
+    config: Arc<Mutex<IoConfig>>,
     /// 当前attach的客户端
     clients: Arc<Mutex<Vec<ClientConnection>>>,
     /// 日志文件
@@ -131,7 +131,8 @@ struct ServerThread {
 
 impl IoManager {
     fn should_record_logs(&self) -> bool {
-        self.config.stdout.is_some() || self.config.journald.is_some()
+        let config = self.config.lock().unwrap();
+        config.stdout.is_some() || config.journald.is_some()
     }
 
     fn parse_cri_log_record(record: &[u8]) -> Option<(&str, &str, &[u8])> {
@@ -169,7 +170,8 @@ impl IoManager {
     }
 
     fn send_journald_records(&self, records: &[Vec<u8>]) {
-        let Some(journal) = self.config.journald.as_ref() else {
+        let journal = self.config.lock().unwrap().journald.clone();
+        let Some(journal) = journal.as_ref() else {
             return;
         };
         if records.is_empty() {
@@ -246,7 +248,7 @@ impl IoManager {
     }
 
     fn max_log_line_size(&self) -> usize {
-        self.config.max_log_line_size.max(1)
+        self.config.lock().unwrap().max_log_line_size.max(1)
     }
 
     fn apply_io_ownership(path: &PathBuf, io_uid: u32, io_gid: u32) -> Result<()> {
@@ -382,7 +384,7 @@ impl IoManager {
     }
 
     fn maybe_sync_log_file(&self, file: &File) -> Result<bool> {
-        if self.config.no_sync_log {
+        if self.config.lock().unwrap().no_sync_log {
             return Ok(false);
         }
         file.sync_all().context("Failed to sync log file to disk")?;
@@ -444,7 +446,7 @@ impl IoManager {
     /// 创建新的IO管理器
     pub fn new() -> Self {
         Self {
-            config: IoConfig::default(),
+            config: Arc::new(Mutex::new(IoConfig::default())),
             clients: Arc::new(Mutex::new(Vec::new())),
             log_file: Arc::new(Mutex::new(None)),
             pending_logs: Arc::new(Mutex::new(PendingLogBytes::default())),
@@ -455,7 +457,7 @@ impl IoManager {
 
     /// 配置IO
     pub fn configure(&mut self, config: IoConfig) -> Result<()> {
-        self.config = config.clone();
+        *self.config.lock().unwrap() = config.clone();
 
         // 设置日志文件
         if let Some(stdout) = &config.stdout {
@@ -464,8 +466,8 @@ impl IoManager {
             let mut log_file = self.log_file.lock().unwrap();
             *log_file = Some(Self::open_output_file(
                 stdout,
-                self.config.io_uid,
-                self.config.io_gid,
+                config.io_uid,
+                config.io_gid,
             )?);
             info!("Log file configured: {:?}", stdout);
         }
@@ -475,7 +477,8 @@ impl IoManager {
 
     /// 启动attach服务器
     pub fn start_attach_server(&mut self) -> Result<()> {
-        if let Some(socket) = &self.config.attach_socket {
+        let config = self.config.lock().unwrap().clone();
+        if let Some(socket) = &config.attach_socket {
             if let Some(parent) = socket.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -483,7 +486,7 @@ impl IoManager {
             Self::cleanup_socket_path(socket);
 
             let listener = UnixListener::bind(socket)?;
-            Self::apply_io_ownership(socket, self.config.io_uid, self.config.io_gid)?;
+            Self::apply_io_ownership(socket, config.io_uid, config.io_gid)?;
             listener.set_nonblocking(true)?;
             info!("Attach server listening on {:?}", socket);
 
@@ -519,14 +522,15 @@ impl IoManager {
 
     /// 启动resize服务器
     pub fn start_resize_server(&self) -> Result<()> {
-        if let Some(socket) = &self.config.resize_socket {
+        let config = self.config.lock().unwrap().clone();
+        if let Some(socket) = &config.resize_socket {
             if let Some(parent) = socket.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             Self::cleanup_socket_path(socket);
 
             let listener = UnixListener::bind(socket)?;
-            Self::apply_io_ownership(socket, self.config.io_uid, self.config.io_gid)?;
+            Self::apply_io_ownership(socket, config.io_uid, config.io_gid)?;
             listener.set_nonblocking(true)?;
             info!("Resize server listening on {:?}", socket);
             let io_manager = self.clone();
@@ -593,14 +597,15 @@ impl IoManager {
 
     /// 启动日志重开服务器
     pub fn start_reopen_log_server(&self) -> Result<()> {
-        if let Some(socket) = &self.config.reopen_socket {
+        let config = self.config.lock().unwrap().clone();
+        if let Some(socket) = &config.reopen_socket {
             if let Some(parent) = socket.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             Self::cleanup_socket_path(socket);
 
             let listener = UnixListener::bind(socket)?;
-            Self::apply_io_ownership(socket, self.config.io_uid, self.config.io_gid)?;
+            Self::apply_io_ownership(socket, config.io_uid, config.io_gid)?;
             listener.set_nonblocking(true)?;
             info!("Log reopen server listening on {:?}", socket);
             let io_manager = self.clone();
@@ -680,13 +685,14 @@ impl IoManager {
     }
 
     pub fn reopen_log_file(&self) -> Result<()> {
-        let Some(stdout) = self.config.stdout.as_ref() else {
+        let config = self.config.lock().unwrap().clone();
+        let Some(stdout) = config.stdout.as_ref() else {
             return Ok(());
         };
         let parent = stdout.parent().context("Invalid stdout path")?;
         std::fs::create_dir_all(parent)?;
 
-        let reopened = Self::open_output_file(stdout, self.config.io_uid, self.config.io_gid)?;
+        let reopened = Self::open_output_file(stdout, config.io_uid, config.io_gid)?;
         let mut log_file = self.log_file.lock().unwrap();
         if let Some(file) = log_file.as_mut() {
             file.flush()?;
@@ -812,9 +818,10 @@ impl IoManager {
 
     /// 设置容器IO重定向（用于runc）
     pub fn setup_stdio_pipes(&self) -> Result<(Option<File>, Option<File>, Option<File>)> {
+        let config = self.config.lock().unwrap().clone();
         // 创建管道用于与容器通信
         // stdin
-        let stdin = if let Some(stdin) = &self.config.stdin {
+        let stdin = if let Some(stdin) = &config.stdin {
             let file = File::open(stdin)?;
             Some(file)
         } else {
@@ -822,20 +829,20 @@ impl IoManager {
         };
 
         // stdout - 直接写入日志文件
-        let stdout = if let Some(stdout) = &self.config.stdout {
+        let stdout = if let Some(stdout) = &config.stdout {
             let parent = stdout.parent().context("Invalid stdout path")?;
             std::fs::create_dir_all(parent)?;
-            let file = Self::open_output_file(stdout, self.config.io_uid, self.config.io_gid)?;
+            let file = Self::open_output_file(stdout, config.io_uid, config.io_gid)?;
             Some(file)
         } else {
             None
         };
 
         // stderr
-        let stderr = if let Some(stderr) = &self.config.stderr {
+        let stderr = if let Some(stderr) = &config.stderr {
             let parent = stderr.parent().context("Invalid stderr path")?;
             std::fs::create_dir_all(parent)?;
-            let file = Self::open_output_file(stderr, self.config.io_uid, self.config.io_gid)?;
+            let file = Self::open_output_file(stderr, config.io_uid, config.io_gid)?;
             Some(file)
         } else {
             None
@@ -909,7 +916,7 @@ mod tests {
     #[test]
     fn test_io_manager_creation() {
         let manager = IoManager::new();
-        assert!(!manager.config.terminal);
+        assert!(!manager.config.lock().unwrap().terminal);
     }
 
     #[test]

@@ -171,9 +171,6 @@ impl ProcessManager {
         if tty {
             cmd.arg("-t");
         }
-        if stdin {
-            cmd.arg("-i");
-        }
 
         // 添加容器ID
         cmd.arg(&self.container_id);

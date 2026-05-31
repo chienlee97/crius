@@ -25,7 +25,7 @@ use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -788,7 +788,7 @@ impl Daemon {
         io_manager: &IoManager,
     ) -> Result<()> {
         let mut command = self.runtime_command();
-        command.arg("exec").arg("-i").arg(&request.container_id);
+        command.arg("exec").arg(&request.container_id);
         for arg in &request.command {
             command.arg(arg);
         }
@@ -1119,6 +1119,66 @@ impl Daemon {
         Err(anyhow::anyhow!("No console fd received from runc"))
     }
 
+    fn create_io_pipe() -> Result<(File, File)> {
+        let mut fds = [0; 2];
+        let result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        if result < 0 {
+            return Err(anyhow::anyhow!(
+                "failed to create container IO pipe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let read = unsafe { File::from_raw_fd(fds[0]) };
+        let write = unsafe { File::from_raw_fd(fds[1]) };
+        Ok((read, write))
+    }
+
+    fn spawn_pipe_pump(
+        mut pipe: File,
+        io_manager: IoManager,
+        stream: &'static str,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 8192];
+            loop {
+                match std::io::Read::read(&mut pipe, &mut buffer) {
+                    Ok(0) => {
+                        Self::finish_pipe_stream(&io_manager, stream);
+                        break;
+                    }
+                    Ok(n) => {
+                        let result = match stream {
+                            "stdout" => io_manager.write_stdout(&buffer[..n]),
+                            "stderr" => io_manager.write_stderr(&buffer[..n]),
+                            _ => unreachable!("unsupported pipe stream {}", stream),
+                        };
+                        if let Err(e) = result {
+                            debug!("{} pump stopped: {}", stream, e);
+                            Self::finish_pipe_stream(&io_manager, stream);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!("{} pump stopped: {}", stream, e);
+                        Self::finish_pipe_stream(&io_manager, stream);
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    fn finish_pipe_stream(io_manager: &IoManager, stream: &str) {
+        let result = match stream {
+            "stdout" => io_manager.finish_stdout(),
+            "stderr" => io_manager.finish_stderr(),
+            _ => unreachable!("unsupported pipe stream {}", stream),
+        };
+        if let Err(e) = result {
+            debug!("failed to finish {} stream: {}", stream, e);
+        }
+    }
+
     /// 设置IO
     fn setup_io(&mut self) -> Result<()> {
         let bundle_config = self.load_bundle_config()?;
@@ -1364,6 +1424,8 @@ impl Daemon {
             .load_container_state(&bundle_config)
             .unwrap_or_default();
 
+        let (stdout_read, stdout_write) = Self::create_io_pipe()?;
+        let (stderr_read, stderr_write) = Self::create_io_pipe()?;
         let mut cmd = self.runtime_command();
         cmd.arg("run").arg("--bundle").arg(&self.bundle);
         if self.no_pivot {
@@ -1379,74 +1441,26 @@ impl Daemon {
         } else {
             cmd.stdin(std::process::Stdio::null());
         }
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
+        cmd.stdout(Stdio::from(stdout_write));
+        cmd.stderr(Stdio::from(stderr_write));
 
         let mut child = cmd.spawn().context("Failed to execute runc run")?;
+        drop(cmd);
         info!(
             "Container {} started via foreground runc run (stdin={}, stdin_once={})",
             self.container_id, container_state.stdin, container_state.stdin_once
         );
 
-        let stdout_handle = if let Some(stdout) = child.stdout.take() {
-            let io_manager = self.io_manager.clone();
-            Some(std::thread::spawn(move || {
-                let mut stdout = stdout;
-                let mut buffer = [0u8; 8192];
-                loop {
-                    match std::io::Read::read(&mut stdout, &mut buffer) {
-                        Ok(0) => {
-                            let _ = io_manager.finish_stdout();
-                            break;
-                        }
-                        Ok(n) => {
-                            if let Err(e) = io_manager.write_stdout(&buffer[..n]) {
-                                debug!("stdout pump stopped: {}", e);
-                                let _ = io_manager.finish_stdout();
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            debug!("stdout pump stopped: {}", e);
-                            let _ = io_manager.finish_stdout();
-                            break;
-                        }
-                    }
-                }
-            }))
-        } else {
-            None
-        };
-
-        let stderr_handle = if let Some(stderr) = child.stderr.take() {
-            let io_manager = self.io_manager.clone();
-            Some(std::thread::spawn(move || {
-                let mut stderr = stderr;
-                let mut buffer = [0u8; 8192];
-                loop {
-                    match std::io::Read::read(&mut stderr, &mut buffer) {
-                        Ok(0) => {
-                            let _ = io_manager.finish_stderr();
-                            break;
-                        }
-                        Ok(n) => {
-                            if let Err(e) = io_manager.write_stderr(&buffer[..n]) {
-                                debug!("stderr pump stopped: {}", e);
-                                let _ = io_manager.finish_stderr();
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            debug!("stderr pump stopped: {}", e);
-                            let _ = io_manager.finish_stderr();
-                            break;
-                        }
-                    }
-                }
-            }))
-        } else {
-            None
-        };
+        let stdout_handle = Some(Self::spawn_pipe_pump(
+            stdout_read,
+            self.io_manager.clone(),
+            "stdout",
+        ));
+        let stderr_handle = Some(Self::spawn_pipe_pump(
+            stderr_read,
+            self.io_manager.clone(),
+            "stderr",
+        ));
 
         if let Some(mut stdin) = child.stdin.take() {
             let io_manager = self.io_manager.clone();
@@ -1685,7 +1699,6 @@ impl Daemon {
         if request.tty {
             cmd.arg("-t");
         }
-        cmd.arg("-i");
         cmd.arg(&request.container_id);
         for arg in &request.command {
             cmd.arg(arg);
