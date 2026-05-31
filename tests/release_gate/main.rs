@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use serde_json::Value;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RootMode {
     Rootful,
@@ -68,6 +70,19 @@ struct SoakProfile {
     concurrent_pods: usize,
     max_fd_growth: usize,
     max_process_growth: usize,
+    min_iterations: usize,
+    required_operations: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SoakReportSummary {
+    profile: String,
+    duration_seconds: u64,
+    iterations: u64,
+    failures: u64,
+    fd_growth: u64,
+    process_growth: u64,
+    operations: Vec<String>,
 }
 
 fn unique_name(prefix: &str) -> String {
@@ -426,6 +441,115 @@ fn run_fault_injection_driver(cases: &[FaultInjectionCase]) {
     }
 }
 
+fn parse_soak_report(raw: &str) -> SoakReportSummary {
+    let report: Value =
+        serde_json::from_str(raw).unwrap_or_else(|err| panic!("invalid soak report JSON: {err}"));
+    let operations = report
+        .get("operations")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("soak report missing operations array: {report}"))
+        .iter()
+        .map(|operation| {
+            operation
+                .as_str()
+                .unwrap_or_else(|| panic!("soak report operation must be a string: {operation}"))
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+
+    SoakReportSummary {
+        profile: report
+            .get("profile")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("soak report missing profile: {report}"))
+            .to_string(),
+        duration_seconds: report
+            .get("duration_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("soak report missing duration_seconds: {report}")),
+        iterations: report
+            .get("iterations")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("soak report missing iterations: {report}")),
+        failures: report
+            .get("failures")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("soak report missing failures: {report}")),
+        fd_growth: report
+            .get("fd_growth")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("soak report missing fd_growth: {report}")),
+        process_growth: report
+            .get("process_growth")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("soak report missing process_growth: {report}")),
+        operations,
+    }
+}
+
+fn validate_soak_report(profile: &SoakProfile, report: &SoakReportSummary) {
+    assert_eq!(report.profile, profile.name);
+    assert!(
+        report.duration_seconds >= profile.min_duration.as_secs(),
+        "soak duration {}s is below required {}s",
+        report.duration_seconds,
+        profile.min_duration.as_secs()
+    );
+    assert!(
+        report.iterations >= profile.min_iterations as u64,
+        "soak iterations {} are below required {}",
+        report.iterations,
+        profile.min_iterations
+    );
+    assert_eq!(report.failures, 0, "soak report contains failures");
+    assert!(
+        report.fd_growth <= profile.max_fd_growth as u64,
+        "fd growth {} exceeds {}",
+        report.fd_growth,
+        profile.max_fd_growth
+    );
+    assert!(
+        report.process_growth <= profile.max_process_growth as u64,
+        "process growth {} exceeds {}",
+        report.process_growth,
+        profile.max_process_growth
+    );
+    for required in profile.required_operations {
+        assert!(
+            report
+                .operations
+                .iter()
+                .any(|operation| operation == required),
+            "soak report missing operation {required}"
+        );
+    }
+}
+
+fn run_release_soak_driver(profile: &SoakProfile) -> SoakReportSummary {
+    let driver =
+        std::env::var("CRIUS_RELEASE_SOAK_DRIVER").unwrap_or_else(|_| "crius-release-soak".into());
+    let endpoint = std::env::var("CRIUS_CRICTL_ENDPOINT")
+        .unwrap_or_else(|_| "unix:///run/crius/crius.sock".to_string());
+    let image = std::env::var("CRIUS_SMOKE_IMAGE").unwrap_or_else(|_| "busybox:latest".to_string());
+    let raw = command_output(
+        &driver,
+        [
+            "--runtime-endpoint",
+            endpoint.as_str(),
+            "--image",
+            image.as_str(),
+            "--profile",
+            profile.name,
+            "--duration-seconds",
+            &profile.min_duration.as_secs().to_string(),
+            "--concurrent-pods",
+            &profile.concurrent_pods.to_string(),
+            "--json",
+        ],
+    );
+    parse_soak_report(&raw)
+}
+
 fn release_matrix() -> Vec<ReleaseTarget> {
     vec![
         ReleaseTarget {
@@ -531,6 +655,18 @@ fn soak_profiles() -> Vec<SoakProfile> {
             concurrent_pods: 10,
             max_fd_growth: 16,
             max_process_growth: 2,
+            min_iterations: 100,
+            required_operations: &[
+                "pull",
+                "create",
+                "start",
+                "exec",
+                "logs",
+                "stats",
+                "stop",
+                "remove",
+                "restart-recovery",
+            ],
         },
         SoakProfile {
             name: "overnight",
@@ -538,6 +674,18 @@ fn soak_profiles() -> Vec<SoakProfile> {
             concurrent_pods: 25,
             max_fd_growth: 32,
             max_process_growth: 4,
+            min_iterations: 1000,
+            required_operations: &[
+                "pull",
+                "create",
+                "start",
+                "exec",
+                "logs",
+                "stats",
+                "stop",
+                "remove",
+                "restart-recovery",
+            ],
         },
     ]
 }
@@ -639,6 +787,53 @@ fn long_running_soak_profiles_have_resource_leak_thresholds() {
     assert!(profiles
         .iter()
         .all(|profile| profile.max_process_growth > 0));
+    assert!(profiles.iter().all(|profile| profile.min_iterations > 0));
+    assert!(profiles
+        .iter()
+        .all(|profile| profile.required_operations.contains(&"restart-recovery")));
+}
+
+#[test]
+fn release_soak_report_parser_validates_resource_and_operation_thresholds() {
+    let profile = soak_profiles()
+        .into_iter()
+        .find(|candidate| candidate.name == "short-release")
+        .unwrap();
+    let report = parse_soak_report(
+        r#"{
+  "profile": "short-release",
+  "duration_seconds": 1800,
+  "iterations": 100,
+  "failures": 0,
+  "fd_growth": 4,
+  "process_growth": 1,
+  "operations": ["pull", "create", "start", "exec", "logs", "stats", "stop", "remove", "restart-recovery"]
+}"#,
+    );
+
+    validate_soak_report(&profile, &report);
+}
+
+#[test]
+#[should_panic(expected = "soak report missing operation restart-recovery")]
+fn release_soak_report_rejects_missing_restart_recovery() {
+    let profile = soak_profiles()
+        .into_iter()
+        .find(|candidate| candidate.name == "short-release")
+        .unwrap();
+    let report = parse_soak_report(
+        r#"{
+  "profile": "short-release",
+  "duration_seconds": 1800,
+  "iterations": 100,
+  "failures": 0,
+  "fd_growth": 4,
+  "process_growth": 1,
+  "operations": ["pull", "create", "start", "exec", "logs", "stats", "stop", "remove"]
+}"#,
+    );
+
+    validate_soak_report(&profile, &report);
 }
 
 #[test]
@@ -744,4 +939,6 @@ fn gated_release_soak_has_fixed_entrypoint() {
         selected.min_duration >= Duration::from_secs(30 * 60),
         "release soak profile is too short"
     );
+    let report = run_release_soak_driver(&selected);
+    validate_soak_report(&selected, &report);
 }
