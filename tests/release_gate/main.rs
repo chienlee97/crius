@@ -57,6 +57,8 @@ struct FaultInjectionCase {
     name: &'static str,
     failure: &'static str,
     expected_state: &'static str,
+    isolated_test: &'static str,
+    real_driver_arg: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +397,35 @@ fn run_kubelet_stats_probe(node_name: &str) {
     );
 }
 
+fn release_gate_test_command(test_name: &str) -> String {
+    format!("cargo test {test_name} --test release_gate")
+}
+
+fn integration_test_command(test_name: &str, test_binary: &str) -> String {
+    format!("cargo test {test_name} --test {test_binary}")
+}
+
+fn run_fault_injection_driver(cases: &[FaultInjectionCase]) {
+    let driver = std::env::var("CRIUS_FAULT_INJECTION_DRIVER")
+        .unwrap_or_else(|_| "crius-fault-injection".to_string());
+    let endpoint = std::env::var("CRIUS_CRICTL_ENDPOINT")
+        .unwrap_or_else(|_| "unix:///run/crius/crius.sock".to_string());
+    let image = std::env::var("CRIUS_SMOKE_IMAGE").unwrap_or_else(|_| "busybox:latest".to_string());
+
+    for case in cases {
+        command_output(
+            &driver,
+            [
+                "--runtime-endpoint",
+                endpoint.as_str(),
+                "--image",
+                image.as_str(),
+                case.real_driver_arg,
+            ],
+        );
+    }
+}
+
 fn release_matrix() -> Vec<ReleaseTarget> {
     vec![
         ReleaseTarget {
@@ -451,31 +482,43 @@ fn fault_injection_cases() -> Vec<FaultInjectionCase> {
             name: "shim-crash",
             failure: "kill shim process while container is running",
             expected_state: "reconnected or degraded shim",
+            isolated_test: "cargo test recovery_fixture_models_missing_shim_socket --test recovery",
+            real_driver_arg: "shim-crash",
         },
         FaultInjectionCase {
             name: "daemon-crash",
             failure: "restart crius without clean shutdown marker",
             expected_state: "ledger recovery completed",
+            isolated_test: "cargo test recovery_fixture_builds_healthy_ledger_graph --test recovery",
+            real_driver_arg: "daemon-crash",
         },
         FaultInjectionCase {
             name: "cni-failure",
             failure: "remove selected CNI plugin before pod setup",
             expected_state: "NetworkReady false with reason",
+            isolated_test: "cargo test network_health_suite_uses_health_service_condition --test network",
+            real_driver_arg: "cni-failure",
         },
         FaultInjectionCase {
             name: "content-store-failure",
             failure: "interrupt pull before final image ref",
             expected_state: "interrupted transfer and no usable image ref",
+            isolated_test: "cargo test image_service_marks_interrupted_transfer_on_startup --lib",
+            real_driver_arg: "content-store-failure",
         },
         FaultInjectionCase {
             name: "ledger-corruption",
             failure: "remove owned artifact from ledger graph",
             expected_state: "repair dry-run reports action",
+            isolated_test: "cargo test recovery_fixture_ledger_repair_dry_run_preserves_state_and_apply_marks_broken --test recovery",
+            real_driver_arg: "ledger-corruption",
         },
         FaultInjectionCase {
             name: "runtime-kill",
             failure: "kill runtime task process",
             expected_state: "stopped or broken runtime artifact",
+            isolated_test: "cargo test wasm_direct_backend_marks_self_exited_engine_stopped --test runtime_backend",
+            real_driver_arg: "runtime-kill",
         },
     ]
 }
@@ -540,9 +583,49 @@ fn fault_injection_matrix_covers_recovery_failure_classes() {
             "missing fault injection case {required}"
         );
     }
-    assert!(cases
-        .iter()
-        .all(|case| !case.failure.is_empty() && !case.expected_state.is_empty()));
+    assert!(cases.iter().all(|case| !case.failure.is_empty()
+        && !case.expected_state.is_empty()
+        && !case.isolated_test.is_empty()
+        && !case.real_driver_arg.is_empty()));
+}
+
+#[test]
+fn fault_injection_matrix_has_executable_isolated_tests() {
+    let cases = fault_injection_cases();
+    for case in &cases {
+        assert!(
+            case.isolated_test.starts_with("cargo test "),
+            "fault injection case {} lacks a cargo test command",
+            case.name
+        );
+        assert!(
+            case.isolated_test.contains(" --test ") || case.isolated_test.ends_with(" --lib"),
+            "fault injection case {} must identify its test binary or lib scope",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn fault_injection_command_helpers_render_expected_cargo_invocations() {
+    assert_eq!(
+        release_gate_test_command("fault_injection_matrix_covers_recovery_failure_classes"),
+        "cargo test fault_injection_matrix_covers_recovery_failure_classes --test release_gate"
+    );
+    assert_eq!(
+        integration_test_command("recovery_fixture_models_missing_shim_socket", "recovery"),
+        "cargo test recovery_fixture_models_missing_shim_socket --test recovery"
+    );
+}
+
+#[test]
+fn gated_fault_injection_has_fixed_entrypoint() {
+    if std::env::var("CRIUS_RUN_FAULT_INJECTION").as_deref() != Ok("1") {
+        eprintln!("skipping fault injection; set CRIUS_RUN_FAULT_INJECTION=1");
+        return;
+    }
+
+    run_fault_injection_driver(&fault_injection_cases());
 }
 
 #[test]
