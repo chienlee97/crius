@@ -850,7 +850,8 @@ async fn status_verbose_returns_structured_config() {
     assert_eq!(config["runtimeFeatures"]["containerStats"], true);
     assert_eq!(config["runtimeFeatures"]["podSandboxStats"], true);
     assert_eq!(config["runtimeFeatures"]["podSandboxMetrics"], true);
-    assert_eq!(config["runtimeFeatures"]["podLifecycleEvents"], false);
+    assert_eq!(config["runtimeFeatures"]["containerEvents"], true);
+    assert_eq!(config["runtimeFeatures"]["podLifecycleEvents"], true);
     assert_eq!(config["runtimeFeatures"]["checkpointContainer"], true);
     assert_eq!(
         response.status.unwrap().conditions.len(),

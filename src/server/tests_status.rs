@@ -8,6 +8,8 @@ fn status_feature_flags_cover_core_cri_workflows() {
     assert_eq!(flags["exec"], true);
     assert_eq!(flags["execSync"], true);
     assert_eq!(flags["attach"], true);
+    assert_eq!(flags["containerEvents"], true);
+    assert_eq!(flags["podLifecycleEvents"], true);
     assert_eq!(flags["updateContainerResources"], true);
 }
 

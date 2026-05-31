@@ -87,7 +87,7 @@ async fn inspect_and_info_endpoints_return_consistent_snapshots() {
 
     let config: serde_json::Value =
         serde_json::from_str(status.info.get("config").unwrap()).unwrap();
-    assert_eq!(config["runtimeFeatures"]["containerEvents"], false);
+    assert_eq!(config["runtimeFeatures"]["containerEvents"], true);
     assert_eq!(container.status.as_ref().unwrap().reason, "Running");
     assert_eq!(container.status.as_ref().unwrap().mounts.len(), 1);
     assert!(container.info.contains_key("info"));
@@ -1157,4 +1157,3 @@ async fn exit_monitor_publishes_async_stop_events() {
     .unwrap();
     assert!(persisted_state.nri_stop_notified);
 }
-
