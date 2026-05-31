@@ -726,12 +726,16 @@ impl ShimManager {
     }
 
     pub fn wait_task(&self, container_id: &str, timeout: Option<Duration>) -> Result<Option<i32>> {
-        match self
-            .rpc_client(container_id)
-            .request(ShimRpcRequest::WaitProcess(WaitProcessRequest {
+        let rpc_timeout = timeout
+            .and_then(|value| value.checked_add(Duration::from_secs(1)))
+            .filter(|value| *value > SHIM_RPC_TIMEOUT)
+            .unwrap_or(SHIM_RPC_TIMEOUT);
+        match ShimRpcClient::new(self.task_socket_path(container_id), rpc_timeout).request(
+            ShimRpcRequest::WaitProcess(WaitProcessRequest {
                 container_id: container_id.to_string(),
                 timeout_ms: timeout.map(|value| value.as_millis() as u64),
-            }))? {
+            }),
+        )? {
             ShimRpcResponse::WaitProcess(WaitProcessResponse { exit_code }) => Ok(exit_code),
             other => Err(anyhow::anyhow!(
                 "unexpected shim RPC response for wait_task: {:?}",
