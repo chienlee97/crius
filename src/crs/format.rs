@@ -133,6 +133,210 @@ pub(crate) fn normalize_cell(value: &str) -> String {
     }
 }
 
+pub(crate) fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes}B")
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+pub(crate) fn format_cpu_millis(nano_cores: u64) -> String {
+    format!("{}m", nano_cores / 1_000_000)
+}
+
+pub(crate) fn format_bool(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeVersionView {
+    pub runtime_name: String,
+    pub runtime_version: String,
+    pub runtime_api_version: String,
+}
+
+impl TableRow for RuntimeVersionView {
+    fn headers() -> &'static [&'static str] {
+        &["RUNTIME", "VERSION", "API VERSION"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.runtime_name.clone(),
+            self.runtime_version.clone(),
+            self.runtime_api_version.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConditionView {
+    pub kind: String,
+    pub status: bool,
+    pub reason: String,
+    pub message: String,
+}
+
+impl TableRow for ConditionView {
+    fn headers() -> &'static [&'static str] {
+        &["TYPE", "STATUS", "REASON", "MESSAGE"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.kind.clone(),
+            format_bool(self.status).to_string(),
+            self.reason.clone(),
+            self.message.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImageView {
+    pub image: String,
+    pub image_id: String,
+    pub size_bytes: u64,
+    pub user_spec: String,
+    pub pinned: bool,
+}
+
+impl TableRow for ImageView {
+    fn headers() -> &'static [&'static str] {
+        &["IMAGE", "IMAGE ID", "SIZE", "USER SPEC", "PINNED"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.image.clone(),
+            self.image_id.clone(),
+            format_bytes(self.size_bytes),
+            self.user_spec.clone(),
+            format_bool(self.pinned).to_string(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PodView {
+    pub pod_id: String,
+    pub name: String,
+    pub namespace: String,
+    pub state: String,
+    pub ip: String,
+    pub created: String,
+    pub attempt: u32,
+}
+
+impl TableRow for PodView {
+    fn headers() -> &'static [&'static str] {
+        &["POD ID", "NAME", "NAMESPACE", "STATE", "IP", "CREATED", "ATTEMPT"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.pod_id.clone(),
+            self.name.clone(),
+            self.namespace.clone(),
+            self.state.clone(),
+            self.ip.clone(),
+            self.created.clone(),
+            self.attempt.to_string(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ContainerView {
+    pub container_id: String,
+    pub pod: String,
+    pub image: String,
+    pub state: String,
+    pub created: String,
+    pub name: String,
+    pub attempt: u32,
+}
+
+impl TableRow for ContainerView {
+    fn headers() -> &'static [&'static str] {
+        &["CONTAINER ID", "POD", "IMAGE", "STATE", "CREATED", "NAME", "ATTEMPT"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.container_id.clone(),
+            self.pod.clone(),
+            self.image.clone(),
+            self.state.clone(),
+            self.created.clone(),
+            self.name.clone(),
+            self.attempt.to_string(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResourceUsageView {
+    pub id: String,
+    pub name: String,
+    pub cpu_nano_cores: u64,
+    pub memory_bytes: u64,
+    pub pids: u64,
+}
+
+impl TableRow for ResourceUsageView {
+    fn headers() -> &'static [&'static str] {
+        &["ID", "NAME", "CPU", "MEMORY", "PIDS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.id.clone(),
+            self.name.clone(),
+            format_cpu_millis(self.cpu_nano_cores),
+            format_bytes(self.memory_bytes),
+            self.pids.to_string(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OperationView {
+    pub target: String,
+    pub status: String,
+    pub message: String,
+}
+
+impl TableRow for OperationView {
+    fn headers() -> &'static [&'static str] {
+        &["TARGET", "STATUS", "MESSAGE"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![self.target.clone(), self.status.clone(), self.message.clone()]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +406,32 @@ mod tests {
             Some("warning: fallback used")
         );
         assert_eq!(render_warnings(&warnings, OutputArg::Json), None);
+    }
+
+    #[test]
+    fn formats_numbers() {
+        assert_eq!(format_bytes(0), "0B");
+        assert_eq!(format_bytes(64 * 1024 * 1024), "64.0MiB");
+        assert_eq!(format_cpu_millis(125_000_000), "125m");
+        assert_eq!(format_bool(true), "true");
+        assert_eq!(format_bool(false), "false");
+    }
+
+    #[test]
+    fn basic_views_have_expected_headers() {
+        assert_eq!(RuntimeVersionView::headers(), &["RUNTIME", "VERSION", "API VERSION"]);
+        assert_eq!(
+            ImageView::headers(),
+            &["IMAGE", "IMAGE ID", "SIZE", "USER SPEC", "PINNED"]
+        );
+        assert_eq!(
+            PodView::headers(),
+            &["POD ID", "NAME", "NAMESPACE", "STATE", "IP", "CREATED", "ATTEMPT"]
+        );
+        assert_eq!(
+            ContainerView::headers(),
+            &["CONTAINER ID", "POD", "IMAGE", "STATE", "CREATED", "NAME", "ATTEMPT"]
+        );
+        assert_eq!(ResourceUsageView::headers(), &["ID", "NAME", "CPU", "MEMORY", "PIDS"]);
     }
 }
