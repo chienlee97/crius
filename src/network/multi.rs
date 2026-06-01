@@ -97,8 +97,17 @@ pub struct MultiNetworkManager {
     network_configs: HashMap<String, MultiNetworkConfig>,
     /// Pod网络状态缓存 (pod_id -> PodNetworkStatus)
     pod_networks: HashMap<String, PodNetworkStatus>,
+    /// CNI config names applied to each pod, in ADD order.
+    pod_cni_configs: HashMap<String, Vec<AppliedCniNetwork>>,
     /// 网络选择器 (基于annotation选择网络)
     network_selector: NetworkSelector,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppliedCniNetwork {
+    network_name: String,
+    cni_config_name: String,
+    interface_name: String,
 }
 
 /// 网络选择器
@@ -170,6 +179,7 @@ impl MultiNetworkManager {
             cni_manager,
             network_configs: HashMap::new(),
             pod_networks: HashMap::new(),
+            pod_cni_configs: HashMap::new(),
             network_selector: NetworkSelector::new("default"),
         }
     }
@@ -261,6 +271,7 @@ impl MultiNetworkManager {
         info!("Pod {} selected networks: {:?}", pod_id, network_names);
 
         let mut interfaces = Vec::new();
+        let mut applied_networks = Vec::new();
         let mut dns_config = None;
 
         // 为每个网络配置接口
@@ -292,6 +303,11 @@ impl MultiNetworkManager {
                     if dns_config.is_none() && network_config.dns_config.is_some() {
                         dns_config = network_config.dns_config.clone();
                     }
+                    applied_networks.push(AppliedCniNetwork {
+                        network_name: network_config.name.clone(),
+                        cni_config_name: network_config.cni_config_name.clone(),
+                        interface_name: if_name.clone(),
+                    });
                     interfaces.push(status);
                 }
                 Err(e) => {
@@ -314,6 +330,8 @@ impl MultiNetworkManager {
         // 缓存网络状态
         self.pod_networks
             .insert(pod_id.to_string(), pod_status.clone());
+        self.pod_cni_configs
+            .insert(pod_id.to_string(), applied_networks);
 
         info!(
             "Pod {} network setup completed with {} interfaces",
@@ -333,10 +351,28 @@ impl MultiNetworkManager {
         network_config: &MultiNetworkConfig,
         if_name: &str,
     ) -> Result<NetworkInterfaceStatus> {
-        // 使用基础CNI管理器设置网络
+        let cni_config = self
+            .cni_manager
+            .network_config(&network_config.cni_config_name)
+            .with_context(|| {
+                format!(
+                    "CNI config {} for network {} not found",
+                    network_config.cni_config_name, network_config.name
+                )
+            })?;
+
         let status = self
             .cni_manager
-            .setup_pod_network(pod_id, netns, pod_name, pod_namespace, "", None)
+            .setup_pod_network_with_config(
+                cni_config,
+                pod_id,
+                netns,
+                if_name,
+                pod_name,
+                pod_namespace,
+                "",
+                None,
+            )
             .await?;
 
         Ok(NetworkInterfaceStatus {
@@ -364,21 +400,37 @@ impl MultiNetworkManager {
                 pod_id
             );
 
-            // 清理每个网络接口
-            for interface in &pod_status.interfaces {
+            let applied_networks = self
+                .pod_cni_configs
+                .get(pod_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    pod_status
+                        .interfaces
+                        .iter()
+                        .map(|interface| AppliedCniNetwork {
+                            network_name: interface.network_name.clone(),
+                            cni_config_name: interface.network_name.clone(),
+                            interface_name: interface.name.clone(),
+                        })
+                        .collect()
+                });
+
+            for applied in applied_networks.iter().rev() {
                 if let Err(e) = self
-                    .teardown_network_interface(pod_id, netns, &interface.network_name)
+                    .teardown_network_interface(pod_id, netns, applied)
                     .await
                 {
                     error!(
                         "Failed to teardown network {} for pod {}: {}",
-                        interface.network_name, pod_id, e
+                        applied.network_name, pod_id, e
                     );
                 }
             }
 
             // 从缓存中移除
             self.pod_networks.remove(pod_id);
+            self.pod_cni_configs.remove(pod_id);
         } else {
             // 如果没有缓存，尝试清理默认网络
             self.cni_manager
@@ -395,11 +447,28 @@ impl MultiNetworkManager {
         &self,
         pod_id: &str,
         netns: &str,
-        _network_name: &str,
+        applied: &AppliedCniNetwork,
     ) -> Result<()> {
-        // 调用CNI DEL命令
+        let cni_config = self
+            .cni_manager
+            .network_config(&applied.cni_config_name)
+            .with_context(|| {
+                format!(
+                    "CNI config {} for network {} not found",
+                    applied.cni_config_name, applied.network_name
+                )
+            })?;
+
         self.cni_manager
-            .teardown_pod_network(pod_id, netns, "", "", "")
+            .teardown_pod_network_with_config(
+                cni_config,
+                pod_id,
+                netns,
+                &applied.interface_name,
+                "",
+                "",
+                "",
+            )
             .await?;
         Ok(())
     }
@@ -438,6 +507,9 @@ impl MultiNetworkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
 
     #[test]
     fn test_network_selector() {
@@ -457,5 +529,133 @@ mod tests {
 
         let networks = selector.select_networks(&[], &[]);
         assert_eq!(networks, vec!["default"]);
+    }
+
+    fn write_recording_plugin(dir: &std::path::Path, plugin: &str) -> std::path::PathBuf {
+        let plugin_path = dir.join(plugin);
+        fs::write(
+            &plugin_path,
+            format!(
+                r#"#!/bin/sh
+set -eu
+record_dir="{record_dir}"
+mkdir -p "$record_dir"
+printf '%s:%s:%s\n' "$CNI_COMMAND" "$CNI_CONTAINERID" "$CNI_IFNAME" >> "$record_dir/commands.log"
+cat > "$record_dir/{plugin}.$CNI_COMMAND.$CNI_IFNAME.json"
+if [ "$CNI_COMMAND" = "ADD" ]; then
+  if [ "{plugin}" = "bridge" ]; then
+    printf '%s\n' '{{"cniVersion":"1.0.0","ips":[{{"address":"10.88.0.2/16"}}]}}'
+  else
+    printf '%s\n' '{{"cniVersion":"1.0.0","ips":[{{"address":"10.99.0.2/16"}}]}}'
+  fi
+fi
+"#,
+                record_dir = dir.display(),
+                plugin = plugin
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&plugin_path, perms).unwrap();
+        plugin_path
+    }
+
+    #[tokio::test]
+    async fn multi_network_uses_selected_cni_configs_and_interfaces() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("bin");
+        let config_dir = dir.path().join("net.d");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        write_recording_plugin(&plugin_dir, "bridge");
+        write_recording_plugin(&plugin_dir, "macvlan");
+        fs::write(
+            config_dir.join("10-default.conf"),
+            r#"{"cniVersion":"1.0.0","name":"default-net","type":"bridge"}"#,
+        )
+        .unwrap();
+        fs::write(
+            config_dir.join("20-secondary.conf"),
+            r#"{"cniVersion":"1.0.0","name":"secondary-net","type":"macvlan"}"#,
+        )
+        .unwrap();
+
+        let cni = CniManager::new(
+            vec![plugin_dir.display().to_string()],
+            vec![config_dir.display().to_string()],
+            dir.path().join("cache").display().to_string(),
+        )
+        .unwrap();
+        let mut manager = MultiNetworkManager::new(cni);
+        manager.load_network_configs().await.unwrap();
+        manager.add_network_config(MultiNetworkConfig {
+            name: "default".to_string(),
+            interface_name: "eth0".to_string(),
+            cni_config_name: "default-net".to_string(),
+            is_default: true,
+            bandwidth_limit: None,
+            ipam_config: None,
+            dns_config: None,
+        });
+        manager.add_network_config(MultiNetworkConfig {
+            name: "secondary".to_string(),
+            interface_name: "net1".to_string(),
+            cni_config_name: "secondary-net".to_string(),
+            is_default: false,
+            bandwidth_limit: None,
+            ipam_config: None,
+            dns_config: None,
+        });
+
+        let status = manager
+            .setup_pod_networks(
+                "pod-1",
+                "/var/run/netns/pod-1",
+                "pod",
+                "default",
+                &[],
+                &[("cni.networks".to_string(), "default,secondary".to_string())],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(status.interfaces.len(), 2);
+        assert_eq!(status.interfaces[0].name, "eth0");
+        assert_eq!(status.interfaces[0].network_name, "default");
+        assert_eq!(
+            status.interfaces[0].ip_address.unwrap().to_string(),
+            "10.88.0.2"
+        );
+        assert_eq!(status.interfaces[1].name, "net1");
+        assert_eq!(status.interfaces[1].network_name, "secondary");
+        assert_eq!(
+            status.interfaces[1].ip_address.unwrap().to_string(),
+            "10.99.0.2"
+        );
+
+        manager
+            .teardown_pod_networks("pod-1", "/var/run/netns/pod-1")
+            .await
+            .unwrap();
+
+        let commands = fs::read_to_string(plugin_dir.join("commands.log")).unwrap();
+        assert_eq!(
+            commands.lines().collect::<Vec<_>>(),
+            [
+                "ADD:pod-1:eth0",
+                "ADD:pod-1:net1",
+                "DEL:pod-1:net1",
+                "DEL:pod-1:eth0"
+            ]
+        );
+        assert!(fs::read_to_string(plugin_dir.join("bridge.ADD.eth0.json"))
+            .unwrap()
+            .contains("\"name\":\"default-net\""));
+        assert!(fs::read_to_string(plugin_dir.join("macvlan.ADD.net1.json"))
+            .unwrap()
+            .contains("\"name\":\"secondary-net\""));
+        assert!(fs::metadata(dir.path().join("cache/pod-1.config.json")).is_err());
+        assert!(fs::metadata(dir.path().join("cache/pod-1.net1.config.json")).is_err());
     }
 }

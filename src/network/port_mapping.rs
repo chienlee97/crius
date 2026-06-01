@@ -270,7 +270,8 @@ impl PortMappingManager {
         let temp_path = temp_file.into_temp_path();
 
         let output = Command::new("nft")
-            .args(["-f", temp_path.to_str().unwrap()])
+            .arg("-f")
+            .arg(&temp_path)
             .output()
             .context("Failed to execute nft command")?;
 

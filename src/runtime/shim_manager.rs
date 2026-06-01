@@ -9,10 +9,26 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::image::snapshotter::RootfsHandle;
+use crate::proto::runtime::v1::LinuxContainerResources;
+use crate::services::{InternalEvent, InternalEventSeverity, LedgerInternalEventSink};
+use crate::shim_rpc::{
+    default_task_socket_path, CheckpointTaskRequest, CreateTaskRequest, DeleteTaskRequest,
+    ExecProcessRequest, KillTaskRequest, OpenAttachStreamRequest, OpenAttachStreamResponse,
+    PauseTaskRequest, ReopenLogRequest, ResizeAttachPtyRequest, ResizePtyRequest,
+    RestoreTaskRequest, ResumeTaskRequest, ShimLinuxResources, ShimRpcClient, ShimRpcRequest,
+    ShimRpcResponse, StartTaskRequest, StatusRequest, StatusResponse, UpdateResourcesRequest,
+    WaitProcessRequest, WaitProcessResponse,
+};
+use crate::storage::{ShimProcessRecord, StorageManager};
 
 const DEFAULT_SHIM_WORK_DIR: &str = "/var/run/crius/shims";
 const SHIM_METADATA_FILE: &str = "shim.json";
 const SHIM_PIDFILE_NAME: &str = "shim.pid";
+const SHIM_RPC_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const SHIM_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn default_shim_work_dir() -> PathBuf {
     std::env::var("CRIUS_SHIM_DIR")
@@ -57,6 +73,8 @@ pub struct ShimConfig {
     pub runtime_path: PathBuf,
     /// CRI 单条日志记录切分阈值（字节）。
     pub max_container_log_line_size: usize,
+    /// 状态账本数据库路径。
+    pub state_db_path: PathBuf,
 }
 
 impl Default for ShimConfig {
@@ -79,6 +97,7 @@ impl Default for ShimConfig {
             systemd_cgroup: false,
             runtime_path: PathBuf::from("runc"),
             max_container_log_line_size: 4096,
+            state_db_path: PathBuf::new(),
         }
     }
 }
@@ -100,6 +119,16 @@ pub struct ShimProcess {
     pub bundle_path: PathBuf,
 }
 
+struct ShimLedgerState<'a> {
+    container_id: &'a str,
+    shim_pid: u32,
+    exit_code_file: &'a Path,
+    log_file: &'a Path,
+    socket_path: &'a Path,
+    bundle_path: &'a Path,
+    state: &'a str,
+}
+
 /// Shim管理器
 #[derive(Debug)]
 pub struct ShimManager {
@@ -108,7 +137,29 @@ pub struct ShimManager {
     processes: Arc<Mutex<Vec<ShimProcess>>>,
 }
 
+fn ensure_empty_response(operation: &str, response: ShimRpcResponse) -> Result<()> {
+    match response {
+        ShimRpcResponse::Empty => Ok(()),
+        other => Err(anyhow::anyhow!(
+            "unexpected shim RPC response for {}: {:?}",
+            operation,
+            other
+        )),
+    }
+}
+
 impl ShimManager {
+    fn ledger_storage(&self) -> Result<Option<StorageManager>> {
+        if self.config.state_db_path.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(StorageManager::new(&self.config.state_db_path)?))
+    }
+
+    fn ledger_enabled(config: &ShimConfig) -> bool {
+        !config.state_db_path.as_os_str().is_empty()
+    }
+
     fn exit_code_file_path(&self, container_id: &str) -> PathBuf {
         self.config.container_exits_dir.join(container_id)
     }
@@ -130,10 +181,11 @@ impl ShimManager {
     }
 
     fn metadata_path(&self, container_id: &str) -> PathBuf {
-        self.config
-            .work_dir
-            .join(container_id)
-            .join(SHIM_METADATA_FILE)
+        Self::metadata_path_for(&self.config, container_id)
+    }
+
+    fn metadata_path_for(config: &ShimConfig, container_id: &str) -> PathBuf {
+        config.work_dir.join(container_id).join(SHIM_METADATA_FILE)
     }
 
     pub fn pidfile_path(&self, container_id: &str) -> PathBuf {
@@ -144,17 +196,48 @@ impl ShimManager {
         PathBuf::from("/proc").join(pid.to_string()).exists()
     }
 
-    fn persist_process_metadata(&self, process: &ShimProcess) -> Result<()> {
-        let metadata_path = self.metadata_path(&process.container_id);
-        if let Some(parent) = metadata_path.parent() {
-            fs::create_dir_all(parent)?;
+    fn persist_shim_ledger_state(&self, state: ShimLedgerState<'_>) -> Result<()> {
+        if let Some(mut storage) = self.ledger_storage()? {
+            storage.save_shim_process(&ShimProcessRecord {
+                container_id: state.container_id.to_string(),
+                shim_pid: state.shim_pid,
+                work_dir: self.config.work_dir.display().to_string(),
+                socket_path: state.socket_path.display().to_string(),
+                exit_code_file: state.exit_code_file.display().to_string(),
+                log_file: state.log_file.display().to_string(),
+                bundle_path: state.bundle_path.display().to_string(),
+                state: state.state.to_string(),
+                last_seen_at: chrono::Utc::now().timestamp(),
+            })?;
         }
-        fs::write(&metadata_path, serde_json::to_vec_pretty(process)?)?;
         Ok(())
     }
 
-    fn persist_pidfile(&self, container_id: &str, shim_pid: u32) -> Result<()> {
-        Self::persist_pidfile_for(&self.config, container_id, shim_pid)
+    fn persist_process_metadata(&self, process: &ShimProcess) {
+        let metadata_path = self.metadata_path(&process.container_id);
+        if let Err(err) = (|| -> Result<()> {
+            if let Some(parent) = metadata_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&metadata_path, serde_json::to_vec_pretty(process)?)?;
+            Ok(())
+        })() {
+            log::warn!(
+                "Failed to write diagnostic shim metadata {}: {}",
+                metadata_path.display(),
+                err
+            );
+        }
+    }
+
+    fn persist_pidfile(&self, container_id: &str, shim_pid: u32) {
+        if let Err(err) = Self::persist_pidfile_for(&self.config, container_id, shim_pid) {
+            log::warn!(
+                "Failed to write diagnostic shim pidfile for {}: {}",
+                container_id,
+                err
+            );
+        }
     }
 
     fn persist_pidfile_for(config: &ShimConfig, container_id: &str, shim_pid: u32) -> Result<()> {
@@ -167,6 +250,9 @@ impl ShimManager {
     }
 
     fn remove_process_metadata(&self, container_id: &str) -> Result<()> {
+        if let Some(mut storage) = self.ledger_storage()? {
+            let _ = storage.delete_shim_process(container_id);
+        }
         let metadata_path = self.metadata_path(container_id);
         if metadata_path.exists() {
             fs::remove_file(metadata_path)?;
@@ -196,6 +282,65 @@ impl ShimManager {
     }
 
     fn restore_processes_from_disk(config: &ShimConfig) -> Vec<ShimProcess> {
+        if Self::ledger_enabled(config) {
+            if let Ok(mut storage) = StorageManager::new(&config.state_db_path) {
+                if let Ok(records) = storage.list_shim_processes() {
+                    let restored = records
+                        .into_iter()
+                        .filter_map(|mut record| {
+                            let live_or_exited = Self::process_exists(record.shim_pid)
+                                || Path::new(&record.exit_code_file).exists();
+                            if !live_or_exited {
+                                return None;
+                            }
+
+                            let metadata_path =
+                                Self::metadata_path_for(config, &record.container_id);
+                            let pidfile_path = Self::pidfile_path_for(config, &record.container_id);
+                            if !metadata_path.exists() || !pidfile_path.exists() {
+                                let previous_state = record.state.clone();
+                                record.state = "degraded".to_string();
+                                record.last_seen_at = chrono::Utc::now().timestamp();
+                                let _ = storage.save_shim_process(&record);
+                                let details = format!(
+                                    "diagnostic shim files missing: metadata={}, pidfile={}",
+                                    metadata_path.exists(),
+                                    pidfile_path.exists()
+                                );
+                                let event = InternalEvent::new(
+                                    "shim.degraded",
+                                    "shim",
+                                    &record.container_id,
+                                    InternalEventSeverity::Warning,
+                                    serde_json::json!({
+                                        "previousState": previous_state,
+                                        "state": "degraded",
+                                        "details": details,
+                                        "metadataExists": metadata_path.exists(),
+                                        "pidfileExists": pidfile_path.exists(),
+                                    }),
+                                );
+                                let _ = LedgerInternalEventSink::new(&config.state_db_path)
+                                    .publish(&event);
+                            }
+
+                            Some(ShimProcess {
+                                container_id: record.container_id,
+                                shim_pid: record.shim_pid,
+                                exit_code_file: PathBuf::from(record.exit_code_file),
+                                log_file: PathBuf::from(record.log_file),
+                                socket_path: PathBuf::from(record.socket_path),
+                                bundle_path: PathBuf::from(record.bundle_path),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    if !restored.is_empty() {
+                        return restored;
+                    }
+                }
+            }
+            return Vec::new();
+        }
         let mut restored = Vec::new();
         let Ok(entries) = fs::read_dir(&config.work_dir) else {
             return restored;
@@ -270,9 +415,51 @@ impl ShimManager {
         self.config.work_dir.join(container_id).join(socket_name)
     }
 
+    pub fn task_socket_path(&self, container_id: &str) -> PathBuf {
+        default_task_socket_path(&self.config.work_dir, container_id)
+    }
+
+    fn rpc_client(&self, container_id: &str) -> ShimRpcClient {
+        ShimRpcClient::new(self.task_socket_path(container_id), SHIM_RPC_TIMEOUT)
+    }
+
+    fn wait_for_rpc_socket(&self, container_id: &str) -> Result<()> {
+        let socket_path = self.task_socket_path(container_id);
+        let deadline = Instant::now() + SHIM_RPC_READY_TIMEOUT;
+        while Instant::now() < deadline {
+            if socket_path.exists() {
+                let client = self.rpc_client(container_id);
+                if matches!(
+                    client.request(ShimRpcRequest::Ping),
+                    Ok(ShimRpcResponse::Empty)
+                ) {
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        Err(anyhow::anyhow!(
+            "shim RPC socket {} did not become ready in {:?}",
+            socket_path.display(),
+            SHIM_RPC_READY_TIMEOUT
+        ))
+    }
+
     /// 启动shim进程来管理容器
     pub fn start_shim(&self, container_id: &str, bundle_path: &Path) -> Result<ShimProcess> {
         info!("Starting shim for container {}", container_id);
+
+        if let Some(existing) = self
+            .list_shims()
+            .into_iter()
+            .find(|process| process.container_id == container_id)
+        {
+            if Self::process_exists(existing.shim_pid) {
+                self.wait_for_rpc_socket(container_id)?;
+                return Ok(existing);
+            }
+        }
 
         // 创建shim工作目录
         let shim_dir = self.config.work_dir.join(container_id);
@@ -286,6 +473,16 @@ impl ShimManager {
         let log_file = shim_dir.join("shim.log");
         let socket_path = attach_dir.join("attach.sock");
 
+        self.persist_shim_ledger_state(ShimLedgerState {
+            container_id,
+            shim_pid: 0,
+            exit_code_file: &exit_code_file,
+            log_file: &log_file,
+            socket_path: &socket_path,
+            bundle_path,
+            state: "planned",
+        })?;
+
         // 构建shim命令
         let mut cmd = Command::new(&self.config.shim_path);
         cmd.arg("--id")
@@ -294,6 +491,8 @@ impl ShimManager {
             .arg(bundle_path)
             .arg("--runtime")
             .arg(&self.config.runtime_path)
+            .arg("--work-dir")
+            .arg(&self.config.work_dir)
             .arg("--exit-code-file")
             .arg(&exit_code_file)
             .arg("--attach-socket-dir")
@@ -302,6 +501,10 @@ impl ShimManager {
             .arg(self.config.io_uid.to_string())
             .arg("--io-gid")
             .arg(self.config.io_gid.to_string());
+
+        if !self.config.state_db_path.as_os_str().is_empty() {
+            cmd.arg("--state-db-path").arg(&self.config.state_db_path);
+        }
 
         if !self.config.runtime_config_path.as_os_str().is_empty() {
             cmd.arg("--runtime-config-path")
@@ -351,7 +554,16 @@ impl ShimManager {
             .context("Failed to start shim process")?;
 
         let shim_pid = child.id();
-        self.persist_pidfile(container_id, shim_pid)?;
+        self.persist_shim_ledger_state(ShimLedgerState {
+            container_id,
+            shim_pid,
+            exit_code_file: &exit_code_file,
+            log_file: &log_file,
+            socket_path: &socket_path,
+            bundle_path,
+            state: "starting",
+        })?;
+        self.persist_pidfile(container_id, shim_pid);
 
         // 在后台等待shim进程（避免僵尸进程）
         std::thread::spawn(move || {
@@ -377,7 +589,17 @@ impl ShimManager {
         processes.retain(|existing| existing.container_id != container_id);
         processes.push(process.clone());
         drop(processes);
-        self.persist_process_metadata(&process)?;
+        self.persist_process_metadata(&process);
+        self.wait_for_rpc_socket(container_id)?;
+        self.persist_shim_ledger_state(ShimLedgerState {
+            container_id,
+            shim_pid,
+            exit_code_file: &process.exit_code_file,
+            log_file: &process.log_file,
+            socket_path: &process.socket_path,
+            bundle_path: &process.bundle_path,
+            state: "running",
+        })?;
 
         Ok(process)
     }
@@ -393,9 +615,318 @@ impl ShimManager {
         Self::read_exit_code_file(&self.exit_code_file_path(container_id))
     }
 
+    pub fn create_task(
+        &self,
+        container_id: &str,
+        bundle_path: &Path,
+        rootfs_path: &Path,
+        snapshot_key: Option<&str>,
+        mount_options: Vec<String>,
+        rootfs: RootfsHandle,
+    ) -> Result<()> {
+        self.start_shim(container_id, bundle_path)?;
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::CreateTask(CreateTaskRequest {
+                container_id: container_id.to_string(),
+                rootfs_path: rootfs_path.to_path_buf(),
+                snapshot_key: snapshot_key.map(ToOwned::to_owned),
+                mount_options,
+                rootfs: Some(rootfs),
+            }))?;
+        ensure_empty_response("create_task", response)
+    }
+
+    pub fn start_task(&self, container_id: &str, bundle_path: &Path) -> Result<()> {
+        self.start_shim(container_id, bundle_path)?;
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::StartTask(StartTaskRequest {
+                container_id: container_id.to_string(),
+            }))?;
+        ensure_empty_response("start_task", response)
+    }
+
+    pub fn restore_task(
+        &self,
+        container_id: &str,
+        bundle_path: &Path,
+        image_path: &Path,
+        work_path: &Path,
+        criu_path: &Path,
+        no_pivot: bool,
+    ) -> Result<()> {
+        self.start_shim(container_id, bundle_path)?;
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::RestoreTask(RestoreTaskRequest {
+                container_id: container_id.to_string(),
+                image_path: image_path.to_path_buf(),
+                work_path: work_path.to_path_buf(),
+                bundle_path: bundle_path.to_path_buf(),
+                criu_path: criu_path.to_path_buf(),
+                no_pivot,
+            }))?;
+        ensure_empty_response("restore_task", response)
+    }
+
+    pub fn exec_process(
+        &self,
+        container_id: &str,
+        command: &[String],
+        tty: bool,
+        exec_cpu_affinity: Option<usize>,
+    ) -> Result<i32> {
+        match self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::ExecProcess(ExecProcessRequest {
+                container_id: container_id.to_string(),
+                command: command.to_vec(),
+                tty,
+                capture_output: false,
+                timeout_ms: None,
+                io_drain_timeout_ms: None,
+                exec_cpu_affinity,
+            }))? {
+            ShimRpcResponse::ExecProcess(response) => Ok(response.exit_code),
+            other => Err(anyhow::anyhow!(
+                "unexpected shim RPC response for exec_process: {:?}",
+                other
+            )),
+        }
+    }
+
+    pub fn exec_sync_process(
+        &self,
+        container_id: &str,
+        command: &[String],
+        tty: bool,
+        timeout: Option<Duration>,
+        exec_cpu_affinity: Option<usize>,
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        match self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::ExecProcess(ExecProcessRequest {
+                container_id: container_id.to_string(),
+                command: command.to_vec(),
+                tty,
+                capture_output: true,
+                timeout_ms: timeout.map(|value| value.as_millis() as u64),
+                io_drain_timeout_ms: None,
+                exec_cpu_affinity,
+            }))? {
+            ShimRpcResponse::ExecProcess(response) => {
+                Ok((response.exit_code, response.stdout, response.stderr))
+            }
+            other => Err(anyhow::anyhow!(
+                "unexpected shim RPC response for exec_sync_process: {:?}",
+                other
+            )),
+        }
+    }
+
+    pub fn wait_task(&self, container_id: &str, timeout: Option<Duration>) -> Result<Option<i32>> {
+        let rpc_timeout = timeout
+            .and_then(|value| value.checked_add(Duration::from_secs(1)))
+            .filter(|value| *value > SHIM_RPC_TIMEOUT)
+            .unwrap_or(SHIM_RPC_TIMEOUT);
+        match ShimRpcClient::new(self.task_socket_path(container_id), rpc_timeout).request(
+            ShimRpcRequest::WaitProcess(WaitProcessRequest {
+                container_id: container_id.to_string(),
+                timeout_ms: timeout.map(|value| value.as_millis() as u64),
+            }),
+        )? {
+            ShimRpcResponse::WaitProcess(WaitProcessResponse { exit_code }) => Ok(exit_code),
+            other => Err(anyhow::anyhow!(
+                "unexpected shim RPC response for wait_task: {:?}",
+                other
+            )),
+        }
+    }
+
+    pub fn kill_task(&self, container_id: &str, signal: &str, all: bool) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::KillTask(KillTaskRequest {
+                container_id: container_id.to_string(),
+                signal: signal.to_string(),
+                all,
+            }))?;
+        ensure_empty_response("kill_task", response)
+    }
+
+    pub fn delete_task(
+        &self,
+        container_id: &str,
+        snapshot_key: Option<&str>,
+        rootfs_path: Option<&Path>,
+    ) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::DeleteTask(DeleteTaskRequest {
+                container_id: container_id.to_string(),
+                snapshot_key: snapshot_key.map(ToOwned::to_owned),
+                rootfs_path: rootfs_path.map(Path::to_path_buf),
+            }))?;
+        ensure_empty_response("delete_task", response)
+    }
+
+    pub fn update_resources(
+        &self,
+        container_id: &str,
+        resources: &LinuxContainerResources,
+    ) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::UpdateResources(UpdateResourcesRequest {
+                container_id: container_id.to_string(),
+                resources: ShimLinuxResources::from(resources),
+            }))?;
+        ensure_empty_response("update_resources", response)
+    }
+
+    pub fn checkpoint_task(
+        &self,
+        container_id: &str,
+        image_path: &Path,
+        work_path: &Path,
+    ) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::CheckpointTask(CheckpointTaskRequest {
+                container_id: container_id.to_string(),
+                image_path: image_path.to_path_buf(),
+                work_path: work_path.to_path_buf(),
+            }))?;
+        ensure_empty_response("checkpoint_task", response)
+    }
+
+    pub fn reopen_log(&self, container_id: &str) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::ReopenLog(ReopenLogRequest {
+                container_id: container_id.to_string(),
+            }))?;
+        ensure_empty_response("reopen_log", response)
+    }
+
+    pub fn resize_pty(&self, container_id: &str, width: u16, height: u16) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::ResizePty(ResizePtyRequest {
+                container_id: container_id.to_string(),
+                width,
+                height,
+            }))?;
+        ensure_empty_response("resize_pty", response)
+    }
+
+    pub fn open_attach_stream(
+        &self,
+        container_id: &str,
+        stdin: bool,
+        stdout: bool,
+        stderr: bool,
+        tty: bool,
+    ) -> Result<OpenAttachStreamResponse> {
+        match self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::OpenAttachStream(OpenAttachStreamRequest {
+                container_id: container_id.to_string(),
+                stdin,
+                stdout,
+                stderr,
+                tty,
+            }))? {
+            ShimRpcResponse::OpenAttachStream(response) => Ok(response),
+            other => Err(anyhow::anyhow!(
+                "unexpected shim RPC response for open_attach_stream: {:?}",
+                other
+            )),
+        }
+    }
+
+    pub fn close_attach_stream(&self, container_id: &str, stream_id: &str) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::CloseAttachStream(
+                crate::shim_rpc::CloseAttachStreamRequest {
+                    container_id: container_id.to_string(),
+                    stream_id: stream_id.to_string(),
+                },
+            ))?;
+        ensure_empty_response("close_attach_stream", response)
+    }
+
+    pub fn resize_attach_pty(
+        &self,
+        container_id: &str,
+        stream_id: Option<&str>,
+        width: u16,
+        height: u16,
+    ) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::ResizeAttachPty(ResizeAttachPtyRequest {
+                container_id: container_id.to_string(),
+                stream_id: stream_id.map(ToOwned::to_owned),
+                width,
+                height,
+            }))?;
+        ensure_empty_response("resize_attach_pty", response)
+    }
+
+    pub fn status(&self, container_id: &str) -> Result<StatusResponse> {
+        match self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::Status(StatusRequest {
+                container_id: container_id.to_string(),
+            }))? {
+            ShimRpcResponse::Status(response) => Ok(response),
+            other => Err(anyhow::anyhow!(
+                "unexpected shim RPC response for status: {:?}",
+                other
+            )),
+        }
+    }
+
+    pub fn pause_task(&self, container_id: &str) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::PauseTask(PauseTaskRequest {
+                container_id: container_id.to_string(),
+            }))?;
+        ensure_empty_response("pause_task", response)
+    }
+
+    pub fn resume_task(&self, container_id: &str) -> Result<()> {
+        let response = self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::ResumeTask(ResumeTaskRequest {
+                container_id: container_id.to_string(),
+            }))?;
+        ensure_empty_response("resume_task", response)
+    }
+
+    pub fn container_pid(&self, container_id: &str) -> Result<Option<i32>> {
+        match self
+            .rpc_client(container_id)
+            .request(ShimRpcRequest::ContainerPid(StatusRequest {
+                container_id: container_id.to_string(),
+            }))? {
+            ShimRpcResponse::ContainerPid(pid) => Ok(pid),
+            other => Err(anyhow::anyhow!(
+                "unexpected shim RPC response for container_pid: {:?}",
+                other
+            )),
+        }
+    }
+
     /// 停止shim进程
     pub fn stop_shim(&self, container_id: &str) -> Result<()> {
         info!("Stopping shim for container {}", container_id);
+
+        let _ = self.delete_task(container_id, None, None);
 
         let mut processes = self.processes.lock().unwrap();
         let removed = processes
@@ -406,7 +937,8 @@ impl ShimManager {
 
         let shim_pid = match removed.as_ref() {
             Some(process) => Some(process.shim_pid),
-            None => self.read_shim_pidfile(container_id)?,
+            None if !Self::ledger_enabled(&self.config) => self.read_shim_pidfile(container_id)?,
+            None => None,
         };
 
         if let Some(shim_pid) = shim_pid {
@@ -458,10 +990,12 @@ impl ShimManager {
                 false
             }
         } else {
-            self.read_shim_pidfile(container_id)
-                .ok()
-                .flatten()
-                .is_some_and(Self::process_exists)
+            !Self::ledger_enabled(&self.config)
+                && self
+                    .read_shim_pidfile(container_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(Self::process_exists)
         }
     }
 
@@ -528,569 +1062,4 @@ impl ShimManager {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_shim_config_default() {
-        let config = ShimConfig::default();
-        assert_eq!(config.shim_path, PathBuf::from("crius-shim"));
-        assert_eq!(config.work_dir, default_shim_work_dir());
-        assert_eq!(config.attach_socket_dir, default_shim_work_dir());
-        assert_eq!(
-            config.container_exits_dir,
-            PathBuf::from("/var/run/crius/exits")
-        );
-        assert!(config.monitor_env.is_empty());
-        assert!(!config.debug);
-        assert!(!config.no_sync_log);
-        assert!(!config.no_pivot);
-    }
-
-    #[test]
-    fn test_shim_manager_creation() {
-        let temp_dir = tempdir().unwrap();
-        let config = ShimConfig {
-            work_dir: temp_dir.path().to_path_buf(),
-            attach_socket_dir: temp_dir.path().join("attach"),
-            container_exits_dir: temp_dir.path().join("exits"),
-            ..Default::default()
-        };
-
-        let manager = ShimManager::new(config);
-        let shims = manager.list_shims();
-        assert!(shims.is_empty());
-    }
-
-    #[test]
-    fn test_shim_manager_restores_live_metadata_from_disk() {
-        let temp_dir = tempdir().unwrap();
-        let work_dir = temp_dir.path().join("shims");
-        let container_dir = work_dir.join("container-1");
-        let exits_dir = temp_dir.path().join("exits");
-        fs::create_dir_all(&container_dir).unwrap();
-        fs::create_dir_all(&exits_dir).unwrap();
-
-        let process = ShimProcess {
-            container_id: "container-1".to_string(),
-            shim_pid: std::process::id(),
-            exit_code_file: exits_dir.join("container-1"),
-            log_file: container_dir.join("shim.log"),
-            socket_path: container_dir.join("attach.sock"),
-            bundle_path: temp_dir.path().join("bundle"),
-        };
-        fs::write(
-            container_dir.join(SHIM_METADATA_FILE),
-            serde_json::to_vec_pretty(&process).unwrap(),
-        )
-        .unwrap();
-
-        let manager = ShimManager::new(ShimConfig {
-            work_dir,
-            attach_socket_dir: temp_dir.path().join("attach"),
-            container_exits_dir: exits_dir,
-            ..Default::default()
-        });
-        let shims = manager.list_shims();
-        assert_eq!(shims.len(), 1);
-        assert_eq!(shims[0].container_id, "container-1");
-        assert_eq!(
-            manager.read_shim_pidfile("container-1").unwrap(),
-            Some(std::process::id())
-        );
-    }
-
-    #[test]
-    fn test_shim_manager_ignores_stale_metadata_from_disk() {
-        let temp_dir = tempdir().unwrap();
-        let work_dir = temp_dir.path().join("shims");
-        let container_dir = work_dir.join("stale-container");
-        let exits_dir = temp_dir.path().join("exits");
-        fs::create_dir_all(&container_dir).unwrap();
-        fs::create_dir_all(&exits_dir).unwrap();
-
-        let process = ShimProcess {
-            container_id: "stale-container".to_string(),
-            shim_pid: 999_999,
-            exit_code_file: exits_dir.join("stale-container"),
-            log_file: container_dir.join("shim.log"),
-            socket_path: container_dir.join("attach.sock"),
-            bundle_path: temp_dir.path().join("bundle"),
-        };
-        fs::write(
-            container_dir.join(SHIM_METADATA_FILE),
-            serde_json::to_vec_pretty(&process).unwrap(),
-        )
-        .unwrap();
-
-        let manager = ShimManager::new(ShimConfig {
-            work_dir,
-            attach_socket_dir: temp_dir.path().join("attach"),
-            container_exits_dir: exits_dir,
-            ..Default::default()
-        });
-        assert!(manager.list_shims().is_empty());
-    }
-
-    #[test]
-    fn test_start_shim_uses_configured_container_exits_dir() {
-        let temp_dir = tempdir().unwrap();
-        let shim_path = temp_dir.path().join("fake-shim.sh");
-        fs::write(
-            &shim_path,
-            r#"#!/bin/sh
-set -eu
-sleep 1
-"#,
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&shim_path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
-        }
-        fs::set_permissions(&shim_path, perms).unwrap();
-
-        let config = ShimConfig {
-            shim_path,
-            work_dir: temp_dir.path().join("shims"),
-            attach_socket_dir: temp_dir.path().join("attach"),
-            container_exits_dir: temp_dir.path().join("exits"),
-            runtime_path: PathBuf::from("/bin/false"),
-            ..Default::default()
-        };
-        let manager = ShimManager::new(config.clone());
-        let bundle = temp_dir.path().join("bundle");
-        fs::create_dir_all(&bundle).unwrap();
-
-        let process = manager.start_shim("container-1", &bundle).unwrap();
-        assert_eq!(
-            process.exit_code_file,
-            config.container_exits_dir.join("container-1")
-        );
-        assert_eq!(
-            manager.read_shim_pidfile("container-1").unwrap(),
-            Some(process.shim_pid)
-        );
-        assert!(manager.pidfile_path("container-1").exists());
-
-        manager.stop_shim("container-1").unwrap();
-        assert!(manager.pidfile_path("container-1").exists());
-    }
-
-    #[test]
-    fn test_get_exit_code_falls_back_to_global_exit_file_without_metadata() {
-        let temp_dir = tempdir().unwrap();
-        let exits_dir = temp_dir.path().join("exits");
-        fs::create_dir_all(&exits_dir).unwrap();
-        fs::write(exits_dir.join("container-1"), "17\n").unwrap();
-
-        let manager = ShimManager::new(ShimConfig {
-            work_dir: temp_dir.path().join("shims"),
-            attach_socket_dir: temp_dir.path().join("attach"),
-            container_exits_dir: exits_dir,
-            ..Default::default()
-        });
-
-        assert_eq!(manager.get_exit_code("container-1").unwrap(), Some(17));
-    }
-
-    #[test]
-    fn test_cleanup_exited_shims_keeps_metadata_while_exit_file_exists() {
-        let temp_dir = tempdir().unwrap();
-        let work_dir = temp_dir.path().join("shims");
-        let container_dir = work_dir.join("container-1");
-        let exits_dir = temp_dir.path().join("exits");
-        fs::create_dir_all(&container_dir).unwrap();
-        fs::create_dir_all(&exits_dir).unwrap();
-
-        let process = ShimProcess {
-            container_id: "container-1".to_string(),
-            shim_pid: 999_999,
-            exit_code_file: exits_dir.join("container-1"),
-            log_file: container_dir.join("shim.log"),
-            socket_path: container_dir.join("attach.sock"),
-            bundle_path: temp_dir.path().join("bundle"),
-        };
-        fs::write(
-            container_dir.join(SHIM_METADATA_FILE),
-            serde_json::to_vec_pretty(&process).unwrap(),
-        )
-        .unwrap();
-        fs::write(&process.exit_code_file, "3\n").unwrap();
-
-        let manager = ShimManager::new(ShimConfig {
-            work_dir: work_dir.clone(),
-            attach_socket_dir: temp_dir.path().join("attach"),
-            container_exits_dir: exits_dir,
-            ..Default::default()
-        });
-
-        assert_eq!(manager.cleanup_exited_shims().unwrap(), 0);
-        assert!(!manager.list_shims().is_empty());
-        assert!(container_dir.join(SHIM_METADATA_FILE).exists());
-    }
-
-    #[test]
-    fn test_start_shim_passes_no_pivot_when_enabled() {
-        let temp_dir = tempdir().unwrap();
-        let shim_path = temp_dir.path().join("fake-shim.sh");
-        let args_path = temp_dir.path().join("shim.args");
-        fs::write(
-            &shim_path,
-            format!(
-                r#"#!/bin/sh
-set -eu
-printf '%s\n' "$@" > "{}"
-sleep 1
-"#,
-                args_path.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&shim_path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
-        }
-        fs::set_permissions(&shim_path, perms).unwrap();
-
-        let manager = ShimManager::new(ShimConfig {
-            shim_path,
-            work_dir: temp_dir.path().join("shims"),
-            attach_socket_dir: temp_dir.path().join("attach"),
-            container_exits_dir: temp_dir.path().join("exits"),
-            no_pivot: true,
-            runtime_path: PathBuf::from("/bin/false"),
-            ..Default::default()
-        });
-        let bundle = temp_dir.path().join("bundle");
-        fs::create_dir_all(&bundle).unwrap();
-
-        manager.start_shim("container-1", &bundle).unwrap();
-        for _ in 0..50 {
-            if args_path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let args = fs::read_to_string(&args_path).unwrap();
-        assert!(args.lines().any(|line| line == "--no-pivot"));
-
-        manager.stop_shim("container-1").unwrap();
-    }
-
-    #[test]
-    fn test_start_shim_passes_no_new_keyring_when_enabled() {
-        let temp_dir = tempdir().unwrap();
-        let shim_path = temp_dir.path().join("fake-shim.sh");
-        let args_path = temp_dir.path().join("shim.args");
-        fs::write(
-            &shim_path,
-            format!(
-                r#"#!/bin/sh
-set -eu
-printf '%s\n' "$@" > "{}"
-sleep 1
-"#,
-                args_path.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&shim_path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
-        }
-        fs::set_permissions(&shim_path, perms).unwrap();
-
-        let manager = ShimManager::new(ShimConfig {
-            shim_path,
-            work_dir: temp_dir.path().join("shims"),
-            attach_socket_dir: temp_dir.path().join("attach"),
-            container_exits_dir: temp_dir.path().join("exits"),
-            no_new_keyring: true,
-            runtime_path: PathBuf::from("/bin/false"),
-            ..Default::default()
-        });
-        let bundle = temp_dir.path().join("bundle");
-        fs::create_dir_all(&bundle).unwrap();
-
-        manager.start_shim("container-1", &bundle).unwrap();
-        for _ in 0..50 {
-            if args_path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let args = fs::read_to_string(&args_path).unwrap();
-        assert!(args.lines().any(|line| line == "--no-new-keyring"));
-
-        manager.stop_shim("container-1").unwrap();
-    }
-
-    #[test]
-    fn test_start_shim_passes_configured_io_owner_flags() {
-        let temp_dir = tempdir().unwrap();
-        let shim_path = temp_dir.path().join("fake-shim.sh");
-        let args_path = temp_dir.path().join("shim.args");
-        fs::write(
-            &shim_path,
-            format!(
-                r#"#!/bin/sh
-set -eu
-printf '%s\n' "$@" > "{}"
-sleep 1
-"#,
-                args_path.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&shim_path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
-        }
-        fs::set_permissions(&shim_path, perms).unwrap();
-
-        let manager = ShimManager::new(ShimConfig {
-            shim_path,
-            work_dir: temp_dir.path().join("shims"),
-            attach_socket_dir: temp_dir.path().join("attach"),
-            container_exits_dir: temp_dir.path().join("exits"),
-            io_uid: 1234,
-            io_gid: 2345,
-            runtime_path: PathBuf::from("/bin/false"),
-            ..Default::default()
-        });
-        let bundle = temp_dir.path().join("bundle");
-        fs::create_dir_all(&bundle).unwrap();
-
-        manager.start_shim("container-1", &bundle).unwrap();
-        for _ in 0..50 {
-            if args_path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let args = fs::read_to_string(&args_path).unwrap();
-        assert!(args.lines().any(|line| line == "--io-uid"));
-        assert!(args.lines().any(|line| line == "1234"));
-        assert!(args.lines().any(|line| line == "--io-gid"));
-        assert!(args.lines().any(|line| line == "2345"));
-
-        manager.stop_shim("container-1").unwrap();
-    }
-
-    #[test]
-    fn test_start_shim_passes_no_sync_log_flag() {
-        let temp_dir = tempdir().unwrap();
-        let shim_path = temp_dir.path().join("fake-shim.sh");
-        let args_path = temp_dir.path().join("shim.args");
-        fs::write(
-            &shim_path,
-            format!(
-                r#"#!/bin/sh
-set -eu
-printf '%s\n' "$@" > "{}"
-sleep 1
-"#,
-                args_path.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&shim_path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
-        }
-        fs::set_permissions(&shim_path, perms).unwrap();
-
-        let manager = ShimManager::new(ShimConfig {
-            shim_path,
-            work_dir: temp_dir.path().join("shims"),
-            attach_socket_dir: temp_dir.path().join("attach"),
-            container_exits_dir: temp_dir.path().join("exits"),
-            no_sync_log: true,
-            runtime_path: PathBuf::from("/bin/false"),
-            ..Default::default()
-        });
-        let bundle = temp_dir.path().join("bundle");
-        fs::create_dir_all(&bundle).unwrap();
-
-        manager.start_shim("container-1", &bundle).unwrap();
-        for _ in 0..50 {
-            if args_path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let args = fs::read_to_string(&args_path).unwrap();
-        assert!(args.lines().any(|line| line == "--no-sync-log"));
-
-        manager.stop_shim("container-1").unwrap();
-    }
-
-    #[test]
-    fn test_start_shim_passes_runtime_config_path_and_monitor_cgroup() {
-        let temp_dir = tempdir().unwrap();
-        let shim_path = temp_dir.path().join("fake-shim.sh");
-        let args_path = temp_dir.path().join("shim.args");
-        fs::write(
-            &shim_path,
-            format!(
-                r#"#!/bin/sh
-set -eu
-printf '%s\n' "$@" > "{}"
-sleep 1
-"#,
-                args_path.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&shim_path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
-        }
-        fs::set_permissions(&shim_path, perms).unwrap();
-
-        let manager = ShimManager::new(ShimConfig {
-            shim_path,
-            runtime_config_path: PathBuf::from("/etc/kata/config.toml"),
-            monitor_cgroup: "system.slice".to_string(),
-            work_dir: temp_dir.path().join("shims"),
-            attach_socket_dir: temp_dir.path().join("attach"),
-            container_exits_dir: temp_dir.path().join("exits"),
-            runtime_path: PathBuf::from("/bin/false"),
-            ..Default::default()
-        });
-        let bundle = temp_dir.path().join("bundle");
-        fs::create_dir_all(&bundle).unwrap();
-
-        manager.start_shim("container-1", &bundle).unwrap();
-        for _ in 0..50 {
-            if args_path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let args = fs::read_to_string(&args_path).unwrap();
-        assert!(args.lines().any(|line| line == "--runtime-config-path"));
-        assert!(args.lines().any(|line| line == "/etc/kata/config.toml"));
-        assert!(args.lines().any(|line| line == "--monitor-cgroup"));
-        assert!(args.lines().any(|line| line == "system.slice"));
-
-        manager.stop_shim("container-1").unwrap();
-    }
-
-    #[test]
-    fn test_start_shim_omits_empty_runtime_config_path_and_monitor_cgroup() {
-        let temp_dir = tempdir().unwrap();
-        let shim_path = temp_dir.path().join("fake-shim.sh");
-        let args_path = temp_dir.path().join("shim.args");
-        fs::write(
-            &shim_path,
-            format!(
-                r#"#!/bin/sh
-set -eu
-printf '%s\n' "$@" > "{}"
-sleep 1
-"#,
-                args_path.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&shim_path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
-        }
-        fs::set_permissions(&shim_path, perms).unwrap();
-
-        let manager = ShimManager::new(ShimConfig {
-            shim_path,
-            work_dir: temp_dir.path().join("shims"),
-            attach_socket_dir: temp_dir.path().join("attach"),
-            container_exits_dir: temp_dir.path().join("exits"),
-            runtime_path: PathBuf::from("/bin/false"),
-            ..Default::default()
-        });
-        let bundle = temp_dir.path().join("bundle");
-        fs::create_dir_all(&bundle).unwrap();
-
-        manager.start_shim("container-1", &bundle).unwrap();
-        for _ in 0..50 {
-            if args_path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let args = fs::read_to_string(&args_path).unwrap();
-        assert!(!args.lines().any(|line| line == "--runtime-config-path"));
-        assert!(!args.lines().any(|line| line == "--monitor-cgroup"));
-
-        manager.stop_shim("container-1").unwrap();
-    }
-
-    #[test]
-    fn test_start_shim_injects_configured_monitor_env() {
-        let temp_dir = tempdir().unwrap();
-        let shim_path = temp_dir.path().join("fake-shim.sh");
-        let env_out = temp_dir.path().join("shim.env");
-        fs::write(
-            &shim_path,
-            r#"#!/bin/sh
-set -eu
-printf '%s\n' "${TEST_MONITOR_VALUE:-}" > "${TEST_MONITOR_ENV_PATH:?}"
-sleep 1
-"#,
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&shim_path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
-        }
-        fs::set_permissions(&shim_path, perms).unwrap();
-
-        let manager = ShimManager::new(ShimConfig {
-            shim_path,
-            work_dir: temp_dir.path().join("shims"),
-            attach_socket_dir: temp_dir.path().join("attach"),
-            container_exits_dir: temp_dir.path().join("exits"),
-            monitor_env: vec![
-                format!("TEST_MONITOR_ENV_PATH={}", env_out.display()),
-                "TEST_MONITOR_VALUE=hello-from-monitor-env".to_string(),
-            ],
-            runtime_path: PathBuf::from("/bin/false"),
-            ..Default::default()
-        });
-        let bundle = temp_dir.path().join("bundle");
-        fs::create_dir_all(&bundle).unwrap();
-
-        manager.start_shim("container-1", &bundle).unwrap();
-        for _ in 0..50 {
-            if env_out.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert_eq!(
-            fs::read_to_string(&env_out).unwrap().trim(),
-            "hello-from-monitor-env"
-        );
-
-        manager.stop_shim("container-1").unwrap();
-    }
-}
+mod tests;

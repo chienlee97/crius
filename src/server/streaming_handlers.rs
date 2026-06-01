@@ -1,4 +1,5 @@
 use super::*;
+use crate::services::{InternalEvent, InternalEventSeverity};
 
 impl RuntimeServiceImpl {
     async fn await_exec_sync_reader(
@@ -90,12 +91,90 @@ impl RuntimeServiceImpl {
             .join("attach.sock")
     }
 
+    pub(super) fn task_socket_path(&self, container_id: &str) -> PathBuf {
+        crate::shim_rpc::default_task_socket_path(&self.shim_work_dir, container_id)
+    }
+
+    async fn fail_if_shim_owned_socket_missing(
+        &self,
+        container_id: &str,
+        operation: &str,
+        socket_name: &str,
+        task_socket_path: &Path,
+        event_type: &str,
+        event_new_state: &str,
+    ) -> Result<(), Status> {
+        let shim_record = {
+            let persistence = self.persistence.lock().await;
+            persistence
+                .get_shim_process_record(container_id)
+                .map_err(|err| {
+                    Status::internal(format!(
+                        "Failed to inspect shim ledger for container {}: {}",
+                        container_id, err
+                    ))
+                })?
+        };
+
+        if shim_record.is_none() {
+            return Ok(());
+        }
+
+        let details = format!(
+            "{} requires shim {} {}, but the ledger-owned shim {} is missing",
+            operation,
+            socket_name,
+            task_socket_path.display(),
+            socket_name
+        );
+        let event = InternalEvent::new(
+            format!("{event_type}.{event_new_state}"),
+            "task",
+            container_id,
+            InternalEventSeverity::Warning,
+            serde_json::json!({
+                "operation": operation,
+                "socketName": socket_name,
+                "socketPath": task_socket_path.display().to_string(),
+                "state": event_new_state,
+                "details": details,
+            }),
+        );
+        if let Err(err) = self.internal_services.events.publish_internal(event).await {
+            log::warn!(
+                "Failed to record missing shim task socket event for {}: {}",
+                container_id,
+                err
+            );
+        }
+
+        Err(Status::failed_precondition(format!(
+            "{} is not available for container {}: shim {} {} is missing",
+            operation,
+            container_id,
+            socket_name,
+            task_socket_path.display()
+        )))
+    }
+
     pub(super) async fn exec(
         &self,
         request: Request<ExecRequest>,
     ) -> Result<Response<ExecResponse>, Status> {
         let mut req = request.into_inner();
         req.container_id = self.resolve_container_id(&req.container_id).await?;
+        let task_socket_path = self.task_socket_path(&req.container_id);
+        if !task_socket_path.exists() {
+            self.fail_if_shim_owned_socket_missing(
+                &req.container_id,
+                "exec",
+                "task socket",
+                &task_socket_path,
+                "exec",
+                "shim_socket_missing",
+            )
+            .await?;
+        }
         self.ensure_container_is_streamable(&req.container_id, "exec")
             .await?;
         let runtime = self
@@ -113,14 +192,66 @@ impl RuntimeServiceImpl {
             .map(|config| config.stream_websockets)
             .unwrap_or(false);
         let exec_cpu_affinity = self.effective_exec_cpu_affinity(&req.container_id).await;
+        let (exec_io_socket_path, exec_resize_socket_path) = if task_socket_path.exists() {
+            let request = crate::shim_rpc::ShimRpcRequest::OpenExecSession(
+                crate::shim_rpc::OpenExecSessionRequest {
+                    container_id: req.container_id.clone(),
+                    command: req.cmd.clone(),
+                    tty: req.tty,
+                    stdin: req.stdin,
+                    stdout: req.stdout,
+                    stderr: req.stderr,
+                    exec_cpu_affinity,
+                },
+            );
+            let task_socket_path_clone = task_socket_path.clone();
+            let response = tokio::task::spawn_blocking(move || {
+                crate::shim_rpc::ShimRpcClient::new(
+                    task_socket_path_clone,
+                    std::time::Duration::from_secs(5),
+                )
+                .request(request)
+            })
+            .await
+            .map_err(|err| Status::internal(format!("Failed to join shim exec task: {}", err)))?
+            .map_err(|err| {
+                Status::internal(format!("Shim exec session request failed: {}", err))
+            })?;
+            match response {
+                crate::shim_rpc::ShimRpcResponse::OpenExecSession(response) => {
+                    (Some(response.io_socket_path), response.resize_socket_path)
+                }
+                other => {
+                    return Err(Status::internal(format!(
+                        "unexpected shim exec session response for container {}: {:?}",
+                        req.container_id, other
+                    )));
+                }
+            }
+        } else {
+            self.fail_if_shim_owned_socket_missing(
+                &req.container_id,
+                "exec",
+                "task socket",
+                &task_socket_path,
+                "exec",
+                "shim_socket_missing",
+            )
+            .await?;
+            (None, None)
+        };
         let streaming = self.get_streaming_server().await?;
         let response = streaming
             .get_exec(
                 &req,
-                runtime_path,
-                runtime_config_path,
-                exec_cpu_affinity,
-                websocket_enabled,
+                crate::streaming::ExecStreamOptions {
+                    runtime_path,
+                    runtime_config_path,
+                    exec_cpu_affinity,
+                    exec_io_socket_path,
+                    exec_resize_socket_path,
+                    websocket_enabled,
+                },
             )
             .await?;
         Ok(Response::new(response))
@@ -141,13 +272,82 @@ impl RuntimeServiceImpl {
             return Err(Status::invalid_argument("cmd must not be empty"));
         }
 
+        let task_socket_path = self.task_socket_path(&container_id);
+        if !task_socket_path.exists() {
+            self.fail_if_shim_owned_socket_missing(
+                &container_id,
+                "exec_sync",
+                "task socket",
+                &task_socket_path,
+                "exec",
+                "shim_socket_missing",
+            )
+            .await?;
+        }
+
         self.ensure_container_is_streamable(&container_id, "exec_sync")
             .await?;
 
         let runtime = self.runtime_for_container_request(&container_id).await?;
+        let exec_cpu_affinity = self.effective_exec_cpu_affinity(&container_id).await;
+        if task_socket_path.exists() {
+            let request =
+                crate::shim_rpc::ShimRpcRequest::ExecProcess(crate::shim_rpc::ExecProcessRequest {
+                    container_id: container_id.clone(),
+                    command: cmd.clone(),
+                    tty: false,
+                    capture_output: true,
+                    timeout_ms: (timeout > 0).then_some(timeout as u64 * 1000),
+                    io_drain_timeout_ms: (!self.config.exec_sync_io_drain_timeout.is_zero())
+                        .then_some(self.config.exec_sync_io_drain_timeout.as_millis() as u64),
+                    exec_cpu_affinity,
+                });
+            let task_socket_path_clone = task_socket_path.clone();
+            let response = tokio::task::spawn_blocking(move || {
+                crate::shim_rpc::ShimRpcClient::new(
+                    task_socket_path_clone,
+                    std::time::Duration::from_secs(5),
+                )
+                .request(request)
+            })
+            .await
+            .map_err(|err| {
+                Status::internal(format!("Failed to join shim exec_sync task: {}", err))
+            })?
+            .map_err(|err| {
+                let message = err.to_string();
+                if message.contains("timed out") {
+                    Status::deadline_exceeded(message)
+                } else {
+                    Status::internal(format!("Shim exec_sync failed: {}", message))
+                }
+            })?;
+
+            if let crate::shim_rpc::ShimRpcResponse::ExecProcess(response) = response {
+                return Ok(Response::new(ExecSyncResponse {
+                    stdout: response.stdout,
+                    stderr: response.stderr,
+                    exit_code: response.exit_code,
+                }));
+            }
+            return Err(Status::internal(format!(
+                "unexpected shim exec_sync response for container {}",
+                container_id
+            )));
+        }
+
+        self.fail_if_shim_owned_socket_missing(
+            &container_id,
+            "exec_sync",
+            "task socket",
+            &task_socket_path,
+            "exec",
+            "shim_socket_missing",
+        )
+        .await?;
+
         let runtime_path = runtime.runtime_path().to_path_buf();
         let runtime_config_path = runtime.runtime_config_path().to_path_buf();
-        let exec_cpu_affinity = self.effective_exec_cpu_affinity(&container_id).await;
         let mut command = TokioCommand::new(&runtime_path);
         if !runtime_config_path.as_os_str().is_empty() {
             command.arg("--config").arg(&runtime_config_path);
@@ -268,6 +468,16 @@ impl RuntimeServiceImpl {
                     pod_id, netns_path
                 )));
             }
+            if self.config.rootless.enabled
+                && !std::path::Path::new(&netns_path).starts_with(&self.config.rootless.netns_dir)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "rootless port-forward for pod sandbox {} requires a network namespace under {}: {}",
+                    pod_id,
+                    self.config.rootless.netns_dir.display(),
+                    netns_path
+                )));
+            }
             netns_path
         };
 
@@ -341,6 +551,16 @@ impl RuntimeServiceImpl {
             }
         }
         if !attach_socket_path.exists() {
+            self.fail_if_shim_owned_socket_missing(
+                &req.container_id,
+                "attach",
+                "attach socket",
+                &attach_socket_path,
+                "attach",
+                "attach_socket_missing",
+            )
+            .await?;
+
             let log_path = {
                 let containers = self.containers.lock().await;
                 containers
@@ -355,10 +575,17 @@ impl RuntimeServiceImpl {
                     .filter(|path| !path.is_empty())
             };
 
-            if !req.stdin && log_path.is_some() {
+            if !req.stdin {
+                let Some(log_path) = log_path else {
+                    return Err(Status::failed_precondition(format!(
+                        "attach is not available for container {}: attach socket {} is missing and no interactive recovery path is available",
+                        req.container_id,
+                        attach_socket_path.display()
+                    )));
+                };
                 let streaming = self.get_streaming_server().await?;
                 let response = streaming
-                    .get_attach_log(&req, PathBuf::from(log_path.unwrap()), websocket_enabled)
+                    .get_attach_log(&req, PathBuf::from(log_path), websocket_enabled)
                     .await?;
                 return Ok(Response::new(response));
             }
@@ -369,8 +596,53 @@ impl RuntimeServiceImpl {
                 attach_socket_path.display()
             )));
         }
+        let (attach_io_socket_path, attach_resize_socket_path, attach_stream_close) =
+            if self.task_socket_path(&req.container_id).exists() {
+                let runtime = self.runtime.clone();
+                let container_id = req.container_id.clone();
+                let stdin = req.stdin;
+                let stdout = req.stdout;
+                let stderr = req.stderr;
+                let tty = req.tty;
+                let response = tokio::task::spawn_blocking(move || {
+                    runtime.open_attach_stream(&container_id, stdin, stdout, stderr, tty)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("Failed to spawn attach stream RPC task: {}", e))
+                })?
+                .map_err(|e| {
+                    Status::failed_precondition(format!(
+                        "attach RPC stream is unavailable for container {}: {}",
+                        req.container_id, e
+                    ))
+                })?;
+                let close_runtime = self.runtime.clone();
+                let close = crate::streaming::AttachStreamClose::new(
+                    req.container_id.clone(),
+                    response.stream_id,
+                    move |container_id, stream_id| {
+                        close_runtime.close_attach_stream(container_id, stream_id)
+                    },
+                );
+                (
+                    Some(response.io_socket_path),
+                    response.resize_socket_path,
+                    Some(close),
+                )
+            } else {
+                (None, None, None)
+            };
         let streaming = self.get_streaming_server().await?;
-        let response = streaming.get_attach(&req, websocket_enabled).await?;
+        let response = streaming
+            .get_attach_with_close(
+                &req,
+                attach_io_socket_path,
+                attach_resize_socket_path,
+                attach_stream_close,
+                websocket_enabled,
+            )
+            .await?;
         Ok(Response::new(response))
     }
 }

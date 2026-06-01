@@ -426,6 +426,18 @@ impl RuntimeServiceImpl {
             req.runtime_handler.trim(),
             effective_namespace_options.as_ref(),
         )?;
+        self.publish_pod_lifecycle_event(
+            &pod_id,
+            "run_start",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "runtimeHandler": runtime_handler,
+                "name": pod_metadata.name.clone(),
+                "namespace": pod_metadata.namespace.clone(),
+                "uid": pod_metadata.uid.clone(),
+            }),
+        )
+        .await;
         let run_as_user = sandbox_security
             .and_then(|security| security.run_as_user.as_ref())
             .map(|user| user.value.to_string());
@@ -711,25 +723,56 @@ impl RuntimeServiceImpl {
             })
             .collect();
         let pause_image = self.requested_pause_image(&pod_config);
-        self.image_service
+        if let Err(status) = self
+            .image_service
             .ensure_image_exists_for_sandbox(&pause_image, &pod_config)
             .await
-            .map_err(|status| {
-                Status::new(
-                    status.code(),
-                    format!(
-                        "failed to ensure pause image {} for pod sandbox: {}",
-                        pause_image,
-                        status.message()
-                    ),
-                )
-            })?;
+        {
+            let mapped = Status::new(
+                status.code(),
+                format!(
+                    "failed to ensure pause image {} for pod sandbox: {}",
+                    pause_image,
+                    status.message()
+                ),
+            );
+            self.publish_pod_lifecycle_event(
+                &pod_id,
+                "run_failed",
+                crate::services::InternalEventSeverity::Error,
+                json!({
+                    "phase": "ensurePauseImage",
+                    "pauseImage": pause_image,
+                    "code": format!("{:?}", mapped.code()),
+                    "message": mapped.message(),
+                }),
+            )
+            .await;
+            return Err(mapped);
+        }
 
         let mut pod_manager = self.pod_manager.lock().await;
-        let pod_id = pod_manager
+        let pod_id = match pod_manager
             .create_pod_sandbox_with_id(pod_id.clone(), sandbox_config)
             .await
-            .map_err(Self::map_run_pod_sandbox_error)?;
+        {
+            Ok(pod_id) => pod_id,
+            Err(err) => {
+                let status = Self::map_run_pod_sandbox_error(err);
+                self.publish_pod_lifecycle_event(
+                    &pod_id,
+                    "run_failed",
+                    crate::services::InternalEventSeverity::Error,
+                    json!({
+                        "phase": "createPodSandbox",
+                        "code": format!("{:?}", status.code()),
+                        "message": status.message(),
+                    }),
+                )
+                .await;
+                return Err(status);
+            }
+        };
         let created_pod = pod_manager.get_pod_sandbox_cloned(&pod_id);
         drop(pod_manager);
 
@@ -802,6 +845,7 @@ impl RuntimeServiceImpl {
                 overhead_linux_resources: pod_overhead.as_ref().map(StoredLinuxResources::from),
                 linux_resources: stored_effective_pod_linux_resources.clone(),
                 stop_notified: false,
+                broken: None,
             })
             .unwrap_or_else(|| StoredPodState {
                 port_mappings: stored_port_mappings,
@@ -849,12 +893,7 @@ impl RuntimeServiceImpl {
             created_at: created_pod
                 .as_ref()
                 .map(|pod| Self::normalize_timestamp_nanos(pod.created_at))
-                .unwrap_or_else(|| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos() as i64
-                }),
+                .unwrap_or_else(Self::now_nanos),
             labels: pod_config.labels.clone(),
             annotations: stored_annotations.clone(),
             runtime_handler: runtime_handler.clone(),
@@ -888,72 +927,117 @@ impl RuntimeServiceImpl {
         } else {
             String::new()
         };
-        let persistence = self.persistence.clone();
-        let pod_sandboxes = self.pod_sandboxes.clone();
-        let removed_pod_sandbox_ids = self.removed_pod_sandbox_ids.clone();
-        let pod_id_for_persist = pod_id.clone();
-        tokio::spawn(async move {
-            if removed_pod_sandbox_ids
-                .lock()
-                .ok()
-                .map(|removed| removed.contains(&pod_id_for_persist))
-                .unwrap_or(false)
+        let pod_root_dir_for_persist = self.config.root_dir.join("pods").join(&pod_id);
+        let current_pod = pod_sandbox.clone();
+        let pod_state = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
+            &current_pod.annotations,
+            INTERNAL_POD_STATE_KEY,
+        )
+        .unwrap_or_default();
+        let state = if current_pod.state == PodSandboxState::SandboxReady as i32 {
+            "ready"
+        } else {
+            "notready"
+        };
+        let netns_path = if RuntimeServiceImpl::pod_requires_managed_netns(Some(&pod_state)) {
+            pod_state.netns_path.clone().unwrap_or(netns_path)
+        } else {
+            String::new()
+        };
+        let metadata = current_pod.metadata.clone().unwrap_or_default();
+        let mut artifacts = vec![crate::storage::RuntimeArtifactRecord {
+            owner_kind: "pod".to_string(),
+            owner_id: pod_id.clone(),
+            artifact_kind: "workspace".to_string(),
+            path: pod_root_dir_for_persist.display().to_string(),
+            state: "active".to_string(),
+            runtime_handler: Some(current_pod.runtime_handler.clone().trim().to_string())
+                .filter(|value| !value.is_empty()),
+            runtime_root: None,
+        }];
+        if !netns_path.is_empty() {
+            artifacts.push(crate::storage::RuntimeArtifactRecord {
+                owner_kind: "pod".to_string(),
+                owner_id: pod_id.clone(),
+                artifact_kind: "netns".to_string(),
+                path: netns_path.clone(),
+                state: "active".to_string(),
+                runtime_handler: Some(current_pod.runtime_handler.clone().trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                runtime_root: None,
+            });
+        }
+        {
+            let mut persistence = self.persistence.lock().await;
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .save_pod_sandbox_state(
+                    &pod_id,
+                    state,
+                    &metadata.name,
+                    &metadata.namespace,
+                    &metadata.uid,
+                    &netns_path,
+                    &current_pod.labels,
+                    &current_pod.annotations,
+                    pod_state.pause_container_id.as_deref(),
+                    pod_state.ip.as_deref(),
+                )
             {
-                return;
-            }
-
-            let Some(current_pod) = ({
-                let pod_sandboxes = pod_sandboxes.lock().await;
-                pod_sandboxes.get(&pod_id_for_persist).cloned()
-            }) else {
-                return;
-            };
-
-            let pod_state = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
-                &current_pod.annotations,
-                INTERNAL_POD_STATE_KEY,
-            )
-            .unwrap_or_default();
-            let state = if current_pod.state == PodSandboxState::SandboxReady as i32 {
-                "ready"
-            } else {
-                "notready"
-            };
-            let netns_path = if RuntimeServiceImpl::pod_requires_managed_netns(Some(&pod_state)) {
-                pod_state.netns_path.unwrap_or(netns_path)
-            } else {
-                String::new()
-            };
-            let metadata = current_pod.metadata.clone().unwrap_or_default();
-
-            let mut persistence = persistence.lock().await;
-            if let Err(err) = persistence.save_pod_sandbox(
-                &pod_id_for_persist,
-                state,
-                &metadata.name,
-                &metadata.namespace,
-                &metadata.uid,
-                &netns_path,
-                &current_pod.labels,
-                &current_pod.annotations,
-                pod_state.pause_container_id.as_deref(),
-                pod_state.ip.as_deref(),
-            ) {
-                log::error!(
+                drop(persistence);
+                self.rollback_failed_pod_sandbox_run(&pod_id).await;
+                self.publish_pod_lifecycle_event(
+                    &pod_id,
+                    "run_failed",
+                    crate::services::InternalEventSeverity::Error,
+                    json!({
+                        "phase": "persistPodSandbox",
+                        "message": err.to_string(),
+                    }),
+                )
+                .await;
+                return Err(Status::internal(format!(
                     "Failed to persist pod sandbox {}: {}",
-                    pod_id_for_persist,
-                    err
-                );
-            } else {
-                log::info!("Pod sandbox {} persisted to database", pod_id_for_persist);
+                    pod_id, err
+                )));
             }
-        });
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .replace_runtime_artifacts("pod", &pod_id, &artifacts)
+            {
+                drop(persistence);
+                self.rollback_failed_pod_sandbox_run(&pod_id).await;
+                self.publish_pod_lifecycle_event(
+                    &pod_id,
+                    "run_failed",
+                    crate::services::InternalEventSeverity::Error,
+                    json!({
+                        "phase": "persistRuntimeArtifacts",
+                        "message": err.to_string(),
+                    }),
+                )
+                .await;
+                return Err(Status::internal(format!(
+                    "Failed to persist runtime artifacts for pod sandbox {}: {}",
+                    pod_id, err
+                )));
+            }
+        }
+        log::info!("Pod sandbox {} persisted to database", pod_id);
         if let Err(err) = self
             .nri
             .run_pod_sandbox(self.nri_pod_event(&pod_id).await)
             .await
         {
             self.rollback_failed_pod_sandbox_run(&pod_id).await;
+            self.publish_pod_lifecycle_event(
+                &pod_id,
+                "run_failed",
+                crate::services::InternalEventSeverity::Error,
+                json!({
+                    "phase": "nriRunPodSandbox",
+                    "message": err.to_string(),
+                }),
+            )
+            .await;
             return Err(Status::internal(format!(
                 "NRI RunPodSandbox failed: {}",
                 err
@@ -961,6 +1045,32 @@ impl RuntimeServiceImpl {
         }
 
         log::info!("Pod sandbox {} created successfully", pod_id);
+        self.publish_pod_lifecycle_event(
+            &pod_id,
+            "run_success",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "state": "ready",
+                "runtimeHandler": runtime_handler,
+                "netnsPath": netns_path,
+                "pauseContainerId": pod_state.pause_container_id,
+                "ip": pod_state.ip,
+            }),
+        )
+        .await;
+        self.publish_network_internal_event(
+            &pod_id,
+            "setup_success",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "netnsPath": netns_path,
+                "runtimeHandler": runtime_handler,
+                "ip": pod_state.ip,
+                "additionalIps": pod_state.additional_ips,
+                "managed": managed_netns,
+            }),
+        )
+        .await;
         if let Some(pause_container_id) = pod_state.pause_container_id.as_deref() {
             self.ensure_pod_exit_monitor_registered(&pod_id, pause_container_id);
         }
@@ -1100,8 +1210,8 @@ impl RuntimeServiceImpl {
         .and_then(|state| state.netns_path)
         .unwrap_or_default();
         let mut persistence = self.persistence.lock().await;
-        persistence
-            .save_pod_sandbox(
+        crate::state::StateLedgerWriter::new(&mut persistence)
+            .save_pod_sandbox_state(
                 &updated_pod.id,
                 if updated_pod.state == PodSandboxState::SandboxReady as i32 {
                     "ready"
@@ -1185,6 +1295,19 @@ impl RuntimeServiceImpl {
         }
 
         log::info!("Stopping pod sandbox {}", pod_id);
+        self.publish_pod_lifecycle_event(
+            &pod_id,
+            "stop_start",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "previousState": if pod.state == PodSandboxState::SandboxReady as i32 {
+                    "ready"
+                } else {
+                    "notready"
+                },
+            }),
+        )
+        .await;
         let container_ids: Vec<String> = {
             let containers = self.containers.lock().await;
             containers
@@ -1205,16 +1328,38 @@ impl RuntimeServiceImpl {
             let mut pod_manager = self.pod_manager.lock().await;
             let has_entry = pod_manager.get_pod_sandbox(&pod_id).is_some();
             if has_entry {
-                pod_manager
-                    .stop_pod_sandbox(&pod_id)
-                    .await
-                    .map_err(|e| Status::internal(format!("Failed to stop pod sandbox: {}", e)))?;
+                if let Err(err) = pod_manager.stop_pod_sandbox(&pod_id).await {
+                    self.publish_network_internal_event(
+                        &pod_id,
+                        "teardown_failed",
+                        crate::services::InternalEventSeverity::Error,
+                        json!({
+                            "phase": "stopPodSandbox",
+                            "message": err.to_string(),
+                        }),
+                    )
+                    .await;
+                    return Err(Status::internal(format!(
+                        "Failed to stop pod sandbox: {}",
+                        err
+                    )));
+                }
             }
             has_entry
         };
         if !cleaned_via_manager {
             self.fallback_cleanup_pod_sandbox_resources(&pod_id, &pod, pod_state.as_ref(), false)
                 .await;
+            self.publish_network_internal_event(
+                &pod_id,
+                "teardown_success",
+                crate::services::InternalEventSeverity::Info,
+                json!({
+                    "phase": "fallbackStopPodSandbox",
+                    "cleanedViaManager": false,
+                }),
+            )
+            .await;
         }
 
         let updated_pod = {
@@ -1240,26 +1385,25 @@ impl RuntimeServiceImpl {
         }
 
         if let Some(updated_pod) = updated_pod {
-            let persistence = self.persistence.clone();
-            tokio::spawn(async move {
-                let netns_path = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
-                    &updated_pod.annotations,
-                    INTERNAL_POD_STATE_KEY,
-                )
-                .and_then(|state| state.netns_path)
-                .unwrap_or_default();
-                let pause_container_id = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
-                    &updated_pod.annotations,
-                    INTERNAL_POD_STATE_KEY,
-                )
-                .and_then(|state| state.pause_container_id);
-                let ip = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
-                    &updated_pod.annotations,
-                    INTERNAL_POD_STATE_KEY,
-                )
-                .and_then(|state| state.ip);
-                let mut persistence = persistence.lock().await;
-                if let Err(err) = persistence.save_pod_sandbox(
+            let netns_path = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
+                &updated_pod.annotations,
+                INTERNAL_POD_STATE_KEY,
+            )
+            .and_then(|state| state.netns_path)
+            .unwrap_or_default();
+            let pause_container_id = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
+                &updated_pod.annotations,
+                INTERNAL_POD_STATE_KEY,
+            )
+            .and_then(|state| state.pause_container_id);
+            let ip = RuntimeServiceImpl::read_internal_state::<StoredPodState>(
+                &updated_pod.annotations,
+                INTERNAL_POD_STATE_KEY,
+            )
+            .and_then(|state| state.ip);
+            let mut persistence = self.persistence.lock().await;
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .save_pod_sandbox_state(
                     &updated_pod.id,
                     "notready",
                     &updated_pod
@@ -1282,13 +1426,35 @@ impl RuntimeServiceImpl {
                     &updated_pod.annotations,
                     pause_container_id.as_deref(),
                     ip.as_deref(),
-                ) {
-                    log::error!("Failed to persist stopped pod {}: {}", updated_pod.id, err);
-                }
-            });
+                )
+            {
+                log::error!("Failed to persist stopped pod {}: {}", updated_pod.id, err);
+            }
+            drop(persistence);
         }
 
         log::info!("Pod sandbox {} stopped", pod_id);
+        self.publish_network_internal_event(
+            &pod_id,
+            "teardown_success",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "phase": "stopPodSandbox",
+                "cleanedViaManager": cleaned_via_manager,
+            }),
+        )
+        .await;
+        self.publish_pod_lifecycle_event(
+            &pod_id,
+            "stop_success",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "state": "notready",
+                "stoppedContainers": stopped_containers.len(),
+                "cleanedViaManager": cleaned_via_manager,
+            }),
+        )
+        .await;
         for container in stopped_containers {
             self.emit_container_event(
                 ContainerEventType::ContainerStoppedEvent,
@@ -1330,6 +1496,15 @@ impl RuntimeServiceImpl {
             let pod_sandboxes = self.pod_sandboxes.lock().await;
             pod_sandboxes.get(&pod_id).cloned()
         };
+        self.publish_pod_lifecycle_event(
+            &pod_id,
+            "remove_start",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "hadPod": existing_pod.is_some(),
+            }),
+        )
+        .await;
         let pod_state = existing_pod.as_ref().and_then(|pod| {
             Self::read_internal_state::<StoredPodState>(&pod.annotations, INTERNAL_POD_STATE_KEY)
         });
@@ -1360,9 +1535,22 @@ impl RuntimeServiceImpl {
             let mut pod_manager = self.pod_manager.lock().await;
             let has_entry = pod_manager.get_pod_sandbox(&pod_id).is_some();
             if has_entry {
-                pod_manager.remove_pod_sandbox(&pod_id).await.map_err(|e| {
-                    Status::internal(format!("Failed to remove pod sandbox: {}", e))
-                })?;
+                if let Err(err) = pod_manager.remove_pod_sandbox(&pod_id).await {
+                    self.publish_network_internal_event(
+                        &pod_id,
+                        "teardown_failed",
+                        crate::services::InternalEventSeverity::Error,
+                        json!({
+                            "phase": "removePodSandbox",
+                            "message": err.to_string(),
+                        }),
+                    )
+                    .await;
+                    return Err(Status::internal(format!(
+                        "Failed to remove pod sandbox: {}",
+                        err
+                    )));
+                }
             }
             has_entry
         };
@@ -1371,6 +1559,16 @@ impl RuntimeServiceImpl {
             if let Some(pod) = existing_pod.as_ref() {
                 self.fallback_cleanup_pod_sandbox_resources(&pod_id, pod, pod_state.as_ref(), true)
                     .await;
+                self.publish_network_internal_event(
+                    &pod_id,
+                    "teardown_success",
+                    crate::services::InternalEventSeverity::Info,
+                    json!({
+                        "phase": "fallbackRemovePodSandbox",
+                        "cleanedViaManager": false,
+                    }),
+                )
+                .await;
             }
         }
 
@@ -1382,26 +1580,40 @@ impl RuntimeServiceImpl {
         }
         self.release_pod_name(&pod_id);
 
-        let persistence = self.persistence.clone();
-        let pod_id_for_delete = pod_id.clone();
-        tokio::spawn(async move {
-            let mut persistence = persistence.lock().await;
-            if let Err(e) = persistence.delete_pod_sandbox(&pod_id_for_delete) {
-                log::error!(
-                    "Failed to delete pod {} from database: {}",
-                    pod_id_for_delete,
-                    e
-                );
-            } else {
-                log::info!("Pod sandbox {} removed from database", pod_id_for_delete);
-            }
-        });
+        let mut persistence = self.persistence.lock().await;
+        if let Err(e) = persistence.delete_pod_sandbox(&pod_id) {
+            log::error!("Failed to delete pod {} from database: {}", pod_id, e);
+        } else {
+            let _ = persistence.delete_runtime_artifacts("pod", &pod_id);
+            log::info!("Pod sandbox {} removed from database", pod_id);
+        }
+        drop(persistence);
 
         if let Err(err) = self.nri.remove_pod_sandbox(pod_remove_event).await {
             log::warn!("NRI RemovePodSandbox failed for {}: {}", pod_id, err);
         }
 
         log::info!("Pod sandbox {} removed", pod_id);
+        self.publish_network_internal_event(
+            &pod_id,
+            "teardown_success",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "phase": "removePodSandbox",
+                "cleanedViaManager": cleaned_via_manager,
+            }),
+        )
+        .await;
+        self.publish_pod_lifecycle_event(
+            &pod_id,
+            "remove_success",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "removedContainers": removed_containers.len(),
+                "cleanedViaManager": cleaned_via_manager,
+            }),
+        )
+        .await;
         for container in removed_containers {
             self.emit_container_event(
                 ContainerEventType::ContainerDeletedEvent,

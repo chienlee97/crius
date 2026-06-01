@@ -1,4 +1,6 @@
+use super::service::RecoveryShimCleanupSummary;
 use super::*;
+use crate::services::{InternalEvent, InternalEventSeverity};
 
 impl RuntimeServiceImpl {
     #[allow(clippy::too_many_arguments)]
@@ -84,9 +86,60 @@ impl RuntimeServiceImpl {
     }
 
     pub(super) fn publish_event(&self, event: ContainerEventResponse) {
-        if let Err(err) = self.events.send(event) {
-            log::debug!("Dropping CRI event without subscribers: {}", err);
+        self.internal_services.events.publish(event);
+    }
+
+    pub(super) async fn publish_lifecycle_internal_event(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+        action: &str,
+        severity: InternalEventSeverity,
+        details: serde_json::Value,
+    ) {
+        let event = InternalEvent::new(
+            format!("{subject_kind}.{action}"),
+            subject_kind,
+            subject_id,
+            severity,
+            details,
+        );
+        if let Err(err) = self.internal_services.events.publish_internal(event).await {
+            log::debug!("Failed to publish {subject_kind} lifecycle event for {subject_id}: {err}");
         }
+    }
+
+    pub(super) async fn publish_pod_lifecycle_event(
+        &self,
+        pod_id: &str,
+        action: &str,
+        severity: InternalEventSeverity,
+        details: serde_json::Value,
+    ) {
+        self.publish_lifecycle_internal_event("pod", pod_id, action, severity, details)
+            .await;
+    }
+
+    pub(super) async fn publish_container_lifecycle_event(
+        &self,
+        container_id: &str,
+        action: &str,
+        severity: InternalEventSeverity,
+        details: serde_json::Value,
+    ) {
+        self.publish_lifecycle_internal_event("container", container_id, action, severity, details)
+            .await;
+    }
+
+    pub(super) async fn publish_network_internal_event(
+        &self,
+        pod_id: &str,
+        action: &str,
+        severity: InternalEventSeverity,
+        details: serde_json::Value,
+    ) {
+        self.publish_lifecycle_internal_event("network", pod_id, action, severity, details)
+            .await;
     }
 
     pub(super) fn exit_code_path(&self, container_id: &str) -> PathBuf {
@@ -262,7 +315,8 @@ impl RuntimeServiceImpl {
         }
     }
 
-    pub(super) async fn cleanup_orphaned_shim_artifacts(&self) {
+    pub(super) async fn cleanup_orphaned_shim_artifacts(&self) -> RecoveryShimCleanupSummary {
+        let mut summary = RecoveryShimCleanupSummary::default();
         let known_container_ids: HashSet<String> =
             self.containers.lock().await.keys().cloned().collect();
         let known_pause_ids: HashSet<String> = self
@@ -278,9 +332,24 @@ impl RuntimeServiceImpl {
                 .and_then(|state| state.pause_container_id)
             })
             .collect();
+        let ledger_shims = self
+            .persistence
+            .lock()
+            .await
+            .list_shim_process_records()
+            .unwrap_or_default();
+        let live_ledger_shims: HashMap<String, u32> = ledger_shims
+            .into_iter()
+            .filter(|record| {
+                PathBuf::from("/proc")
+                    .join(record.shim_pid.to_string())
+                    .exists()
+            })
+            .map(|record| (record.container_id, record.shim_pid))
+            .collect();
 
         let Ok(entries) = std::fs::read_dir(&self.shim_work_dir) else {
-            return;
+            return summary;
         };
 
         for entry in entries.flatten() {
@@ -296,46 +365,33 @@ impl RuntimeServiceImpl {
             if known_container_ids.contains(id) || known_pause_ids.contains(id) {
                 continue;
             }
-
-            let metadata = std::fs::read(path.join("shim.json"))
-                .ok()
-                .and_then(|raw| serde_json::from_slice::<ShimProcess>(&raw).ok());
-            let live_process = metadata
-                .as_ref()
-                .map(|process| {
-                    PathBuf::from("/proc")
-                        .join(process.shim_pid.to_string())
-                        .exists()
-                })
-                .unwrap_or(false);
-
-            if live_process {
+            if let Some(shim_pid) = live_ledger_shims.get(id) {
                 log::warn!(
                     "Keeping orphaned shim directory {} because shim pid {} still appears live",
                     path.display(),
-                    metadata
-                        .as_ref()
-                        .map(|process| process.shim_pid)
-                        .unwrap_or_default()
+                    shim_pid
                 );
                 continue;
             }
 
             if let Err(err) = std::fs::remove_dir_all(&path) {
+                summary.failures += 1;
                 log::warn!(
                     "Failed to remove orphaned shim directory {}: {}",
                     path.display(),
                     err
                 );
+            } else {
+                summary.shim_dirs_removed += 1;
             }
         }
 
         if self.attach_socket_dir == self.shim_work_dir {
-            return;
+            return summary;
         }
 
         let Ok(entries) = std::fs::read_dir(&self.attach_socket_dir) else {
-            return;
+            return summary;
         };
 
         for entry in entries.flatten() {
@@ -351,39 +407,27 @@ impl RuntimeServiceImpl {
             if known_container_ids.contains(id) || known_pause_ids.contains(id) {
                 continue;
             }
-
-            let metadata = std::fs::read(self.shim_work_dir.join(id).join("shim.json"))
-                .ok()
-                .and_then(|raw| serde_json::from_slice::<ShimProcess>(&raw).ok());
-            let live_process = metadata
-                .as_ref()
-                .map(|process| {
-                    PathBuf::from("/proc")
-                        .join(process.shim_pid.to_string())
-                        .exists()
-                })
-                .unwrap_or(false);
-
-            if live_process {
+            if let Some(shim_pid) = live_ledger_shims.get(id) {
                 log::warn!(
                     "Keeping orphaned attach socket directory {} because shim pid {} still appears live",
                     path.display(),
-                    metadata
-                        .as_ref()
-                        .map(|process| process.shim_pid)
-                        .unwrap_or_default()
+                    shim_pid
                 );
                 continue;
             }
 
             if let Err(err) = std::fs::remove_dir_all(&path) {
+                summary.failures += 1;
                 log::warn!(
                     "Failed to remove orphaned attach socket directory {}: {}",
                     path.display(),
                     err
                 );
+            } else {
+                summary.attach_socket_dirs_removed += 1;
             }
         }
+        summary
     }
 
     #[allow(dead_code)]
@@ -648,10 +692,12 @@ impl RuntimeServiceImpl {
 
         {
             let mut persistence = persistence.lock().await;
-            if let Err(err) = persistence.update_container_state(
-                container_id,
-                crate::runtime::ContainerStatus::Stopped(exit_code),
-            ) {
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .update_container_state(
+                    container_id,
+                    crate::runtime::ContainerStatus::Stopped(exit_code),
+                )
+            {
                 log::warn!(
                     "Exit monitor failed to persist container {} state: {}",
                     container_id,
@@ -681,8 +727,8 @@ impl RuntimeServiceImpl {
 
         if updated_pod.is_some() {
             let mut persistence = persistence.lock().await;
-            if let Err(err) =
-                persistence.update_pod_state(&updated_container.pod_sandbox_id, "notready")
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .update_pod_state(&updated_container.pod_sandbox_id, "notready")
             {
                 log::warn!(
                     "Exit monitor failed to persist pod {} state: {}",
@@ -749,38 +795,15 @@ impl RuntimeServiceImpl {
         annotations: &HashMap<String, String>,
         persistence: &Arc<Mutex<PersistenceManager>>,
     ) {
-        let encoded_annotations = match serde_json::to_string(annotations) {
-            Ok(encoded) => encoded,
-            Err(err) => {
-                log::warn!(
-                    "Exit monitor failed to encode annotations for {}: {}",
-                    container_id,
-                    err
-                );
-                return;
-            }
-        };
-
         let mut persistence = persistence.lock().await;
-        match persistence.storage().get_container(container_id) {
-            Ok(Some(mut record)) => {
-                record.annotations = encoded_annotations;
-                if let Err(err) = persistence.storage_mut().save_container(&record) {
-                    log::warn!(
-                        "Exit monitor failed to persist annotations for {}: {}",
-                        container_id,
-                        err
-                    );
-                }
-            }
-            Ok(None) => {}
-            Err(err) => {
-                log::warn!(
-                    "Exit monitor failed to load container record {}: {}",
-                    container_id,
-                    err
-                );
-            }
+        if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+            .update_container_annotations(container_id, annotations)
+        {
+            log::warn!(
+                "Exit monitor failed to persist annotations for {}: {}",
+                container_id,
+                err
+            );
         }
     }
 
@@ -810,7 +833,9 @@ impl RuntimeServiceImpl {
 
         {
             let mut persistence = persistence.lock().await;
-            if let Err(err) = persistence.update_pod_state(pod_id, "notready") {
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .update_pod_state(pod_id, "notready")
+            {
                 log::warn!(
                     "Pause exit monitor failed to persist pod {} state: {}",
                     pod_id,
@@ -943,17 +968,19 @@ impl RuntimeServiceImpl {
 
             {
                 let mut persistence = persistence.lock().await;
-                if let Err(err) = persistence.update_container_state(
-                    &container_id,
-                    match runtime_status {
-                        ContainerStatus::Created => crate::runtime::ContainerStatus::Created,
-                        ContainerStatus::Running => crate::runtime::ContainerStatus::Running,
-                        ContainerStatus::Stopped(code) => {
-                            crate::runtime::ContainerStatus::Stopped(code)
-                        }
-                        ContainerStatus::Unknown => crate::runtime::ContainerStatus::Unknown,
-                    },
-                ) {
+                if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                    .update_container_state(
+                        &container_id,
+                        match runtime_status {
+                            ContainerStatus::Created => crate::runtime::ContainerStatus::Created,
+                            ContainerStatus::Running => crate::runtime::ContainerStatus::Running,
+                            ContainerStatus::Stopped(code) => {
+                                crate::runtime::ContainerStatus::Stopped(code)
+                            }
+                            ContainerStatus::Unknown => crate::runtime::ContainerStatus::Unknown,
+                        },
+                    )
+                {
                     log::warn!(
                         "Background state refresh failed to persist container {}: {}",
                         container_id,
@@ -1061,7 +1088,9 @@ impl RuntimeServiceImpl {
                 } else {
                     "notready"
                 };
-                if let Err(err) = persistence.update_pod_state(&pod_id, target_state) {
+                if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                    .update_pod_state(&pod_id, target_state)
+                {
                     log::warn!(
                         "Background state refresh failed to persist pod {}: {}",
                         pod_id,

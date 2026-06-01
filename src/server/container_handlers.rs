@@ -69,9 +69,8 @@ impl RuntimeServiceImpl {
                 let in_memory = existing_container.is_some();
                 let persisted_record = {
                     let persistence = self.persistence.lock().await;
-                    persistence
-                        .storage()
-                        .get_container(&existing_id)
+                    crate::state::StateLedger::new(&persistence)
+                        .container(&existing_id)
                         .ok()
                         .flatten()
                 };
@@ -360,9 +359,8 @@ impl RuntimeServiceImpl {
 
         let persisted = {
             let persistence = self.persistence.lock().await;
-            persistence
-                .storage()
-                .get_container(container_id)
+            crate::state::StateLedger::new(&persistence)
+                .container(container_id)
                 .map_err(|e| {
                     Status::internal(format!(
                         "Failed to load persisted container {}: {}",
@@ -397,9 +395,10 @@ impl RuntimeServiceImpl {
                     .ok()
                     .flatten()
                 {
-                    if let Err(err) =
-                        self.persist_bundle_annotations(&event.container.id, &container.annotations)
-                    {
+                    if let Err(err) = self.persist_bundle_annotations_if_oci(
+                        &event.container.id,
+                        &container.annotations,
+                    ) {
                         log::warn!(
                             "Failed to persist undo stop annotations for {}: {}",
                             event.container.id,
@@ -545,20 +544,17 @@ impl RuntimeServiceImpl {
                 None => crate::runtime::ContainerStatus::Unknown,
             },
         };
-        let persistence = self.persistence.clone();
-        let container_id_owned = container_id.to_string();
-        tokio::spawn(async move {
-            let mut persistence = persistence.lock().await;
-            if let Err(err) =
-                persistence.update_container_state(&container_id_owned, persistence_status)
-            {
-                log::error!(
-                    "Failed to update container {} state in database: {}",
-                    container_id_owned,
-                    err
-                );
-            }
-        });
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+            .update_container_state(container_id, persistence_status)
+        {
+            log::error!(
+                "Failed to update container {} state in database: {}",
+                container_id,
+                err
+            );
+        }
+        drop(persistence);
 
         Ok(updated_container)
     }
@@ -615,7 +611,7 @@ impl RuntimeServiceImpl {
         if let Some(container) = &updated_container {
             self.persist_container_annotations(container_id, &container.annotations)
                 .await?;
-            self.persist_bundle_annotations(container_id, &container.annotations)?;
+            self.persist_bundle_annotations_if_oci(container_id, &container.annotations)?;
         }
 
         let persistence_status = match final_runtime_status {
@@ -625,7 +621,9 @@ impl RuntimeServiceImpl {
             ContainerStatus::Unknown => crate::runtime::ContainerStatus::Created,
         };
         let mut persistence = self.persistence.lock().await;
-        if let Err(err) = persistence.update_container_state(container_id, persistence_status) {
+        if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+            .update_container_state(container_id, persistence_status)
+        {
             log::error!(
                 "Failed to update failed-start container {} state in database: {}",
                 container_id,
@@ -721,14 +719,42 @@ impl RuntimeServiceImpl {
             return Ok(updated_container);
         }
 
+        let reserved_nri_stop = needs_nri_stop && !stop_notified;
+        if reserved_nri_stop {
+            let reservation = self
+                .mutate_container_internal_state(actual_container_id, |state| {
+                    state.nri_stop_notified = true;
+                })
+                .await;
+            if let Err(err) = reservation {
+                log::warn!(
+                    "Failed to reserve NRI stop notification for {}: {}",
+                    actual_container_id,
+                    err
+                );
+            }
+        }
+
         let runtime = self.runtime.clone();
         let actual_container_id_owned = actual_container_id.to_string();
-        tokio::task::spawn_blocking(move || {
+        let stop_result = tokio::task::spawn_blocking(move || {
             runtime.stop_container(&actual_container_id_owned, Some(timeout))
         })
         .await
-        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-        .map_err(|e| Status::internal(format!("Failed to stop container: {}", e)))?;
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))
+        .and_then(|result| {
+            result.map_err(|e| Status::internal(format!("Failed to stop container: {}", e)))
+        });
+        if let Err(status) = stop_result {
+            if reserved_nri_stop {
+                let _ = self
+                    .mutate_container_internal_state(actual_container_id, |state| {
+                        state.nri_stop_notified = false;
+                    })
+                    .await;
+            }
+            return Err(status);
+        }
 
         let final_runtime_status = {
             let runtime = self.runtime.clone();
@@ -742,7 +768,7 @@ impl RuntimeServiceImpl {
             .finalize_container_stop_state(actual_container_id, final_runtime_status)
             .await?;
 
-        if needs_nri_stop && !stop_notified {
+        if reserved_nri_stop {
             let current_annotations = updated_container
                 .as_ref()
                 .map(|container| container.annotations.clone())
@@ -839,23 +865,17 @@ impl RuntimeServiceImpl {
         self.remove_seccomp_notifier(actual_container_id);
         self.release_container_name(actual_container_id);
 
-        let persistence = self.persistence.clone();
-        let container_id_for_delete = actual_container_id.to_string();
-        tokio::spawn(async move {
-            let mut persistence = persistence.lock().await;
-            if let Err(err) = persistence.delete_container(&container_id_for_delete) {
-                log::error!(
-                    "Failed to delete container {} from database: {}",
-                    container_id_for_delete,
-                    err
-                );
-            } else {
-                log::info!(
-                    "Container {} removed from database",
-                    container_id_for_delete
-                );
-            }
-        });
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = persistence.delete_container(actual_container_id) {
+            log::error!(
+                "Failed to delete container {} from database: {}",
+                actual_container_id,
+                err
+            );
+        } else {
+            log::info!("Container {} removed from database", actual_container_id);
+        }
+        drop(persistence);
 
         Ok(deleted_container)
     }
@@ -871,6 +891,18 @@ impl RuntimeServiceImpl {
                 annotations.insert(key.clone(), value.clone());
             }
         }
+    }
+
+    pub(super) fn sync_spec_annotations(
+        spec: &mut crate::oci::spec::Spec,
+        annotations: &HashMap<String, String>,
+    ) {
+        let spec_annotations = spec.annotations.get_or_insert_with(HashMap::new);
+        spec_annotations.extend(
+            annotations
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
     }
 
     pub(super) fn refresh_nri_event_container_from_spec(
@@ -1002,12 +1034,44 @@ impl RuntimeServiceImpl {
             return Ok(Response::new(StopContainerResponse {}));
         };
         self.ensure_container_loaded(&actual_container_id).await?;
-        let updated_container = self
+        self.publish_container_lifecycle_event(
+            &actual_container_id,
+            "stop_start",
+            crate::services::InternalEventSeverity::Info,
+            json!({ "timeout": timeout }),
+        )
+        .await;
+        let updated_container = match self
             .stop_container_internal(&actual_container_id, timeout)
-            .await?;
+            .await
+        {
+            Ok(container) => container,
+            Err(status) => {
+                self.publish_container_lifecycle_event(
+                    &actual_container_id,
+                    "stop_failed",
+                    crate::services::InternalEventSeverity::Error,
+                    json!({
+                        "code": format!("{:?}", status.code()),
+                        "message": status.message(),
+                    }),
+                )
+                .await;
+                return Err(status);
+            }
+        };
 
         log::info!("Container {} stopped", actual_container_id);
         if let Some(container) = updated_container {
+            self.publish_container_lifecycle_event(
+                &actual_container_id,
+                "stop_success",
+                crate::services::InternalEventSeverity::Info,
+                json!({
+                    "state": Self::runtime_state_name(container.state),
+                }),
+            )
+            .await;
             self.emit_container_event(
                 ContainerEventType::ContainerStoppedEvent,
                 &container,
@@ -1033,10 +1097,42 @@ impl RuntimeServiceImpl {
             return Ok(Response::new(RemoveContainerResponse {}));
         };
         self.ensure_container_loaded(&actual_container_id).await?;
-        let deleted_container = self.remove_container_internal(&actual_container_id).await?;
+        self.publish_container_lifecycle_event(
+            &actual_container_id,
+            "remove_start",
+            crate::services::InternalEventSeverity::Info,
+            serde_json::Value::Null,
+        )
+        .await;
+        let deleted_container = match self.remove_container_internal(&actual_container_id).await {
+            Ok(container) => container,
+            Err(status) => {
+                self.publish_container_lifecycle_event(
+                    &actual_container_id,
+                    "remove_failed",
+                    crate::services::InternalEventSeverity::Error,
+                    json!({
+                        "code": format!("{:?}", status.code()),
+                        "message": status.message(),
+                    }),
+                )
+                .await;
+                return Err(status);
+            }
+        };
 
         log::info!("Container {} removed", actual_container_id);
         if let Some(container) = deleted_container {
+            self.publish_container_lifecycle_event(
+                &actual_container_id,
+                "remove_success",
+                crate::services::InternalEventSeverity::Info,
+                json!({
+                    "podSandboxId": container.pod_sandbox_id,
+                    "previousState": Self::runtime_state_name(container.state),
+                }),
+            )
+            .await;
             self.emit_container_event(
                 ContainerEventType::ContainerDeletedEvent,
                 &container,
@@ -1449,6 +1545,17 @@ impl RuntimeServiceImpl {
         let mut container_name_guard = self
             .reserve_container_name_for_create(&container_id, &container_name_key)
             .await?;
+        self.publish_container_lifecycle_event(
+            &container_id,
+            "create_start",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "podSandboxId": pod_sandbox_id.clone(),
+                "name": container_metadata.name.clone(),
+                "attempt": container_metadata.attempt,
+            }),
+        )
+        .await;
 
         log::info!("Creating container with ID: {}", container_id);
         log::debug!("Container config: {:?}", config);
@@ -1462,14 +1569,15 @@ impl RuntimeServiceImpl {
                 )
             })
         };
+        let pod_external_annotations = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes
+                .get(&pod_sandbox_id)
+                .map(|pod| Self::external_pod_annotations(&pod.annotations))
+                .unwrap_or_default()
+        };
         let nri_activation_annotations = {
-            let mut annotations = {
-                let pod_sandboxes = self.pod_sandboxes.lock().await;
-                pod_sandboxes
-                    .get(&pod_sandbox_id)
-                    .map(|pod| Self::external_pod_annotations(&pod.annotations))
-                    .unwrap_or_default()
-            };
+            let mut annotations = pod_external_annotations.clone();
             if let Some(sandbox_config) = sandbox_config.as_ref() {
                 for (key, value) in &sandbox_config.annotations {
                     annotations.insert(key.clone(), value.clone());
@@ -1740,6 +1848,27 @@ impl RuntimeServiceImpl {
             );
         }
         let mut stored_annotations = config.annotations.clone();
+        let mut effective_pod_resource_class_annotations = pod_external_annotations.clone();
+        if let Some(sandbox_config) = sandbox_config.as_ref() {
+            for (key, value) in &sandbox_config.annotations {
+                effective_pod_resource_class_annotations.insert(key.clone(), value.clone());
+            }
+        }
+        let resource_class_request =
+            crate::security::resource_classes::requested_classes_from_annotations(
+                &container_metadata.name,
+                &config.annotations,
+                &effective_pod_resource_class_annotations,
+            );
+        if let Some(blockio_class) = resource_class_request.blockio_class.as_ref() {
+            let resources = linux_resources.get_or_insert_with(Default::default);
+            resources.blockio_class = Some(blockio_class.clone());
+        }
+        if let Some(rdt_class) = resource_class_request.rdt_class.as_ref() {
+            let resources = linux_resources.get_or_insert_with(Default::default);
+            resources.rdt_class = crate::security::resource_classes::resolve_rdt_class(rdt_class)
+                .and_then(|rdt| rdt.clos_id);
+        }
         if let Some(raw) =
             nri_activation_annotations.get(CRIO_SECCOMP_NOTIFIER_ACTION_V2_ANNOTATION)
         {
@@ -1808,7 +1937,7 @@ impl RuntimeServiceImpl {
             });
         }
 
-        let container_state = StoredContainerState {
+        let mut container_state = StoredContainerState {
             cgroup_parent: sandbox_linux
                 .and_then(|linux| {
                     (!linux.cgroup_parent.is_empty()).then(|| linux.cgroup_parent.clone())
@@ -1847,6 +1976,7 @@ impl RuntimeServiceImpl {
             exit_code: None,
             nri_stop_notified: false,
             nri_remove_notified: false,
+            broken: None,
             linux_resources,
             mounts: config
                 .mounts
@@ -1873,19 +2003,6 @@ impl RuntimeServiceImpl {
             container_state.cgroup_parent,
             host_network
         );
-        Self::insert_internal_state(
-            &mut stored_annotations,
-            INTERNAL_CONTAINER_STATE_KEY,
-            &container_state,
-        )?;
-        if let Some(checkpoint_restore) = checkpoint_restore.as_ref() {
-            Self::insert_internal_state(
-                &mut stored_annotations,
-                INTERNAL_CHECKPOINT_RESTORE_KEY,
-                checkpoint_restore,
-            )?;
-        }
-
         let container_config = ContainerConfig {
             name: config
                 .metadata
@@ -1916,6 +2033,11 @@ impl RuntimeServiceImpl {
             annotations: stored_annotations
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            cdi_devices: config
+                .cdi_devices
+                .iter()
+                .map(|device| device.name.clone())
                 .collect(),
             privileged: container_privileged,
             user: run_as_user,
@@ -1984,32 +2106,55 @@ impl RuntimeServiceImpl {
                 .join(&container_id)
                 .join("rootfs"),
         };
-        self.runtime
+        let runtime_backend = self
+            .runtime
             .runtime_for_handler(runtime_handler)
             .map_err(|e| {
                 Status::failed_precondition(format!("Failed to resolve runtime handler: {}", e))
-            })?
-            .validate_mount_requests(&container_config)
-            .map_err(|e| e.to_status())?;
+            })?;
+        let uses_oci_context = matches!(
+            runtime_backend.context_kind(),
+            RuntimeContextKind::OciBundle
+        );
+        if uses_oci_context {
+            runtime_backend
+                .runtime_context()
+                .validate_mount_requests(&container_config)
+                .map_err(|e| e.to_status())?;
+        }
         let create_deadline = self.container_create_deadline_for_handler(runtime_handler);
-        let runtime = self.runtime.clone();
-        let requested_container_id = container_id.clone();
-        let container_config_clone = container_config.clone();
-        self.run_container_create_phase_until(create_deadline, "prepare_rootfs", async move {
-            tokio::task::spawn_blocking(move || {
-                runtime.prepare_rootfs(&requested_container_id, &container_config_clone)
-            })
-            .await
-            .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-            .map_err(|e| Status::internal(format!("Failed to prepare container rootfs: {}", e)))
-        })
-        .await?;
+        let prepared_rootfs = if uses_oci_context {
+            let runtime = self.runtime.clone();
+            let requested_container_id = container_id.clone();
+            let container_config_clone = container_config.clone();
+            Some(
+                self.run_container_create_phase_until(
+                    create_deadline,
+                    "prepare_rootfs",
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            runtime.prepare_rootfs(&requested_container_id, &container_config_clone)
+                        })
+                        .await
+                        .map_err(|e| {
+                            Status::internal(format!("Failed to spawn blocking task: {}", e))
+                        })?
+                        .map_err(|e| {
+                            Status::internal(format!("Failed to prepare container rootfs: {}", e))
+                        })
+                    },
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
-        let runtime = self.runtime.clone();
-        let requested_container_id = container_id.clone();
-        let container_config_clone = container_config.clone();
-        let pristine_spec = self
-            .run_container_create_phase_until(create_deadline, "build_spec", async move {
+        let pristine_spec = if uses_oci_context {
+            let runtime = self.runtime.clone();
+            let requested_container_id = container_id.clone();
+            let container_config_clone = container_config.clone();
+            self.run_container_create_phase_until(create_deadline, "build_spec", async move {
                 tokio::task::spawn_blocking(move || {
                     runtime.build_spec(&requested_container_id, &container_config_clone)
                 })
@@ -2017,7 +2162,10 @@ impl RuntimeServiceImpl {
                 .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
                 .map_err(|e| Status::internal(format!("Failed to build pristine OCI spec: {}", e)))
             })
-            .await?;
+            .await?
+        } else {
+            Self::direct_task_pristine_spec(&container_config)
+        };
 
         let mut nri_event = self
             .nri_container_event(&pod_sandbox_id, &container_id, &stored_annotations)
@@ -2094,9 +2242,90 @@ impl RuntimeServiceImpl {
         }
 
         let mut adjusted_spec = pristine_spec.clone();
+        let mut cdi_requests = crate::security::cdi::requested_devices_from_cri_and_annotations(
+            &container_config.cdi_devices,
+            &stored_annotations,
+        )
+        .map_err(|e| Status::invalid_argument(format!("CDI device request failed: {}", e)))?;
+        let nri_cdi_requests = nri_create_result
+            .adjustment
+            .CDI_devices
+            .iter()
+            .map(|device| device.name.trim())
+            .filter(|name| !name.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let mut seen_cdi_requests: std::collections::HashSet<String> =
+            cdi_requests.iter().cloned().collect();
+        for name in &nri_cdi_requests {
+            if seen_cdi_requests.insert(name.clone()) {
+                cdi_requests.push(name.clone());
+            }
+        }
+        let mut adjustment_without_cdi = nri_create_result.adjustment.clone();
+        adjustment_without_cdi.CDI_devices.clear();
+        let (nri_blockio_class, nri_rdt_class) = crate::nri::resource_class_names(
+            adjustment_without_cdi
+                .linux
+                .as_ref()
+                .and_then(|linux| linux.resources.as_ref()),
+        );
+        let nri_rdt_adjustment = crate::nri::rdt_adjustment_name(
+            adjustment_without_cdi
+                .linux
+                .as_ref()
+                .and_then(|linux| linux.rdt.as_ref()),
+        );
+        let capability_report = crate::security::SecurityManager::new().host_capability_report(
+            &self.nri_config.cdi_spec_dirs,
+            Some(&self.nri_config.blockio_config_path),
+        );
+        let feature_gate =
+            capability_report.evaluate_feature_request(&crate::security::SecurityFeatureRequest {
+                cdi_devices: cdi_requests.clone(),
+                blockio_class: resource_class_request.blockio_class.clone(),
+                rdt_class: resource_class_request.rdt_class.clone(),
+                nri_cdi_devices: nri_cdi_requests,
+                nri_blockio_class,
+                nri_rdt_class,
+                nri_rdt_adjustment,
+            });
+        let security_degraded_reasons = match feature_gate {
+            crate::security::SecurityFeatureGate::Allowed => Vec::new(),
+            crate::security::SecurityFeatureGate::Degraded { reasons } => reasons,
+            crate::security::SecurityFeatureGate::Rejected { reason } => {
+                return Err(Status::failed_precondition(reason));
+            }
+        };
+        let rdt_degraded = !security_degraded_reasons.is_empty()
+            && capability_report.rdt.state != crate::security::HostCapabilityState::Available;
+        if rdt_degraded {
+            if let Some(resources) = container_state.linux_resources.as_mut() {
+                resources.rdt_class = None;
+            }
+            if let Some(linux) = adjustment_without_cdi.linux.as_mut() {
+                if let Some(resources) = linux.resources.as_mut() {
+                    resources.rdt_class = protobuf::MessageField::none();
+                }
+                linux.rdt = protobuf::MessageField::none();
+            }
+        }
+        crate::security::cdi::apply_cdi_devices(
+            &mut adjusted_spec,
+            &cdi_requests,
+            self.nri_config.enable_cdi,
+            Some(&self.nri_config.cdi_spec_dirs),
+        )
+        .map_err(|e| Status::internal(format!("CDI device injection failed: {}", e)))?;
+        crate::security::resource_classes::apply_resource_class_request(
+            &mut adjusted_spec,
+            &resource_class_request,
+            Some(&self.nri_config.blockio_config_path),
+        )
+        .map_err(|e| Status::internal(format!("Resource class resolution failed: {}", e)))?;
         crate::nri::apply_container_adjustment_with_options(
             &mut adjusted_spec,
-            &nri_create_result.adjustment,
+            &adjustment_without_cdi,
             crate::nri::AdjustmentOptions {
                 blockio_config_path: Some(&self.nri_config.blockio_config_path),
                 cdi_enabled: self.nri_config.enable_cdi,
@@ -2104,6 +2333,14 @@ impl RuntimeServiceImpl {
             },
         )
         .map_err(|e| Status::internal(format!("NRI CreateContainer failed: {}", e)))?;
+        if rdt_degraded {
+            if let Some(linux) = adjusted_spec.linux.as_mut() {
+                linux.intel_rdt = None;
+                if let Some(resources) = linux.resources.as_mut() {
+                    resources.intel_rdt = None;
+                }
+            }
+        }
         let cgroup_support = Self::cgroup_support_flags();
         Self::validate_spec_hugetlb_limits_with_flags(
             &adjusted_spec,
@@ -2116,39 +2353,112 @@ impl RuntimeServiceImpl {
             cgroup_support,
             self.config.tolerate_missing_hugetlb_controller,
         );
-        self.runtime
-            .enforce_oom_score_adj_policy(&container_id, &mut adjusted_spec)
-            .map_err(|e| {
-                Status::internal(format!("Failed to enforce oom_score_adj policy: {}", e))
-            })?;
+        if !security_degraded_reasons.is_empty() {
+            let annotations = adjusted_spec.annotations.get_or_insert_with(HashMap::new);
+            annotations.insert(
+                "io.crius.security.degraded-reasons".to_string(),
+                security_degraded_reasons.join("; "),
+            );
+        }
+        if uses_oci_context {
+            self.runtime
+                .enforce_oom_score_adj_policy(&container_id, &mut adjusted_spec)
+                .map_err(|e| {
+                    Status::internal(format!("Failed to enforce oom_score_adj policy: {}", e))
+                })?;
+        }
         Self::apply_adjusted_annotations(&mut stored_annotations, &nri_create_result.adjustment);
+        Self::insert_internal_state(
+            &mut stored_annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+            &container_state,
+        )?;
+        if let Some(checkpoint_restore) = checkpoint_restore.as_ref() {
+            Self::insert_internal_state(
+                &mut stored_annotations,
+                INTERNAL_CHECKPOINT_RESTORE_KEY,
+                checkpoint_restore,
+            )?;
+        }
+        Self::sync_spec_annotations(&mut adjusted_spec, &stored_annotations);
         Self::refresh_nri_event_container_from_spec(
             &mut nri_event,
             &adjusted_spec,
             &stored_annotations,
         );
 
-        let runtime = self.runtime.clone();
-        let requested_container_id = container_id.clone();
-        let rootfs = container_config.rootfs.clone();
-        let write_bundle_result = self
-            .run_container_create_phase_until(create_deadline, "write_bundle", async move {
-                tokio::task::spawn_blocking(move || {
-                    runtime.write_bundle(&requested_container_id, &rootfs, &adjusted_spec)
-                })
-                .await
-                .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))
-                .and_then(|result| {
-                    result.map_err(|e| {
-                        Status::internal(format!("Failed to write container bundle: {}", e))
+        if uses_oci_context {
+            let runtime = self.runtime.clone();
+            let requested_container_id = container_id.clone();
+            let rootfs = container_config.rootfs.clone();
+            let write_bundle_result = self
+                .run_container_create_phase_until(create_deadline, "write_bundle", async move {
+                    tokio::task::spawn_blocking(move || {
+                        runtime.write_bundle(&requested_container_id, &rootfs, &adjusted_spec)
+                    })
+                    .await
+                    .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))
+                    .and_then(|result| {
+                        result.map_err(|e| {
+                            Status::internal(format!("Failed to write container bundle: {}", e))
+                        })
                     })
                 })
-            })
-            .await;
-        if let Err(status) = write_bundle_result {
-            self.rollback_failed_container_create(&container_id, nri_event.clone())
                 .await;
-            return Err(status);
+            if let Err(status) = write_bundle_result {
+                self.rollback_failed_container_create(&container_id, nri_event.clone())
+                    .await;
+                return Err(status);
+            }
+            let prepared_rootfs =
+                prepared_rootfs.expect("prepared rootfs exists when OCI context is used");
+            let runtime = self.runtime.clone();
+            let requested_container_id = container_id.clone();
+            let create_task_result = self
+                .run_container_create_phase_until(create_deadline, "create_task", async move {
+                    tokio::task::spawn_blocking(move || {
+                        runtime.create_task_from_prepared_bundle(
+                            &requested_container_id,
+                            prepared_rootfs,
+                        )
+                    })
+                    .await
+                    .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))
+                    .and_then(|result| {
+                        result.map_err(|e| {
+                            Status::internal(format!("Failed to create backend task: {}", e))
+                        })
+                    })
+                })
+                .await;
+            if let Err(status) = create_task_result {
+                self.rollback_failed_container_create(&container_id, nri_event.clone())
+                    .await;
+                return Err(status);
+            }
+        } else {
+            let runtime = self.runtime.clone();
+            let requested_container_id = container_id.clone();
+            let container_config_clone = container_config.clone();
+            let create_result = self
+                .run_container_create_phase_until(create_deadline, "create_task", async move {
+                    tokio::task::spawn_blocking(move || {
+                        runtime.create_container(&requested_container_id, &container_config_clone)
+                    })
+                    .await
+                    .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))
+                    .and_then(|result| {
+                        result.map(|_| ()).map_err(|e| {
+                            Status::internal(format!("Failed to create backend task: {}", e))
+                        })
+                    })
+                })
+                .await;
+            if let Err(status) = create_result {
+                self.rollback_failed_container_create(&container_id, nri_event.clone())
+                    .await;
+                return Err(status);
+            }
         }
 
         let created_id = container_id.clone();
@@ -2156,10 +2466,7 @@ impl RuntimeServiceImpl {
             id: created_id.clone(),
             pod_sandbox_id: pod_sandbox_id.clone(),
             state: ContainerState::ContainerCreated as i32,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as i64,
+            created_at: Self::now_nanos(),
             labels: config.labels.clone(),
             metadata: config.metadata.clone(),
             annotations: stored_annotations.clone(),
@@ -2181,72 +2488,79 @@ impl RuntimeServiceImpl {
         );
         drop(containers);
 
-        let persistence = self.persistence.clone();
-        let containers = self.containers.clone();
-        let removed_container_ids = self.removed_container_ids.clone();
-        let created_id_for_persist = created_id.clone();
-        let pod_sandbox_id_for_persist = pod_sandbox_id.clone();
-        let container_image_ref_for_persist = container_image_ref.clone();
-        let command_for_persist = container_config.command.clone();
-        tokio::spawn(async move {
-            if removed_container_ids
-                .lock()
-                .ok()
-                .map(|removed| removed.contains(&created_id_for_persist))
-                .unwrap_or(false)
+        let state = match container.state {
+            x if x == ContainerState::ContainerCreated as i32 => {
+                crate::runtime::ContainerStatus::Created
+            }
+            x if x == ContainerState::ContainerRunning as i32 => {
+                crate::runtime::ContainerStatus::Running
+            }
+            x if x == ContainerState::ContainerExited as i32 => {
+                let exit_code = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+                    &container.annotations,
+                    INTERNAL_CONTAINER_STATE_KEY,
+                )
+                .and_then(|state| state.exit_code)
+                .unwrap_or_default();
+                crate::runtime::ContainerStatus::Stopped(exit_code)
+            }
+            _ => crate::runtime::ContainerStatus::Unknown,
+        };
+        {
+            let mut persistence = self.persistence.lock().await;
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .save_container_state(
+                    &created_id,
+                    &pod_sandbox_id,
+                    state,
+                    &container_image_ref,
+                    &container_config.command,
+                    &container.labels,
+                    &container.annotations,
+                )
             {
-                return;
-            }
-
-            let Some(current_container) = ({
-                let containers = containers.lock().await;
-                containers.get(&created_id_for_persist).cloned()
-            }) else {
-                return;
-            };
-
-            let state = match current_container.state {
-                x if x == ContainerState::ContainerCreated as i32 => {
-                    crate::runtime::ContainerStatus::Created
-                }
-                x if x == ContainerState::ContainerRunning as i32 => {
-                    crate::runtime::ContainerStatus::Running
-                }
-                x if x == ContainerState::ContainerExited as i32 => {
-                    let exit_code =
-                        RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
-                            &current_container.annotations,
-                            INTERNAL_CONTAINER_STATE_KEY,
-                        )
-                        .and_then(|state| state.exit_code)
-                        .unwrap_or_default();
-                    crate::runtime::ContainerStatus::Stopped(exit_code)
-                }
-                _ => crate::runtime::ContainerStatus::Unknown,
-            };
-
-            let mut persistence = persistence.lock().await;
-            if let Err(err) = persistence.save_container(
-                &created_id_for_persist,
-                &pod_sandbox_id_for_persist,
-                state,
-                &container_image_ref_for_persist,
-                &command_for_persist,
-                &current_container.labels,
-                &current_container.annotations,
-            ) {
-                log::error!(
+                drop(persistence);
+                self.rollback_failed_container_create(&created_id, nri_event)
+                    .await;
+                return Err(Status::internal(format!(
                     "Failed to persist container {}: {}",
-                    created_id_for_persist,
-                    err
-                );
-            } else {
-                log::info!("Container {} persisted to database", created_id_for_persist);
+                    created_id, err
+                )));
             }
-        });
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .update_container_ledger_metadata(
+                    &created_id,
+                    Some(runtime_handler),
+                    Some(runtime_backend.backend_name()),
+                    Some(&created_id),
+                )
+            {
+                drop(persistence);
+                self.rollback_failed_container_create(&created_id, nri_event)
+                    .await;
+                return Err(Status::internal(format!(
+                    "Failed to persist ledger metadata for container {}: {}",
+                    created_id, err
+                )));
+            }
+        }
+        log::info!("Container {} persisted to database", created_id);
         if let Err(err) = self.nri.post_create_container(nri_event.clone()).await {
             log::warn!("NRI PostCreateContainer failed for {}: {}", created_id, err);
         }
+        self.publish_container_lifecycle_event(
+            &created_id,
+            "create_success",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "podSandboxId": pod_sandbox_id,
+                "state": "created",
+                "runtimeHandler": runtime_handler,
+                "runtimeBackend": runtime_backend.backend_name(),
+                "imageRef": container_image_ref,
+            }),
+        )
+        .await;
         self.emit_container_event(
             ContainerEventType::ContainerCreatedEvent,
             &container,
@@ -2258,6 +2572,40 @@ impl RuntimeServiceImpl {
         Ok(Response::new(CreateContainerResponse {
             container_id: created_id,
         }))
+    }
+
+    fn direct_task_pristine_spec(config: &ContainerConfig) -> crate::oci::spec::Spec {
+        let mut spec = crate::oci::spec::Spec::new("1.0.2");
+        let mut args = Vec::with_capacity(1 + config.args.len());
+        args.extend(config.command.iter().cloned());
+        args.extend(config.args.iter().cloned());
+        spec.process = Some(crate::oci::spec::Process {
+            terminal: Some(config.tty),
+            user: None,
+            args,
+            env: Some(
+                config
+                    .env
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect(),
+            ),
+            cwd: config
+                .working_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "/".to_string()),
+            capabilities: None,
+            rlimits: None,
+            oom_score_adj: None,
+            scheduler: None,
+            no_new_privileges: config.no_new_privileges,
+            apparmor_profile: config.apparmor_profile.clone(),
+            selinux_label: config.selinux_label.clone(),
+            io_priority: None,
+        });
+        spec.annotations = Some(config.annotations.iter().cloned().collect());
+        spec
     }
 
     pub(super) async fn start_container_impl(
@@ -2290,6 +2638,19 @@ impl RuntimeServiceImpl {
                 container.state,
             )
         };
+        self.publish_container_lifecycle_event(
+            &actual_container_id,
+            "start_start",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "podSandboxId": container_pod_id,
+                "previousState": Self::runtime_state_name(container_state),
+                "runtimeState": Self::runtime_state_name(Self::map_runtime_container_state(
+                    runtime_status_before_start.clone()
+                )),
+            }),
+        )
+        .await;
         if let Some(mode) = self
             .container_internal_state(&actual_container_id)
             .await
@@ -2320,10 +2681,21 @@ impl RuntimeServiceImpl {
                 }
                 runtime_state
             };
-            return Err(Self::start_container_precondition_error(
+            let status =
+                Self::start_container_precondition_error(&actual_container_id, effective_state);
+            self.publish_container_lifecycle_event(
                 &actual_container_id,
-                effective_state,
-            ));
+                "start_failed",
+                crate::services::InternalEventSeverity::Warning,
+                json!({
+                    "phase": "precondition",
+                    "state": Self::runtime_state_name(effective_state),
+                    "code": format!("{:?}", status.code()),
+                    "message": status.message(),
+                }),
+            )
+            .await;
+            return Err(status);
         }
 
         if matches!(
@@ -2342,10 +2714,21 @@ impl RuntimeServiceImpl {
                 .unwrap_or_else(|| {
                     Self::map_runtime_container_state(runtime_status_before_start.clone())
                 });
-            return Err(Self::start_container_precondition_error(
+            let status =
+                Self::start_container_precondition_error(&actual_container_id, effective_state);
+            self.publish_container_lifecycle_event(
                 &actual_container_id,
-                effective_state,
-            ));
+                "start_failed",
+                crate::services::InternalEventSeverity::Warning,
+                json!({
+                    "phase": "runtimePrecondition",
+                    "state": Self::runtime_state_name(effective_state),
+                    "code": format!("{:?}", status.code()),
+                    "message": status.message(),
+                }),
+            )
+            .await;
+            return Err(status);
         }
 
         let checkpoint_restore = {
@@ -2406,6 +2789,17 @@ impl RuntimeServiceImpl {
             let _ = self
                 .finalize_failed_container_start_state(&actual_container_id, final_runtime_status)
                 .await?;
+            self.publish_container_lifecycle_event(
+                &actual_container_id,
+                "start_failed",
+                crate::services::InternalEventSeverity::Error,
+                json!({
+                    "phase": "runtimeStart",
+                    "code": format!("{:?}", status.code()),
+                    "message": status.message(),
+                }),
+            )
+            .await;
             return Err(status);
         }
 
@@ -2444,9 +2838,20 @@ impl RuntimeServiceImpl {
             let _ = self
                 .finalize_failed_container_start_state(&actual_container_id, final_runtime_status)
                 .await?;
-            return Err(Status::internal(
-                "Container failed to reach a known runtime state after start",
-            ));
+            let status =
+                Status::internal("Container failed to reach a known runtime state after start");
+            self.publish_container_lifecycle_event(
+                &actual_container_id,
+                "start_failed",
+                crate::services::InternalEventSeverity::Error,
+                json!({
+                    "phase": "runtimeStatus",
+                    "code": format!("{:?}", status.code()),
+                    "message": status.message(),
+                }),
+            )
+            .await;
+            return Err(status);
         }
 
         if !matches!(final_runtime_status, ContainerStatus::Running) {
@@ -2468,10 +2873,22 @@ impl RuntimeServiceImpl {
                     .await;
                 }
             }
-            return Err(Status::internal(format!(
+            let status = Status::internal(format!(
                 "Container did not reach running state after start; runtime reported {}",
                 Self::runtime_state_name(Self::map_runtime_container_state(final_runtime_status))
-            )));
+            ));
+            self.publish_container_lifecycle_event(
+                &actual_container_id,
+                "start_failed",
+                crate::services::InternalEventSeverity::Error,
+                json!({
+                    "phase": "runtimeStatus",
+                    "code": format!("{:?}", status.code()),
+                    "message": status.message(),
+                }),
+            )
+            .await;
+            return Err(status);
         }
 
         {
@@ -2496,11 +2913,9 @@ impl RuntimeServiceImpl {
             })
             .await?;
         if let Some(container) = updated_container.as_ref() {
-            self.persist_bundle_annotations(&actual_container_id, &container.annotations)?;
+            self.persist_bundle_annotations_if_oci(&actual_container_id, &container.annotations)?;
         }
 
-        let persistence = self.persistence.clone();
-        let actual_container_id_for_persist = actual_container_id.clone();
         let persistence_state = match observed_state {
             x if x == ContainerState::ContainerRunning as i32 => {
                 crate::runtime::ContainerStatus::Running
@@ -2513,18 +2928,18 @@ impl RuntimeServiceImpl {
             }
             _ => crate::runtime::ContainerStatus::Unknown,
         };
-        tokio::spawn(async move {
-            let mut persistence = persistence.lock().await;
-            if let Err(err) = persistence
-                .update_container_state(&actual_container_id_for_persist, persistence_state)
+        {
+            let mut persistence = self.persistence.lock().await;
+            if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+                .update_container_state(&actual_container_id, persistence_state)
             {
                 log::error!(
                     "Failed to update container {} state in database: {}",
-                    actual_container_id_for_persist,
+                    actual_container_id,
                     err
                 );
             }
-        });
+        }
         if checkpoint_restore.is_some() {
             let updated_annotations = {
                 let mut containers = self.containers.lock().await;
@@ -2538,11 +2953,21 @@ impl RuntimeServiceImpl {
             if let Some(updated_annotations) = updated_annotations {
                 self.persist_container_annotations(&actual_container_id, &updated_annotations)
                     .await?;
-                self.persist_bundle_annotations(&actual_container_id, &updated_annotations)?;
+                self.persist_bundle_annotations_if_oci(&actual_container_id, &updated_annotations)?;
             }
         }
 
         log::info!("Container {} started", container_id);
+        self.publish_container_lifecycle_event(
+            &actual_container_id,
+            "start_success",
+            crate::services::InternalEventSeverity::Info,
+            json!({
+                "podSandboxId": container_pod_id,
+                "state": Self::runtime_state_name(observed_state),
+            }),
+        )
+        .await;
         if observed_state == ContainerState::ContainerCreated as i32
             || observed_state == ContainerState::ContainerRunning as i32
         {

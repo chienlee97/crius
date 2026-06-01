@@ -241,7 +241,11 @@ impl VolumeManager {
                         }
                     }
                 }
-                Ok(PathBuf::from(config.source.as_ref().unwrap()))
+                config
+                    .source
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("volume source is required for bind/hostPath"))
             }
             VolumeType::EmptyDir => {
                 // 创建emptyDir目录

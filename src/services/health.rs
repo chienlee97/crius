@@ -1,0 +1,817 @@
+use std::path::Path;
+
+use serde::Serialize;
+
+use crate::image::{PullCgroupEffectiveConfig, PullCgroupMode, PullCgroupScopeRecord};
+use crate::network::CniLoadStatus;
+use crate::proto::runtime::v1::RuntimeCondition;
+use crate::security::HostCapabilityReport;
+use crate::state::LedgerCheckReport;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthCondition {
+    pub ready: bool,
+    pub reason: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InternalHealthCondition {
+    #[serde(rename = "type")]
+    pub condition_type: String,
+    pub ready: bool,
+    pub reason: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryLedgerHealthSummary {
+    pub broken_containers: usize,
+    pub broken_pods: usize,
+    pub broken_snapshots: usize,
+    pub stale_snapshots: usize,
+    pub broken_runtime_artifacts: usize,
+    pub dead_shims: usize,
+    pub broken_shims: usize,
+    pub degraded_shims: usize,
+}
+
+pub struct WatcherStatusInput<'a> {
+    pub reload_watcher_active: bool,
+    pub watcher_status: serde_json::Value,
+    pub watcher_backoff_count: u32,
+    pub watcher_next_retry_unix_millis: Option<i64>,
+    pub watcher_last_error: Option<&'a str>,
+    pub reload_error: Option<&'a str>,
+    pub cni_watch_error: Option<&'a str>,
+    pub shim_reconnect_supported: bool,
+}
+
+pub struct ExtendedConditionsInput<'a> {
+    pub image_root: &'a Path,
+    pub snapshot_root: &'a Path,
+    pub shim_work_dir: &'a Path,
+    pub security_capabilities: Option<&'a HostCapabilityReport>,
+    pub attempted_repair: Option<bool>,
+    pub repair_succeeded: Option<bool>,
+    pub shim_reconnect_supported: bool,
+    pub recovery_ledger_summary: Option<&'a RecoveryLedgerHealthSummary>,
+    pub recovery_ledger_check_report: Option<&'a LedgerCheckReport>,
+}
+
+impl RecoveryLedgerHealthSummary {
+    pub fn unhealthy_object_count(&self) -> usize {
+        self.broken_containers
+            + self.broken_pods
+            + self.broken_snapshots
+            + self.stale_snapshots
+            + self.broken_runtime_artifacts
+            + self.dead_shims
+            + self.broken_shims
+            + self.degraded_shims
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.unhealthy_object_count() == 0
+    }
+}
+
+impl InternalHealthCondition {
+    fn ready(condition_type: &str, reason: &str, message: String) -> Self {
+        Self {
+            condition_type: condition_type.to_string(),
+            ready: true,
+            reason: reason.to_string(),
+            message,
+        }
+    }
+
+    fn not_ready(condition_type: &str, reason: &str, message: String) -> Self {
+        Self {
+            condition_type: condition_type.to_string(),
+            ready: false,
+            reason: reason.to_string(),
+            message,
+        }
+    }
+}
+
+impl HealthCondition {
+    pub fn runtime_condition(&self) -> RuntimeCondition {
+        RuntimeCondition {
+            r#type: "RuntimeReady".to_string(),
+            status: self.ready,
+            reason: self.reason.clone(),
+            message: self.message.clone(),
+        }
+    }
+
+    pub fn network_condition(&self) -> RuntimeCondition {
+        RuntimeCondition {
+            r#type: "NetworkReady".to_string(),
+            status: self.ready,
+            reason: self.reason.clone(),
+            message: self.message.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HealthService;
+
+impl HealthService {
+    pub fn runtime_condition_for_path(
+        &self,
+        path: &Path,
+        version: Option<String>,
+    ) -> HealthCondition {
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                return HealthCondition {
+                    ready: false,
+                    reason: "RuntimeBinaryMissing".to_string(),
+                    message: format!("runtime binary does not exist at {}", path.display()),
+                };
+            }
+        };
+
+        if !metadata.is_file() {
+            return HealthCondition {
+                ready: false,
+                reason: "RuntimeBinaryInvalid".to_string(),
+                message: format!("runtime path is not a regular file: {}", path.display()),
+            };
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return HealthCondition {
+                    ready: false,
+                    reason: "RuntimeBinaryNotExecutable".to_string(),
+                    message: format!("runtime binary is not executable: {}", path.display()),
+                };
+            }
+        }
+
+        let version = version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        HealthCondition {
+            ready: true,
+            reason: "RuntimeIsReady".to_string(),
+            message: format!(
+                "runtime binary is available at {} ({})",
+                path.display(),
+                version
+            ),
+        }
+    }
+
+    pub fn network_condition(
+        &self,
+        cni_status: &CniLoadStatus,
+        reload_error: Option<&str>,
+        cni_watch_error: Option<&str>,
+    ) -> HealthCondition {
+        if let Some(error) = reload_error {
+            return Self::network_reload_error_condition(error);
+        }
+
+        if let Some(error) = cni_watch_error.filter(|error| Self::is_cni_template_error(error)) {
+            return HealthCondition {
+                ready: false,
+                reason: "CniTemplateRenderFailed".to_string(),
+                message: error.to_string(),
+            };
+        }
+
+        let (ready, reason, message) = cni_status.condition();
+        if !ready {
+            return HealthCondition {
+                ready,
+                reason,
+                message,
+            };
+        }
+
+        if let Some(error) = cni_watch_error {
+            return HealthCondition {
+                ready: false,
+                reason: "NetworkConfigReloadFailed".to_string(),
+                message: error.to_string(),
+            };
+        }
+
+        HealthCondition {
+            ready,
+            reason,
+            message,
+        }
+    }
+
+    fn network_reload_error_condition(error: &str) -> HealthCondition {
+        let reason = if Self::is_cni_template_error(error) {
+            "CniTemplateRenderFailed"
+        } else {
+            "ConfigReloadFailed"
+        };
+        HealthCondition {
+            ready: false,
+            reason: reason.to_string(),
+            message: error.to_string(),
+        }
+    }
+
+    fn is_cni_template_error(error: &str) -> bool {
+        error.contains("CNI config template")
+            || error.contains("generated CNI config")
+            || error.contains("PodCIDR")
+    }
+
+    pub fn watcher_status(&self, input: WatcherStatusInput<'_>) -> serde_json::Value {
+        serde_json::json!({
+            "reloadWatcherActive": input.reload_watcher_active,
+            "watcherStatus": input.watcher_status,
+            "watcherBackoffCount": input.watcher_backoff_count,
+            "watcherNextRetryUnixMillis": input.watcher_next_retry_unix_millis,
+            "watcherLastError": input.watcher_last_error,
+            "lastReloadError": input.reload_error,
+            "lastCniWatchError": input.cni_watch_error,
+            "shimReconnectSupported": input.shim_reconnect_supported,
+        })
+    }
+
+    pub fn image_condition(&self, image_root: &Path) -> InternalHealthCondition {
+        self.directory_condition(
+            "ImageReady",
+            image_root,
+            DirectoryConditionReasons {
+                ready: "ImageStoreReady",
+                missing: "ImageStoreMissing",
+                invalid: "ImageStoreInvalid",
+                read_only: "ImageStoreReadOnly",
+                label: "image store",
+            },
+        )
+    }
+
+    pub fn snapshot_condition(&self, snapshot_root: &Path) -> InternalHealthCondition {
+        self.directory_condition(
+            "SnapshotReady",
+            snapshot_root,
+            DirectoryConditionReasons {
+                ready: "SnapshotRootReady",
+                missing: "SnapshotRootMissing",
+                invalid: "SnapshotRootInvalid",
+                read_only: "SnapshotRootReadOnly",
+                label: "snapshot root",
+            },
+        )
+    }
+
+    pub fn shim_condition(
+        &self,
+        shim_work_dir: &Path,
+        reconnect_supported: bool,
+    ) -> InternalHealthCondition {
+        if !reconnect_supported {
+            return InternalHealthCondition::not_ready(
+                "ShimReady",
+                "ShimReconnectUnsupported",
+                "shim reconnect support is disabled".to_string(),
+            );
+        }
+
+        self.directory_condition(
+            "ShimReady",
+            shim_work_dir,
+            DirectoryConditionReasons {
+                ready: "ShimWorkDirReady",
+                missing: "ShimWorkDirMissing",
+                invalid: "ShimWorkDirInvalid",
+                read_only: "ShimWorkDirReadOnly",
+                label: "shim work directory",
+            },
+        )
+    }
+
+    pub fn recovery_condition(
+        &self,
+        attempted_repair: Option<bool>,
+        repair_succeeded: Option<bool>,
+        ledger_summary: Option<&RecoveryLedgerHealthSummary>,
+        ledger_check_report: Option<&LedgerCheckReport>,
+    ) -> InternalHealthCondition {
+        if let Some(summary) = ledger_summary.filter(|summary| !summary.is_healthy()) {
+            return InternalHealthCondition::not_ready(
+                "RecoveryReady",
+                "RecoveryObjectsDegraded",
+                format!(
+                    "recovery ledger has {} unhealthy object(s): {} broken container(s), {} broken pod(s), {} broken snapshot(s), {} stale snapshot(s), {} broken runtime artifact(s), {} dead shim(s), {} broken shim(s), {} degraded shim(s)",
+                    summary.unhealthy_object_count(),
+                    summary.broken_containers,
+                    summary.broken_pods,
+                    summary.broken_snapshots,
+                    summary.stale_snapshots,
+                    summary.broken_runtime_artifacts,
+                    summary.dead_shims,
+                    summary.broken_shims,
+                    summary.degraded_shims
+                ),
+            );
+        }
+
+        if let Some(report) = ledger_check_report.filter(|report| report.issue_count > 0) {
+            return InternalHealthCondition::not_ready(
+                "RecoveryReady",
+                "RecoveryLedgerCheckFailed",
+                format!(
+                    "recovery ledger check found {} issue(s), {} repairable, {} planned repair action(s)",
+                    report.issue_count, report.repairable_issue_count, report.action_count
+                ),
+            );
+        }
+
+        match (attempted_repair, repair_succeeded) {
+            (Some(true), Some(false)) => InternalHealthCondition::not_ready(
+                "RecoveryReady",
+                "RecoveryRepairFailed",
+                "startup persistence repair was attempted and failed".to_string(),
+            ),
+            (Some(true), Some(true)) => InternalHealthCondition::ready(
+                "RecoveryReady",
+                "RecoveryRepairSucceeded",
+                "startup persistence repair completed successfully".to_string(),
+            ),
+            (Some(false), _) => InternalHealthCondition::ready(
+                "RecoveryReady",
+                "RecoveryRepairNotNeeded",
+                "startup recovery did not require persistence repair".to_string(),
+            ),
+            (None, _) => InternalHealthCondition::ready(
+                "RecoveryReady",
+                "RecoveryStatusUnavailable",
+                "startup recovery status has not been recorded".to_string(),
+            ),
+            (Some(true), None) => InternalHealthCondition::ready(
+                "RecoveryReady",
+                "RecoveryRepairInProgress",
+                "startup persistence repair has not recorded a final result".to_string(),
+            ),
+        }
+    }
+
+    pub fn security_condition(
+        &self,
+        capabilities: Option<&HostCapabilityReport>,
+    ) -> InternalHealthCondition {
+        let Some(capabilities) = capabilities else {
+            return InternalHealthCondition::ready(
+                "SecurityReady",
+                "SecurityStatusUnavailable",
+                "security host capability status has not been collected".to_string(),
+            );
+        };
+
+        let degraded = capabilities.degraded_reasons();
+        if degraded.is_empty() {
+            return InternalHealthCondition::ready(
+                "SecurityReady",
+                "SecurityCapabilitiesAvailable",
+                "all tracked host security capabilities are available".to_string(),
+            );
+        }
+
+        InternalHealthCondition::ready(
+            "SecurityReady",
+            "SecurityCapabilitiesDegraded",
+            degraded.join("; "),
+        )
+    }
+
+    pub fn pull_cgroup_condition(
+        &self,
+        effective: &PullCgroupEffectiveConfig,
+        last_scope: Option<&PullCgroupScopeRecord>,
+    ) -> InternalHealthCondition {
+        if let Some(error) = last_scope.and_then(|scope| scope.error.as_deref()) {
+            return InternalHealthCondition::not_ready(
+                "PullCgroupReady",
+                "PullCgroupScopeFailed",
+                error.to_string(),
+            );
+        }
+
+        if effective.rootless_degraded {
+            return InternalHealthCondition::ready(
+                "PullCgroupReady",
+                "PullCgroupDisabledByRootless",
+                format!(
+                    "runtime.separate_pull_cgroup={} is disabled because rootless mode disables cgroups",
+                    effective.configured
+                ),
+            );
+        }
+
+        if effective.disable_cgroup_degraded {
+            return InternalHealthCondition::ready(
+                "PullCgroupReady",
+                "PullCgroupDisabledByRuntimeConfig",
+                format!(
+                    "runtime.separate_pull_cgroup={} is disabled because runtime cgroups are disabled",
+                    effective.configured
+                ),
+            );
+        }
+
+        match effective.mode {
+            PullCgroupMode::Disabled => InternalHealthCondition::ready(
+                "PullCgroupReady",
+                "PullCgroupDisabled",
+                "separate pull cgroup is not configured".to_string(),
+            ),
+            PullCgroupMode::Pod | PullCgroupMode::Path => InternalHealthCondition::ready(
+                "PullCgroupReady",
+                "PullCgroupReady",
+                format!(
+                    "separate pull cgroup is enabled with {:?} mode",
+                    effective.mode
+                ),
+            ),
+        }
+    }
+
+    pub fn extended_conditions(
+        &self,
+        input: ExtendedConditionsInput<'_>,
+    ) -> Vec<InternalHealthCondition> {
+        vec![
+            self.image_condition(input.image_root),
+            self.snapshot_condition(input.snapshot_root),
+            self.shim_condition(input.shim_work_dir, input.shim_reconnect_supported),
+            self.security_condition(input.security_capabilities),
+            self.recovery_condition(
+                input.attempted_repair,
+                input.repair_succeeded,
+                input.recovery_ledger_summary,
+                input.recovery_ledger_check_report,
+            ),
+        ]
+    }
+
+    fn directory_condition(
+        &self,
+        condition_type: &str,
+        path: &Path,
+        reasons: DirectoryConditionReasons,
+    ) -> InternalHealthCondition {
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                return InternalHealthCondition::not_ready(
+                    condition_type,
+                    reasons.missing,
+                    format!("{} does not exist at {}", reasons.label, path.display()),
+                );
+            }
+        };
+
+        if !metadata.is_dir() {
+            return InternalHealthCondition::not_ready(
+                condition_type,
+                reasons.invalid,
+                format!("{} is not a directory: {}", reasons.label, path.display()),
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o222 == 0 {
+                return InternalHealthCondition::not_ready(
+                    condition_type,
+                    reasons.read_only,
+                    format!("{} is not writable: {}", reasons.label, path.display()),
+                );
+            }
+        }
+
+        InternalHealthCondition::ready(
+            condition_type,
+            reasons.ready,
+            format!("{} is available at {}", reasons.label, path.display()),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirectoryConditionReasons {
+    ready: &'static str,
+    missing: &'static str,
+    invalid: &'static str,
+    read_only: &'static str,
+    label: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn runtime_condition_reports_missing_binary() {
+        let service = HealthService;
+        let condition = service.runtime_condition_for_path(Path::new("/definitely/missing"), None);
+
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "RuntimeBinaryMissing");
+    }
+
+    #[test]
+    fn network_condition_prefers_reload_error() {
+        let service = HealthService;
+        let status = CniLoadStatus {
+            checked_at_unix_millis: 1,
+            ready: true,
+            reason: "NetworkReady".to_string(),
+            message: "ok".to_string(),
+            discovered_files: Vec::new(),
+            invalid_files: Vec::new(),
+            loaded_networks: Vec::new(),
+            declared_plugins: Vec::new(),
+            missing_plugin_binaries: Vec::new(),
+            default_network_name: None,
+        };
+
+        let condition = service.network_condition(&status, Some("reload failed"), None);
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "ConfigReloadFailed");
+        assert_eq!(condition.message, "reload failed");
+    }
+
+    #[test]
+    fn network_condition_reports_cni_template_reload_failure() {
+        let service = HealthService;
+        let status = ready_cni_status();
+
+        let condition = service.network_condition(
+            &status,
+            Some("Failed to render CNI config template: invalid PodCIDR"),
+            None,
+        );
+
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "CniTemplateRenderFailed");
+    }
+
+    #[test]
+    fn network_condition_preserves_cni_plugin_missing_reason() {
+        let service = HealthService;
+        let status = CniLoadStatus {
+            ready: false,
+            reason: "CNIPluginMissing".to_string(),
+            message: "missing or non-executable CNI plugin binary/binaries: bridge".to_string(),
+            declared_plugins: vec!["bridge".to_string()],
+            missing_plugin_binaries: vec!["bridge".to_string()],
+            ..ready_cni_status()
+        };
+
+        let condition = service.network_condition(&status, None, Some("missing plugin bridge"));
+
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "CNIPluginMissing");
+        assert_eq!(condition.message, status.message);
+    }
+
+    #[test]
+    fn network_condition_preserves_cni_config_invalid_reason() {
+        let service = HealthService;
+        let status = CniLoadStatus {
+            ready: false,
+            reason: "CNIConfigInvalid".to_string(),
+            message: "failed to parse 1 CNI config file(s): broken.conflist".to_string(),
+            invalid_files: vec!["broken.conflist".to_string()],
+            ..ready_cni_status()
+        };
+
+        let condition = service.network_condition(&status, None, Some("parse failed"));
+
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "CNIConfigInvalid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_condition_accepts_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let service = HealthService;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("runtime");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        let condition = service.runtime_condition_for_path(&path, Some("runtime 1.0".to_string()));
+        assert!(condition.ready);
+        assert_eq!(condition.reason, "RuntimeIsReady");
+    }
+
+    fn ready_cni_status() -> CniLoadStatus {
+        CniLoadStatus {
+            checked_at_unix_millis: 1,
+            ready: true,
+            reason: "CNINetworkConfigReady".to_string(),
+            message: "loaded 1 CNI network config(s) and 1 plugin type(s)".to_string(),
+            discovered_files: vec!["10-test.conflist".to_string()],
+            invalid_files: Vec::new(),
+            loaded_networks: vec!["test".to_string()],
+            declared_plugins: vec!["bridge".to_string()],
+            missing_plugin_binaries: Vec::new(),
+            default_network_name: Some("test".to_string()),
+        }
+    }
+
+    #[test]
+    fn extended_conditions_report_subsystem_readiness() {
+        let service = HealthService;
+        let dir = tempdir().unwrap();
+        let image_root = dir.path().join("images");
+        let snapshot_root = image_root.join("snapshots");
+        let shim_work_dir = dir.path().join("shims");
+        std::fs::create_dir_all(&snapshot_root).unwrap();
+        std::fs::create_dir_all(&shim_work_dir).unwrap();
+
+        let conditions = service.extended_conditions(ExtendedConditionsInput {
+            image_root: &image_root,
+            snapshot_root: &snapshot_root,
+            shim_work_dir: &shim_work_dir,
+            security_capabilities: None,
+            attempted_repair: Some(false),
+            repair_succeeded: None,
+            shim_reconnect_supported: true,
+            recovery_ledger_summary: None,
+            recovery_ledger_check_report: None,
+        });
+
+        assert_eq!(conditions.len(), 5);
+        assert!(conditions.iter().all(|condition| condition.ready));
+        assert!(conditions
+            .iter()
+            .any(|condition| condition.condition_type == "ImageReady"));
+        assert!(conditions
+            .iter()
+            .any(|condition| condition.condition_type == "SnapshotReady"));
+        assert!(conditions
+            .iter()
+            .any(|condition| condition.condition_type == "ShimReady"));
+        assert!(conditions
+            .iter()
+            .any(|condition| condition.condition_type == "SecurityReady"));
+        assert!(conditions
+            .iter()
+            .any(|condition| condition.condition_type == "RecoveryReady"));
+    }
+
+    #[test]
+    fn extended_conditions_report_missing_snapshot_root_and_recovery_failure() {
+        let service = HealthService;
+        let dir = tempdir().unwrap();
+        let image_root = dir.path().join("images");
+        let shim_work_dir = dir.path().join("shims");
+        std::fs::create_dir_all(&image_root).unwrap();
+        std::fs::create_dir_all(&shim_work_dir).unwrap();
+
+        let snapshot_root = image_root.join("snapshots");
+        let conditions = service.extended_conditions(ExtendedConditionsInput {
+            image_root: &image_root,
+            snapshot_root: &snapshot_root,
+            shim_work_dir: &shim_work_dir,
+            security_capabilities: None,
+            attempted_repair: Some(true),
+            repair_succeeded: Some(false),
+            shim_reconnect_supported: true,
+            recovery_ledger_summary: None,
+            recovery_ledger_check_report: None,
+        });
+
+        let snapshot = conditions
+            .iter()
+            .find(|condition| condition.condition_type == "SnapshotReady")
+            .unwrap();
+        assert!(!snapshot.ready);
+        assert_eq!(snapshot.reason, "SnapshotRootMissing");
+
+        let recovery = conditions
+            .iter()
+            .find(|condition| condition.condition_type == "RecoveryReady")
+            .unwrap();
+        assert!(!recovery.ready);
+        assert_eq!(recovery.reason, "RecoveryRepairFailed");
+    }
+
+    #[test]
+    fn security_condition_reports_degraded_host_capability_reason() {
+        let service = HealthService;
+        let capabilities = HostCapabilityReport {
+            seccomp: crate::security::HostCapabilityProbe::available("seccomp", "ok"),
+            apparmor: crate::security::HostCapabilityProbe::degraded(
+                "apparmor",
+                "AppArmor securityfs is unavailable",
+            ),
+            selinux: crate::security::HostCapabilityProbe::available("selinux", "ok"),
+            cdi: crate::security::HostCapabilityProbe::available("cdi", "ok"),
+            blockio: crate::security::HostCapabilityProbe::available("blockio", "ok"),
+            rdt: crate::security::HostCapabilityProbe::available("rdt", "ok"),
+            devices: crate::security::HostCapabilityProbe::available("devices", "ok"),
+            cgroup: crate::security::HostCapabilityProbe::available("cgroup", "ok"),
+        };
+
+        let condition = service.security_condition(Some(&capabilities));
+
+        assert!(condition.ready);
+        assert_eq!(condition.condition_type, "SecurityReady");
+        assert_eq!(condition.reason, "SecurityCapabilitiesDegraded");
+        assert!(condition.message.contains("AppArmor securityfs"));
+    }
+
+    #[test]
+    fn recovery_condition_reports_unhealthy_ledger_objects() {
+        let service = HealthService;
+        let summary = RecoveryLedgerHealthSummary {
+            broken_runtime_artifacts: 2,
+            dead_shims: 1,
+            degraded_shims: 1,
+            ..Default::default()
+        };
+
+        let condition = service.recovery_condition(Some(false), None, Some(&summary), None);
+
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "RecoveryObjectsDegraded");
+        assert!(condition.message.contains("4 unhealthy object"));
+        assert!(condition.message.contains("2 broken runtime artifact"));
+        assert!(condition.message.contains("1 dead shim"));
+        assert!(condition.message.contains("1 degraded shim"));
+    }
+
+    #[test]
+    fn recovery_condition_reports_ledger_check_issues() {
+        let service = HealthService;
+        let report = LedgerCheckReport {
+            dry_run: true,
+            checked_at_unix_millis: 1,
+            issue_count: 2,
+            repairable_issue_count: 1,
+            action_count: 1,
+            applied_action_count: 0,
+            issues: Vec::new(),
+            actions: Vec::new(),
+        };
+
+        let condition = service.recovery_condition(Some(false), None, None, Some(&report));
+
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "RecoveryLedgerCheckFailed");
+        assert!(condition.message.contains("2 issue"));
+        assert!(condition.message.contains("1 repairable"));
+    }
+
+    #[test]
+    fn pull_cgroup_condition_reports_scope_failure() {
+        let service = HealthService;
+        let effective = PullCgroupEffectiveConfig {
+            configured: "kubepods/pod1".to_string(),
+            mode: PullCgroupMode::Path,
+            enabled: true,
+            rootless_degraded: false,
+            disable_cgroup_degraded: false,
+            cgroup_driver: crate::config::CgroupDriverConfig::Cgroupfs,
+        };
+        let last_scope = PullCgroupScopeRecord {
+            configured: "kubepods/pod1".to_string(),
+            mode: PullCgroupMode::Path,
+            effective_path: Some("/sys/fs/cgroup/kubepods/pod1".to_string()),
+            entered: false,
+            active: false,
+            restored: false,
+            error: Some("failed to create pull cgroup".to_string()),
+            at_unix_millis: 7,
+            started_at_unix_millis: 7,
+            ended_at_unix_millis: Some(7),
+        };
+
+        let condition = service.pull_cgroup_condition(&effective, Some(&last_scope));
+
+        assert_eq!(condition.condition_type, "PullCgroupReady");
+        assert!(!condition.ready);
+        assert_eq!(condition.reason, "PullCgroupScopeFailed");
+        assert_eq!(condition.message, "failed to create pull cgroup");
+    }
+}

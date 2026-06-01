@@ -3,7 +3,11 @@
 //! 提供与server模块的集成，实现容器和Pod状态的自动持久化
 
 use crate::runtime::ContainerStatus;
-use crate::storage::{ContainerRecord, PodSandboxRecord, StorageManager};
+use crate::storage::{
+    ContainerRecord, ContentGcCandidate, ContentTransferRecord, ImageRecord, ImageRefRecord,
+    PodSandboxRecord, RuntimeArtifactRecord, SchemaMigrationRecord, ShimProcessRecord,
+    SnapshotRecord, StorageManager,
+};
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -32,6 +36,9 @@ pub fn container_to_record(
                 annotations: serde_json::to_string(annotations).unwrap_or_default(),
                 exit_code: Some(code),
                 exit_time: Some(chrono::Utc::now().timestamp()),
+                runtime_handler: None,
+                runtime_backend: None,
+                snapshot_key: None,
             }
         }
         ContainerStatus::Unknown => "unknown",
@@ -48,6 +55,9 @@ pub fn container_to_record(
         annotations: serde_json::to_string(annotations).unwrap_or_default(),
         exit_code: None,
         exit_time: None,
+        runtime_handler: None,
+        runtime_backend: None,
+        snapshot_key: None,
     }
 }
 
@@ -147,6 +157,14 @@ impl PersistenceManager {
         self.storage.attempt_repair()
     }
 
+    pub fn schema_version(&self) -> Result<i64> {
+        self.storage.schema_version()
+    }
+
+    pub fn latest_schema_migration(&self) -> Result<Option<SchemaMigrationRecord>> {
+        self.storage.latest_schema_migration()
+    }
+
     /// 保存容器状态
     #[allow(clippy::too_many_arguments)]
     pub fn save_container(
@@ -183,6 +201,33 @@ impl PersistenceManager {
     /// 删除容器记录
     pub fn delete_container(&mut self, container_id: &str) -> Result<()> {
         self.storage.delete_container(container_id)
+    }
+
+    pub fn update_container_annotations(
+        &mut self,
+        container_id: &str,
+        annotations: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.storage.update_container_annotations(
+            container_id,
+            &serde_json::to_string(annotations).unwrap_or_default(),
+        )
+    }
+
+    pub fn update_container_ledger_metadata(
+        &mut self,
+        container_id: &str,
+        runtime_handler: Option<&str>,
+        runtime_backend: Option<&str>,
+        snapshot_key: Option<&str>,
+    ) -> Result<()> {
+        let Some(mut record) = self.storage.get_container(container_id)? else {
+            return Ok(());
+        };
+        record.runtime_handler = runtime_handler.map(ToString::to_string);
+        record.runtime_backend = runtime_backend.map(ToString::to_string);
+        record.snapshot_key = snapshot_key.map(ToString::to_string);
+        self.storage.save_container(&record)
     }
 
     /// 保存Pod沙箱
@@ -223,6 +268,106 @@ impl PersistenceManager {
     /// 删除Pod沙箱
     pub fn delete_pod_sandbox(&mut self, pod_id: &str) -> Result<()> {
         self.storage.delete_pod_sandbox(pod_id)
+    }
+
+    pub fn update_pod_annotations(
+        &mut self,
+        pod_id: &str,
+        annotations: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.storage.update_pod_annotations(
+            pod_id,
+            &serde_json::to_string(annotations).unwrap_or_default(),
+        )
+    }
+
+    pub fn save_image_record(
+        &mut self,
+        record: &ImageRecord,
+        refs: &[ImageRefRecord],
+    ) -> Result<()> {
+        self.storage.save_image(record)?;
+        self.storage.replace_image_refs(&record.id, refs)
+    }
+
+    pub fn get_image_record(&self, image_id: &str) -> Result<Option<ImageRecord>> {
+        self.storage.get_image(image_id)
+    }
+
+    pub fn list_image_records(&self) -> Result<Vec<ImageRecord>> {
+        self.storage.list_images()
+    }
+
+    pub fn list_image_refs(&self, image_id: Option<&str>) -> Result<Vec<ImageRefRecord>> {
+        self.storage.list_image_refs(image_id)
+    }
+
+    pub fn save_content_transfer_record(&mut self, record: &ContentTransferRecord) -> Result<()> {
+        self.storage.save_content_transfer(record)
+    }
+
+    pub fn list_content_transfer_records(&self) -> Result<Vec<ContentTransferRecord>> {
+        self.storage.list_content_transfers()
+    }
+
+    pub fn list_content_gc_candidates(&self) -> Result<Vec<ContentGcCandidate>> {
+        self.storage.list_content_gc_candidates()
+    }
+
+    pub fn mark_running_content_transfers_interrupted(&mut self) -> Result<usize> {
+        self.storage.mark_running_content_transfers_interrupted(
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        )
+    }
+
+    pub fn delete_image_record(&mut self, image_id: &str) -> Result<()> {
+        self.storage.delete_image(image_id)
+    }
+
+    pub fn save_snapshot_record(&mut self, record: &SnapshotRecord) -> Result<()> {
+        self.storage.save_snapshot(record)
+    }
+
+    pub fn list_snapshot_records(&self) -> Result<Vec<SnapshotRecord>> {
+        self.storage.list_snapshots()
+    }
+
+    pub fn delete_snapshot_record(&mut self, key: &str) -> Result<()> {
+        self.storage.delete_snapshot(key)
+    }
+
+    pub fn replace_runtime_artifacts(
+        &mut self,
+        owner_kind: &str,
+        owner_id: &str,
+        records: &[RuntimeArtifactRecord],
+    ) -> Result<()> {
+        self.storage
+            .replace_runtime_artifacts(owner_kind, owner_id, records)
+    }
+
+    pub fn list_runtime_artifacts(&self) -> Result<Vec<RuntimeArtifactRecord>> {
+        self.storage.list_runtime_artifacts()
+    }
+
+    pub fn delete_runtime_artifacts(&mut self, owner_kind: &str, owner_id: &str) -> Result<()> {
+        self.storage.delete_runtime_artifacts(owner_kind, owner_id)
+    }
+
+    pub fn save_shim_process_record(&mut self, record: &ShimProcessRecord) -> Result<()> {
+        self.storage.save_shim_process(record)
+    }
+
+    pub fn get_shim_process_record(&self, container_id: &str) -> Result<Option<ShimProcessRecord>> {
+        self.storage.get_shim_process(container_id)
+    }
+
+    pub fn list_shim_process_records(&self) -> Result<Vec<ShimProcessRecord>> {
+        self.storage.list_shim_processes()
+    }
+
+    pub fn delete_shim_process_record(&mut self, container_id: &str) -> Result<()> {
+        self.storage.delete_shim_process(container_id)
     }
 
     /// 恢复所有容器状态

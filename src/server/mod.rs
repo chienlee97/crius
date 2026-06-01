@@ -38,8 +38,8 @@ use crate::proto::runtime::v1::{
     PodSandboxStatsResponse, PodSandboxStatus, PodSandboxStatusRequest, PodSandboxStatusResponse,
     RemoveContainerRequest, RemoveContainerResponse, RemovePodSandboxRequest,
     RemovePodSandboxResponse, ReopenContainerLogRequest, ReopenContainerLogResponse,
-    RuntimeCondition, RuntimeConfigRequest, RuntimeConfigResponse, RuntimeStatus,
-    StartContainerRequest, StartContainerResponse, StopContainerRequest, StopContainerResponse,
+    RuntimeConfigRequest, RuntimeConfigResponse, RuntimeStatus, StartContainerRequest,
+    StartContainerResponse, StopContainerRequest, StopContainerResponse,
     UpdateContainerResourcesRequest, UpdateContainerResourcesResponse,
     UpdatePodSandboxResourcesRequest, UpdatePodSandboxResourcesResponse,
     UpdateRuntimeConfigRequest, UpdateRuntimeConfigResponse,
@@ -61,7 +61,7 @@ use crate::nri::{
 use crate::pod::{PodSandboxConfig, PodSandboxManager};
 use crate::runtime::{
     ContainerConfig, ContainerRuntime, ContainerStatus, DeviceMapping, MountConfig, NamespacePaths,
-    RuncRuntime, SeccompProfile, ShimConfig, ShimProcess,
+    RuncRuntime, RuntimeContextKind, SeccompProfile, ShimConfig,
 };
 use crate::streaming::StreamingServer;
 
@@ -79,7 +79,8 @@ mod streaming_handlers;
 
 pub(super) use service::RuntimeRegistry;
 pub use service::{
-    IrqBalanceRestoreStatus, RuntimeConfig, RuntimeMetricsProvider, RuntimeServiceImpl,
+    IrqBalanceRestoreStatus, RuntimeConfig, RuntimeMetricsProvider, RuntimeReloadState,
+    RuntimeReloadWatcherStatus, RuntimeReloadableConfig, RuntimeServiceImpl,
 };
 
 const INTERNAL_ANNOTATION_PREFIX: &str = "io.crius.internal/";
@@ -115,632 +116,8 @@ const CONTAINER_TYPE_CONTAINER: &str = "container";
 const NRI_ALLOWED_ANNOTATION_PREFIXES_ENV: &str = "CRIUS_NRI_ALLOWED_ANNOTATION_PREFIXES";
 const NRI_MIN_MEMORY_LIMIT_ENV: &str = "CRIUS_NRI_CONTAINER_MIN_MEMORY_BYTES";
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct StoredNamespaceOptions {
-    network: i32,
-    pid: i32,
-    ipc: i32,
-    target_id: String,
-    userns_options: Option<StoredUserNamespace>,
-}
-
-impl StoredNamespaceOptions {
-    fn to_proto(&self) -> NamespaceOption {
-        NamespaceOption {
-            network: self.network,
-            pid: self.pid,
-            ipc: self.ipc,
-            target_id: self.target_id.clone(),
-            userns_options: self
-                .userns_options
-                .as_ref()
-                .map(StoredUserNamespace::to_proto),
-        }
-    }
-}
-
-impl From<&NamespaceOption> for StoredNamespaceOptions {
-    fn from(value: &NamespaceOption) -> Self {
-        Self {
-            network: value.network,
-            pid: value.pid,
-            ipc: value.ipc,
-            target_id: value.target_id.clone(),
-            userns_options: value.userns_options.as_ref().map(StoredUserNamespace::from),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct StoredUserNamespace {
-    mode: i32,
-    uids: Vec<StoredIdMapping>,
-    gids: Vec<StoredIdMapping>,
-}
-
-impl StoredUserNamespace {
-    fn to_proto(&self) -> crate::proto::runtime::v1::UserNamespace {
-        crate::proto::runtime::v1::UserNamespace {
-            mode: self.mode,
-            uids: self.uids.iter().map(StoredIdMapping::to_proto).collect(),
-            gids: self.gids.iter().map(StoredIdMapping::to_proto).collect(),
-        }
-    }
-}
-
-impl From<&crate::proto::runtime::v1::UserNamespace> for StoredUserNamespace {
-    fn from(value: &crate::proto::runtime::v1::UserNamespace) -> Self {
-        Self {
-            mode: value.mode,
-            uids: value.uids.iter().map(StoredIdMapping::from).collect(),
-            gids: value.gids.iter().map(StoredIdMapping::from).collect(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct StoredIdMapping {
-    host_id: u32,
-    container_id: u32,
-    length: u32,
-}
-
-impl StoredIdMapping {
-    fn to_proto(&self) -> crate::proto::runtime::v1::IdMapping {
-        crate::proto::runtime::v1::IdMapping {
-            host_id: self.host_id,
-            container_id: self.container_id,
-            length: self.length,
-        }
-    }
-}
-
-impl From<&crate::proto::runtime::v1::IdMapping> for StoredIdMapping {
-    fn from(value: &crate::proto::runtime::v1::IdMapping) -> Self {
-        Self {
-            host_id: value.host_id,
-            container_id: value.container_id,
-            length: value.length,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct StoredHugepageLimit {
-    page_size: String,
-    limit: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct StoredLinuxDeviceCgroup {
-    allow: bool,
-    device_type: Option<String>,
-    major: Option<i64>,
-    minor: Option<i64>,
-    access: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct StoredLinuxResources {
-    cpu_period: i64,
-    cpu_quota: i64,
-    cpu_shares: i64,
-    memory_limit_in_bytes: i64,
-    oom_score_adj: i64,
-    cpuset_cpus: String,
-    cpuset_mems: String,
-    hugepage_limits: Vec<StoredHugepageLimit>,
-    unified: HashMap<String, String>,
-    memory_swap_limit_in_bytes: i64,
-    memory_reservation_in_bytes: Option<i64>,
-    memory_kernel_limit_in_bytes: Option<i64>,
-    memory_kernel_tcp_limit_in_bytes: Option<i64>,
-    memory_swappiness: Option<u64>,
-    memory_disable_oom_killer: Option<bool>,
-    memory_use_hierarchy: Option<bool>,
-    cpu_realtime_runtime: Option<i64>,
-    cpu_realtime_period: Option<u64>,
-    pids_limit: Option<i64>,
-    devices: Vec<StoredLinuxDeviceCgroup>,
-    blockio_class: Option<String>,
-    rdt_class: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CgroupResourceSupport {
-    swap: bool,
-    hugetlb: bool,
-    memory_kernel: bool,
-    memory_kernel_tcp: bool,
-    memory_swappiness: bool,
-    memory_disable_oom_killer: bool,
-    memory_use_hierarchy: bool,
-    cpu_realtime: bool,
-    blockio: bool,
-    rdt: bool,
-}
-
-impl StoredLinuxResources {
-    fn to_proto(&self) -> crate::proto::runtime::v1::LinuxContainerResources {
-        crate::proto::runtime::v1::LinuxContainerResources {
-            cpu_period: self.cpu_period,
-            cpu_quota: self.cpu_quota,
-            cpu_shares: self.cpu_shares,
-            memory_limit_in_bytes: self.memory_limit_in_bytes,
-            oom_score_adj: self.oom_score_adj,
-            cpuset_cpus: self.cpuset_cpus.clone(),
-            cpuset_mems: self.cpuset_mems.clone(),
-            hugepage_limits: self
-                .hugepage_limits
-                .iter()
-                .map(|limit| crate::proto::runtime::v1::HugepageLimit {
-                    page_size: limit.page_size.clone(),
-                    limit: limit.limit,
-                })
-                .collect(),
-            unified: self.unified.clone(),
-            memory_swap_limit_in_bytes: self.memory_swap_limit_in_bytes,
-        }
-    }
-
-    fn optional_int64(value: i64) -> protobuf::MessageField<crate::nri_proto::api::OptionalInt64> {
-        let mut result = crate::nri_proto::api::OptionalInt64::new();
-        result.value = value;
-        protobuf::MessageField::some(result)
-    }
-
-    fn optional_uint64(
-        value: u64,
-    ) -> protobuf::MessageField<crate::nri_proto::api::OptionalUInt64> {
-        let mut result = crate::nri_proto::api::OptionalUInt64::new();
-        result.value = value;
-        protobuf::MessageField::some(result)
-    }
-
-    fn optional_bool(value: bool) -> protobuf::MessageField<crate::nri_proto::api::OptionalBool> {
-        let mut result = crate::nri_proto::api::OptionalBool::new();
-        result.value = value;
-        protobuf::MessageField::some(result)
-    }
-
-    fn optional_string(
-        value: impl Into<String>,
-    ) -> protobuf::MessageField<crate::nri_proto::api::OptionalString> {
-        let mut result = crate::nri_proto::api::OptionalString::new();
-        result.value = value.into();
-        protobuf::MessageField::some(result)
-    }
-
-    fn apply_nri(&mut self, resources: &crate::nri_proto::api::LinuxResources) {
-        if let Some(memory) = resources.memory.as_ref() {
-            if let Some(limit) = memory.limit.as_ref() {
-                self.memory_limit_in_bytes = limit.value;
-            }
-            if let Some(reservation) = memory.reservation.as_ref() {
-                self.memory_reservation_in_bytes = Some(reservation.value);
-            }
-            if let Some(swap) = memory.swap.as_ref() {
-                self.memory_swap_limit_in_bytes = swap.value;
-            }
-            if let Some(kernel) = memory.kernel.as_ref() {
-                self.memory_kernel_limit_in_bytes = Some(kernel.value);
-            }
-            if let Some(kernel_tcp) = memory.kernel_tcp.as_ref() {
-                self.memory_kernel_tcp_limit_in_bytes = Some(kernel_tcp.value);
-            }
-            if let Some(swappiness) = memory.swappiness.as_ref() {
-                self.memory_swappiness = Some(swappiness.value);
-            }
-            if let Some(disable_oom_killer) = memory.disable_oom_killer.as_ref() {
-                self.memory_disable_oom_killer = Some(disable_oom_killer.value);
-            }
-            if let Some(use_hierarchy) = memory.use_hierarchy.as_ref() {
-                self.memory_use_hierarchy = Some(use_hierarchy.value);
-            }
-        }
-
-        if let Some(cpu) = resources.cpu.as_ref() {
-            if let Some(shares) = cpu.shares.as_ref() {
-                self.cpu_shares = shares.value as i64;
-            }
-            if let Some(quota) = cpu.quota.as_ref() {
-                self.cpu_quota = quota.value;
-            }
-            if let Some(period) = cpu.period.as_ref() {
-                self.cpu_period = period.value as i64;
-            }
-            if let Some(runtime) = cpu.realtime_runtime.as_ref() {
-                self.cpu_realtime_runtime = Some(runtime.value);
-            }
-            if let Some(period) = cpu.realtime_period.as_ref() {
-                self.cpu_realtime_period = Some(period.value);
-            }
-            if !cpu.cpus.is_empty() {
-                self.cpuset_cpus = cpu.cpus.clone();
-            }
-            if !cpu.mems.is_empty() {
-                self.cpuset_mems = cpu.mems.clone();
-            }
-        }
-
-        for limit in &resources.hugepage_limits {
-            if let Some(existing) = self
-                .hugepage_limits
-                .iter_mut()
-                .find(|existing| existing.page_size == limit.page_size)
-            {
-                existing.limit = limit.limit;
-            } else {
-                self.hugepage_limits.push(StoredHugepageLimit {
-                    page_size: limit.page_size.clone(),
-                    limit: limit.limit,
-                });
-            }
-        }
-
-        if let Some(pids) = resources.pids.as_ref() {
-            self.pids_limit = Some(pids.limit);
-        }
-        if !resources.devices.is_empty() {
-            self.devices = resources
-                .devices
-                .iter()
-                .map(|device| StoredLinuxDeviceCgroup {
-                    allow: device.allow,
-                    device_type: (!device.type_.is_empty()).then(|| device.type_.clone()),
-                    major: device.major.as_ref().map(|value| value.value),
-                    minor: device.minor.as_ref().map(|value| value.value),
-                    access: (!device.access.is_empty()).then(|| device.access.clone()),
-                })
-                .collect();
-        }
-        if let Some(blockio_class) = resources.blockio_class.as_ref() {
-            self.blockio_class =
-                (!blockio_class.value.trim().is_empty()).then(|| blockio_class.value.clone());
-        }
-        if let Some(rdt_class) = resources.rdt_class.as_ref() {
-            self.rdt_class = resolve_rdt_class(&rdt_class.value).and_then(|rdt| rdt.clos_id);
-        }
-        for (key, value) in &resources.unified {
-            self.unified.insert(key.clone(), value.clone());
-        }
-    }
-
-    fn to_nri(&self) -> crate::nri_proto::api::LinuxResources {
-        let mut result = linux_resources_from_cri(&self.to_proto());
-
-        if self.memory_reservation_in_bytes.is_some()
-            || self.memory_kernel_limit_in_bytes.is_some()
-            || self.memory_kernel_tcp_limit_in_bytes.is_some()
-            || self.memory_swappiness.is_some()
-            || self.memory_disable_oom_killer.is_some()
-            || self.memory_use_hierarchy.is_some()
-        {
-            let mut memory = result.memory.take().unwrap_or_default();
-            if let Some(reservation) = self.memory_reservation_in_bytes {
-                memory.reservation = Self::optional_int64(reservation);
-            }
-            if let Some(kernel) = self.memory_kernel_limit_in_bytes {
-                memory.kernel = Self::optional_int64(kernel);
-            }
-            if let Some(kernel_tcp) = self.memory_kernel_tcp_limit_in_bytes {
-                memory.kernel_tcp = Self::optional_int64(kernel_tcp);
-            }
-            if let Some(swappiness) = self.memory_swappiness {
-                memory.swappiness = Self::optional_uint64(swappiness);
-            }
-            if let Some(disable_oom_killer) = self.memory_disable_oom_killer {
-                memory.disable_oom_killer = Self::optional_bool(disable_oom_killer);
-            }
-            if let Some(use_hierarchy) = self.memory_use_hierarchy {
-                memory.use_hierarchy = Self::optional_bool(use_hierarchy);
-            }
-            result.memory = protobuf::MessageField::some(memory);
-        }
-
-        if self.cpu_realtime_runtime.is_some() || self.cpu_realtime_period.is_some() {
-            let mut cpu = result.cpu.take().unwrap_or_default();
-            if let Some(runtime) = self.cpu_realtime_runtime {
-                cpu.realtime_runtime = Self::optional_int64(runtime);
-            }
-            if let Some(period) = self.cpu_realtime_period {
-                cpu.realtime_period = Self::optional_uint64(period);
-            }
-            result.cpu = protobuf::MessageField::some(cpu);
-        }
-
-        if let Some(limit) = self.pids_limit {
-            result.pids = protobuf::MessageField::some(crate::nri_proto::api::LinuxPids {
-                limit,
-                ..Default::default()
-            });
-        }
-        if !self.devices.is_empty() {
-            result.devices = self
-                .devices
-                .iter()
-                .map(|device| crate::nri_proto::api::LinuxDeviceCgroup {
-                    allow: device.allow,
-                    type_: device.device_type.clone().unwrap_or_default(),
-                    major: device
-                        .major
-                        .map(|value| {
-                            let mut value_msg = crate::nri_proto::api::OptionalInt64::new();
-                            value_msg.value = value;
-                            protobuf::MessageField::some(value_msg)
-                        })
-                        .unwrap_or_default(),
-                    minor: device
-                        .minor
-                        .map(|value| {
-                            let mut value_msg = crate::nri_proto::api::OptionalInt64::new();
-                            value_msg.value = value;
-                            protobuf::MessageField::some(value_msg)
-                        })
-                        .unwrap_or_default(),
-                    access: device.access.clone().unwrap_or_default(),
-                    ..Default::default()
-                })
-                .collect();
-        }
-        if let Some(blockio_class) = self.blockio_class.as_ref() {
-            result.blockio_class = Self::optional_string(blockio_class.clone());
-        }
-        if let Some(rdt_class) = self.rdt_class.as_ref() {
-            result.rdt_class = Self::optional_string(rdt_class.clone());
-        }
-
-        result
-    }
-}
-
-impl From<&crate::proto::runtime::v1::LinuxContainerResources> for StoredLinuxResources {
-    fn from(value: &crate::proto::runtime::v1::LinuxContainerResources) -> Self {
-        Self {
-            cpu_period: value.cpu_period,
-            cpu_quota: value.cpu_quota,
-            cpu_shares: value.cpu_shares,
-            memory_limit_in_bytes: value.memory_limit_in_bytes,
-            oom_score_adj: value.oom_score_adj,
-            cpuset_cpus: value.cpuset_cpus.clone(),
-            cpuset_mems: value.cpuset_mems.clone(),
-            hugepage_limits: value
-                .hugepage_limits
-                .iter()
-                .map(|limit| StoredHugepageLimit {
-                    page_size: limit.page_size.clone(),
-                    limit: limit.limit,
-                })
-                .collect(),
-            unified: value.unified.clone(),
-            memory_swap_limit_in_bytes: value.memory_swap_limit_in_bytes,
-            memory_reservation_in_bytes: None,
-            memory_kernel_limit_in_bytes: None,
-            memory_kernel_tcp_limit_in_bytes: None,
-            memory_swappiness: None,
-            memory_disable_oom_killer: None,
-            memory_use_hierarchy: None,
-            cpu_realtime_runtime: None,
-            cpu_realtime_period: None,
-            pids_limit: None,
-            devices: Vec::new(),
-            blockio_class: None,
-            rdt_class: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct StoredSecurityProfile {
-    profile_type: i32,
-    localhost_ref: String,
-}
-
-impl StoredSecurityProfile {
-    fn from_runtime_seccomp(profile: &SeccompProfile) -> Self {
-        match profile {
-            SeccompProfile::RuntimeDefault => Self {
-                profile_type:
-                    crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault as i32,
-                localhost_ref: String::new(),
-            },
-            SeccompProfile::Unconfined => Self {
-                profile_type: crate::proto::runtime::v1::security_profile::ProfileType::Unconfined
-                    as i32,
-                localhost_ref: String::new(),
-            },
-            SeccompProfile::Localhost(path) => Self {
-                profile_type: crate::proto::runtime::v1::security_profile::ProfileType::Localhost
-                    as i32,
-                localhost_ref: path.to_string_lossy().to_string(),
-            },
-        }
-    }
-
-    fn to_runtime_seccomp(&self) -> Option<SeccompProfile> {
-        match self.profile_type {
-            x if x
-                == crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
-                    as i32 =>
-            {
-                Some(SeccompProfile::RuntimeDefault)
-            }
-            x if x
-                == crate::proto::runtime::v1::security_profile::ProfileType::Unconfined as i32 =>
-            {
-                Some(SeccompProfile::Unconfined)
-            }
-            x if x
-                == crate::proto::runtime::v1::security_profile::ProfileType::Localhost as i32 =>
-            {
-                if self.localhost_ref.is_empty() {
-                    None
-                } else {
-                    Some(SeccompProfile::Localhost(PathBuf::from(
-                        self.localhost_ref.clone(),
-                    )))
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn to_nri_seccomp(&self) -> Option<crate::nri_proto::api::SecurityProfile> {
-        let mut profile = crate::nri_proto::api::SecurityProfile::new();
-        match self.profile_type {
-            x if x
-                == crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
-                    as i32 =>
-            {
-                profile.profile_type =
-                    crate::nri_proto::api::security_profile::ProfileType::RUNTIME_DEFAULT.into();
-            }
-            x if x
-                == crate::proto::runtime::v1::security_profile::ProfileType::Unconfined as i32 =>
-            {
-                profile.profile_type =
-                    crate::nri_proto::api::security_profile::ProfileType::UNCONFINED.into();
-            }
-            x if x
-                == crate::proto::runtime::v1::security_profile::ProfileType::Localhost as i32 =>
-            {
-                profile.profile_type =
-                    crate::nri_proto::api::security_profile::ProfileType::LOCALHOST.into();
-                profile.localhost_ref = self.localhost_ref.clone();
-            }
-            _ => return None,
-        }
-
-        Some(profile)
-    }
-}
-
-impl From<&crate::proto::runtime::v1::SecurityProfile> for StoredSecurityProfile {
-    fn from(value: &crate::proto::runtime::v1::SecurityProfile) -> Self {
-        Self {
-            profile_type: value.profile_type,
-            localhost_ref: value.localhost_ref.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct StoredPodState {
-    port_mappings: Vec<StoredPortMapping>,
-    raw_cni_result: Option<serde_json::Value>,
-    hostname: Option<String>,
-    log_directory: Option<String>,
-    runtime_handler: String,
-    runtime_pod_cidr: Option<String>,
-    netns_path: Option<String>,
-    pause_container_id: Option<String>,
-    ip: Option<String>,
-    additional_ips: Vec<String>,
-    cgroup_parent: Option<String>,
-    sysctls: HashMap<String, String>,
-    namespace_options: Option<StoredNamespaceOptions>,
-    privileged: bool,
-    run_as_user: Option<String>,
-    run_as_group: Option<u32>,
-    supplemental_groups: Vec<u32>,
-    readonly_rootfs: bool,
-    no_new_privileges: Option<bool>,
-    apparmor_profile: Option<String>,
-    selinux_label: Option<String>,
-    seccomp_profile: Option<StoredSecurityProfile>,
-    overhead_linux_resources: Option<StoredLinuxResources>,
-    linux_resources: Option<StoredLinuxResources>,
-    stop_notified: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct StoredPortMapping {
-    protocol: String,
-    container_port: i32,
-    host_port: i32,
-    host_ip: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct StoredContainerState {
-    log_path: Option<String>,
-    tty: bool,
-    stdin: bool,
-    stdin_once: bool,
-    privileged: bool,
-    readonly_rootfs: bool,
-    cgroup_parent: Option<String>,
-    network_namespace_path: Option<String>,
-    linux_resources: Option<StoredLinuxResources>,
-    mounts: Vec<StoredMount>,
-    run_as_user: Option<String>,
-    run_as_group: Option<u32>,
-    supplemental_groups: Vec<u32>,
-    no_new_privileges: Option<bool>,
-    apparmor_profile: Option<String>,
-    seccomp_profile: Option<StoredSecurityProfile>,
-    seccomp_notifier_action: Option<String>,
-    metadata_name: Option<String>,
-    metadata_attempt: Option<u32>,
-    started_at: Option<i64>,
-    finished_at: Option<i64>,
-    exit_code: Option<i32>,
-    nri_stop_notified: bool,
-    nri_remove_notified: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredCheckpointRestore {
-    checkpoint_location: String,
-    checkpoint_image_path: String,
-    oci_config: serde_json::Value,
-    image_ref: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct StoredRuntimeNetworkConfig {
-    pod_cidr: String,
-}
-
-struct CniTemplateContext {
-    pod_cidr: String,
-    pod_cidr_ranges: Vec<String>,
-    routes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct StoredMount {
-    container_path: String,
-    host_path: String,
-    image: String,
-    image_sub_path: String,
-    readonly: bool,
-    selinux_relabel: bool,
-    propagation: i32,
-}
-
-#[derive(Clone)]
-struct NriRuntimeDomain {
-    containers: Arc<Mutex<HashMap<String, Container>>>,
-    pod_sandboxes: Arc<Mutex<HashMap<String, crate::proto::runtime::v1::PodSandbox>>>,
-    config: RuntimeConfig,
-    nri_config: NriConfig,
-    runtime: RuntimeRegistry,
-    persistence: Arc<Mutex<PersistenceManager>>,
-    events: tokio::sync::broadcast::Sender<ContainerEventResponse>,
-}
+mod state_model;
+use state_model::*;
 
 impl RuntimeServiceImpl {
     fn cgroup_support_flags() -> CgroupResourceSupport {
@@ -833,11 +210,13 @@ impl RuntimeServiceImpl {
         support: CgroupResourceSupport,
         tolerate_missing_hugetlb_controller: bool,
     ) {
-        let Some(resources) = spec
-            .linux
-            .as_mut()
-            .and_then(|linux| linux.resources.as_mut())
-        else {
+        let Some(linux) = spec.linux.as_mut() else {
+            return;
+        };
+        if !support.rdt {
+            linux.intel_rdt = None;
+        }
+        let Some(resources) = linux.resources.as_mut() else {
             return;
         };
 
@@ -878,9 +257,7 @@ impl RuntimeServiceImpl {
         }
 
         if !support.rdt {
-            if let Some(linux) = spec.linux.as_mut() {
-                linux.intel_rdt = None;
-            }
+            resources.intel_rdt = None;
         }
     }
 
@@ -1426,7 +803,7 @@ impl RuntimeServiceImpl {
     fn now_nanos() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos() as i64
     }
 
@@ -1456,9 +833,13 @@ impl RuntimeServiceImpl {
         let pause_container_id = pod_state
             .as_ref()
             .and_then(|state| state.pause_container_id.clone());
-        let pause_spec = pause_container_id
-            .as_deref()
-            .and_then(|container_id| runtime.as_ref()?.load_spec(container_id).ok());
+        let pause_spec = pause_container_id.as_deref().and_then(|container_id| {
+            runtime
+                .as_ref()?
+                .runtime_context()
+                .load_spec(container_id)
+                .ok()
+        });
 
         let mut pod = crate::nri_proto::api::PodSandbox::new();
         pod.id = pod_sandbox.id.clone();
@@ -1543,7 +924,12 @@ impl RuntimeServiceImpl {
         if let Some(pause_container_id) = pause_container_id.as_deref() {
             pod.pid = runtime
                 .as_ref()
-                .and_then(|runtime| runtime.container_pid(pause_container_id).ok())
+                .and_then(|runtime| {
+                    runtime
+                        .task_controller()
+                        .container_pid(pause_container_id)
+                        .ok()
+                })
                 .flatten()
                 .unwrap_or_default() as u32;
         }
@@ -1564,7 +950,7 @@ impl RuntimeServiceImpl {
         );
         let spec = runtime
             .as_ref()
-            .and_then(|runtime| runtime.load_spec(&container.id).ok());
+            .and_then(|runtime| runtime.runtime_context().load_spec(&container.id).ok());
         let spec_annotations = spec.as_ref().and_then(|loaded| loaded.annotations.as_ref());
 
         let mut nri_container = crate::nri_proto::api::Container::new();
@@ -1600,7 +986,12 @@ impl RuntimeServiceImpl {
             .unwrap_or_default();
         nri_container.state = if runtime
             .as_ref()
-            .and_then(|runtime| runtime.is_container_paused(&container.id).ok())
+            .and_then(|runtime| {
+                runtime
+                    .task_controller()
+                    .is_container_paused(&container.id)
+                    .ok()
+            })
             .unwrap_or(false)
         {
             crate::nri_proto::api::ContainerState::CONTAINER_PAUSED.into()
@@ -1631,7 +1022,7 @@ impl RuntimeServiceImpl {
         nri_container.status_message = message;
         nri_container.pid = runtime
             .as_ref()
-            .and_then(|runtime| runtime.container_pid(&container.id).ok())
+            .and_then(|runtime| runtime.task_controller().container_pid(&container.id).ok())
             .flatten()
             .unwrap_or_default() as u32;
 
@@ -1704,22 +1095,9 @@ impl RuntimeServiceImpl {
         container_id: &str,
         annotations: &HashMap<String, String>,
     ) -> Result<(), Status> {
-        let encoded_annotations = serde_json::to_string(annotations)
-            .map_err(|e| Status::internal(format!("Failed to encode annotations: {}", e)))?;
-
         let mut persistence = self.persistence.lock().await;
-        let Some(mut record) = persistence
-            .storage()
-            .get_container(container_id)
-            .map_err(|e| Status::internal(format!("Failed to load container record: {}", e)))?
-        else {
-            return Ok(());
-        };
-
-        record.annotations = encoded_annotations;
-        persistence
-            .storage_mut()
-            .save_container(&record)
+        crate::state::StateLedgerWriter::new(&mut persistence)
+            .update_container_annotations(container_id, annotations)
             .map_err(|e| Status::internal(format!("Failed to persist container record: {}", e)))
     }
 
@@ -1760,6 +1138,23 @@ impl RuntimeServiceImpl {
                 e
             ))
         })
+    }
+
+    fn persist_bundle_annotations_if_oci(
+        &self,
+        container_id: &str,
+        annotations: &HashMap<String, String>,
+    ) -> Result<(), Status> {
+        let backend = self
+            .runtime
+            .runtime_for_container(container_id)
+            .map_err(|e| {
+                Status::failed_precondition(format!("Failed to resolve runtime handler: {}", e))
+            })?;
+        if matches!(backend.context_kind(), RuntimeContextKind::OciBundle) {
+            self.persist_bundle_annotations(container_id, annotations)?;
+        }
+        Ok(())
     }
 
     async fn mutate_container_internal_state<F>(
@@ -2008,43 +1403,6 @@ impl RuntimeServiceImpl {
         Ok(())
     }
 
-    fn security_profile_name(
-        profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
-        deprecated_profile: &str,
-    ) -> Option<String> {
-        if let Some(profile) = profile {
-            match profile.profile_type {
-                x if x
-                    == crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
-                        as i32 =>
-                {
-                    Some("runtime/default".to_string())
-                }
-                x if x
-                    == crate::proto::runtime::v1::security_profile::ProfileType::Unconfined
-                        as i32 =>
-                {
-                    Some("unconfined".to_string())
-                }
-                x if x
-                    == crate::proto::runtime::v1::security_profile::ProfileType::Localhost
-                        as i32 =>
-                {
-                    if profile.localhost_ref.is_empty() {
-                        None
-                    } else {
-                        Some(profile.localhost_ref.clone())
-                    }
-                }
-                _ => None,
-            }
-        } else if deprecated_profile.is_empty() {
-            None
-        } else {
-            Some(deprecated_profile.to_string())
-        }
-    }
-
     fn security_availability() -> crate::security::SecurityManager {
         crate::security::SecurityManager::new()
     }
@@ -2055,33 +1413,21 @@ impl RuntimeServiceImpl {
         deprecated_profile: &str,
         privileged: bool,
     ) -> Result<Option<String>, Status> {
-        let requested = Self::security_profile_name(profile, deprecated_profile);
         let security = Self::security_availability();
-        if self.config.disable_apparmor || !security.is_apparmor_available() {
-            return match requested.as_deref() {
-                Some(profile)
-                    if !profile.eq_ignore_ascii_case("unconfined") && !profile.is_empty() =>
-                {
-                    Err(Status::failed_precondition(
-                        "apparmor is not available or is disabled for this node",
-                    ))
-                }
-                _ => Ok(None),
-            };
-        }
-
-        if privileged {
-            return Ok(None);
-        }
-
-        match requested.as_deref() {
-            None => Ok(Some(self.config.apparmor_default_profile.clone())),
-            Some(profile) if profile.eq_ignore_ascii_case("runtime/default") => {
-                Ok(Some(self.config.apparmor_default_profile.clone()))
-            }
-            Some(profile) if profile.eq_ignore_ascii_case("unconfined") => Ok(None),
-            Some(profile) => Ok(Some(profile.to_string())),
-        }
+        crate::security::apparmor::effective_profile_from_proto(
+            profile,
+            deprecated_profile,
+            privileged,
+            &crate::security::apparmor::AppArmorPolicy {
+                default_profile: self
+                    .current_reloadable_config()
+                    .apparmor_default_profile
+                    .clone(),
+                disabled: self.config.disable_apparmor,
+                available: security.is_apparmor_available(),
+            },
+        )
+        .map_err(|err| Status::failed_precondition(err.to_string()))
     }
 
     #[allow(deprecated)]
@@ -2111,65 +1457,17 @@ impl RuntimeServiceImpl {
             .unwrap_or("")
     }
 
-    fn generated_selinux_level(seed: &str, category_range: u32) -> String {
-        let effective_range = category_range.max(1);
-        if effective_range == 1 {
-            return "s0:c0,c0".to_string();
-        }
-
-        let digest = Sha256::digest(seed.as_bytes());
-        let first =
-            u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) % effective_range;
-        let mut second =
-            u32::from_le_bytes([digest[4], digest[5], digest[6], digest[7]]) % effective_range;
-        if second == first {
-            second = (second + 1) % effective_range;
-        }
-        let (low, high) = if first <= second {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        format!("s0:c{low},c{high}")
-    }
-
+    #[cfg(test)]
     fn selinux_label_from_proto(
         options: Option<&crate::proto::runtime::v1::SeLinuxOption>,
         auto_level_seed: Option<&str>,
         selinux_category_range: u32,
     ) -> Option<String> {
-        let options = options?;
-        if options.user.is_empty()
-            && options.role.is_empty()
-            && options.r#type.is_empty()
-            && options.level.is_empty()
-        {
-            return None;
-        }
-
-        let user = if options.user.is_empty() {
-            "system_u"
-        } else {
-            options.user.as_str()
-        };
-        let role = if options.role.is_empty() {
-            "system_r"
-        } else {
-            options.role.as_str()
-        };
-        let selinux_type = if options.r#type.is_empty() {
-            "container_t"
-        } else {
-            options.r#type.as_str()
-        };
-        let level = if options.level.is_empty() {
-            auto_level_seed
-                .map(|seed| Self::generated_selinux_level(seed, selinux_category_range))
-                .unwrap_or_else(|| "s0".to_string())
-        } else {
-            options.level.clone()
-        };
-        Some(format!("{}:{}:{}:{}", user, role, selinux_type, level))
+        crate::security::selinux::label_from_options(
+            options,
+            auto_level_seed,
+            selinux_category_range,
+        )
     }
 
     fn effective_selinux_label_from_proto(
@@ -2178,83 +1476,40 @@ impl RuntimeServiceImpl {
         host_network: bool,
         auto_level_seed: Option<&str>,
     ) -> Option<String> {
-        if !self.config.enable_selinux {
-            return None;
-        }
-
         let security = Self::security_availability();
-        if !security.is_selinux_available() {
-            return None;
-        }
-
-        if host_network && self.config.hostnetwork_disable_selinux {
-            return None;
-        }
-
-        Self::selinux_label_from_proto(options, auto_level_seed, self.config.selinux_category_range)
+        crate::security::selinux::effective_label_from_config(
+            options,
+            host_network,
+            auto_level_seed,
+            crate::security::selinux::SelinuxResolverConfig {
+                enabled: self.config.enable_selinux,
+                category_range: self.config.selinux_category_range,
+                hostnetwork_disable: self.config.hostnetwork_disable_selinux,
+            },
+            security.is_selinux_available(),
+        )
     }
 
+    #[cfg(test)]
     fn seccomp_profile_from_proto(
         profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
         deprecated_profile: &str,
     ) -> Option<SeccompProfile> {
-        if let Some(profile) = profile {
-            return match profile.profile_type {
-                x if x
-                    == crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
-                        as i32 =>
-                {
-                    Some(SeccompProfile::RuntimeDefault)
-                }
-                x if x
-                    == crate::proto::runtime::v1::security_profile::ProfileType::Unconfined
-                        as i32 =>
-                {
-                    Some(SeccompProfile::Unconfined)
-                }
-                x if x
-                    == crate::proto::runtime::v1::security_profile::ProfileType::Localhost
-                        as i32 =>
-                {
-                    if profile.localhost_ref.is_empty() {
-                        None
-                    } else {
-                        Some(SeccompProfile::Localhost(PathBuf::from(
-                            profile.localhost_ref.clone(),
-                        )))
-                    }
-                }
-                _ => None,
-            };
-        }
-
-        if deprecated_profile.is_empty() {
-            None
-        } else {
-            Some(SeccompProfile::Localhost(PathBuf::from(
-                deprecated_profile.to_string(),
-            )))
-        }
+        crate::security::seccomp::profile_from_proto(profile, deprecated_profile)
     }
 
     fn seccomp_profile_from_selector(selector: &str) -> Option<SeccompProfile> {
-        let selector = selector.trim();
-        if selector.is_empty() {
-            return None;
-        }
-        if selector.eq_ignore_ascii_case("runtime/default")
-            || selector.eq_ignore_ascii_case("docker/default")
-        {
-            return Some(SeccompProfile::RuntimeDefault);
-        }
-        if selector.eq_ignore_ascii_case("unconfined") {
-            return Some(SeccompProfile::Unconfined);
-        }
-        if let Some(localhost_ref) = selector.strip_prefix("localhost/") {
-            return (!localhost_ref.trim().is_empty())
-                .then(|| SeccompProfile::Localhost(PathBuf::from(localhost_ref)));
-        }
-        Some(SeccompProfile::Localhost(PathBuf::from(selector)))
+        crate::security::seccomp::profile_from_selector(selector)
+    }
+
+    fn expand_runtime_default_seccomp_profile(
+        &self,
+        profile: Option<SeccompProfile>,
+    ) -> Option<SeccompProfile> {
+        crate::security::seccomp::expand_runtime_default_profile(
+            profile,
+            &self.current_reloadable_config().seccomp_profile,
+        )
     }
 
     fn effective_seccomp_profile_from_proto(
@@ -2263,16 +1518,14 @@ impl RuntimeServiceImpl {
         deprecated_profile: &str,
         privileged: bool,
     ) -> Option<SeccompProfile> {
-        match Self::seccomp_profile_from_proto(profile, deprecated_profile) {
-            Some(SeccompProfile::RuntimeDefault) if privileged => {
-                Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
-            }
-            Some(explicit) => Some(explicit),
-            None if privileged => {
-                Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
-            }
-            None => Self::seccomp_profile_from_selector(&self.config.unset_seccomp_profile),
-        }
+        crate::security::seccomp::effective_profile(
+            profile,
+            deprecated_profile,
+            privileged,
+            &self.config.privileged_seccomp_profile,
+            &self.config.unset_seccomp_profile,
+            &self.current_reloadable_config().seccomp_profile,
+        )
     }
 
     fn stored_seccomp_profile_from_proto(
@@ -2306,17 +1559,23 @@ impl RuntimeServiceImpl {
                         == crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
                             as i32 =>
             {
-                Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
-                    .as_ref()
-                    .map(StoredSecurityProfile::from_runtime_seccomp)
+                self.expand_runtime_default_seccomp_profile(Self::seccomp_profile_from_selector(
+                    &self.config.privileged_seccomp_profile,
+                ))
+                .as_ref()
+                .map(StoredSecurityProfile::from_runtime_seccomp)
             }
             Some(explicit) => Some(explicit),
-            None if privileged => {
-                Self::seccomp_profile_from_selector(&self.config.privileged_seccomp_profile)
-                    .as_ref()
-                    .map(StoredSecurityProfile::from_runtime_seccomp)
-            }
-            None => Self::seccomp_profile_from_selector(&self.config.unset_seccomp_profile)
+            None if privileged => self
+                .expand_runtime_default_seccomp_profile(Self::seccomp_profile_from_selector(
+                    &self.config.privileged_seccomp_profile,
+                ))
+                .as_ref()
+                .map(StoredSecurityProfile::from_runtime_seccomp),
+            None => self
+                .expand_runtime_default_seccomp_profile(Self::seccomp_profile_from_selector(
+                    &self.config.unset_seccomp_profile,
+                ))
                 .as_ref()
                 .map(StoredSecurityProfile::from_runtime_seccomp),
         }
@@ -2841,11 +2100,13 @@ impl RuntimeServiceImpl {
             Err(_) => return ContainerStatus::Unknown,
         };
         let container_id = container_id.to_string();
-        tokio::task::spawn_blocking(move || runtime.container_status(&container_id))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(ContainerStatus::Unknown)
+        tokio::task::spawn_blocking(move || {
+            runtime.task_controller().container_status(&container_id)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(ContainerStatus::Unknown)
     }
 
     fn runtime_container_status_name(status: &ContainerStatus) -> &'static str {
@@ -2860,7 +2121,7 @@ impl RuntimeServiceImpl {
     async fn runtime_for_container_request(
         &self,
         container_id: &str,
-    ) -> Result<RuncRuntime, Status> {
+    ) -> Result<Arc<dyn crate::runtime::RuntimeBackend>, Status> {
         let annotations = {
             let containers = self.containers.lock().await;
             containers
@@ -2917,7 +2178,7 @@ impl RuntimeServiceImpl {
             .await
             .ok()?;
         let container_id = container_id.to_string();
-        tokio::task::spawn_blocking(move || runtime.container_pid(&container_id))
+        tokio::task::spawn_blocking(move || runtime.task_controller().container_pid(&container_id))
             .await
             .ok()
             .and_then(Result::ok)
@@ -3179,15 +2440,17 @@ impl RuntimeServiceImpl {
             .runtime_for_container_request(runtime_container_id)
             .await?;
         let container_id = runtime_container_id.to_string();
-        let pid = tokio::task::spawn_blocking(move || runtime.container_pid(&container_id))
-            .await
-            .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
-            .map_err(|e| {
-                Status::internal(format!(
-                    "Failed to query container PID for {}: {}",
-                    runtime_container_id, e
-                ))
-            })?;
+        let pid = tokio::task::spawn_blocking(move || {
+            runtime.task_controller().container_pid(&container_id)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(|e| {
+            Status::internal(format!(
+                "Failed to query container PID for {}: {}",
+                runtime_container_id, e
+            ))
+        })?;
 
         Ok(pid.map(|pid| PathBuf::from(format!("/proc/{}/ns/{}", pid, namespace))))
     }
@@ -3265,9 +2528,8 @@ impl RuntimeServiceImpl {
         requested_id: &str,
     ) -> Result<Option<String>, Status> {
         let persistence = self.persistence.lock().await;
-        let records = persistence
-            .storage()
-            .list_containers()
+        let records = crate::state::StateLedger::new(&persistence)
+            .container_records()
             .map_err(|e| Status::internal(format!("Failed to list containers: {}", e)))?;
         drop(persistence);
 
@@ -3574,30 +2836,9 @@ impl NriRuntimeDomain {
         container_id: &str,
         annotations: &HashMap<String, String>,
     ) -> crate::nri::Result<()> {
-        let encoded_annotations = serde_json::to_string(annotations).map_err(|e| {
-            crate::nri::NriError::Plugin(format!(
-                "failed to encode annotations for {}: {}",
-                container_id, e
-            ))
-        })?;
-
         let mut persistence = self.persistence.lock().await;
-        let Some(mut record) = persistence
-            .storage()
-            .get_container(container_id)
-            .map_err(|e| {
-                crate::nri::NriError::Plugin(format!(
-                    "failed to load container {} from persistence: {}",
-                    container_id, e
-                ))
-            })?
-        else {
-            return Ok(());
-        };
-        record.annotations = encoded_annotations;
-        persistence
-            .storage_mut()
-            .save_container(&record)
+        crate::state::StateLedgerWriter::new(&mut persistence)
+            .update_container_annotations(container_id, annotations)
             .map_err(|e| {
                 crate::nri::NriError::Plugin(format!(
                     "failed to persist container {} annotations: {}",
@@ -3730,7 +2971,7 @@ impl NriRuntimeDomain {
             .await?;
 
         let mut persistence = self.persistence.lock().await;
-        persistence
+        crate::state::StateLedgerWriter::new(&mut persistence)
             .update_container_state(
                 &container_id,
                 match runtime_status {
@@ -3828,7 +3069,7 @@ impl NriRuntimeDomain {
             .await?;
 
         let mut persistence = self.persistence.lock().await;
-        persistence
+        crate::state::StateLedgerWriter::new(&mut persistence)
             .update_container_state(
                 &container_id,
                 match exit_code {
@@ -4193,10 +3434,10 @@ impl RuntimeService for RuntimeServiceImpl {
             .and_then(|runtime_config| runtime_config.network_config)
             .filter(|network_config| !network_config.pod_cidr.trim().is_empty());
 
-        Self::sync_generated_cni_config(&self.config.cni_config, next_network_config.as_ref())
-            .map_err(|e| {
-                Status::invalid_argument(format!("Failed to render CNI config template: {}", e))
-            })?;
+        let cni_config = self.current_cni_config();
+        Self::sync_generated_cni_config(&cni_config, next_network_config.as_ref()).map_err(
+            |e| Status::invalid_argument(format!("Failed to render CNI config template: {}", e)),
+        )?;
         Self::persist_runtime_network_config(&self.config.root_dir, next_network_config.as_ref())
             .map_err(|e| Status::internal(format!("Failed to persist runtime config: {}", e)))?;
 
@@ -4212,34 +3453,7 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: Request<GetEventsRequest>,
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
-        let mut events = self.events.subscribe();
-        let (tx, rx) = tokio::sync::mpsc::channel(128);
-
-        tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(event) => {
-                        if tx.send(Ok(event)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if tx
-                            .send(Err(Status::resource_exhausted(
-                                "CRI event stream lagged behind producer",
-                            )))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(self.internal_services.events.stream()))
     }
 
     //

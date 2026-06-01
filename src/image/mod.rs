@@ -1,10 +1,15 @@
+pub mod content_store;
+pub mod layer;
+pub mod metadata_store;
 pub mod policy;
+pub mod pull_cgroup;
+pub mod snapshotter;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -24,7 +29,28 @@ use crate::proto::runtime::v1::{
     Int64Value, ListImagesRequest, ListImagesResponse, PullImageRequest, PullImageResponse,
     RemoveImageRequest, RemoveImageResponse, UInt64Value,
 };
-use crate::storage::StorageManager;
+use crate::storage::{ContentGcBlocker, StorageManager};
+use content_store::{
+    ContentStore, ContentTransferRecord, ContentTransferStatus, ContentTransferTracker,
+    FsContentStore, RemoteContentProviderKind,
+};
+use metadata_store::FilesystemImageMetadataStore;
+pub use pull_cgroup::{
+    validate_pull_cgroup_config, PullCgroupEffectiveConfig, PullCgroupExecutor, PullCgroupMode,
+    PullCgroupScopeRecord,
+};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentGcSummary {
+    pub dry_run: bool,
+    pub candidates: usize,
+    pub eligible: usize,
+    pub skipped: usize,
+    pub deleted: usize,
+    pub failed: usize,
+    pub bytes_deleted: u64,
+}
 
 /// crius镜像
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -61,37 +87,43 @@ pub struct ImageServiceImpl {
     images: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Image>>>,
     storage_path: PathBuf,
     storage_driver: String,
-    global_auth_file: Option<PathBuf>,
-    namespaced_auth_dir: Option<PathBuf>,
+    storage_options: Vec<String>,
+    parsed_storage_options: OverlayImageStorageOptions,
+    content_store: Arc<FsContentStore>,
+    metadata_store: Arc<FilesystemImageMetadataStore>,
     default_transport: String,
     short_name_mode: String,
     pull_progress_timeout: std::time::Duration,
     max_concurrent_downloads: usize,
     pull_retry_count: u32,
-    registry_config_dir: Option<PathBuf>,
-    decryption_keys_path: Option<PathBuf>,
-    decryption_decoder_path: String,
-    decryption_keyprovider_config: Option<PathBuf>,
     additional_artifact_stores: Vec<PathBuf>,
-    pinned_image_patterns: Vec<String>,
-    signature_policy: Option<PathBuf>,
-    signature_policy_dir: Option<PathBuf>,
-    big_files_temporary_dir: Option<PathBuf>,
+    _big_files_temporary_dir: Option<PathBuf>,
     in_progress_pulls: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    transfer_tracker: ContentTransferTracker,
     #[cfg(test)]
     test_pull_handler: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<TestPullHandler>>>>,
+    #[cfg(test)]
+    test_pull_scope_observer:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<TestPullScopeObserver>>>>,
+    reloadable_config: Arc<RwLock<ReloadableImageConfig>>,
+    pull_cgroup: PullCgroupExecutor,
+    ledger_db_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 pub struct ImageMetricsProvider {
     images: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Image>>>,
-    storage_path: PathBuf,
+    _storage_path: PathBuf,
+    content_store: Arc<FsContentStore>,
+    metadata_store: Arc<FilesystemImageMetadataStore>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ImageServiceOptions {
     pub storage_path: PathBuf,
+    pub ledger_db_path: Option<PathBuf>,
     pub storage_driver: String,
+    pub storage_options: Vec<String>,
     pub global_auth_file: Option<PathBuf>,
     pub namespaced_auth_dir: Option<PathBuf>,
     pub default_transport: String,
@@ -108,6 +140,134 @@ pub struct ImageServiceOptions {
     pub signature_policy: Option<PathBuf>,
     pub signature_policy_dir: Option<PathBuf>,
     pub big_files_temporary_dir: Option<PathBuf>,
+    pub separate_pull_cgroup: String,
+    pub cgroup_driver: crate::config::CgroupDriverConfig,
+    pub rootless: crate::rootless::EffectiveRootlessConfig,
+    pub disable_cgroup: bool,
+    #[cfg(test)]
+    pub pull_cgroup_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayImageStorageOptions {
+    pub mount_program: Option<PathBuf>,
+    pub ignore_chown_errors: bool,
+}
+
+impl OverlayImageStorageOptions {
+    fn parse(storage_driver: &str, options: &[String]) -> Result<Self, Error> {
+        if storage_driver != "overlay" && !options.is_empty() {
+            return Err(Error::Config(format!(
+                "image.storage_options is not supported for image.driver {storage_driver}"
+            )));
+        }
+
+        let mut parsed = Self::default();
+        let mut seen = HashSet::new();
+        for option in options {
+            let (key, value) = parse_storage_option(option)?;
+            if !seen.insert(key.clone()) {
+                return Err(Error::Config(format!(
+                    "image.storage_options contains duplicate key {key}"
+                )));
+            }
+            match key.as_str() {
+                "overlay.mount_program" => {
+                    if !Path::new(&value).is_absolute() {
+                        return Err(Error::Config(format!(
+                            "image.storage_options overlay.mount_program must be an absolute path, got {value}"
+                        )));
+                    }
+                    parsed.mount_program = Some(PathBuf::from(value));
+                }
+                "overlay.ignore_chown_errors" => {
+                    parsed.ignore_chown_errors =
+                        parse_storage_option_bool(&value).map_err(|err| {
+                            Error::Config(format!(
+                                "image.storage_options overlay.ignore_chown_errors: {err}"
+                            ))
+                        })?;
+                }
+                other => {
+                    return Err(Error::Config(format!(
+                        "unsupported image.storage_options key {other}; supported overlay keys are overlay.mount_program and overlay.ignore_chown_errors"
+                    )));
+                }
+            }
+        }
+
+        Ok(parsed)
+    }
+}
+
+fn parse_storage_option(option: &str) -> Result<(String, String), Error> {
+    let trimmed = option.trim();
+    let (key, value) = trimmed
+        .split_once('=')
+        .or_else(|| trimmed.split_once(char::is_whitespace))
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "image.storage_options entry {option:?}: expected key=value format"
+            ))
+        })?;
+    let key = key.trim();
+    let value = value.trim();
+    if key.is_empty() {
+        return Err(Error::Config(format!(
+            "image.storage_options entry {option:?}: key must not be empty"
+        )));
+    }
+    if value.is_empty() {
+        return Err(Error::Config(format!(
+            "image.storage_options entry {option:?}: value must not be empty"
+        )));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+fn parse_storage_option_bool(value: &str) -> std::result::Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!("invalid boolean value {other}")),
+    }
+}
+
+fn content_gc_blocker_detail(blocker: &ContentGcBlocker) -> serde_json::Value {
+    match blocker {
+        ContentGcBlocker::ContentRef {
+            owner_kind,
+            owner_id,
+            ref_kind,
+        } => serde_json::json!({
+            "kind": "contentRef",
+            "ownerKind": owner_kind,
+            "ownerId": owner_id,
+            "refKind": ref_kind,
+        }),
+        ContentGcBlocker::ActiveTransfer {
+            transfer_id,
+            source,
+        } => serde_json::json!({
+            "kind": "activeTransfer",
+            "transferId": transfer_id,
+            "source": source,
+        }),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReloadableImageConfig {
+    pub global_auth_file: Option<PathBuf>,
+    pub namespaced_auth_dir: Option<PathBuf>,
+    pub registry_config_dir: Option<PathBuf>,
+    pub decryption_keys_path: Option<PathBuf>,
+    pub decryption_decoder_path: String,
+    pub decryption_keyprovider_config: Option<PathBuf>,
+    pub pinned_image_patterns: Vec<String>,
+    pub signature_policy: Option<PathBuf>,
+    pub signature_policy_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -159,10 +319,25 @@ struct PulledImageMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct StoredLayerMeta {
+    #[serde(default)]
+    pub digest: String,
     pub path: String,
     pub media_type: String,
     pub source_media_type: String,
     pub encrypted: bool,
+}
+
+impl StoredLayerMeta {
+    fn relative_display_path(&self) -> Option<String> {
+        let path = Path::new(self.path.trim());
+        if self.path.trim().is_empty() {
+            return None;
+        }
+        path.strip_prefix("blobs")
+            .ok()
+            .map(|value| value.display().to_string())
+            .or_else(|| Some(self.path.clone()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -182,16 +357,11 @@ pub struct ResolvedArtifactMount {
 }
 
 #[derive(Debug)]
-struct StagedLayer {
-    index: usize,
-    path: PathBuf,
-}
-
-#[derive(Debug)]
 struct PulledLayerData {
-    index: usize,
     bytes: Vec<u8>,
     media_type: String,
+    source_media_type: String,
+    encrypted: bool,
 }
 
 struct PersistedPullImage {
@@ -252,6 +422,9 @@ pub(crate) type TestPullHandler =
     dyn Fn(TestPullRequest) -> Result<TestPullResponse, Status> + Send + Sync;
 
 #[cfg(test)]
+pub(crate) type TestPullScopeObserver = dyn Fn(&'static str, bool) + Send + Sync;
+
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TestRegistryAuth {
     Anonymous,
@@ -291,6 +464,164 @@ const TEST_EMPTY_LAYER_TAR_GZ: &[u8] = &[
 ];
 
 impl ImageServiceImpl {
+    fn current_reloadable_config(&self) -> ReloadableImageConfig {
+        self.reloadable_config
+            .read()
+            .expect("image reloadable config lock poisoned")
+            .clone()
+    }
+
+    pub fn apply_reloadable_config(&self, next: ReloadableImageConfig) {
+        *self
+            .reloadable_config
+            .write()
+            .expect("image reloadable config lock poisoned") = next;
+    }
+
+    pub fn reloadable_config_snapshot(&self) -> ReloadableImageConfig {
+        self.current_reloadable_config()
+    }
+
+    pub fn pull_cgroup_effective_config(&self) -> PullCgroupEffectiveConfig {
+        self.pull_cgroup.effective_config()
+    }
+
+    pub fn last_pull_cgroup_scope(&self) -> Option<PullCgroupScopeRecord> {
+        self.pull_cgroup.last_scope()
+    }
+
+    pub fn content_transfer_status(&self) -> ContentTransferStatus {
+        self.transfer_tracker.snapshot()
+    }
+
+    fn persist_content_transfer_record(&self, record: &ContentTransferRecord) -> Result<(), Error> {
+        let Some(db_path) = self.ledger_db_path.as_ref() else {
+            return Ok(());
+        };
+        StorageManager::new(db_path)
+            .and_then(|mut storage| storage.save_content_transfer(&record.to_storage()))
+            .map_err(|err| Error::Storage(format!("failed to persist content transfer: {err}")))
+    }
+
+    fn persist_content_transfer_by_id(&self, transfer_id: &str) -> Result<(), Error> {
+        let Some(record) = self.transfer_tracker.record(transfer_id) else {
+            return Ok(());
+        };
+        self.persist_content_transfer_record(&record)
+    }
+
+    fn publish_image_internal_event(
+        &self,
+        image_ref: &str,
+        kind: &str,
+        severity: crate::services::InternalEventSeverity,
+        details: serde_json::Value,
+    ) {
+        let Some(db_path) = self.ledger_db_path.as_ref() else {
+            return;
+        };
+        let event =
+            crate::services::InternalEvent::new(kind, "image", image_ref, severity, details);
+        if let Err(err) = crate::services::LedgerInternalEventSink::new(db_path).publish(&event) {
+            log::debug!("Failed to publish image internal event {kind} for {image_ref}: {err}");
+        }
+    }
+
+    fn publish_gc_internal_event(
+        &self,
+        subject_id: &str,
+        kind: &str,
+        severity: crate::services::InternalEventSeverity,
+        details: serde_json::Value,
+    ) {
+        let Some(db_path) = self.ledger_db_path.as_ref() else {
+            return;
+        };
+        let event = crate::services::InternalEvent::new(kind, "gc", subject_id, severity, details);
+        if let Err(err) = crate::services::LedgerInternalEventSink::new(db_path).publish(&event) {
+            log::debug!("Failed to publish GC internal event {kind} for {subject_id}: {err}");
+        }
+    }
+
+    pub fn collect_content_garbage(&self, dry_run: bool) -> Result<ContentGcSummary, Error> {
+        let Some(db_path) = self.ledger_db_path.as_ref() else {
+            return Ok(ContentGcSummary {
+                dry_run,
+                ..Default::default()
+            });
+        };
+        let storage = StorageManager::new(db_path)
+            .map_err(|err| Error::Storage(format!("failed to open content GC ledger: {err}")))?;
+        let candidates = storage.list_content_gc_candidates().map_err(|err| {
+            Error::Storage(format!("failed to list content GC candidates: {err}"))
+        })?;
+        let mut summary = ContentGcSummary {
+            dry_run,
+            candidates: candidates.len(),
+            ..Default::default()
+        };
+
+        for candidate in candidates {
+            let digest = candidate.blob.digest.clone();
+            if candidate.blockers.is_empty() {
+                self.publish_gc_internal_event(
+                    &digest,
+                    "gc.candidate",
+                    crate::services::InternalEventSeverity::Info,
+                    serde_json::json!({
+                        "digest": digest,
+                        "size": candidate.blob.size,
+                        "dryRun": dry_run,
+                    }),
+                );
+                if dry_run {
+                    summary.eligible += 1;
+                    continue;
+                }
+                match self.content_store.delete_blob(&candidate.blob.digest) {
+                    Ok(()) => {
+                        summary.deleted += 1;
+                        summary.bytes_deleted += candidate.blob.size;
+                        self.publish_gc_internal_event(
+                            &candidate.blob.digest,
+                            "gc.delete",
+                            crate::services::InternalEventSeverity::Info,
+                            serde_json::json!({
+                                "digest": candidate.blob.digest,
+                                "size": candidate.blob.size,
+                            }),
+                        );
+                    }
+                    Err(err) => {
+                        summary.failed += 1;
+                        self.publish_gc_internal_event(
+                            &candidate.blob.digest,
+                            "gc.fail",
+                            crate::services::InternalEventSeverity::Error,
+                            serde_json::json!({
+                                "digest": candidate.blob.digest,
+                                "message": err.to_string(),
+                            }),
+                        );
+                    }
+                }
+            } else {
+                summary.skipped += 1;
+                self.publish_gc_internal_event(
+                    &digest,
+                    "gc.skip",
+                    crate::services::InternalEventSeverity::Debug,
+                    serde_json::json!({
+                        "digest": digest,
+                        "blockers": candidate.blockers.iter().map(content_gc_blocker_detail).collect::<Vec<_>>(),
+                    }),
+                );
+            }
+        }
+
+        Ok(summary)
+    }
+
     fn should_retry_pull_status(status: &Status) -> bool {
         matches!(
             status.code(),
@@ -384,7 +715,8 @@ impl ImageServiceImpl {
         if let Some(source_reference) = meta.source_reference.as_deref() {
             refs.push(source_reference);
         }
-        Self::image_is_pinned_by_patterns(&self.pinned_image_patterns, refs)
+        let reloadable = self.current_reloadable_config();
+        Self::image_is_pinned_by_patterns(&reloadable.pinned_image_patterns, refs)
     }
 
     fn canonicalize_image_reference(reference: &str) -> String {
@@ -756,7 +1088,8 @@ impl ImageServiceImpl {
         &self,
         reference: &Reference,
     ) -> Result<Option<RegistryAuth>, Status> {
-        let Some(path) = self.global_auth_file.as_ref() else {
+        let reloadable = self.current_reloadable_config();
+        let Some(path) = reloadable.global_auth_file.as_ref() else {
             return Ok(None);
         };
 
@@ -772,7 +1105,8 @@ impl ImageServiceImpl {
     }
 
     fn namespaced_auth_file_path(&self, namespace: &str, reference: &Reference) -> Option<PathBuf> {
-        let root = self.namespaced_auth_dir.as_ref()?;
+        let reloadable = self.current_reloadable_config();
+        let root = reloadable.namespaced_auth_dir.as_ref()?;
         let namespace = namespace.trim();
         if namespace.is_empty() {
             return None;
@@ -801,7 +1135,8 @@ impl ImageServiceImpl {
     }
 
     fn registry_hosts_toml_path(&self, registry: &str) -> Option<PathBuf> {
-        let config_dir = self.registry_config_dir.as_ref()?;
+        let reloadable = self.current_reloadable_config();
+        let config_dir = reloadable.registry_config_dir.as_ref()?;
         for alias in Self::registry_auth_aliases(registry) {
             let exact = config_dir.join(&alias).join("hosts.toml");
             if exact.exists() {
@@ -936,20 +1271,12 @@ impl ImageServiceImpl {
             .as_nanos() as i64
     }
 
-    fn image_records_dir(root: &Path) -> PathBuf {
-        root.join("images")
-    }
-
     fn artifact_records_dir(root: &Path) -> PathBuf {
-        root.join("artifacts")
+        FilesystemImageMetadataStore::artifact_records_dir(root)
     }
 
     fn local_record_dir(root: &Path, id: &str, artifact: bool) -> PathBuf {
-        if artifact {
-            Self::artifact_records_dir(root).join(id)
-        } else {
-            Self::image_records_dir(root).join(id)
-        }
+        FilesystemImageMetadataStore::local_record_dir(root, id, artifact)
     }
 
     fn is_artifact_meta(meta: &ImageMeta) -> bool {
@@ -960,51 +1287,11 @@ impl ImageServiceImpl {
     }
 
     fn load_meta_from_record_dir(record_dir: &Path) -> Option<ImageMeta> {
-        let raw = std::fs::read(record_dir.join("metadata.json")).ok()?;
-        serde_json::from_slice(&raw).ok()
-    }
-
-    fn load_meta_for_image_id(&self, image_id: &str) -> Option<ImageMeta> {
-        let main_roots = std::iter::once(self.storage_path.as_path())
-            .chain(self.additional_artifact_stores.iter().map(PathBuf::as_path));
-        for root in main_roots {
-            for artifact in [false, true] {
-                let record_dir = Self::local_record_dir(root, image_id, artifact);
-                if let Some(mut meta) = Self::load_meta_from_record_dir(&record_dir) {
-                    meta.pinned = self.image_is_pinned_meta(&meta);
-                    return Some(meta);
-                }
-            }
-        }
-        None
+        FilesystemImageMetadataStore::load_meta_from_record_dir(record_dir)
     }
 
     fn additional_artifact_store_roots(&self) -> impl Iterator<Item = &Path> {
         self.additional_artifact_stores.iter().map(PathBuf::as_path)
-    }
-
-    fn load_records_from_dir(
-        &self,
-        records_dir: &Path,
-        images: &mut HashMap<String, Image>,
-    ) -> Result<(), Error> {
-        if !records_dir.exists() {
-            return Ok(());
-        }
-
-        for entry in std::fs::read_dir(records_dir).context("Failed to read records directory")? {
-            let entry = entry.context("Failed to read record entry")?;
-            let Some(mut meta) = Self::load_meta_from_record_dir(&entry.path()) else {
-                continue;
-            };
-            meta.pinned = self.image_is_pinned_meta(&meta);
-            let image = Self::image_from_meta(&meta);
-            for tag in &meta.repo_tags {
-                images.insert(tag.clone(), image.clone());
-            }
-        }
-
-        Ok(())
     }
 
     fn artifact_mount_candidates(
@@ -1175,29 +1462,28 @@ impl ImageServiceImpl {
 
     fn build_image_verbose_info(
         image: &Image,
-        storage_path: &Path,
-        additional_artifact_stores: &[PathBuf],
+        metadata_store: &FilesystemImageMetadataStore,
+        content_store: &FsContentStore,
         storage_driver: &str,
+        storage_options: &[String],
+        parsed_storage_options: &OverlayImageStorageOptions,
     ) -> Result<HashMap<String, String>, Status> {
-        let mut candidate_dirs = additional_artifact_stores
-            .iter()
-            .map(|root| Self::artifact_records_dir(root).join(&image.id))
-            .collect::<Vec<_>>();
-        candidate_dirs.push(Self::image_records_dir(storage_path).join(&image.id));
-        candidate_dirs.push(Self::artifact_records_dir(storage_path).join(&image.id));
-        let image_dir = candidate_dirs
-            .into_iter()
-            .find(|path| path.join("metadata.json").exists())
-            .unwrap_or_else(|| Self::image_records_dir(storage_path).join(&image.id));
-        let meta = Self::load_meta_from_record_dir(&image_dir);
-        let layer_files = meta
+        let stored = metadata_store.load_by_id(&image.id);
+        let image_dir = stored
             .as_ref()
+            .map(|record| record.record_dir.clone())
+            .unwrap_or_else(|| {
+                FilesystemImageMetadataStore::image_records_dir(metadata_store.storage_root())
+                    .join(&image.id)
+            });
+        let meta = stored.as_ref().map(|record| &record.meta);
+        let layer_files = meta
             .map(|meta| {
                 if !meta.stored_layers.is_empty() {
                     return meta
                         .stored_layers
                         .iter()
-                        .map(|layer| layer.path.clone())
+                        .filter_map(StoredLayerMeta::relative_display_path)
                         .collect::<Vec<_>>();
                 }
                 Vec::new()
@@ -1222,8 +1508,8 @@ impl ImageServiceImpl {
                     })
                     .collect::<Vec<_>>()
             });
-        let (snapshot_bytes, snapshot_inodes) =
-            Self::collect_path_usage(&image_dir).unwrap_or((0, 0));
+        let (metadata_bytes, metadata_inodes) = metadata_store.usage().unwrap_or((0, 0));
+        let (content_bytes, content_inodes) = content_store.total_usage().unwrap_or((0, 0));
         let collected_at = Self::now_nanos();
 
         let payload = serde_json::json!({
@@ -1232,43 +1518,40 @@ impl ImageServiceImpl {
             "repoDigests": image.repo_digests,
             "size": image.size,
             "pinned": image.pinned,
-            "pulledAt": meta.as_ref().map(|meta| meta.pulled_at),
-            "sourceReference": meta.as_ref().and_then(|meta| meta.source_reference.clone()),
-            "os": meta.as_ref().and_then(|meta| meta.os.clone()),
-            "architecture": meta.as_ref().and_then(|meta| meta.architecture.clone()),
-            "configUser": meta.as_ref().and_then(|meta| meta.config_user.clone()),
+            "pulledAt": meta.map(|meta| meta.pulled_at),
+            "sourceReference": meta.and_then(|meta| meta.source_reference.clone()),
+            "os": meta.and_then(|meta| meta.os.clone()),
+            "architecture": meta.and_then(|meta| meta.architecture.clone()),
+            "configUser": meta.and_then(|meta| meta.config_user.clone()),
             "annotations": meta
-                .as_ref()
                 .map(|meta| meta.annotations.clone())
                 .unwrap_or_default(),
             "declaredVolumes": meta
-                .as_ref()
                 .map(|meta| meta.declared_volumes.clone())
                 .unwrap_or_default(),
             "manifestMediaType": meta
-                .as_ref()
                 .and_then(|meta| meta.manifest_media_type.clone()),
             "selectedManifestDigest": meta
-                .as_ref()
                 .and_then(|meta| meta.selected_manifest_digest.clone()),
             "selectedPlatform": meta
-                .as_ref()
                 .and_then(|meta| meta.selected_platform.clone()),
             "storedLayers": meta
-                .as_ref()
                 .map(|meta| meta.stored_layers.clone())
                 .unwrap_or_default(),
-            "artifactType": meta.as_ref().and_then(|meta| meta.artifact_type.clone()),
+            "artifactType": meta.and_then(|meta| meta.artifact_type.clone()),
             "artifactBlobs": meta
-                .as_ref()
                 .map(|meta| meta.artifact_blobs.clone())
                 .unwrap_or_default(),
             "storagePath": image_dir.display().to_string(),
             "storageDriver": storage_driver,
+            "storageOptions": storage_options,
+            "effectiveStorageOptions": parsed_storage_options,
             "layers": layer_files,
             "snapshotStats": {
-                "usedBytes": snapshot_bytes,
-                "inodesUsed": snapshot_inodes,
+                "metadataBytes": metadata_bytes,
+                "metadataInodes": metadata_inodes,
+                "contentBytes": content_bytes,
+                "contentInodes": content_inodes,
                 "layerCount": layer_files.len(),
                 "collectedAt": collected_at,
             },
@@ -1282,30 +1565,6 @@ impl ImageServiceImpl {
             })?,
         );
         Ok(info)
-    }
-
-    fn collect_path_usage(path: &Path) -> io::Result<(u64, u64)> {
-        if !path.exists() {
-            return Ok((0, 0));
-        }
-
-        let mut used_bytes = 0u64;
-        let mut inodes_used = 0u64;
-
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let metadata = entry.metadata()?;
-            inodes_used += 1;
-            if metadata.is_dir() {
-                let (child_bytes, child_inodes) = Self::collect_path_usage(&entry.path())?;
-                used_bytes = used_bytes.saturating_add(child_bytes);
-                inodes_used = inodes_used.saturating_add(child_inodes);
-            } else {
-                used_bytes = used_bytes.saturating_add(metadata.len());
-            }
-        }
-
-        Ok((used_bytes, inodes_used))
     }
 
     fn database_path(&self) -> Option<PathBuf> {
@@ -1322,13 +1581,15 @@ impl ImageServiceImpl {
         let namespace = namespace
             .map(str::trim)
             .filter(|namespace| !namespace.is_empty());
-        if let (Some(dir), Some(namespace)) = (self.signature_policy_dir.as_ref(), namespace) {
+        let reloadable = self.current_reloadable_config();
+        if let (Some(dir), Some(namespace)) = (reloadable.signature_policy_dir.as_ref(), namespace)
+        {
             let candidate = dir.join(format!("{namespace}.json"));
             if candidate.exists() {
                 return Some(candidate);
             }
         }
-        self.signature_policy.clone()
+        reloadable.signature_policy
     }
 
     fn enforce_signature_policy(
@@ -1349,12 +1610,6 @@ impl ImageServiceImpl {
         crate::image::policy::evaluate_signature_policy(&policy, reference).map_err(|err| {
             Status::failed_precondition(format!("signature policy rejected {}: {}", reference, err))
         })
-    }
-
-    fn staged_layers_dir(&self) -> PathBuf {
-        self.big_files_temporary_dir
-            .clone()
-            .unwrap_or_else(|| self.storage_path.join("tmp"))
     }
 
     fn decrypted_media_type_for(source_media_type: &str) -> Result<(String, &'static str), Status> {
@@ -1385,6 +1640,7 @@ impl ImageServiceImpl {
 
     fn image_decryption_enabled(&self) -> bool {
         !self
+            .current_reloadable_config()
             .decryption_keys_path
             .as_ref()
             .map(|path| path.as_os_str().is_empty())
@@ -1397,14 +1653,15 @@ impl ImageServiceImpl {
         encrypted_bytes: &[u8],
     ) -> Result<(Vec<u8>, String), Status> {
         let (decrypted_media_type, _) = Self::decrypted_media_type_for(source_media_type)?;
-        let keys_path = self.decryption_keys_path.as_ref().ok_or_else(|| {
+        let reloadable = self.current_reloadable_config();
+        let keys_path = reloadable.decryption_keys_path.as_ref().ok_or_else(|| {
             Status::failed_precondition(
                 "encrypted image layer requires image.decryption_keys_path to be configured",
             )
         })?;
-        let mut command = std::process::Command::new(self.decryption_decoder_path.trim());
+        let mut command = std::process::Command::new(reloadable.decryption_decoder_path.trim());
         command.arg("--decryption-keys-path").arg(keys_path);
-        if let Some(config) = self.decryption_keyprovider_config.as_ref() {
+        if let Some(config) = reloadable.decryption_keyprovider_config.as_ref() {
             command.env("OCICRYPT_KEYPROVIDER_CONFIG", config.as_os_str());
         }
         command.stdin(std::process::Stdio::piped());
@@ -1413,7 +1670,7 @@ impl ImageServiceImpl {
         let mut child = command.spawn().map_err(|err| {
             Status::failed_precondition(format!(
                 "failed to start image decryption decoder {}: {}",
-                self.decryption_decoder_path, err
+                reloadable.decryption_decoder_path, err
             ))
         })?;
         if let Some(stdin) = child.stdin.as_mut() {
@@ -1444,73 +1701,6 @@ impl ImageServiceImpl {
             )));
         }
         Ok((output.stdout, decrypted_media_type))
-    }
-
-    fn stage_layers(&self, layers: Vec<PulledLayerData>) -> Result<Vec<StagedLayer>, Status> {
-        let staging_root = self.staged_layers_dir();
-        std::fs::create_dir_all(&staging_root).map_err(|err| {
-            Status::internal(format!(
-                "failed to create image staging directory {}: {}",
-                staging_root.display(),
-                err
-            ))
-        })?;
-        let stage_id = uuid::Uuid::new_v4().to_string();
-        let stage_dir = staging_root.join(stage_id);
-        std::fs::create_dir_all(&stage_dir).map_err(|err| {
-            Status::internal(format!(
-                "failed to create image staging workspace {}: {}",
-                stage_dir.display(),
-                err
-            ))
-        })?;
-
-        let mut staged = Vec::with_capacity(layers.len());
-        for layer in layers {
-            let extension = Self::plain_media_type_to_extension(&layer.media_type);
-            let path = stage_dir.join(format!("{}.{}", layer.index, extension));
-            if let Err(err) = std::fs::write(&path, layer.bytes) {
-                let _ = std::fs::remove_dir_all(&stage_dir);
-                return Err(Status::internal(format!(
-                    "failed to stage image layer {} in {}: {}",
-                    layer.index,
-                    path.display(),
-                    err
-                )));
-            }
-            staged.push(StagedLayer {
-                index: layer.index,
-                path,
-            });
-        }
-        Ok(staged)
-    }
-
-    fn persist_staged_layers(
-        &self,
-        image_dir: &Path,
-        staged_layers: &[StagedLayer],
-    ) -> Result<(), Status> {
-        for staged in staged_layers {
-            let layer_path = image_dir.join(format!("{}.tar.gz", staged.index));
-            std::fs::rename(&staged.path, &layer_path)
-                .or_else(|_| std::fs::copy(&staged.path, &layer_path).map(|_| ()))
-                .map_err(|err| {
-                    Status::internal(format!(
-                        "failed to persist staged layer {} to {}: {}",
-                        staged.path.display(),
-                        layer_path.display(),
-                        err
-                    ))
-                })?;
-        }
-        if let Some(stage_dir) = staged_layers
-            .first()
-            .and_then(|staged| staged.path.parent().map(PathBuf::from))
-        {
-            let _ = std::fs::remove_dir_all(stage_dir);
-        }
-        Ok(())
     }
 
     fn image_is_in_use(
@@ -1578,14 +1768,18 @@ impl ImageServiceImpl {
     pub fn metrics_provider(&self) -> ImageMetricsProvider {
         ImageMetricsProvider {
             images: self.images.clone(),
-            storage_path: self.storage_path.clone(),
+            _storage_path: self.storage_path.clone(),
+            content_store: self.content_store.clone(),
+            metadata_store: self.metadata_store.clone(),
         }
     }
 
     pub fn new_with_options(options: ImageServiceOptions) -> Result<Self, Error> {
         let ImageServiceOptions {
             storage_path,
+            ledger_db_path,
             storage_driver,
+            storage_options,
             global_auth_file,
             namespaced_auth_dir,
             default_transport,
@@ -1602,7 +1796,39 @@ impl ImageServiceImpl {
             signature_policy,
             signature_policy_dir,
             big_files_temporary_dir,
+            separate_pull_cgroup,
+            cgroup_driver,
+            rootless,
+            disable_cgroup,
+            #[cfg(test)]
+            pull_cgroup_root,
         } = options;
+        #[cfg(not(test))]
+        let pull_cgroup = PullCgroupExecutor::new(
+            separate_pull_cgroup,
+            cgroup_driver,
+            rootless.enabled,
+            disable_cgroup,
+        );
+        #[cfg(test)]
+        let pull_cgroup = PullCgroupExecutor::new_with_root(
+            separate_pull_cgroup,
+            cgroup_driver,
+            rootless.enabled,
+            disable_cgroup,
+            pull_cgroup_root.unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup")),
+        );
+        let reloadable_config = ReloadableImageConfig {
+            global_auth_file,
+            namespaced_auth_dir,
+            registry_config_dir,
+            decryption_keys_path,
+            decryption_decoder_path,
+            decryption_keyprovider_config,
+            pinned_image_patterns,
+            signature_policy,
+            signature_policy_dir,
+        };
         let storage_driver = storage_driver.trim().to_string();
 
         if storage_driver != "overlay" {
@@ -1611,36 +1837,49 @@ impl ImageServiceImpl {
                 storage_driver
             )));
         }
+        let parsed_storage_options =
+            OverlayImageStorageOptions::parse(&storage_driver, &storage_options)?;
 
         if !storage_path.exists() {
             std::fs::create_dir_all(&storage_path).context("Failed to create storage directory")?;
         }
 
         let images = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let content_store = Arc::new(FsContentStore::new_with_ledger(
+            &storage_path,
+            ledger_db_path.clone(),
+        )?);
+        let transfer_tracker = ContentTransferTracker::new_with_ledger(ledger_db_path.clone())?;
+        let metadata_store = Arc::new(FilesystemImageMetadataStore::new(
+            &storage_path,
+            additional_artifact_stores.clone(),
+            ledger_db_path.clone(),
+        ));
 
         Ok(Self {
             images,
             storage_path,
             storage_driver,
-            global_auth_file,
-            namespaced_auth_dir,
+            storage_options,
+            parsed_storage_options,
+            content_store,
+            metadata_store,
             default_transport,
             short_name_mode,
             pull_progress_timeout,
             max_concurrent_downloads,
             pull_retry_count,
-            registry_config_dir,
-            decryption_keys_path,
-            decryption_decoder_path,
-            decryption_keyprovider_config,
             additional_artifact_stores,
-            pinned_image_patterns,
-            signature_policy,
-            signature_policy_dir,
-            big_files_temporary_dir,
+            _big_files_temporary_dir: big_files_temporary_dir,
             in_progress_pulls: Arc::new(Mutex::new(HashMap::new())),
+            transfer_tracker,
             #[cfg(test)]
             test_pull_handler: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            test_pull_scope_observer: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            reloadable_config: Arc::new(RwLock::new(reloadable_config)),
+            pull_cgroup,
+            ledger_db_path,
         })
     }
 
@@ -1684,12 +1923,51 @@ impl ImageServiceImpl {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_test_pull_scope_observer(
+        &self,
+        observer: std::sync::Arc<TestPullScopeObserver>,
+    ) {
+        if let Ok(mut slot) = self.test_pull_scope_observer.lock() {
+            *slot = Some(observer);
+        }
+    }
+
+    #[cfg(test)]
     fn snapshot_test_pull_handler(&self) -> Option<std::sync::Arc<TestPullHandler>> {
         self.test_pull_handler
             .lock()
             .ok()
             .and_then(|handler| handler.clone())
     }
+
+    #[cfg(test)]
+    fn transfer_provider_kind(&self) -> RemoteContentProviderKind {
+        if self.snapshot_test_pull_handler().is_some() {
+            RemoteContentProviderKind::Test
+        } else {
+            RemoteContentProviderKind::Registry
+        }
+    }
+
+    #[cfg(not(test))]
+    fn transfer_provider_kind(&self) -> RemoteContentProviderKind {
+        RemoteContentProviderKind::Registry
+    }
+
+    #[cfg(test)]
+    fn observe_test_pull_scope(&self, stage: &'static str) {
+        if let Some(observer) = self
+            .test_pull_scope_observer
+            .lock()
+            .ok()
+            .and_then(|observer| observer.clone())
+        {
+            observer(stage, self.pull_cgroup.scope_active());
+        }
+    }
+
+    #[cfg(not(test))]
+    fn observe_test_pull_scope(&self, _stage: &'static str) {}
 
     #[cfg(test)]
     fn test_registry_auth(auth: &RegistryAuth) -> TestRegistryAuth {
@@ -1704,32 +1982,15 @@ impl ImageServiceImpl {
 
     // 加载本地镜像
     pub async fn load_local_images(&self) -> Result<(), Error> {
-        info!("load_local_images called");
-        let images_dir = Self::image_records_dir(&self.storage_path);
-        let artifacts_dir = Self::artifact_records_dir(&self.storage_path);
-        info!("Images directory: {:?}", images_dir);
-        info!("Artifacts directory: {:?}", artifacts_dir);
-
-        if !images_dir.exists() {
-            std::fs::create_dir_all(&images_dir)?;
-        }
-        if !artifacts_dir.exists() {
-            std::fs::create_dir_all(&artifacts_dir)?;
-        }
-
         let mut images = self.images.lock().await;
         images.clear();
-        info!("Reading image records from directory");
-        self.load_records_from_dir(&images_dir, &mut images)?;
-        info!("Reading artifact records from directory");
-        self.load_records_from_dir(&artifacts_dir, &mut images)?;
-        for root in self.additional_artifact_store_roots() {
-            let artifact_dir = Self::artifact_records_dir(root);
-            info!(
-                "Reading additional artifact records from {:?}",
-                artifact_dir
-            );
-            self.load_records_from_dir(&artifact_dir, &mut images)?;
+        for record in self.metadata_store.load_all()? {
+            let mut meta = record.meta;
+            meta.pinned = self.image_is_pinned_meta(&meta);
+            let image = Self::image_from_meta(&meta);
+            for tag in &meta.repo_tags {
+                images.insert(tag.clone(), image.clone());
+            }
         }
 
         Ok(())
@@ -1747,40 +2008,18 @@ impl ImageServiceImpl {
             }
         }
 
-        let mut roots = vec![self.storage_path.clone()];
-        roots.extend(self.additional_artifact_stores.iter().cloned());
-        for root in roots {
-            for records_dir in [
-                Self::image_records_dir(&root),
-                Self::artifact_records_dir(&root),
-            ] {
-                if !records_dir.exists() {
-                    continue;
-                }
-                let entries = match std::fs::read_dir(&records_dir) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("Failed to read records directory {:?}: {}", records_dir, e);
-                        continue;
-                    }
-                };
-
-                for entry in entries.flatten() {
-                    let record_dir = entry.path();
-                    let Some(mut meta) = Self::load_meta_from_record_dir(&record_dir) else {
-                        continue;
-                    };
-                    meta.pinned = self.image_is_pinned_meta(&meta);
-                    let image = Self::image_from_meta(&meta);
-                    if Self::image_matches_ref(&image, image_ref) {
-                        let mut images = self.images.lock().await;
-                        for tag in &meta.repo_tags {
-                            images.insert(tag.clone(), image.clone());
-                        }
-                        return Some(image);
-                    }
-                }
+        if let Ok(Some(record)) = self
+            .metadata_store
+            .find_by_reference(image_ref, Self::image_matches_ref)
+        {
+            let mut meta = record.meta;
+            meta.pinned = self.image_is_pinned_meta(&meta);
+            let image = Self::image_from_meta(&meta);
+            let mut images = self.images.lock().await;
+            for tag in &meta.repo_tags {
+                images.insert(tag.clone(), image.clone());
             }
+            return Some(image);
         }
 
         None
@@ -1788,22 +2027,7 @@ impl ImageServiceImpl {
 
     // 保存镜像元数据
     async fn save_image_metadata(&self, image: &CriusImage) -> Result<(), Error> {
-        let record_dir = Self::local_record_dir(
-            &self.storage_path,
-            &image.id,
-            image
-                .artifact_type
-                .as_ref()
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false),
-        );
-        let meta_path = record_dir.join("metadata.json");
-        if !meta_path.exists() {
-            std::fs::create_dir_all(meta_path.parent().unwrap())
-                .context("Failed to create metadata directory")?;
-        }
-        let meta_data = serde_json::to_vec(image).context("Failed to serialize metadata")?;
-        std::fs::write(meta_path, meta_data).context("Failed to write metadata")?;
+        self.metadata_store.save(image)?;
         Ok(())
     }
 
@@ -1829,17 +2053,31 @@ impl ImageServiceImpl {
             .as_ref()
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false);
+        self.observe_test_pull_scope("persist-record-start");
         let record_dir = Self::local_record_dir(&self.storage_path, &image_id, is_artifact);
         std::fs::create_dir_all(&record_dir).map_err(|e: io::Error| {
             Status::internal(format!("Failed to create image record directory: {}", e))
         })?;
-        let staged_layers = self.stage_layers(layers_to_persist)?;
-        info!(
-            "Persisting {} staged blobs to {:?}",
-            staged_layers.len(),
-            record_dir
-        );
-        self.persist_staged_layers(&record_dir, &staged_layers)?;
+        let persisted_layers = layers_to_persist
+            .into_iter()
+            .map(|layer| {
+                self.content_store
+                    .put_blob("", &layer.media_type, &layer.bytes)
+                    .map(|info| StoredLayerMeta {
+                        digest: info.digest,
+                        path: info.relative_path.display().to_string(),
+                        media_type: layer.media_type.clone(),
+                        source_media_type: layer.source_media_type,
+                        encrypted: layer.encrypted,
+                    })
+                    .map_err(|err| {
+                        Status::internal(format!("Failed to persist layer blob: {}", err))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut pulled_metadata = pulled_metadata;
+        pulled_metadata.stored_layers = persisted_layers;
+        let reloadable = self.current_reloadable_config();
 
         self.save_image_metadata(&CriusImage {
             id: image_id.clone(),
@@ -1847,7 +2085,7 @@ impl ImageServiceImpl {
             repo_digests: repo_digests.clone(),
             size: image_size,
             pinned: Self::image_is_pinned_by_patterns(
-                &self.pinned_image_patterns,
+                &reloadable.pinned_image_patterns,
                 [canonical_ref.as_str(), requested_ref.as_str()],
             ),
             pulled_at: Self::now_nanos(),
@@ -1873,6 +2111,7 @@ impl ImageServiceImpl {
             error!("Failed to save image metadata: {}", e);
             Status::internal(format!("Failed to save image metadata: {}", e))
         })?;
+        self.observe_test_pull_scope("persist-metadata-saved");
 
         let image = Image {
             id: image_id.clone(),
@@ -1880,7 +2119,7 @@ impl ImageServiceImpl {
             repo_digests,
             size: image_size,
             pinned: Self::image_is_pinned_by_patterns(
-                &self.pinned_image_patterns,
+                &reloadable.pinned_image_patterns,
                 [canonical_ref.as_str(), requested_ref.as_str()],
             ),
             spec: Some(ImageSpec {
@@ -1912,6 +2151,7 @@ impl ImageServiceImpl {
         auth: &RegistryAuth,
         pull_namespace: Option<&str>,
     ) -> Result<Response<PullImageResponse>, Status> {
+        self.observe_test_pull_scope("test-handler");
         let response = handler(TestPullRequest {
             requested_ref: requested_ref.to_string(),
             canonical_ref: canonical_ref.to_string(),
@@ -1922,14 +2162,16 @@ impl ImageServiceImpl {
             .parse()
             .map_err(|e| Status::invalid_argument(format!("Invalid image reference: {}", e)))?;
         let layers_to_persist = vec![PulledLayerData {
-            index: 0,
             bytes: TEST_EMPTY_LAYER_TAR_GZ.to_vec(),
             media_type: TEST_PULL_LAYER_MEDIA_TYPE.to_string(),
+            source_media_type: TEST_PULL_LAYER_MEDIA_TYPE.to_string(),
+            encrypted: false,
         }];
         let metadata = PulledImageMetadata {
             annotations: response.annotations,
             declared_volumes: response.declared_volumes,
             stored_layers: vec![StoredLayerMeta {
+                digest: String::new(),
                 path: "0.tar.gz".to_string(),
                 media_type: TEST_PULL_LAYER_MEDIA_TYPE.to_string(),
                 source_media_type: TEST_PULL_LAYER_MEDIA_TYPE.to_string(),
@@ -1950,7 +2192,9 @@ impl ImageServiceImpl {
     }
 
     fn load_image_metadata(&self, image_id: &str) -> Option<ImageMeta> {
-        self.load_meta_for_image_id(image_id)
+        self.metadata_store
+            .load_by_id(image_id)
+            .map(|record| record.meta)
     }
 
     async fn persist_local_image_alias(
@@ -1962,6 +2206,7 @@ impl ImageServiceImpl {
         let Some(existing) = self.load_image_metadata(&image.id) else {
             return Ok(());
         };
+        let reloadable = self.current_reloadable_config();
 
         let mut repo_tags = existing.repo_tags.clone();
         Self::push_unique(&mut repo_tags, canonical_ref);
@@ -1977,7 +2222,7 @@ impl ImageServiceImpl {
             repo_digests: image.repo_digests.clone(),
             size: image.size,
             pinned: Self::image_is_pinned_by_patterns(
-                &self.pinned_image_patterns,
+                &reloadable.pinned_image_patterns,
                 image
                     .repo_tags
                     .iter()
@@ -2011,8 +2256,9 @@ impl ImageServiceImpl {
 
     async fn persist_image_from_proto(&self, image: &Image) -> Result<(), Error> {
         let existing = self.load_image_metadata(&image.id).unwrap_or_default();
+        let reloadable = self.current_reloadable_config();
         let pinned = Self::image_is_pinned_by_patterns(
-            &self.pinned_image_patterns,
+            &reloadable.pinned_image_patterns,
             image
                 .repo_tags
                 .iter()
@@ -2634,15 +2880,17 @@ impl ImageServiceImpl {
             };
             let extension = Self::plain_media_type_to_extension(&media_type);
             stored_layers.push(StoredLayerMeta {
+                digest: String::new(),
                 path: format!("{idx}.{extension}"),
                 media_type: media_type.clone(),
-                source_media_type,
+                source_media_type: source_media_type.clone(),
                 encrypted,
             });
             layer_data.push(PulledLayerData {
-                index: idx,
                 bytes,
                 media_type,
+                source_media_type,
+                encrypted,
             });
         }
         metadata.stored_layers = stored_layers;
@@ -2669,13 +2917,13 @@ impl ImageMetricsProvider {
             grouped
         };
         let total_image_size_bytes = grouped.values().map(|image| image.size).sum();
-        let (image_fs_bytes_used, image_fs_inodes_used) =
-            ImageServiceImpl::collect_path_usage(&self.storage_path).unwrap_or((0, 0));
+        let (metadata_bytes, metadata_inodes) = self.metadata_store.usage().unwrap_or((0, 0));
+        let (content_bytes, content_inodes) = self.content_store.total_usage().unwrap_or((0, 0));
         crate::metrics::ImageMetricsSnapshot {
             image_count: grouped.len(),
             total_image_size_bytes,
-            image_fs_bytes_used,
-            image_fs_inodes_used,
+            image_fs_bytes_used: metadata_bytes.saturating_add(content_bytes),
+            image_fs_inodes_used: metadata_inodes.saturating_add(content_inodes),
         }
     }
 }
@@ -2770,9 +3018,11 @@ impl ImageService for ImageServiceImpl {
                     info: if req.verbose {
                         Self::build_image_verbose_info(
                             &image,
-                            &self.storage_path,
-                            &self.additional_artifact_stores,
+                            &self.metadata_store,
+                            &self.content_store,
                             &self.storage_driver,
+                            &self.storage_options,
+                            &self.parsed_storage_options,
                         )?
                     } else {
                         HashMap::new()
@@ -2812,6 +3062,15 @@ impl ImageService for ImageServiceImpl {
             .as_ref()
             .and_then(|config| config.metadata.as_ref())
             .map(|metadata| metadata.namespace.clone());
+        let pod_cgroup_parent = req
+            .sandbox_config
+            .as_ref()
+            .and_then(|config| config.linux.as_ref())
+            .map(|linux| linux.cgroup_parent.as_str());
+        let pull_cgroup_target = self
+            .pull_cgroup
+            .target_for_pod(pod_cgroup_parent)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
         self.enforce_signature_policy(&reference, pull_namespace.as_deref())?;
 
         let auth = match req.auth.clone() {
@@ -2874,8 +3133,48 @@ impl ImageService for ImageServiceImpl {
             "Local image not found, start remote pull: {}",
             canonical_ref
         );
+        let transfer = self.transfer_tracker.start(
+            canonical_ref.clone(),
+            self.transfer_provider_kind(),
+            "resolving",
+        );
+        let transfer_id = transfer.id().to_string();
+        self.persist_content_transfer_by_id(&transfer_id)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        self.publish_image_internal_event(
+            &canonical_ref,
+            "image.pull_start",
+            crate::services::InternalEventSeverity::Info,
+            serde_json::json!({
+                "requestedRef": requested_ref,
+                "canonicalRef": canonical_ref,
+                "transferId": transfer_id,
+                "provider": self.transfer_provider_kind().as_str(),
+            }),
+        );
+        transfer.update("pulling", 0, 0);
+        self.persist_content_transfer_by_id(&transfer_id)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        self.publish_image_internal_event(
+            &canonical_ref,
+            "image.pull_progress",
+            crate::services::InternalEventSeverity::Info,
+            serde_json::json!({
+                "transferId": transfer_id,
+                "stage": "pulling",
+                "bytesCompleted": 0,
+                "bytesTotal": 0,
+            }),
+        );
 
         let pull_outcome = Self::execute_pull_with_retries(self.pull_retry_count, || async {
+            transfer.update("attempt", 0, 0);
+            self.persist_content_transfer_by_id(&transfer_id)
+                .map_err(|err| Status::internal(err.to_string()))?;
+            let _pull_cgroup_scope = self
+                .pull_cgroup
+                .enter(&pull_cgroup_target)
+                .map_err(|err| Status::failed_precondition(err.to_string()))?;
             #[cfg(test)]
             if let Some(handler) = self.snapshot_test_pull_handler() {
                 return self
@@ -2910,7 +3209,39 @@ impl ImageService for ImageServiceImpl {
             notify.notify_waiters();
         }
 
-        pull_outcome
+        match pull_outcome {
+            Ok(response) => {
+                transfer.succeed();
+                self.persist_content_transfer_by_id(&transfer_id)
+                    .map_err(|err| Status::internal(err.to_string()))?;
+                self.publish_image_internal_event(
+                    &canonical_ref,
+                    "image.pull_success",
+                    crate::services::InternalEventSeverity::Info,
+                    serde_json::json!({
+                        "transferId": transfer_id,
+                        "imageRef": response.get_ref().image_ref,
+                    }),
+                );
+                Ok(response)
+            }
+            Err(status) => {
+                transfer.fail(status.message().to_string());
+                self.persist_content_transfer_by_id(&transfer_id)
+                    .map_err(|err| Status::internal(err.to_string()))?;
+                self.publish_image_internal_event(
+                    &canonical_ref,
+                    "image.pull_fail",
+                    crate::services::InternalEventSeverity::Error,
+                    serde_json::json!({
+                        "transferId": transfer_id,
+                        "code": format!("{:?}", status.code()),
+                        "message": status.message(),
+                    }),
+                );
+                Err(status)
+            }
+        }
     }
 
     // 删除镜像
@@ -3042,16 +3373,8 @@ impl ImageService for ImageServiceImpl {
                             .as_ref()
                             .map(Self::is_artifact_meta)
                             .unwrap_or(false);
-                        let record_dir =
-                            Self::local_record_dir(&self.storage_path, &image_id, is_artifact);
-                        if record_dir.exists() {
-                            info!("Removing image directory: {:?}", record_dir);
-                            if let Err(e) = tokio::fs::remove_dir_all(&record_dir).await {
-                                error!("Failed to remove image directory {:?}: {}", record_dir, e);
-                                // 即使磁盘清理失败，也返回成功，因为内存中的信息已经删除
-                            } else {
-                                info!("Successfully removed image directory: {:?}", record_dir);
-                            }
+                        if let Err(err) = self.metadata_store.delete_by_id(&image_id, is_artifact) {
+                            error!("Failed to delete image metadata for {}: {}", image_id, err);
                         }
                     }
 
@@ -3070,20 +3393,21 @@ impl ImageService for ImageServiceImpl {
         &self,
         _request: Request<ImageFsInfoRequest>,
     ) -> Result<Response<ImageFsInfoResponse>, Status> {
-        let images_dir = self.storage_path.join("images");
-        let (used_bytes, inodes_used) =
-            Self::collect_path_usage(&images_dir).map_err(|e: io::Error| {
-                Status::internal(format!(
-                    "Failed to collect image filesystem usage from {}: {}",
-                    images_dir.display(),
-                    e
-                ))
-            })?;
+        let (metadata_bytes, metadata_inodes) = self
+            .metadata_store
+            .usage()
+            .map_err(|e| Status::internal(format!("Failed to collect metadata usage: {}", e)))?;
+        let (content_bytes, content_inodes) = self
+            .content_store
+            .total_usage()
+            .map_err(|e| Status::internal(format!("Failed to collect content usage: {}", e)))?;
+        let used_bytes = metadata_bytes.saturating_add(content_bytes);
+        let inodes_used = metadata_inodes.saturating_add(content_inodes);
 
         let usage = FilesystemUsage {
             timestamp: Self::now_nanos(),
             fs_id: Some(FilesystemIdentifier {
-                mountpoint: images_dir.display().to_string(),
+                mountpoint: self.storage_path.display().to_string(),
             }),
             used_bytes: Some(UInt64Value { value: used_bytes }),
             inodes_used: Some(UInt64Value { value: inodes_used }),
@@ -3097,1666 +3421,4 @@ impl ImageService for ImageServiceImpl {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::proto::runtime::v1::{
-        ImageFilter, ImageFsInfoRequest, ImageSpec, PodSandboxConfig, PodSandboxMetadata,
-    };
-    use crate::storage::{ContainerRecord, StorageManager};
-    use chrono::Utc;
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tempfile::{tempdir, TempDir};
-
-    fn test_image_service_result_with_options(
-        storage_path: &Path,
-        storage_driver: &str,
-        global_auth_file: Option<&Path>,
-        namespaced_auth_dir: Option<&Path>,
-        registry_config_dir: Option<&Path>,
-        pinned_image_patterns: Vec<String>,
-    ) -> Result<ImageServiceImpl, Error> {
-        ImageServiceImpl::new_with_options(ImageServiceOptions {
-            storage_path: storage_path.to_path_buf(),
-            storage_driver: storage_driver.to_string(),
-            global_auth_file: global_auth_file.map(Path::to_path_buf),
-            namespaced_auth_dir: namespaced_auth_dir.map(Path::to_path_buf),
-            default_transport: "docker://".to_string(),
-            short_name_mode: "disabled".to_string(),
-            pull_progress_timeout: std::time::Duration::ZERO,
-            max_concurrent_downloads: 3,
-            pull_retry_count: 0,
-            registry_config_dir: registry_config_dir.map(Path::to_path_buf),
-            decryption_keys_path: None,
-            decryption_decoder_path: "ctd-decoder".to_string(),
-            decryption_keyprovider_config: None,
-            additional_artifact_stores: Vec::new(),
-            pinned_image_patterns,
-            signature_policy: None,
-            signature_policy_dir: None,
-            big_files_temporary_dir: None,
-        })
-    }
-
-    fn test_image_service_with_options(
-        storage_path: &Path,
-        storage_driver: &str,
-        global_auth_file: Option<&Path>,
-        namespaced_auth_dir: Option<&Path>,
-        registry_config_dir: Option<&Path>,
-        pinned_image_patterns: Vec<String>,
-    ) -> ImageServiceImpl {
-        test_image_service_result_with_options(
-            storage_path,
-            storage_driver,
-            global_auth_file,
-            namespaced_auth_dir,
-            registry_config_dir,
-            pinned_image_patterns,
-        )
-        .unwrap()
-    }
-
-    async fn test_image_service() -> ImageServiceImpl {
-        let dir = tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        std::mem::forget(dir);
-        test_image_service_with_options(
-            &path,
-            "overlay",
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Vec::new(),
-        )
-    }
-
-    fn test_image_service_in_tempdir() -> (TempDir, ImageServiceImpl) {
-        let dir = tempdir().unwrap();
-        let service = test_image_service_with_options(
-            dir.path(),
-            "overlay",
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Vec::new(),
-        );
-        (dir, service)
-    }
-
-    #[test]
-    fn image_service_rejects_unsupported_storage_driver() {
-        let dir = tempdir().unwrap();
-        let err = match test_image_service_result_with_options(
-            dir.path(),
-            "btrfs",
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Vec::new(),
-        ) {
-            Ok(_) => panic!("unsupported image driver must fail initialization"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("image.driver must be \"overlay\""));
-    }
-
-    #[test]
-    fn image_service_uses_global_auth_file_for_matching_registry() {
-        let dir = tempdir().unwrap();
-        let auth_file = dir.path().join("config.json");
-        std::fs::write(
-            &auth_file,
-            r#"{
-                "auths": {
-                    "https://index.docker.io/v1/": {
-                        "auth": "dXNlcjpwYXNz"
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-        let service = test_image_service_with_options(
-            dir.path(),
-            "overlay",
-            Some(&auth_file),
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Vec::new(),
-        );
-        let reference: Reference = "docker.io/library/busybox:latest".parse().unwrap();
-
-        let auth = service
-            .registry_auth_from_global_auth_file(&reference)
-            .unwrap()
-            .expect("matching auth should be loaded");
-
-        match auth {
-            RegistryAuth::Basic(username, password) => {
-                assert_eq!(username, "user");
-                assert_eq!(password, "pass");
-            }
-            RegistryAuth::Anonymous => panic!("expected basic auth from auth file"),
-        }
-    }
-
-    #[test]
-    fn image_service_uses_namespaced_auth_file_for_matching_registry() {
-        let dir = tempdir().unwrap();
-        let auth_dir = dir.path().join("credentialprovider");
-        std::fs::create_dir_all(&auth_dir).unwrap();
-        let reference: Reference = "docker.io/library/busybox:latest".parse().unwrap();
-        let service = test_image_service_with_options(
-            dir.path(),
-            "overlay",
-            Option::<&Path>::None,
-            Some(&auth_dir),
-            Option::<&Path>::None,
-            Vec::new(),
-        );
-        let auth_path = service
-            .namespaced_auth_file_path("default", &reference)
-            .expect("expected namespaced auth path");
-        std::fs::write(
-            &auth_path,
-            r#"{
-                "auths": {
-                    "https://index.docker.io/v1/": {
-                        "auth": "dGVzdDpzZWNyZXQ="
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        match service
-            .registry_auth_from_namespaced_auth_dir(&reference, Some("default"))
-            .unwrap()
-            .expect("expected auth from namespaced auth dir")
-        {
-            RegistryAuth::Basic(username, password) => {
-                assert_eq!(username, "test");
-                assert_eq!(password, "secret");
-            }
-            RegistryAuth::Anonymous => panic!("expected basic auth from namespaced auth dir"),
-        }
-    }
-
-    #[test]
-    fn namespaced_auth_dir_takes_precedence_over_global_auth_file() {
-        let dir = tempdir().unwrap();
-        let auth_dir = dir.path().join("credentialprovider");
-        std::fs::create_dir_all(&auth_dir).unwrap();
-        let global_auth_file = dir.path().join("global.json");
-        std::fs::write(
-            &global_auth_file,
-            r#"{
-                "auths": {
-                    "https://index.docker.io/v1/": {
-                        "auth": "Z2xvYmFsOnNlY3JldA=="
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-        let reference: Reference = "docker.io/library/busybox:latest".parse().unwrap();
-        let service = test_image_service_with_options(
-            dir.path(),
-            "overlay",
-            Some(&global_auth_file),
-            Some(&auth_dir),
-            Option::<&Path>::None,
-            Vec::new(),
-        );
-        let auth_path = service
-            .namespaced_auth_file_path("default", &reference)
-            .expect("expected namespaced auth path");
-        std::fs::write(
-            &auth_path,
-            r#"{
-                "auths": {
-                    "https://index.docker.io/v1/": {
-                        "auth": "bmFtZXNwYWNlOnNlY3JldA=="
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let namespaced = service
-            .registry_auth_from_namespaced_auth_dir(&reference, Some("default"))
-            .unwrap()
-            .expect("expected namespaced auth");
-        let global = service
-            .registry_auth_from_global_auth_file(&reference)
-            .unwrap()
-            .expect("expected global auth");
-
-        match (namespaced, global) {
-            (RegistryAuth::Basic(ns_user, _), RegistryAuth::Basic(global_user, _)) => {
-                assert_eq!(ns_user, "namespace");
-                assert_eq!(global_user, "global");
-            }
-            _ => panic!("expected basic auth from both sources"),
-        }
-    }
-
-    #[tokio::test]
-    async fn ensure_image_exists_for_sandbox_falls_back_to_global_auth_file() {
-        let dir = tempdir().unwrap();
-        let global_auth_file = dir.path().join("global.json");
-        std::fs::write(
-            &global_auth_file,
-            r#"{
-                "auths": {
-                    "registry.example": {
-                        "auth": "Z2xvYmFsOnNlY3JldA=="
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-        let service = test_image_service_with_options(
-            dir.path(),
-            "overlay",
-            Some(&global_auth_file),
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Vec::new(),
-        );
-        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        service.set_test_pull_handler(Arc::new({
-            let observed = observed.clone();
-            move |request| {
-                observed.lock().unwrap().push(request);
-                Ok(TestPullResponse {
-                    image_id: "sha256:global-auth".to_string(),
-                    size: 12,
-                    ..Default::default()
-                })
-            }
-        }));
-
-        let sandbox_config = PodSandboxConfig {
-            metadata: Some(PodSandboxMetadata {
-                name: "test-pod".to_string(),
-                uid: "uid-1".to_string(),
-                namespace: "default".to_string(),
-                attempt: 0,
-            }),
-            ..Default::default()
-        };
-        let image = service
-            .ensure_image_exists_for_sandbox("registry.example/repo:latest", &sandbox_config)
-            .await
-            .expect("missing sandbox image should be pulled through global auth");
-
-        assert_eq!(image.id, "sha256:global-auth");
-        let calls = observed.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0].auth,
-            TestRegistryAuth::Basic {
-                username: "global".to_string(),
-                password: "secret".to_string(),
-            }
-        );
-        assert_eq!(calls[0].pull_namespace.as_deref(), Some("default"));
-    }
-
-    #[tokio::test]
-    async fn collect_with_concurrency_limit_honors_max_parallelism() {
-        let peak = Arc::new(AtomicUsize::new(0));
-        let current = Arc::new(AtomicUsize::new(0));
-        let results = ImageServiceImpl::collect_with_concurrency_limit(2, vec![0usize, 1, 2, 3], {
-            let peak = peak.clone();
-            let current = current.clone();
-            move |idx| {
-                let peak = peak.clone();
-                let current = current.clone();
-                async move {
-                    let active = current.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(active, Ordering::SeqCst);
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    current.fetch_sub(1, Ordering::SeqCst);
-                    Ok::<_, Status>((idx, vec![idx as u8], 1))
-                }
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(results.len(), 4);
-        assert!(peak.load(Ordering::SeqCst) <= 2);
-    }
-
-    #[tokio::test]
-    async fn execute_pull_with_retries_retries_retryable_failures() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let result = ImageServiceImpl::execute_pull_with_retries(2, {
-            let attempts = attempts.clone();
-            move || {
-                let attempts = attempts.clone();
-                async move {
-                    let current = attempts.fetch_add(1, Ordering::SeqCst);
-                    if current == 0 {
-                        Err(Status::internal("temporary pull failure"))
-                    } else {
-                        Ok("ok")
-                    }
-                }
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(result, "ok");
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn short_name_mode_enforcing_rejects_unqualified_pull_reference() {
-        let dir = tempdir().unwrap();
-        let service = ImageServiceImpl::new_with_options(ImageServiceOptions {
-            storage_path: dir.path().to_path_buf(),
-            storage_driver: "overlay".to_string(),
-            global_auth_file: None,
-            namespaced_auth_dir: None,
-            default_transport: "docker://".to_string(),
-            short_name_mode: "enforcing".to_string(),
-            pull_progress_timeout: std::time::Duration::ZERO,
-            max_concurrent_downloads: 3,
-            pull_retry_count: 0,
-            registry_config_dir: None,
-            decryption_keys_path: None,
-            decryption_decoder_path: "ctd-decoder".to_string(),
-            decryption_keyprovider_config: None,
-            additional_artifact_stores: Vec::new(),
-            pinned_image_patterns: Vec::new(),
-            signature_policy: None,
-            signature_policy_dir: None,
-            big_files_temporary_dir: None,
-        })
-        .unwrap();
-
-        let err = service
-            .resolve_pull_reference("busybox")
-            .expect_err("short name should be rejected");
-        assert!(err
-            .message()
-            .contains("short image names are rejected when image.short_name_mode = enforcing"));
-    }
-
-    #[test]
-    fn short_name_mode_disabled_normalizes_short_name_with_default_transport() {
-        let dir = tempdir().unwrap();
-        let service = test_image_service_with_options(
-            dir.path(),
-            "overlay",
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Vec::new(),
-        );
-
-        assert_eq!(
-            service.resolve_pull_reference("busybox").unwrap(),
-            "docker.io/library/busybox:latest"
-        );
-        assert_eq!(
-            service.resolve_pull_reference("docker://busybox").unwrap(),
-            "docker.io/library/busybox:latest"
-        );
-    }
-
-    #[tokio::test]
-    async fn pull_progress_timeout_cancels_stalled_response_body() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-
-        let dir = tempdir().unwrap();
-        let service = ImageServiceImpl::new_with_options(ImageServiceOptions {
-            storage_path: dir.path().to_path_buf(),
-            storage_driver: "overlay".to_string(),
-            global_auth_file: None,
-            namespaced_auth_dir: None,
-            default_transport: "docker://".to_string(),
-            short_name_mode: "disabled".to_string(),
-            pull_progress_timeout: std::time::Duration::from_millis(50),
-            max_concurrent_downloads: 3,
-            pull_retry_count: 0,
-            registry_config_dir: None,
-            decryption_keys_path: None,
-            decryption_decoder_path: "ctd-decoder".to_string(),
-            decryption_keyprovider_config: None,
-            additional_artifact_stores: Vec::new(),
-            pinned_image_patterns: Vec::new(),
-            signature_policy: None,
-            signature_policy_dir: None,
-            big_files_temporary_dir: None,
-        })
-        .unwrap();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 1024];
-            let _ = socket.read(&mut buf).await.unwrap();
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
-                .await
-                .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            let _ = socket.write_all(b"body").await;
-        });
-
-        let response = reqwest::get(format!("http://{}/slow", addr)).await.unwrap();
-        let err = service
-            .read_response_bytes_with_progress_timeout(response, "test body")
-            .await
-            .expect_err("stalled response body should time out");
-        assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
-    }
-
-    async fn insert_image(service: &ImageServiceImpl, image: Image) {
-        let mut images = service.images.lock().await;
-        for tag in &image.repo_tags {
-            images.insert(tag.clone(), image.clone());
-        }
-    }
-
-    #[test]
-    fn registry_config_dir_loads_hosts_toml_endpoints() {
-        let dir = tempdir().unwrap();
-        let registry_dir = dir.path().join("certs.d").join("docker.io");
-        std::fs::create_dir_all(&registry_dir).unwrap();
-        std::fs::write(
-            registry_dir.join("hosts.toml"),
-            r#"
-server = "https://docker.io"
-
-[host."https://mirror.local"]
-  capabilities = ["pull"]
-
-[host."https://registry-1.docker.io"]
-  capabilities = ["pull", "resolve"]
-"#,
-        )
-        .unwrap();
-        let registry_config_dir = dir.path().join("certs.d");
-        let service = test_image_service_with_options(
-            dir.path(),
-            "overlay",
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Some(registry_config_dir.as_path()),
-            Vec::new(),
-        );
-        let reference: Reference = "docker.io/library/busybox:latest".parse().unwrap();
-
-        let resolve_endpoints = service.registry_endpoints_for(&reference, true).unwrap();
-        let pull_endpoints = service.registry_endpoints_for(&reference, false).unwrap();
-
-        assert!(resolve_endpoints
-            .iter()
-            .any(|endpoint| endpoint.base_url == "https://registry-1.docker.io"));
-        assert!(resolve_endpoints
-            .iter()
-            .any(|endpoint| endpoint.base_url == "https://docker.io"));
-        assert!(!resolve_endpoints
-            .iter()
-            .any(|endpoint| endpoint.base_url == "https://mirror.local"));
-        assert!(pull_endpoints
-            .iter()
-            .any(|endpoint| endpoint.base_url == "https://mirror.local"));
-    }
-
-    #[test]
-    fn registry_config_dir_reload_reads_updated_hosts_toml() {
-        let dir = tempdir().unwrap();
-        let registry_dir = dir.path().join("certs.d").join("docker.io");
-        std::fs::create_dir_all(&registry_dir).unwrap();
-        let hosts_path = registry_dir.join("hosts.toml");
-        std::fs::write(
-            &hosts_path,
-            r#"
-[host."https://mirror-a.local"]
-  capabilities = ["pull", "resolve"]
-"#,
-        )
-        .unwrap();
-        let registry_config_dir = dir.path().join("certs.d");
-        let service = test_image_service_with_options(
-            dir.path(),
-            "overlay",
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Some(registry_config_dir.as_path()),
-            Vec::new(),
-        );
-        let reference: Reference = "docker.io/library/busybox:latest".parse().unwrap();
-
-        let first = service.registry_endpoints_for(&reference, false).unwrap();
-        assert!(first
-            .iter()
-            .any(|endpoint| endpoint.base_url == "https://mirror-a.local"));
-
-        std::fs::write(
-            &hosts_path,
-            r#"
-[host."https://mirror-b.local"]
-  capabilities = ["pull", "resolve"]
-"#,
-        )
-        .unwrap();
-
-        let second = service.registry_endpoints_for(&reference, false).unwrap();
-        assert!(second
-            .iter()
-            .any(|endpoint| endpoint.base_url == "https://mirror-b.local"));
-        assert!(!second
-            .iter()
-            .any(|endpoint| endpoint.base_url == "https://mirror-a.local"));
-    }
-
-    #[tokio::test]
-    async fn list_images_supports_filter_image_ref() {
-        let service = test_image_service().await;
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:1111111111111111".to_string(),
-                repo_tags: vec!["busybox:latest".to_string()],
-                ..Default::default()
-            },
-        )
-        .await;
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:2222222222222222".to_string(),
-                repo_tags: vec!["pause:3.9".to_string()],
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let by_tag = ImageService::list_images(
-            &service,
-            Request::new(ListImagesRequest {
-                filter: Some(ImageFilter {
-                    image: Some(ImageSpec {
-                        image: "busybox:latest".to_string(),
-                        ..Default::default()
-                    }),
-                }),
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        assert_eq!(by_tag.images.len(), 1);
-        assert_eq!(by_tag.images[0].id, "sha256:1111111111111111");
-
-        let by_id_prefix = ImageService::list_images(
-            &service,
-            Request::new(ListImagesRequest {
-                filter: Some(ImageFilter {
-                    image: Some(ImageSpec {
-                        image: "111111111111".to_string(),
-                        ..Default::default()
-                    }),
-                }),
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        assert_eq!(by_id_prefix.images.len(), 1);
-        assert_eq!(by_id_prefix.images[0].repo_tags, vec!["busybox:latest"]);
-    }
-
-    #[tokio::test]
-    async fn image_status_returns_empty_response_when_missing() {
-        let service = test_image_service().await;
-
-        let response = ImageService::image_status(
-            &service,
-            Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "missing:latest".to_string(),
-                    ..Default::default()
-                }),
-                verbose: false,
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-
-        assert!(response.image.is_none());
-        assert!(response.info.is_empty());
-    }
-
-    #[tokio::test]
-    async fn image_status_verbose_returns_structured_info_and_repo_digests() {
-        let (dir, service) = test_image_service_in_tempdir();
-        let image_dir = dir.path().join("images").join("sha256:img-id");
-        std::fs::create_dir_all(&image_dir).unwrap();
-        std::fs::write(image_dir.join("0.tar.gz"), b"layer").unwrap();
-
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:img-id".to_string(),
-                repo_tags: vec!["busybox:latest".to_string()],
-                repo_digests: vec!["docker.io/library/busybox@sha256:img-id".to_string()],
-                size: 5,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let response = ImageService::image_status(
-            &service,
-            Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "busybox:latest".to_string(),
-                    ..Default::default()
-                }),
-                verbose: true,
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-
-        let image = response.image.expect("expected image status");
-        assert_eq!(
-            image.repo_digests,
-            vec!["docker.io/library/busybox@sha256:img-id"]
-        );
-        assert_eq!(
-            image
-                .spec
-                .expect("expected image spec")
-                .user_specified_image,
-            "busybox:latest"
-        );
-        assert!(!image.pinned);
-        let info: serde_json::Value =
-            serde_json::from_str(response.info.get("info").expect("missing verbose info")).unwrap();
-        assert_eq!(info["id"], "sha256:img-id");
-        assert_eq!(info["repoTags"][0], "busybox:latest");
-        assert_eq!(
-            info["repoDigests"][0],
-            "docker.io/library/busybox@sha256:img-id"
-        );
-        assert_eq!(info["pinned"], false);
-        assert_eq!(info["layers"][0], "0.tar.gz");
-    }
-
-    #[tokio::test]
-    async fn image_status_verbose_includes_selected_platform_metadata() {
-        let (dir, service) = test_image_service_in_tempdir();
-        let image_dir = dir.path().join("images").join("sha256:platform-id");
-        std::fs::create_dir_all(&image_dir).unwrap();
-
-        service
-            .save_image_metadata(&CriusImage {
-                id: "sha256:platform-id".to_string(),
-                repo_tags: vec!["repo/platform:latest".to_string()],
-                repo_digests: vec!["repo/platform@sha256:platform-id".to_string()],
-                size: 7,
-                pinned: false,
-                pulled_at: 1,
-                source_reference: None,
-                os: Some("linux".to_string()),
-                architecture: Some("amd64".to_string()),
-                config_user: None,
-                config_env: Vec::new(),
-                config_entrypoint: Vec::new(),
-                config_cmd: Vec::new(),
-                config_working_dir: None,
-                annotations: HashMap::new(),
-                declared_volumes: Vec::new(),
-                manifest_media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
-                selected_manifest_digest: Some("sha256:child-manifest".to_string()),
-                selected_platform: Some("linux/amd64".to_string()),
-                stored_layers: Vec::new(),
-                artifact_type: None,
-                artifact_blobs: Vec::new(),
-            })
-            .await
-            .unwrap();
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:platform-id".to_string(),
-                repo_tags: vec!["repo/platform:latest".to_string()],
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let response = ImageService::image_status(
-            &service,
-            Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "repo/platform:latest".to_string(),
-                    ..Default::default()
-                }),
-                verbose: true,
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-
-        let info: serde_json::Value =
-            serde_json::from_str(response.info.get("info").expect("missing verbose info")).unwrap();
-        assert_eq!(info["selectedManifestDigest"], "sha256:child-manifest");
-        assert_eq!(info["selectedPlatform"], "linux/amd64");
-    }
-
-    #[tokio::test]
-    async fn remove_image_is_idempotent_when_missing() {
-        let service = test_image_service().await;
-
-        ImageService::remove_image(
-            &service,
-            Request::new(RemoveImageRequest {
-                image: Some(ImageSpec {
-                    image: "missing:latest".to_string(),
-                    ..Default::default()
-                }),
-            }),
-        )
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn list_images_deduplicates_same_id_across_multiple_tags() {
-        let service = test_image_service().await;
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:same-id".to_string(),
-                repo_tags: vec!["repo/a:latest".to_string()],
-                ..Default::default()
-            },
-        )
-        .await;
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:same-id".to_string(),
-                repo_tags: vec!["repo/b:latest".to_string()],
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let response =
-            ImageService::list_images(&service, Request::new(ListImagesRequest { filter: None }))
-                .await
-                .unwrap()
-                .into_inner();
-        assert_eq!(response.images.len(), 1);
-        assert_eq!(response.images[0].id, "sha256:same-id");
-        assert_eq!(
-            response.images[0].repo_tags,
-            vec!["repo/a:latest".to_string(), "repo/b:latest".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn image_status_aggregates_tags_and_user_for_same_id() {
-        let (dir, service) = test_image_service_in_tempdir();
-        service
-            .save_image_metadata(&CriusImage {
-                id: "sha256:agg-id".to_string(),
-                repo_tags: vec!["repo/a:latest".to_string(), "repo/b:latest".to_string()],
-                repo_digests: vec!["repo/a@sha256:agg-id".to_string()],
-                size: 42,
-                pinned: false,
-                pulled_at: 1,
-                source_reference: None,
-                os: Some("linux".to_string()),
-                architecture: Some("amd64".to_string()),
-                config_user: Some("1001".to_string()),
-                config_env: Vec::new(),
-                config_entrypoint: Vec::new(),
-                config_cmd: Vec::new(),
-                config_working_dir: None,
-                annotations: HashMap::new(),
-                declared_volumes: Vec::new(),
-                manifest_media_type: None,
-                selected_manifest_digest: None,
-                selected_platform: None,
-                stored_layers: Vec::new(),
-                artifact_type: None,
-                artifact_blobs: Vec::new(),
-            })
-            .await
-            .unwrap();
-        let image_dir = dir.path().join("images").join("sha256:agg-id");
-        std::fs::create_dir_all(&image_dir).unwrap();
-
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:agg-id".to_string(),
-                repo_tags: vec!["repo/a:latest".to_string()],
-                repo_digests: vec!["repo/a@sha256:agg-id".to_string()],
-                ..Default::default()
-            },
-        )
-        .await;
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:agg-id".to_string(),
-                repo_tags: vec!["repo/b:latest".to_string()],
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let response = ImageService::image_status(
-            &service,
-            Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "repo/b:latest".to_string(),
-                    ..Default::default()
-                }),
-                verbose: false,
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        let image = response.image.expect("expected aggregated image status");
-        assert_eq!(
-            image.repo_tags,
-            vec!["repo/a:latest".to_string(), "repo/b:latest".to_string()]
-        );
-        assert_eq!(image.repo_digests, vec!["repo/a@sha256:agg-id".to_string()]);
-        let spec = image.spec.expect("expected image spec");
-        assert_eq!(spec.image, "repo/b:latest");
-        assert_eq!(spec.user_specified_image, "repo/b:latest");
-        assert_eq!(
-            image.uid.expect("expected uid from image metadata").value,
-            1001
-        );
-        assert!(image.username.is_empty());
-    }
-
-    #[tokio::test]
-    async fn image_status_restores_spec_annotations_from_metadata() {
-        let service = test_image_service().await;
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:anno-id".to_string(),
-                repo_tags: vec!["repo/anno:latest".to_string()],
-                ..Default::default()
-            },
-        )
-        .await;
-        service
-            .save_image_metadata(&CriusImage {
-                id: "sha256:anno-id".to_string(),
-                repo_tags: vec!["repo/anno:latest".to_string()],
-                repo_digests: Vec::new(),
-                size: 7,
-                pinned: false,
-                pulled_at: 0,
-                source_reference: None,
-                os: None,
-                architecture: None,
-                config_user: None,
-                config_env: Vec::new(),
-                config_entrypoint: Vec::new(),
-                config_cmd: Vec::new(),
-                config_working_dir: None,
-                annotations: HashMap::from([(
-                    "org.opencontainers.image.title".to_string(),
-                    "anno".to_string(),
-                )]),
-                declared_volumes: vec!["/var/lib/data".to_string()],
-                manifest_media_type: None,
-                selected_manifest_digest: None,
-                selected_platform: None,
-                stored_layers: Vec::new(),
-                artifact_type: None,
-                artifact_blobs: Vec::new(),
-            })
-            .await
-            .unwrap();
-
-        let response = ImageService::image_status(
-            &service,
-            Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "repo/anno:latest".to_string(),
-                    ..Default::default()
-                }),
-                verbose: false,
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        let image = response.image.expect("expected image");
-        assert_eq!(
-            image
-                .spec
-                .expect("expected image spec")
-                .annotations
-                .get("org.opencontainers.image.title")
-                .map(String::as_str),
-            Some("anno")
-        );
-    }
-
-    #[test]
-    fn registry_auth_from_auth_config_decodes_auth_field() {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode("demo-user:demo-password".as_bytes());
-        let auth = AuthConfig {
-            auth: encoded,
-            ..Default::default()
-        };
-        match ImageServiceImpl::registry_auth_from_auth_config(auth).unwrap() {
-            RegistryAuth::Basic(username, password) => {
-                assert_eq!(username, "demo-user");
-                assert_eq!(password, "demo-password");
-            }
-            RegistryAuth::Anonymous => panic!("expected basic auth from encoded auth field"),
-        }
-    }
-
-    #[test]
-    fn provided_registry_bearer_token_prefers_registry_then_identity_token() {
-        let auth = AuthConfig {
-            registry_token: "registry-token".to_string(),
-            identity_token: "identity-token".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            ImageServiceImpl::provided_registry_bearer_token(&auth),
-            Some("registry-token".to_string())
-        );
-
-        let auth = AuthConfig {
-            identity_token: "identity-token".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            ImageServiceImpl::provided_registry_bearer_token(&auth),
-            Some("identity-token".to_string())
-        );
-    }
-
-    #[test]
-    fn canonical_image_id_keeps_full_digest_without_truncation() {
-        let digest = "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let id = ImageServiceImpl::canonical_image_id(digest, b"fallback");
-        assert_eq!(id, digest);
-    }
-
-    #[test]
-    fn canonicalize_image_reference_expands_short_names() {
-        assert_eq!(
-            ImageServiceImpl::canonicalize_image_reference("busybox"),
-            "docker.io/library/busybox:latest"
-        );
-        assert_eq!(
-            ImageServiceImpl::canonicalize_image_reference("busybox:1.36"),
-            "docker.io/library/busybox:1.36"
-        );
-        assert_eq!(
-            ImageServiceImpl::canonicalize_image_reference("library/busybox"),
-            "docker.io/library/busybox:latest"
-        );
-    }
-
-    #[test]
-    fn pinned_pattern_matching_supports_exact_glob_and_keyword_modes() {
-        assert!(ImageServiceImpl::pinned_pattern_matches(
-            "registry.k8s.io/pause:3.9",
-            "registry.k8s.io/pause:3.9"
-        ));
-        assert!(ImageServiceImpl::pinned_pattern_matches(
-            "busybox*",
-            "busybox:latest"
-        ));
-        assert!(ImageServiceImpl::pinned_pattern_matches(
-            "*pause*",
-            "registry.k8s.io/pause:3.9"
-        ));
-        assert!(!ImageServiceImpl::pinned_pattern_matches(
-            "busybox*",
-            "registry.k8s.io/pause:3.9"
-        ));
-    }
-
-    #[tokio::test]
-    async fn image_status_matches_short_name_against_canonical_tag() {
-        let service = test_image_service().await;
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:busybox-id".to_string(),
-                repo_tags: vec!["docker.io/library/busybox:latest".to_string()],
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let response = ImageService::image_status(
-            &service,
-            Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "busybox".to_string(),
-                    ..Default::default()
-                }),
-                verbose: false,
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        assert_eq!(
-            response.image.expect("expected image for short name").id,
-            "sha256:busybox-id"
-        );
-    }
-
-    #[tokio::test]
-    async fn load_local_images_marks_matching_pinned_images() {
-        let dir = tempdir().unwrap();
-        let image_dir = dir.path().join("images").join("sha256:pinned-id");
-        std::fs::create_dir_all(&image_dir).unwrap();
-        std::fs::write(
-            image_dir.join("metadata.json"),
-            serde_json::json!({
-                "id": "sha256:pinned-id",
-                "repo_tags": ["busybox:latest"],
-                "repo_digests": [],
-                "pinned": false
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let service = test_image_service_with_options(
-            dir.path(),
-            "overlay",
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            vec!["busybox*".to_string()],
-        );
-
-        service.load_local_images().await.unwrap();
-        let response =
-            ImageService::list_images(&service, Request::new(ListImagesRequest { filter: None }))
-                .await
-                .unwrap()
-                .into_inner();
-        assert_eq!(response.images.len(), 1);
-        assert!(response.images[0].pinned);
-    }
-
-    #[tokio::test]
-    async fn image_fs_info_reports_real_usage() {
-        let (dir, service) = test_image_service_in_tempdir();
-        let image_dir = dir.path().join("images").join("sha256:test-id");
-        std::fs::create_dir_all(&image_dir).unwrap();
-        std::fs::write(image_dir.join("layer1.tar"), b"abcde").unwrap();
-        std::fs::write(image_dir.join("layer2.tar"), b"123456789").unwrap();
-
-        let response = ImageService::image_fs_info(&service, Request::new(ImageFsInfoRequest {}))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(response.image_filesystems.len(), 1);
-        let usage = &response.image_filesystems[0];
-        assert!(usage.timestamp > 0);
-        assert_eq!(
-            usage
-                .fs_id
-                .as_ref()
-                .expect("expected filesystem identifier")
-                .mountpoint,
-            dir.path().join("images").display().to_string()
-        );
-        let used_bytes = usage
-            .used_bytes
-            .as_ref()
-            .expect("expected used bytes")
-            .value;
-        assert!(
-            used_bytes >= 14,
-            "expected used bytes >= 14, got {}",
-            used_bytes
-        );
-    }
-
-    #[tokio::test]
-    async fn remove_image_reports_in_use_when_container_references_it() {
-        let (dir, service) = test_image_service_in_tempdir();
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:busybox-id".to_string(),
-                repo_tags: vec!["busybox:latest".to_string()],
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let db_path = dir.path().join("crius.db");
-        let mut storage = StorageManager::new(&db_path).unwrap();
-        storage
-            .save_container(&ContainerRecord {
-                id: "container-1".to_string(),
-                pod_id: "pod-1".to_string(),
-                state: "running".to_string(),
-                image: "busybox:latest".to_string(),
-                command: "sleep 60".to_string(),
-                created_at: Utc::now().timestamp(),
-                labels: "{}".to_string(),
-                annotations: "{}".to_string(),
-                exit_code: None,
-                exit_time: None,
-            })
-            .unwrap();
-
-        let err = ImageService::remove_image(
-            &service,
-            Request::new(RemoveImageRequest {
-                image: Some(ImageSpec {
-                    image: "busybox:latest".to_string(),
-                    ..Default::default()
-                }),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err.message().contains("in use"));
-    }
-
-    #[tokio::test]
-    async fn remove_image_untags_single_reference_when_other_tags_remain() {
-        let (dir, service) = test_image_service_in_tempdir();
-        let image_dir = dir.path().join("images").join("sha256:untag-id");
-        std::fs::create_dir_all(&image_dir).unwrap();
-        service
-            .save_image_metadata(&CriusImage {
-                id: "sha256:untag-id".to_string(),
-                repo_tags: vec![
-                    "docker.io/library/busybox:latest".to_string(),
-                    "docker.io/library/busybox:debug".to_string(),
-                ],
-                repo_digests: vec!["docker.io/library/busybox@sha256:untag-id".to_string()],
-                size: 10,
-                pinned: false,
-                pulled_at: 123,
-                source_reference: Some("busybox".to_string()),
-                os: Some("linux".to_string()),
-                architecture: Some("amd64".to_string()),
-                config_user: Some("1000".to_string()),
-                config_env: Vec::new(),
-                config_entrypoint: Vec::new(),
-                config_cmd: Vec::new(),
-                config_working_dir: None,
-                annotations: HashMap::from([(
-                    "org.opencontainers.image.title".to_string(),
-                    "busybox".to_string(),
-                )]),
-                declared_volumes: vec!["/cache".to_string(), "/data".to_string()],
-                manifest_media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
-                selected_manifest_digest: None,
-                selected_platform: None,
-                stored_layers: Vec::new(),
-                artifact_type: None,
-                artifact_blobs: Vec::new(),
-            })
-            .await
-            .unwrap();
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:untag-id".to_string(),
-                repo_tags: vec![
-                    "docker.io/library/busybox:latest".to_string(),
-                    "docker.io/library/busybox:debug".to_string(),
-                ],
-                repo_digests: vec!["docker.io/library/busybox@sha256:untag-id".to_string()],
-                spec: Some(ImageSpec {
-                    image: "docker.io/library/busybox:latest".to_string(),
-                    user_specified_image: "docker.io/library/busybox:latest".to_string(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-        .await;
-
-        ImageService::remove_image(
-            &service,
-            Request::new(RemoveImageRequest {
-                image: Some(ImageSpec {
-                    image: "docker.io/library/busybox:latest".to_string(),
-                    ..Default::default()
-                }),
-            }),
-        )
-        .await
-        .unwrap();
-
-        let remaining = ImageService::image_status(
-            &service,
-            Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "docker.io/library/busybox:debug".to_string(),
-                    ..Default::default()
-                }),
-                verbose: true,
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        let image = remaining.image.expect("expected remaining tag");
-        assert_eq!(image.repo_tags, vec!["docker.io/library/busybox:debug"]);
-        let info: serde_json::Value =
-            serde_json::from_str(remaining.info.get("info").expect("missing verbose info"))
-                .unwrap();
-        assert_eq!(info["pulledAt"], 123);
-        assert_eq!(info["sourceReference"], "busybox");
-        assert_eq!(info["os"], "linux");
-        assert_eq!(info["architecture"], "amd64");
-        assert_eq!(info["configUser"], "1000");
-        assert_eq!(
-            info["manifestMediaType"],
-            "application/vnd.oci.image.manifest.v1+json"
-        );
-        assert_eq!(
-            info["annotations"]["org.opencontainers.image.title"],
-            "busybox"
-        );
-        assert_eq!(
-            info["declaredVolumes"],
-            serde_json::json!(["/cache", "/data"])
-        );
-        assert!(
-            image_dir.exists(),
-            "image directory should remain after untag"
-        );
-
-        let removed = ImageService::image_status(
-            &service,
-            Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "docker.io/library/busybox:latest".to_string(),
-                    ..Default::default()
-                }),
-                verbose: false,
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        assert!(removed.image.is_none());
-    }
-
-    #[tokio::test]
-    async fn remove_image_by_id_deletes_all_tags_for_same_image() {
-        let dir = tempdir().unwrap();
-        let service = test_image_service_with_options(
-            dir.path(),
-            "overlay",
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Vec::new(),
-        );
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:multi-tag-id".to_string(),
-                repo_tags: vec![
-                    "docker.io/library/busybox:latest".to_string(),
-                    "docker.io/library/busybox:debug".to_string(),
-                ],
-                repo_digests: vec!["docker.io/library/busybox@sha256:multi-tag-id".to_string()],
-                ..Default::default()
-            },
-        )
-        .await;
-
-        ImageService::remove_image(
-            &service,
-            Request::new(RemoveImageRequest {
-                image: Some(ImageSpec {
-                    image: "sha256:multi-tag-id".to_string(),
-                    ..Default::default()
-                }),
-            }),
-        )
-        .await
-        .expect("image id removal should delete the whole image");
-
-        for reference in [
-            "sha256:multi-tag-id",
-            "docker.io/library/busybox:latest",
-            "docker.io/library/busybox:debug",
-        ] {
-            let removed = ImageService::image_status(
-                &service,
-                Request::new(ImageStatusRequest {
-                    image: Some(ImageSpec {
-                        image: reference.to_string(),
-                        ..Default::default()
-                    }),
-                    verbose: false,
-                }),
-            )
-            .await
-            .expect("image status lookup should succeed")
-            .into_inner();
-            assert!(
-                removed.image.is_none(),
-                "reference {reference} should be removed with image id deletion"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn remove_image_allows_pinned_images() {
-        let dir = tempdir().unwrap();
-        let service = test_image_service_with_options(
-            dir.path(),
-            "overlay",
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            Option::<&Path>::None,
-            vec!["busybox*".to_string()],
-        );
-        insert_image(
-            &service,
-            Image {
-                id: "sha256:pinned-id".to_string(),
-                repo_tags: vec!["busybox:latest".to_string()],
-                pinned: true,
-                ..Default::default()
-            },
-        )
-        .await;
-
-        let response = ImageService::remove_image(
-            &service,
-            Request::new(RemoveImageRequest {
-                image: Some(ImageSpec {
-                    image: "busybox:latest".to_string(),
-                    ..Default::default()
-                }),
-            }),
-        )
-        .await
-        .expect("pinned image removal should succeed");
-        let _ = response.into_inner();
-
-        let removed = ImageService::image_status(
-            &service,
-            Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "busybox:latest".to_string(),
-                    ..Default::default()
-                }),
-                verbose: false,
-            }),
-        )
-        .await
-        .expect("image status lookup should succeed")
-        .into_inner();
-        assert!(removed.image.is_none());
-    }
-
-    #[tokio::test]
-    async fn load_local_images_includes_additional_artifact_stores() {
-        let dir = tempdir().unwrap();
-        let additional = dir.path().join("readonly-store");
-        let artifact_dir = additional.join("artifacts").join("sha256:artifact-id");
-        std::fs::create_dir_all(&artifact_dir).unwrap();
-        std::fs::write(artifact_dir.join("0.tar.gz"), b"artifact").unwrap();
-        std::fs::write(
-            artifact_dir.join("metadata.json"),
-            serde_json::to_vec(&CriusImage {
-                id: "sha256:artifact-id".to_string(),
-                repo_tags: vec!["registry.example.com/artifact:latest".to_string()],
-                repo_digests: vec!["registry.example.com/artifact@sha256:artifact-id".to_string()],
-                size: 8,
-                pinned: false,
-                pulled_at: 0,
-                source_reference: None,
-                os: None,
-                architecture: None,
-                config_user: None,
-                config_env: Vec::new(),
-                config_entrypoint: Vec::new(),
-                config_cmd: Vec::new(),
-                config_working_dir: None,
-                annotations: HashMap::new(),
-                declared_volumes: Vec::new(),
-                manifest_media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
-                selected_manifest_digest: None,
-                selected_platform: None,
-                stored_layers: Vec::new(),
-                artifact_type: Some("application/vnd.example.artifact".to_string()),
-                artifact_blobs: vec![ArtifactBlobMeta {
-                    digest: "sha256:blob".to_string(),
-                    media_type: "text/plain".to_string(),
-                    path: "artifact.txt".to_string(),
-                    size: 8,
-                    annotations: HashMap::from([(
-                        "org.opencontainers.image.title".to_string(),
-                        "artifact.txt".to_string(),
-                    )]),
-                }],
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        let service = ImageServiceImpl::new_with_options(ImageServiceOptions {
-            storage_path: dir.path().join("storage"),
-            storage_driver: "overlay".to_string(),
-            global_auth_file: None,
-            namespaced_auth_dir: None,
-            default_transport: "docker://".to_string(),
-            short_name_mode: "disabled".to_string(),
-            pull_progress_timeout: std::time::Duration::ZERO,
-            max_concurrent_downloads: 3,
-            pull_retry_count: 0,
-            registry_config_dir: None,
-            decryption_keys_path: None,
-            decryption_decoder_path: "ctd-decoder".to_string(),
-            decryption_keyprovider_config: None,
-            additional_artifact_stores: vec![additional.clone()],
-            pinned_image_patterns: Vec::new(),
-            signature_policy: None,
-            signature_policy_dir: None,
-            big_files_temporary_dir: None,
-        })
-        .unwrap();
-
-        service.load_local_images().await.unwrap();
-        let response = ImageService::image_status(
-            &service,
-            Request::new(ImageStatusRequest {
-                image: Some(ImageSpec {
-                    image: "registry.example.com/artifact:latest".to_string(),
-                    user_specified_image: "registry.example.com/artifact:latest".to_string(),
-                    runtime_handler: String::new(),
-                    annotations: HashMap::new(),
-                }),
-                verbose: true,
-            }),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-
-        let image = response
-            .image
-            .expect("artifact should be visible in image status");
-        assert_eq!(image.id, "sha256:artifact-id");
-        let info: serde_json::Value =
-            serde_json::from_str(response.info.get("info").unwrap()).unwrap();
-        assert_eq!(info["artifactType"], "application/vnd.example.artifact");
-        assert_eq!(info["storagePath"], artifact_dir.display().to_string());
-    }
-
-    #[tokio::test]
-    async fn remove_image_rejects_artifact_from_additional_store() {
-        let dir = tempdir().unwrap();
-        let additional = dir.path().join("readonly-store");
-        let artifact_dir = additional.join("artifacts").join("sha256:artifact-id");
-        std::fs::create_dir_all(&artifact_dir).unwrap();
-        std::fs::write(artifact_dir.join("0.tar.gz"), b"artifact").unwrap();
-        std::fs::write(
-            artifact_dir.join("metadata.json"),
-            serde_json::to_vec(&CriusImage {
-                id: "sha256:artifact-id".to_string(),
-                repo_tags: vec!["registry.example.com/artifact:latest".to_string()],
-                repo_digests: vec!["registry.example.com/artifact@sha256:artifact-id".to_string()],
-                size: 8,
-                pinned: false,
-                pulled_at: 0,
-                source_reference: None,
-                os: None,
-                architecture: None,
-                config_user: None,
-                config_env: Vec::new(),
-                config_entrypoint: Vec::new(),
-                config_cmd: Vec::new(),
-                config_working_dir: None,
-                annotations: HashMap::new(),
-                declared_volumes: Vec::new(),
-                manifest_media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
-                selected_manifest_digest: None,
-                selected_platform: None,
-                stored_layers: Vec::new(),
-                artifact_type: Some("application/vnd.example.artifact".to_string()),
-                artifact_blobs: vec![ArtifactBlobMeta {
-                    digest: "sha256:blob".to_string(),
-                    media_type: "text/plain".to_string(),
-                    path: "artifact.txt".to_string(),
-                    size: 8,
-                    annotations: HashMap::new(),
-                }],
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        let service = ImageServiceImpl::new_with_options(ImageServiceOptions {
-            storage_path: dir.path().join("storage"),
-            storage_driver: "overlay".to_string(),
-            global_auth_file: None,
-            namespaced_auth_dir: None,
-            default_transport: "docker://".to_string(),
-            short_name_mode: "disabled".to_string(),
-            pull_progress_timeout: std::time::Duration::ZERO,
-            max_concurrent_downloads: 3,
-            pull_retry_count: 0,
-            registry_config_dir: None,
-            decryption_keys_path: None,
-            decryption_decoder_path: "ctd-decoder".to_string(),
-            decryption_keyprovider_config: None,
-            additional_artifact_stores: vec![additional],
-            pinned_image_patterns: Vec::new(),
-            signature_policy: None,
-            signature_policy_dir: None,
-            big_files_temporary_dir: None,
-        })
-        .unwrap();
-        service.load_local_images().await.unwrap();
-
-        let err = ImageService::remove_image(
-            &service,
-            Request::new(RemoveImageRequest {
-                image: Some(ImageSpec {
-                    image: "registry.example.com/artifact:latest".to_string(),
-                    user_specified_image: String::new(),
-                    runtime_handler: String::new(),
-                    annotations: HashMap::new(),
-                }),
-            }),
-        )
-        .await
-        .expect_err("removing read-only additional store artifact must fail");
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err
-            .message()
-            .contains("read-only additional OCI artifact store"));
-    }
-
-    #[test]
-    fn decrypt_layer_bytes_uses_external_decoder() {
-        let dir = tempdir().unwrap();
-        let decoder = dir.path().join("fake-decoder.sh");
-        let keys_dir = dir.path().join("keys");
-        std::fs::create_dir_all(&keys_dir).unwrap();
-        std::fs::write(keys_dir.join("test.pem"), b"key").unwrap();
-        std::fs::write(
-            &decoder,
-            r#"#!/bin/sh
-set -eu
-cat
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&decoder, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let service = ImageServiceImpl::new_with_options(ImageServiceOptions {
-            storage_path: dir.path().join("storage"),
-            storage_driver: "overlay".to_string(),
-            global_auth_file: None,
-            namespaced_auth_dir: None,
-            default_transport: "docker://".to_string(),
-            short_name_mode: "disabled".to_string(),
-            pull_progress_timeout: std::time::Duration::ZERO,
-            max_concurrent_downloads: 3,
-            pull_retry_count: 0,
-            registry_config_dir: None,
-            decryption_keys_path: Some(keys_dir),
-            decryption_decoder_path: decoder.display().to_string(),
-            decryption_keyprovider_config: None,
-            additional_artifact_stores: Vec::new(),
-            pinned_image_patterns: Vec::new(),
-            signature_policy: None,
-            signature_policy_dir: None,
-            big_files_temporary_dir: None,
-        })
-        .unwrap();
-
-        let (bytes, media_type) = service
-            .decrypt_layer_bytes(
-                "application/vnd.oci.image.layer.v1.tar+gzip+encrypted",
-                b"encrypted-layer",
-            )
-            .unwrap();
-        assert_eq!(bytes, b"encrypted-layer");
-        assert_eq!(media_type, "application/vnd.oci.image.layer.v1.tar+gzip");
-    }
-}
-
-pub mod layer;
+mod tests;

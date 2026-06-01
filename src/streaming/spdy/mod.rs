@@ -1,4 +1,3 @@
-#[path = "spdy_dictionary.rs"]
 mod spdy_dictionary;
 
 use std::ffi::{c_char, CStr};

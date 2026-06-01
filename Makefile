@@ -1,6 +1,6 @@
 # Makefile for crius vendor patch workflow
 
-.PHONY: all build clean check-patch apply-patch run test
+.PHONY: all build clean check-patch apply-patch run test release-gate crictl-smoke kubelet-smoke fault-injection release-soak
 
 # 默认目标
 all: build
@@ -93,6 +93,21 @@ test: build
 		fi; \
 		kill $$SERVER_PID 2>/dev/null || true
 
+release-gate:
+	cargo test --test release_gate
+
+crictl-smoke:
+	CRIUS_RUN_CRICTL_SMOKE=1 cargo test --test release_gate gated_crictl_smoke_has_fixed_entrypoint -- --nocapture
+
+kubelet-smoke:
+	CRIUS_RUN_KUBELET_SMOKE=1 cargo test --test release_gate gated_kubelet_smoke_has_fixed_entrypoint -- --nocapture
+
+fault-injection:
+	CRIUS_RUN_FAULT_INJECTION=1 cargo test --test release_gate gated_fault_injection_has_fixed_entrypoint -- --nocapture
+
+release-soak:
+	CRIUS_RUN_RELEASE_SOAK=1 cargo test --test release_gate gated_release_soak_has_fixed_entrypoint -- --nocapture
+
 # 清理
 clean:
 	@echo "清理构建产物..."
@@ -110,6 +125,11 @@ help:
 	@echo "  apply-patch - 应用vendor补丁"
 	@echo "  run        - 构建并运行服务"
 	@echo "  test       - 构建并测试crictl兼容性"
+	@echo "  release-gate - 运行发布门槛定义与gated入口测试"
+	@echo "  crictl-smoke - 运行真实crictl smoke gate"
+	@echo "  kubelet-smoke - 运行真实kubelet/kubectl smoke gate"
+	@echo "  fault-injection - 运行真实故障注入 gate"
+	@echo "  release-soak - 运行release soak gate"
 	@echo "  clean      - 清理构建产物"
 	@echo "  rebuild    - 清理并重新构建"
 	@echo "  help       - 显示此帮助信息"

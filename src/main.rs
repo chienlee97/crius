@@ -155,6 +155,11 @@ async fn main() -> Result<(), Error> {
     apply_cli_overrides(&args, &mut config);
     config.normalize_derived_settings();
     config.validate()?;
+    let effective_rootless = crius::rootless::EffectiveRootlessConfig::resolve(&config.rootless)
+        .map_err(|err| anyhow::anyhow!("failed to resolve rootless config: {}", err))?;
+    if effective_rootless.enabled {
+        std::env::set_var("XDG_RUNTIME_DIR", &effective_rootless.xdg_runtime_dir);
+    }
     std::env::set_var(
         "CRIUS_ATTACH_SOCKET_DIR",
         config.runtime.attach_socket_dir.trim(),
@@ -186,7 +191,10 @@ async fn main() -> Result<(), Error> {
         )
     };
     let mut cni_config = config.network.cni_config();
-    if config.network.netns_mounts_under_state_dir {
+    cni_config.set_rootless_config(Some(effective_rootless.clone()));
+    if effective_rootless.enabled {
+        cni_config.set_netns_mount_dir(effective_rootless.netns_dir.clone());
+    } else if config.network.netns_mounts_under_state_dir {
         cni_config.set_netns_mount_dir(PathBuf::from(&config.runtime.root).join("netns"));
     }
     if !config.runtime.pinns_path.trim().is_empty() {
@@ -234,6 +242,7 @@ async fn main() -> Result<(), Error> {
         image_signature_policy: PathBuf::from(&config.image.signature_policy),
         image_signature_policy_dir: PathBuf::from(&config.image.signature_policy_dir),
         image_storage_options: config.image.storage_options.clone(),
+        image_external_snapshotters: config.image.external_snapshotters.clone(),
         image_volumes: config.image.image_volumes.clone(),
         image_pinned_images: {
             let mut pinned = config.image.pinned_images.clone();
@@ -315,8 +324,9 @@ async fn main() -> Result<(), Error> {
         internal_wipe: config.runtime.internal_wipe,
         internal_repair: config.runtime.internal_repair,
         bind_mount_prefix: PathBuf::from(&config.runtime.bind_mount_prefix),
-        disable_cgroup: config.runtime.disable_cgroup,
-        tolerate_missing_hugetlb_controller: config.runtime.tolerate_missing_hugetlb_controller,
+        disable_cgroup: config.runtime.disable_cgroup || effective_rootless.disable_cgroup,
+        tolerate_missing_hugetlb_controller: config.runtime.tolerate_missing_hugetlb_controller
+            || effective_rootless.tolerate_missing_hugetlb_controller,
         separate_pull_cgroup: config.runtime.separate_pull_cgroup.clone(),
         seccomp_profile: PathBuf::from(&config.security.seccomp_profile),
         privileged_seccomp_profile: config.security.privileged_seccomp_profile.clone(),
@@ -357,6 +367,7 @@ async fn main() -> Result<(), Error> {
         restrict_oom_score_adj: config.runtime.restrict_oom_score_adj,
         enable_unprivileged_ports: config.runtime.enable_unprivileged_ports,
         enable_unprivileged_icmp: config.runtime.enable_unprivileged_icmp,
+        rootless: effective_rootless,
         shim: ShimConfig {
             shim_path: PathBuf::from(&config.runtime.shim_path),
             runtime_config_path: PathBuf::from(&config.runtime.runtime_config_path),
@@ -378,8 +389,10 @@ async fn main() -> Result<(), Error> {
             ),
             runtime_path: PathBuf::from(&config.runtime.runtime_path),
             max_container_log_line_size: config.logging.max_container_log_line_size,
+            state_db_path: PathBuf::from(&config.root).join("crius.db"),
         },
         streaming: config.api.streaming.clone(),
+        config_path: Some(args.config.clone()),
     };
     let listen = config.api.listen.clone();
 
@@ -1097,6 +1110,8 @@ mod tests {
             runtime_configs: std::collections::HashMap::from([(
                 "runc".to_string(),
                 crius::config::ResolvedRuntimeHandlerConfig {
+                    backend: "runc".to_string(),
+                    backend_options: std::collections::HashMap::new(),
                     runtime_path: "/definitely/missing/runc".to_string(),
                     runtime_config_path: String::new(),
                     runtime_root: "/tmp/crius-main-test-runtime-root".to_string(),
@@ -1134,6 +1149,7 @@ mod tests {
             image_signature_policy: PathBuf::new(),
             image_signature_policy_dir: PathBuf::new(),
             image_storage_options: Vec::new(),
+            image_external_snapshotters: std::collections::HashMap::new(),
             image_volumes: "mkdir".to_string(),
             image_pinned_images: Vec::new(),
             image_big_files_temporary_dir: PathBuf::new(),
@@ -1245,6 +1261,7 @@ mod tests {
             restrict_oom_score_adj: false,
             enable_unprivileged_ports: false,
             enable_unprivileged_icmp: false,
+            rootless: crius::rootless::EffectiveRootlessConfig::disabled(),
             shim: ShimConfig {
                 shim_path: PathBuf::from("/definitely/missing/crius-shim"),
                 runtime_config_path: PathBuf::new(),
@@ -1263,8 +1280,10 @@ mod tests {
                 systemd_cgroup: false,
                 runtime_path: PathBuf::from("/definitely/missing/runc"),
                 max_container_log_line_size: 4096,
+                state_db_path: PathBuf::from("/tmp/crius-main-test.db"),
             },
             streaming: StreamingConfig::default(),
+            config_path: None,
         }
     }
 
@@ -1337,7 +1356,7 @@ mod tests {
         );
         assert_eq!(
             config.runtime.clean_shutdown_file,
-            "/run/custom-crius/clean.shutdown"
+            "/var/lib/crius/clean.shutdown"
         );
         assert_eq!(config.network.config_dirs, vec!["/etc/cni/custom.d"]);
         assert_eq!(config.network.plugin_dirs, vec!["/opt/cni/custom-bin"]);

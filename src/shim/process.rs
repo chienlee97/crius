@@ -32,12 +32,10 @@ impl ProcessManager {
         );
 
         let output = Command::new(&self.runtime)
-            .args([
-                "create",
-                "--bundle",
-                bundle.to_str().unwrap(),
-                &self.container_id,
-            ])
+            .arg("create")
+            .arg("--bundle")
+            .arg(bundle)
+            .arg(&self.container_id)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -172,9 +170,6 @@ impl ProcessManager {
 
         if tty {
             cmd.arg("-t");
-        }
-        if stdin {
-            cmd.arg("-i");
         }
 
         // 添加容器ID
