@@ -10,6 +10,7 @@ extern crate self as crius;
 pub mod attach;
 pub mod cgroups;
 pub mod config;
+pub mod crs;
 pub mod error;
 pub mod image;
 pub mod metrics;
