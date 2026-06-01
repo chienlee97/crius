@@ -1,5 +1,6 @@
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use serde_json::Value;
 
 use crate::proto::diagnostics::v1::{
     diagnostics_service_server::DiagnosticsService, ContainerLogChunk, ContainerLogRequest,
@@ -17,6 +18,9 @@ pub struct DiagnosticsState {
     config_path: String,
     state_dir: String,
     socket_path: String,
+    config_json: String,
+    redacted_config_json: String,
+    redacted_fields: Vec<String>,
 }
 
 impl DiagnosticsState {
@@ -30,13 +34,25 @@ impl DiagnosticsState {
         config_path: impl Into<String>,
         state_dir: impl Into<String>,
         socket_path: impl Into<String>,
+        config: &crate::config::Config,
     ) -> Self {
+        let config_value = serde_json::to_value(config).unwrap_or_else(|_| Value::Null);
+        let config_json = serde_json::to_string(&config_value).unwrap_or_else(|_| "{}".into());
+        let mut redacted_config = config_value;
+        let mut redacted_fields = Vec::new();
+        redact_sensitive_config(&mut redacted_config, "", &mut redacted_fields);
+        let redacted_config_json =
+            serde_json::to_string(&redacted_config).unwrap_or_else(|_| "{}".into());
+
         Self {
             version: version.into(),
             git_commit: git_commit.into(),
             config_path: config_path.into(),
             state_dir: state_dir.into(),
             socket_path: socket_path.into(),
+            config_json,
+            redacted_config_json,
+            redacted_fields,
         }
     }
 }
@@ -77,9 +93,22 @@ impl DiagnosticsService for DiagnosticsServiceImpl {
 
     async fn effective_config(
         &self,
-        _request: Request<EffectiveConfigRequest>,
+        request: Request<EffectiveConfigRequest>,
     ) -> Result<Response<EffectiveConfigResponse>, Status> {
-        Err(unimplemented("EffectiveConfig"))
+        let include_sensitive = request.into_inner().include_sensitive;
+        Ok(Response::new(EffectiveConfigResponse {
+            config_json: if include_sensitive {
+                self.state.config_json.clone()
+            } else {
+                self.state.redacted_config_json.clone()
+            },
+            redacted_fields: if include_sensitive {
+                Vec::new()
+            } else {
+                self.state.redacted_fields.clone()
+            },
+            warnings: Vec::new(),
+        }))
     }
 
     async fn runtime_handlers(
@@ -148,6 +177,40 @@ impl DiagnosticsService for DiagnosticsServiceImpl {
     }
 }
 
+fn redact_sensitive_config(value: &mut Value, path: &str, redacted_fields: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                if is_sensitive_key(key) {
+                    *child = Value::String("<redacted>".into());
+                    redacted_fields.push(child_path);
+                } else {
+                    redact_sensitive_config(child, &child_path, redacted_fields);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter_mut().enumerate() {
+                redact_sensitive_config(child, &format!("{path}[{index}]"), redacted_fields);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("password")
+        || key.contains("token")
+        || key.contains("secret")
+        || key.contains("auth")
+}
+
 #[cfg(test)]
 mod tests {
     use tonic::Code;
@@ -159,14 +222,12 @@ mod tests {
         let service = DiagnosticsServiceImpl::new(DiagnosticsState::empty());
 
         let error = service
-            .effective_config(Request::new(EffectiveConfigRequest {
-                include_sensitive: false,
-            }))
+            .runtime_handlers(Request::new(RuntimeHandlersRequest {}))
             .await
             .expect_err("stub should be unimplemented");
 
         assert_eq!(error.code(), Code::Unimplemented);
-        assert!(error.message().contains("EffectiveConfig"));
+        assert!(error.message().contains("RuntimeHandlers"));
     }
 
     #[tokio::test]
@@ -177,6 +238,7 @@ mod tests {
             "/etc/crius/crius.conf",
             "/var/lib/crius",
             "/run/crius/crius.sock",
+            &crate::config::Config::default(),
         ));
 
         let response = service
@@ -190,5 +252,33 @@ mod tests {
         assert_eq!(response.config_path, "/etc/crius/crius.conf");
         assert_eq!(response.state_dir, "/var/lib/crius");
         assert_eq!(response.socket_path, "/run/crius/crius.sock");
+    }
+
+    #[tokio::test]
+    async fn effective_config_redacts_sensitive_fields() {
+        let mut config = crate::config::Config::default();
+        config.image.global_auth_file = "/var/lib/kubelet/config.json".into();
+        let service = DiagnosticsServiceImpl::new(DiagnosticsState::new(
+            "0.1.0",
+            "abc123",
+            "/etc/crius/crius.conf",
+            "/var/lib/crius",
+            "/run/crius/crius.sock",
+            &config,
+        ));
+
+        let response = service
+            .effective_config(Request::new(EffectiveConfigRequest {
+                include_sensitive: false,
+            }))
+            .await
+            .expect("effective config should succeed")
+            .into_inner();
+
+        assert!(response.config_json.contains("<redacted>"));
+        assert!(response
+            .redacted_fields
+            .iter()
+            .any(|field| field.contains("global_auth_file")));
     }
 }

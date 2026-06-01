@@ -461,6 +461,7 @@ async fn main() -> Result<(), Error> {
         args.config.display().to_string(),
         runtime_config.root_dir.display().to_string(),
         listen.strip_prefix("unix://").unwrap_or(&listen).to_string(),
+        &config,
     );
     let diagnostics_service_server =
         DiagnosticsServiceServer::new(DiagnosticsServiceImpl::new(diagnostics_state))
