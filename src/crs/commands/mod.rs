@@ -55,7 +55,7 @@ pub(crate) async fn dispatch(
             command => pod::handle(ctx, client, command).await,
         },
         Command::Container(args) => match args.command {
-            ContainerCommand::Attach { id } => attach::handle(ctx, client, id).await,
+            ContainerCommand::Attach { id, .. } => attach::handle(ctx, client, id).await,
             ContainerCommand::Exec(args) => exec::handle(ctx, client, args).await,
             ContainerCommand::Logs(args) => logs::handle(ctx, client, args).await,
             command => container::handle(ctx, client, command).await,

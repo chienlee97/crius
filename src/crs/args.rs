@@ -153,6 +153,8 @@ pub struct ContainerLogsArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct ExecArgs {
+    #[command(flatten)]
+    pub stream: StreamOptions,
     pub container: String,
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
@@ -189,6 +191,34 @@ pub enum PullPolicyArg {
 pub enum ExecModeArg {
     Sync,
     Attach,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum StreamProtocolArg {
+    Websocket,
+    Spdy,
+}
+
+impl Default for StreamProtocolArg {
+    fn default() -> Self {
+        Self::Websocket
+    }
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct StreamOptions {
+    #[arg(short = 'i', long)]
+    pub stdin: bool,
+    #[arg(short = 't', long)]
+    pub tty: bool,
+    #[arg(long, default_value_t = true)]
+    pub stdout: bool,
+    #[arg(long, default_value_t = true)]
+    pub stderr: bool,
+    #[arg(long)]
+    pub resize: Option<String>,
+    #[arg(long, value_enum, default_value_t = StreamProtocolArg::Websocket)]
+    pub protocol: StreamProtocolArg,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -329,7 +359,11 @@ pub enum ContainerCommand {
     Remove { id: String },
     Exec(ExecArgs),
     ExecSync(ExecArgs),
-    Attach { id: String },
+    Attach {
+        id: String,
+        #[command(flatten)]
+        stream: StreamOptions,
+    },
     Stats(ContainerStatsArgs),
     Checkpoint { id: String, #[arg(long)] location: String },
     Update { id: String },
@@ -381,6 +415,8 @@ pub struct RunArgs {
     pub tty: bool,
     #[arg(long)]
     pub stdin: bool,
+    #[arg(long, value_enum, default_value_t = StreamProtocolArg::Websocket)]
+    pub protocol: StreamProtocolArg,
     #[arg(long)]
     pub pod: Option<String>,
     #[arg(long, value_enum, default_value_t = PullPolicyArg::Missing)]

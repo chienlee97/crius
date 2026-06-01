@@ -2,7 +2,7 @@ use clap::{error::ErrorKind, Parser};
 use crius::crs::args::{
     Args, Command, ConfigCommand, ContainerCommand, ContainerStateArg, ExecModeArg, GcCommand,
     ImageCommand, ObjectType, PodCommand, PodStateArg, PullPolicyArg, RecoveryCommand,
-    RuntimeCommand, StopObjectType,
+    RuntimeCommand, StopObjectType, StreamProtocolArg,
 };
 use std::time::Duration;
 
@@ -209,7 +209,19 @@ fn parses_container_command_arguments() {
     assert_eq!(list.state, Some(ContainerStateArg::Running));
     assert_eq!(list.labels, vec!["app=test"]);
 
-    let args = Args::try_parse_from(["crs", "container", "exec", "ctr1", "--", "echo", "ok"])
+    let args = Args::try_parse_from([
+        "crs",
+        "container",
+        "exec",
+        "--tty",
+        "--stdin",
+        "--protocol",
+        "spdy",
+        "ctr1",
+        "--",
+        "echo",
+        "ok",
+    ])
         .expect("container exec command should parse");
     let Command::Container(container) = args.command else {
         panic!("expected container command");
@@ -218,6 +230,9 @@ fn parses_container_command_arguments() {
         panic!("expected container exec command");
     };
     assert_eq!(exec.container, "ctr1");
+    assert!(exec.stream.tty);
+    assert!(exec.stream.stdin);
+    assert_eq!(exec.stream.protocol, StreamProtocolArg::Spdy);
     assert_eq!(exec.command, vec!["echo", "ok"]);
 }
 
@@ -431,4 +446,21 @@ fn rejects_execute_mode_without_explicit_choice() {
     let gc_error = Args::try_parse_from(["crs", "gc", "run"])
         .expect_err("gc run requires dry-run or execute");
     assert_eq!(gc_error.kind(), ErrorKind::MissingRequiredArgument);
+}
+
+#[test]
+fn rejects_conflicting_auth_sources() {
+    let error = Args::try_parse_from([
+        "crs",
+        "image",
+        "pull",
+        "busybox",
+        "--auth-json",
+        "{}",
+        "--username",
+        "alice",
+    ])
+    .expect_err("auth-json and username should conflict");
+
+    assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
 }
