@@ -1,5 +1,7 @@
 use clap::{error::ErrorKind, Parser};
-use crius::crs::args::{Args, Command, ObjectType, StopObjectType};
+use crius::crs::args::{
+    Args, Command, ConfigCommand, ObjectType, RuntimeCommand, StopObjectType,
+};
 use std::time::Duration;
 
 #[test]
@@ -162,4 +164,58 @@ fn parses_base_and_multitype_shortcut_args() {
     assert!(remove.force);
     assert_eq!(remove.object_type, Some(ObjectType::Container));
     assert_eq!(remove.target, "container1");
+}
+
+#[test]
+fn parses_config_commands() {
+    let args = Args::try_parse_from(["crs", "config", "show"]).expect("config show should parse");
+    let Command::Config(config) = args.command else {
+        panic!("expected config command");
+    };
+    assert!(matches!(config.command, ConfigCommand::Show));
+
+    let args = Args::try_parse_from(["crs", "config", "reload-status"])
+        .expect("config reload-status should parse");
+    let Command::Config(config) = args.command else {
+        panic!("expected config command");
+    };
+    assert!(matches!(config.command, ConfigCommand::ReloadStatus));
+}
+
+#[test]
+fn parses_runtime_commands() {
+    let args =
+        Args::try_parse_from(["crs", "runtime", "config"]).expect("runtime config should parse");
+    let Command::Runtime(runtime) = args.command else {
+        panic!("expected runtime command");
+    };
+    assert!(matches!(runtime.command, RuntimeCommand::Config));
+
+    let args = Args::try_parse_from(["crs", "runtime", "update", "--pod-cidr", "10.244.0.0/16"])
+        .expect("runtime update should parse");
+    let Command::Runtime(runtime) = args.command else {
+        panic!("expected runtime command");
+    };
+    let RuntimeCommand::Update { pod_cidr } = runtime.command else {
+        panic!("expected runtime update command");
+    };
+    assert_eq!(pod_cidr, "10.244.0.0/16");
+
+    let args = Args::try_parse_from(["crs", "runtime", "handlers", "--verbose"])
+        .expect("runtime handlers should parse");
+    let Command::Runtime(runtime) = args.command else {
+        panic!("expected runtime command");
+    };
+    let RuntimeCommand::Handlers { verbose } = runtime.command else {
+        panic!("expected runtime handlers command");
+    };
+    assert!(verbose);
+}
+
+#[test]
+fn rejects_runtime_update_without_pod_cidr() {
+    let error = Args::try_parse_from(["crs", "runtime", "update"])
+        .expect_err("runtime update requires --pod-cidr");
+
+    assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
 }
