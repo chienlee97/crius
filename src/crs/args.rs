@@ -327,9 +327,67 @@ pub struct PodCreateArgs {
     #[arg(long)]
     pub name: Option<String>,
     #[arg(long)]
+    pub uid: Option<String>,
+    #[arg(long)]
     pub namespace: Option<String>,
     #[arg(long)]
+    pub attempt: Option<u32>,
+    #[arg(long)]
+    pub hostname: Option<String>,
+    #[arg(long)]
+    pub log_dir: Option<String>,
+    #[arg(long = "dns-server")]
+    pub dns_servers: Vec<String>,
+    #[arg(long = "dns-search")]
+    pub dns_searches: Vec<String>,
+    #[arg(long = "dns-option")]
+    pub dns_options: Vec<String>,
+    #[arg(long = "publish")]
+    pub publish: Vec<String>,
+    #[arg(long)]
     pub runtime_handler: Option<String>,
+    #[arg(long)]
+    pub cgroup_parent: Option<String>,
+    #[arg(long = "sysctl")]
+    pub sysctls: Vec<String>,
+    #[arg(long)]
+    pub host_network: bool,
+    #[arg(long)]
+    pub host_pid: bool,
+    #[arg(long)]
+    pub host_ipc: bool,
+    #[arg(long)]
+    pub userns: Option<String>,
+    #[arg(long = "uid-map")]
+    pub uid_maps: Vec<String>,
+    #[arg(long = "gid-map")]
+    pub gid_maps: Vec<String>,
+    #[command(flatten)]
+    pub security: SandboxSecurityArgs,
+    #[arg(long = "overhead")]
+    pub overhead: Vec<String>,
+    #[arg(long = "pod-resource")]
+    pub pod_resources: Vec<String>,
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct SandboxSecurityArgs {
+    #[arg(long)]
+    pub sandbox_user: Option<String>,
+    #[arg(long)]
+    pub sandbox_group: Option<u32>,
+    #[arg(long = "sandbox-supplemental-group")]
+    pub sandbox_supplemental_groups: Vec<u32>,
+    #[arg(long)]
+    pub sandbox_readonly_rootfs: bool,
+    #[arg(long)]
+    pub sandbox_privileged: bool,
+    #[arg(long)]
+    pub sandbox_seccomp: Option<String>,
+    #[arg(long)]
+    pub sandbox_apparmor: Option<String>,
+    #[arg(long)]
+    pub sandbox_selinux: Option<String>,
 }
 
 #[derive(Debug, Default, ClapArgs)]
@@ -387,9 +445,110 @@ pub struct ContainerListArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct ContainerCreateArgs {
+    #[command(flatten)]
+    pub options: ContainerCreateOptions,
     pub pod: String,
     pub image: String,
+    #[arg(last = true)]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct ContainerCreateOptions {
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long)]
+    pub attempt: Option<u32>,
+    #[arg(long = "command")]
+    pub commands: Vec<String>,
+    #[arg(long = "arg")]
+    pub args: Vec<String>,
+    #[arg(long)]
+    pub workdir: Option<String>,
+    #[arg(long = "env")]
+    pub env: Vec<String>,
+    #[arg(long = "env-file")]
+    pub env_files: Vec<String>,
+    #[arg(long = "mount")]
+    pub mounts: Vec<String>,
+    #[arg(long = "device")]
+    pub devices: Vec<String>,
+    #[arg(long = "cdi-device")]
+    pub cdi_devices: Vec<String>,
+    #[arg(long)]
+    pub log_path: Option<String>,
+    #[arg(long)]
+    pub stdin: bool,
+    #[arg(long)]
+    pub tty: bool,
+    #[command(flatten)]
+    pub resources: ContainerResourceArgs,
+    #[command(flatten)]
+    pub security: ContainerSecurityArgs,
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct ContainerResourceArgs {
+    #[arg(long)]
+    pub cpu_period: Option<i64>,
+    #[arg(long)]
+    pub cpu_quota: Option<i64>,
+    #[arg(long)]
+    pub cpu_shares: Option<i64>,
+    #[arg(long)]
+    pub memory: Option<String>,
+    #[arg(long)]
+    pub memory_swap: Option<String>,
+    #[arg(long)]
+    pub oom_score_adj: Option<i64>,
+    #[arg(long)]
+    pub cpuset_cpus: Option<String>,
+    #[arg(long)]
+    pub cpuset_mems: Option<String>,
+    #[arg(long = "hugepage")]
+    pub hugepages: Vec<String>,
+    #[arg(long = "unified")]
+    pub unified: Vec<String>,
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct ContainerSecurityArgs {
+    #[arg(long)]
+    pub privileged: bool,
+    #[arg(long = "cap-add")]
+    pub cap_add: Vec<String>,
+    #[arg(long = "cap-drop")]
+    pub cap_drop: Vec<String>,
+    #[arg(long = "ambient-cap-add")]
+    pub ambient_cap_add: Vec<String>,
+    #[arg(long)]
+    pub user: Option<String>,
+    #[arg(long)]
+    pub group: Option<String>,
+    #[arg(long = "supplemental-group")]
+    pub supplemental_groups: Vec<String>,
+    #[arg(long)]
+    pub readonly_rootfs: bool,
+    #[arg(long)]
+    pub no_new_privs: bool,
+    #[arg(long = "masked-path")]
+    pub masked_paths: Vec<String>,
+    #[arg(long = "readonly-path")]
+    pub readonly_paths: Vec<String>,
+    #[arg(long)]
+    pub seccomp: Option<String>,
+    #[arg(long)]
+    pub apparmor: Option<String>,
+    #[arg(long)]
+    pub selinux: Option<String>,
+    #[arg(long)]
+    pub pid: Option<String>,
+    #[arg(long)]
+    pub ipc: Option<String>,
+    #[arg(long)]
+    pub blockio_class: Option<String>,
+    #[arg(long)]
+    pub rdt_class: Option<String>,
 }
 
 #[derive(Debug, Default, ClapArgs)]

@@ -183,6 +183,39 @@ fn parses_pod_command_arguments() {
 }
 
 #[test]
+fn parses_pod_create_arguments() {
+    let args = Args::try_parse_from([
+        "crs",
+        "pod",
+        "run",
+        "--name",
+        "pod1",
+        "--namespace",
+        "ns1",
+        "--host-network",
+        "--dns-server",
+        "1.1.1.1",
+        "--publish",
+        "8080:80",
+        "--sandbox-seccomp",
+        "runtime/default",
+    ])
+    .expect("pod create args should parse");
+    let Command::Pod(pod) = args.command else {
+        panic!("expected pod command");
+    };
+    let PodCommand::Run(run) = pod.command else {
+        panic!("expected pod run command");
+    };
+    assert_eq!(run.name.as_deref(), Some("pod1"));
+    assert_eq!(run.namespace.as_deref(), Some("ns1"));
+    assert!(run.host_network);
+    assert_eq!(run.dns_servers, vec!["1.1.1.1"]);
+    assert_eq!(run.publish, vec!["8080:80"]);
+    assert_eq!(run.security.sandbox_seccomp.as_deref(), Some("runtime/default"));
+}
+
+#[test]
 fn parses_container_command_arguments() {
     let args = Args::try_parse_from([
         "crs",
@@ -234,6 +267,42 @@ fn parses_container_command_arguments() {
     assert!(exec.stream.stdin);
     assert_eq!(exec.stream.protocol, StreamProtocolArg::Spdy);
     assert_eq!(exec.command, vec!["echo", "ok"]);
+}
+
+#[test]
+fn parses_container_create_arguments() {
+    let args = Args::try_parse_from([
+        "crs",
+        "container",
+        "create",
+        "--name",
+        "ctr1",
+        "--mount",
+        "type=bind,src=/x,dst=/y",
+        "--memory",
+        "64MiB",
+        "--cap-add",
+        "NET_ADMIN",
+        "pod1",
+        "busybox",
+        "--",
+        "sleep",
+        "1",
+    ])
+    .expect("container create args should parse");
+    let Command::Container(container) = args.command else {
+        panic!("expected container command");
+    };
+    let ContainerCommand::Create(create) = container.command else {
+        panic!("expected container create command");
+    };
+    assert_eq!(create.pod, "pod1");
+    assert_eq!(create.image, "busybox");
+    assert_eq!(create.options.name.as_deref(), Some("ctr1"));
+    assert_eq!(create.options.mounts, vec!["type=bind,src=/x,dst=/y"]);
+    assert_eq!(create.options.resources.memory.as_deref(), Some("64MiB"));
+    assert_eq!(create.options.security.cap_add, vec!["NET_ADMIN"]);
+    assert_eq!(create.command, vec!["sleep", "1"]);
 }
 
 #[test]
