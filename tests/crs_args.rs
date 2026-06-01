@@ -1,6 +1,6 @@
 use clap::{error::ErrorKind, Parser};
 use crius::crs::args::{
-    Args, Command, ConfigCommand, ObjectType, RuntimeCommand, StopObjectType,
+    Args, Command, ConfigCommand, ImageCommand, ObjectType, RuntimeCommand, StopObjectType,
 };
 use std::time::Duration;
 
@@ -218,4 +218,51 @@ fn rejects_runtime_update_without_pod_cidr() {
         .expect_err("runtime update requires --pod-cidr");
 
     assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+}
+
+#[test]
+fn parses_image_commands_and_auth_args() {
+    let args = Args::try_parse_from([
+        "crs",
+        "image",
+        "pull",
+        "registry.example.test/app:latest",
+        "--username",
+        "alice",
+        "--password",
+        "secret",
+        "--server",
+        "registry.example.test",
+        "--pod",
+        "pod1",
+    ])
+    .expect("image pull auth should parse");
+    let Command::Image(image) = args.command else {
+        panic!("expected image command");
+    };
+    let ImageCommand::Pull(pull) = image.command else {
+        panic!("expected image pull command");
+    };
+    assert_eq!(pull.image, "registry.example.test/app:latest");
+    assert_eq!(pull.auth.username.as_deref(), Some("alice"));
+    assert_eq!(pull.auth.password.as_deref(), Some("secret"));
+    assert_eq!(pull.auth.server.as_deref(), Some("registry.example.test"));
+    assert_eq!(pull.pod.as_deref(), Some("pod1"));
+
+    let args = Args::try_parse_from(["crs", "image", "list", "--image", "busybox"])
+        .expect("image list filter should parse");
+    let Command::Image(image) = args.command else {
+        panic!("expected image command");
+    };
+    let ImageCommand::List(list) = image.command else {
+        panic!("expected image list command");
+    };
+    assert_eq!(list.image.as_deref(), Some("busybox"));
+
+    let args = Args::try_parse_from(["crs", "image", "fs-info"])
+        .expect("image fs-info should parse");
+    let Command::Image(image) = args.command else {
+        panic!("expected image command");
+    };
+    assert!(matches!(image.command, ImageCommand::FsInfo));
 }

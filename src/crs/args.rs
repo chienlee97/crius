@@ -87,7 +87,49 @@ pub struct ImageListArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct ImagePullArgs {
+    #[command(flatten)]
+    pub auth: ImageAuthArgs,
+    #[arg(long)]
+    pub pod: Option<String>,
     pub image: String,
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct ImageAuthArgs {
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "auth_file",
+            "username",
+            "password",
+            "server",
+            "identity_token",
+            "registry_token"
+        ]
+    )]
+    pub auth_json: Option<String>,
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "auth_json",
+            "username",
+            "password",
+            "server",
+            "identity_token",
+            "registry_token"
+        ]
+    )]
+    pub auth_file: Option<String>,
+    #[arg(long)]
+    pub username: Option<String>,
+    #[arg(long, requires = "username")]
+    pub password: Option<String>,
+    #[arg(long, requires = "username")]
+    pub server: Option<String>,
+    #[arg(long, requires = "username")]
+    pub identity_token: Option<String>,
+    #[arg(long, requires = "username")]
+    pub registry_token: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
