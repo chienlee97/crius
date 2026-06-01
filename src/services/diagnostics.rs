@@ -11,11 +11,33 @@ use crate::proto::diagnostics::v1::{
 };
 
 #[derive(Clone, Debug, Default)]
-pub struct DiagnosticsState {}
+pub struct DiagnosticsState {
+    version: String,
+    git_commit: String,
+    config_path: String,
+    state_dir: String,
+    socket_path: String,
+}
 
 impl DiagnosticsState {
     pub fn empty() -> Self {
-        Self {}
+        Self::default()
+    }
+
+    pub fn new(
+        version: impl Into<String>,
+        git_commit: impl Into<String>,
+        config_path: impl Into<String>,
+        state_dir: impl Into<String>,
+        socket_path: impl Into<String>,
+    ) -> Self {
+        Self {
+            version: version.into(),
+            git_commit: git_commit.into(),
+            config_path: config_path.into(),
+            state_dir: state_dir.into(),
+            socket_path: socket_path.into(),
+        }
     }
 }
 
@@ -44,7 +66,13 @@ impl DiagnosticsService for DiagnosticsServiceImpl {
         &self,
         _request: Request<ServerInfoRequest>,
     ) -> Result<Response<ServerInfoResponse>, Status> {
-        Err(unimplemented("ServerInfo"))
+        Ok(Response::new(ServerInfoResponse {
+            version: self.state.version.clone(),
+            git_commit: self.state.git_commit.clone(),
+            config_path: self.state.config_path.clone(),
+            state_dir: self.state.state_dir.clone(),
+            socket_path: self.state.socket_path.clone(),
+        }))
     }
 
     async fn effective_config(
@@ -131,11 +159,36 @@ mod tests {
         let service = DiagnosticsServiceImpl::new(DiagnosticsState::empty());
 
         let error = service
-            .server_info(Request::new(ServerInfoRequest {}))
+            .effective_config(Request::new(EffectiveConfigRequest {
+                include_sensitive: false,
+            }))
             .await
             .expect_err("stub should be unimplemented");
 
         assert_eq!(error.code(), Code::Unimplemented);
-        assert!(error.message().contains("ServerInfo"));
+        assert!(error.message().contains("EffectiveConfig"));
+    }
+
+    #[tokio::test]
+    async fn server_info_returns_state() {
+        let service = DiagnosticsServiceImpl::new(DiagnosticsState::new(
+            "0.1.0",
+            "abc123",
+            "/etc/crius/crius.conf",
+            "/var/lib/crius",
+            "/run/crius/crius.sock",
+        ));
+
+        let response = service
+            .server_info(Request::new(ServerInfoRequest {}))
+            .await
+            .expect("server info should succeed")
+            .into_inner();
+
+        assert_eq!(response.version, "0.1.0");
+        assert_eq!(response.git_commit, "abc123");
+        assert_eq!(response.config_path, "/etc/crius/crius.conf");
+        assert_eq!(response.state_dir, "/var/lib/crius");
+        assert_eq!(response.socket_path, "/run/crius/crius.sock");
     }
 }

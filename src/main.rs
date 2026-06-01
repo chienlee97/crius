@@ -15,8 +15,10 @@ use crius::oci::spec::Spec;
 use crius::proto::runtime::v1::{
     image_service_server::ImageServiceServer, runtime_service_server::RuntimeServiceServer,
 };
+use crius::proto::diagnostics::v1::diagnostics_service_server::DiagnosticsServiceServer;
 use crius::runtime::ShimConfig;
 use crius::server::{IrqBalanceRestoreStatus, RuntimeConfig, RuntimeServiceImpl};
+use crius::services::{DiagnosticsServiceImpl, DiagnosticsState};
 use crius::streaming::StreamingServer;
 use tokio::net::UnixListener as TokioUnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -453,10 +455,22 @@ async fn main() -> Result<(), Error> {
     let image_service_server = ImageServiceServer::new(image_service)
         .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
         .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
+    let diagnostics_state = DiagnosticsState::new(
+        env!("CARGO_PKG_VERSION"),
+        option_env!("GIT_COMMIT").unwrap_or("unknown"),
+        args.config.display().to_string(),
+        runtime_config.root_dir.display().to_string(),
+        listen.strip_prefix("unix://").unwrap_or(&listen).to_string(),
+    );
+    let diagnostics_service_server =
+        DiagnosticsServiceServer::new(DiagnosticsServiceImpl::new(diagnostics_state))
+            .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
+            .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
 
     let server = Server::builder()
         .add_service(runtime_service_server)
         .add_service(image_service_server)
+        .add_service(diagnostics_service_server)
         .add_service(reflection_service);
 
     let shutdown_watchdog = spawn_shutdown_watchdog();
