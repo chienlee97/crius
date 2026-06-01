@@ -78,6 +78,31 @@ impl CrsClient {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn runtime(&self) -> Result<RuntimeServiceClient<Channel>, CliError> {
+        self.runtime.clone().ok_or_else(|| {
+            CliError::daemon_unavailable(
+                self.endpoint(),
+                "runtime service client is not connected; call CrsClient::connect first",
+            )
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn image(&self) -> Result<ImageServiceClient<Channel>, CliError> {
+        self.image.clone().ok_or_else(|| {
+            CliError::daemon_unavailable(
+                self.endpoint(),
+                "image service client is not connected; call CrsClient::connect first",
+            )
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn diagnostics(&self) -> Result<(), CliError> {
+        Err(self.diagnostics_unavailable())
+    }
+
+    #[allow(dead_code)]
     pub(crate) async fn with_rpc_timeout<F, T>(&self, future: F) -> Result<T, CliError>
     where
         F: Future<Output = Result<T, CliError>>,
@@ -182,6 +207,17 @@ mod tests {
         let error = client.diagnostics_unavailable();
 
         assert!(error.to_string().contains("diagnostics service is not available"));
+    }
+
+    #[test]
+    fn getters_report_unconnected_clients() {
+        let args = Args::try_parse_from(["crs", "version"]).expect("args should parse");
+        let ctx = CliContext::from_args(&args).expect("context should build");
+        let client = CrsClient::new(&ctx);
+
+        assert_eq!(client.runtime().unwrap_err().exit_status().code(), 125);
+        assert_eq!(client.image().unwrap_err().exit_status().code(), 125);
+        assert_eq!(client.diagnostics().unwrap_err().exit_status().code(), 1);
     }
 
     #[tokio::test]
