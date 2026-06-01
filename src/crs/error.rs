@@ -5,6 +5,7 @@ pub enum ExitStatus {
     Success,
     General,
     Usage,
+    Timeout,
 }
 
 impl ExitStatus {
@@ -13,6 +14,7 @@ impl ExitStatus {
             Self::Success => 0,
             Self::General => 1,
             Self::Usage => 2,
+            Self::Timeout => 124,
         }
     }
 }
@@ -48,6 +50,10 @@ impl CommandResult {
 pub enum CliError {
     #[error("{command} is not implemented yet")]
     NotImplemented { command: String },
+    #[error("{message} for endpoint {endpoint}")]
+    Timeout { message: String, endpoint: String },
+    #[error("diagnostics service is not available from this crius daemon at {endpoint}")]
+    DiagnosticsUnavailable { endpoint: String },
 }
 
 impl CliError {
@@ -57,9 +63,24 @@ impl CliError {
         }
     }
 
+    pub(crate) fn timeout(message: impl Into<String>, endpoint: impl Into<String>) -> Self {
+        Self::Timeout {
+            message: message.into(),
+            endpoint: endpoint.into(),
+        }
+    }
+
+    pub(crate) fn diagnostics_unavailable(endpoint: impl Into<String>) -> Self {
+        Self::DiagnosticsUnavailable {
+            endpoint: endpoint.into(),
+        }
+    }
+
     pub(crate) fn exit_status(&self) -> ExitStatus {
         match self {
             Self::NotImplemented { .. } => ExitStatus::General,
+            Self::Timeout { .. } => ExitStatus::Timeout,
+            Self::DiagnosticsUnavailable { .. } => ExitStatus::General,
         }
     }
 

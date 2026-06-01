@@ -44,7 +44,7 @@ where
             return CommandResult::failure(ExitStatus::Usage);
         }
     };
-    let client = CrsClient::new(ctx.endpoint_display());
+    let client = CrsClient::new(&ctx);
 
     match commands::dispatch(&ctx, &client, args.command).await {
         Ok(result) => result,
