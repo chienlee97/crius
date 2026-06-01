@@ -1,6 +1,7 @@
 use clap::{error::ErrorKind, Parser};
 use crius::crs::args::{
-    Args, Command, ConfigCommand, ImageCommand, ObjectType, RuntimeCommand, StopObjectType,
+    Args, Command, ConfigCommand, ContainerCommand, ContainerStateArg, ImageCommand, ObjectType,
+    PodCommand, PodStateArg, RuntimeCommand, StopObjectType,
 };
 use std::time::Duration;
 
@@ -133,6 +134,90 @@ fn parses_top_level_command_groups() {
 
         assert!(assert_command(&args.command), "unexpected command for {argv:?}");
     }
+}
+
+#[test]
+fn parses_pod_command_arguments() {
+    let args = Args::try_parse_from([
+        "crs",
+        "pod",
+        "list",
+        "--id",
+        "pod1",
+        "--state",
+        "ready",
+        "--label",
+        "app=test",
+    ])
+    .expect("pod list filters should parse");
+    let Command::Pod(pod) = args.command else {
+        panic!("expected pod command");
+    };
+    let PodCommand::List(list) = pod.command else {
+        panic!("expected pod list command");
+    };
+    assert_eq!(list.id.as_deref(), Some("pod1"));
+    assert_eq!(list.state, Some(PodStateArg::Ready));
+    assert_eq!(list.labels, vec!["app=test"]);
+
+    let args = Args::try_parse_from([
+        "crs",
+        "pod",
+        "port-forward",
+        "pod1",
+        "--forward",
+        "8080:80",
+        "--forward",
+        "8443:443",
+    ])
+    .expect("pod port-forward should parse repeated forwards");
+    let Command::Pod(pod) = args.command else {
+        panic!("expected pod command");
+    };
+    let PodCommand::PortForward { pod, forward } = pod.command else {
+        panic!("expected pod port-forward command");
+    };
+    assert_eq!(pod, "pod1");
+    assert_eq!(forward, vec!["8080:80", "8443:443"]);
+}
+
+#[test]
+fn parses_container_command_arguments() {
+    let args = Args::try_parse_from([
+        "crs",
+        "container",
+        "list",
+        "--id",
+        "ctr1",
+        "--pod",
+        "pod1",
+        "--state",
+        "running",
+        "--label",
+        "app=test",
+    ])
+    .expect("container list filters should parse");
+    let Command::Container(container) = args.command else {
+        panic!("expected container command");
+    };
+    let ContainerCommand::List(list) = container.command else {
+        panic!("expected container list command");
+    };
+    assert_eq!(list.id.as_deref(), Some("ctr1"));
+    assert_eq!(list.pod.as_deref(), Some("pod1"));
+    assert_eq!(list.state, Some(ContainerStateArg::Running));
+    assert_eq!(list.labels, vec!["app=test"]);
+
+    let args = Args::try_parse_from(["crs", "container", "exec", "ctr1", "--", "echo", "ok"])
+        .expect("container exec command should parse");
+    let Command::Container(container) = args.command else {
+        panic!("expected container command");
+    };
+    let ContainerCommand::Exec(exec) = container.command else {
+        panic!("expected container exec command");
+    };
+    assert_eq!(exec.container, "ctr1");
+    assert_eq!(exec.command, vec!["echo", "ok"]);
 }
 
 #[test]

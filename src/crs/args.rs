@@ -164,6 +164,20 @@ pub enum StopObjectType {
     Pod,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum PodStateArg {
+    Ready,
+    Notready,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ContainerStateArg {
+    Created,
+    Running,
+    Exited,
+    Unknown,
+}
+
 #[derive(Debug, ClapArgs)]
 pub struct StopArgs {
     #[arg(long = "type", value_enum)]
@@ -232,15 +246,54 @@ pub struct PodArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PodCommand {
-    List(ListArgs),
+    List(PodListArgs),
     Inspect { pod: String },
-    Run,
-    Stop { pod: String },
+    Run(PodCreateArgs),
+    Stop {
+        pod: String,
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u32>,
+    },
     Remove { pod: String },
-    Stats { pod: Option<String> },
+    Stats(PodStatsArgs),
     Metrics,
-    UpdateResources { pod: String },
+    UpdateResources {
+        pod: String,
+        #[arg(long = "overhead")]
+        overhead: Vec<String>,
+        #[arg(long = "pod-resource")]
+        pod_resource: Vec<String>,
+    },
     PortForward { pod: String, #[arg(long)] forward: Vec<String> },
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct PodListArgs {
+    #[arg(long)]
+    pub id: Option<String>,
+    #[arg(long, value_enum)]
+    pub state: Option<PodStateArg>,
+    #[arg(long = "label")]
+    pub labels: Vec<String>,
+    #[arg(long)]
+    pub all: bool,
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct PodCreateArgs {
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long)]
+    pub namespace: Option<String>,
+    #[arg(long)]
+    pub runtime_handler: Option<String>,
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct PodStatsArgs {
+    pub pod: Option<String>,
+    #[arg(long = "label")]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -251,20 +304,54 @@ pub struct ContainerArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ContainerCommand {
-    List(ListArgs),
+    List(ContainerListArgs),
     Inspect { id: String },
-    Create { pod: String, image: String, command: Vec<String> },
+    Create(ContainerCreateArgs),
     Start { id: String },
-    Stop { id: String },
+    Stop {
+        id: String,
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u32>,
+    },
     Remove { id: String },
     Exec(ExecArgs),
     ExecSync(ExecArgs),
     Attach { id: String },
-    Stats { id: Option<String> },
+    Stats(ContainerStatsArgs),
     Checkpoint { id: String, #[arg(long)] location: String },
     Update { id: String },
     ReopenLog { id: String },
     Logs(ContainerLogsArgs),
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct ContainerListArgs {
+    #[arg(long)]
+    pub id: Option<String>,
+    #[arg(long)]
+    pub pod: Option<String>,
+    #[arg(long, value_enum)]
+    pub state: Option<ContainerStateArg>,
+    #[arg(long = "label")]
+    pub labels: Vec<String>,
+    #[arg(long)]
+    pub all: bool,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct ContainerCreateArgs {
+    pub pod: String,
+    pub image: String,
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct ContainerStatsArgs {
+    pub id: Option<String>,
+    #[arg(long)]
+    pub pod: Option<String>,
+    #[arg(long = "label")]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, ClapArgs)]
