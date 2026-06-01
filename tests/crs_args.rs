@@ -1,5 +1,5 @@
 use clap::{error::ErrorKind, Parser};
-use crius::crs::args::Args;
+use crius::crs::args::{Args, Command};
 use std::time::Duration;
 
 #[test]
@@ -65,4 +65,71 @@ fn rejects_invalid_output_value() {
         .expect_err("invalid output value should fail parsing");
 
     assert_eq!(error.kind(), ErrorKind::InvalidValue);
+}
+
+#[test]
+fn parses_top_level_shortcut_commands() {
+    let cases: &[(&[&str], fn(&Command) -> bool)] = &[
+        (&["crs", "version"], |command| matches!(command, Command::Version(_))),
+        (&["crs", "status"], |command| matches!(command, Command::Status(_))),
+        (&["crs", "doctor"], |command| matches!(command, Command::Doctor(_))),
+        (&["crs", "ps"], |command| matches!(command, Command::Ps(_))),
+        (&["crs", "pods"], |command| matches!(command, Command::Pods(_))),
+        (&["crs", "images"], |command| matches!(command, Command::Images(_))),
+        (&["crs", "pull", "busybox"], |command| matches!(command, Command::Pull(_))),
+        (&["crs", "inspect", "abc123"], |command| {
+            matches!(command, Command::Inspect(_))
+        }),
+        (&["crs", "logs", "abc123"], |command| matches!(command, Command::Logs(_))),
+        (&["crs", "exec", "abc123", "--", "echo"], |command| {
+            matches!(command, Command::Exec(_))
+        }),
+        (&["crs", "stop", "abc123"], |command| matches!(command, Command::Stop(_))),
+        (&["crs", "rm", "abc123"], |command| matches!(command, Command::Rm(_))),
+    ];
+
+    for (argv, assert_command) in cases {
+        let args = Args::try_parse_from(*argv).unwrap_or_else(|error| {
+            panic!("failed to parse {argv:?}: {error}");
+        });
+
+        assert!(assert_command(&args.command), "unexpected command for {argv:?}");
+    }
+}
+
+#[test]
+fn parses_top_level_command_groups() {
+    let cases: &[(&[&str], fn(&Command) -> bool)] = &[
+        (&["crs", "config", "show"], |command| matches!(command, Command::Config(_))),
+        (&["crs", "runtime", "config"], |command| {
+            matches!(command, Command::Runtime(_))
+        }),
+        (&["crs", "image", "list"], |command| matches!(command, Command::Image(_))),
+        (&["crs", "pod", "list"], |command| matches!(command, Command::Pod(_))),
+        (&["crs", "container", "list"], |command| {
+            matches!(command, Command::Container(_))
+        }),
+        (&["crs", "run", "busybox"], |command| matches!(command, Command::Run(_))),
+        (&["crs", "events"], |command| matches!(command, Command::Events(_))),
+        (&["crs", "stats"], |command| matches!(command, Command::Stats(_))),
+        (&["crs", "metrics", "descriptors"], |command| {
+            matches!(command, Command::Metrics(_))
+        }),
+        (&["crs", "recovery", "status"], |command| {
+            matches!(command, Command::Recovery(_))
+        }),
+        (&["crs", "gc", "candidates"], |command| matches!(command, Command::Gc(_))),
+        (&["crs", "debug", "network"], |command| matches!(command, Command::Debug(_))),
+        (&["crs", "completion", "bash"], |command| {
+            matches!(command, Command::Completion(_))
+        }),
+    ];
+
+    for (argv, assert_command) in cases {
+        let args = Args::try_parse_from(*argv).unwrap_or_else(|error| {
+            panic!("failed to parse {argv:?}: {error}");
+        });
+
+        assert!(assert_command(&args.command), "unexpected command for {argv:?}");
+    }
 }
