@@ -178,6 +178,19 @@ pub enum ContainerStateArg {
     Unknown,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum PullPolicyArg {
+    Missing,
+    Always,
+    Never,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ExecModeArg {
+    Sync,
+    Attach,
+}
+
 #[derive(Debug, ClapArgs)]
 pub struct StopArgs {
     #[arg(long = "type", value_enum)]
@@ -356,6 +369,24 @@ pub struct ContainerStatsArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct RunArgs {
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long)]
+    pub namespace: Option<String>,
+    #[arg(long)]
+    pub detach: bool,
+    #[arg(long)]
+    pub rm: bool,
+    #[arg(long)]
+    pub tty: bool,
+    #[arg(long)]
+    pub stdin: bool,
+    #[arg(long)]
+    pub pod: Option<String>,
+    #[arg(long, value_enum, default_value_t = PullPolicyArg::Missing)]
+    pub pull: PullPolicyArg,
+    #[arg(long, value_enum, default_value_t = ExecModeArg::Attach)]
+    pub exec_mode: ExecModeArg,
     pub image: String,
     pub command: Vec<String>,
 }
@@ -388,7 +419,7 @@ pub struct RecoveryArgs {
 pub enum RecoveryCommand {
     Status,
     Check,
-    Repair { #[arg(long)] dry_run: bool, #[arg(long)] execute: bool },
+    Repair(ExecuteModeArgs),
 }
 
 #[derive(Debug, ClapArgs)]
@@ -400,7 +431,16 @@ pub struct GcArgs {
 #[derive(Debug, Subcommand)]
 pub enum GcCommand {
     Candidates,
-    Run { #[arg(long)] dry_run: bool, #[arg(long)] execute: bool },
+    Run(ExecuteModeArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+#[group(required = true, multiple = false)]
+pub struct ExecuteModeArgs {
+    #[arg(long)]
+    pub dry_run: bool,
+    #[arg(long)]
+    pub execute: bool,
 }
 
 #[derive(Debug, ClapArgs)]

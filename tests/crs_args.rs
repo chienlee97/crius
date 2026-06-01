@@ -1,7 +1,8 @@
 use clap::{error::ErrorKind, Parser};
 use crius::crs::args::{
-    Args, Command, ConfigCommand, ContainerCommand, ContainerStateArg, ImageCommand, ObjectType,
-    PodCommand, PodStateArg, RuntimeCommand, StopObjectType,
+    Args, Command, ConfigCommand, ContainerCommand, ContainerStateArg, ExecModeArg, GcCommand,
+    ImageCommand, ObjectType, PodCommand, PodStateArg, PullPolicyArg, RecoveryCommand,
+    RuntimeCommand, StopObjectType,
 };
 use std::time::Duration;
 
@@ -350,4 +351,84 @@ fn parses_image_commands_and_auth_args() {
         panic!("expected image command");
     };
     assert!(matches!(image.command, ImageCommand::FsInfo));
+}
+
+#[test]
+fn parses_run_command_arguments() {
+    let args = Args::try_parse_from([
+        "crs",
+        "run",
+        "--rm",
+        "--tty",
+        "--stdin",
+        "--pod",
+        "pod1",
+        "--pull",
+        "always",
+        "--exec-mode",
+        "sync",
+        "busybox",
+        "echo",
+        "ok",
+    ])
+    .expect("run command options should parse");
+    let Command::Run(run) = args.command else {
+        panic!("expected run command");
+    };
+    assert!(run.rm);
+    assert!(run.tty);
+    assert!(run.stdin);
+    assert_eq!(run.pod.as_deref(), Some("pod1"));
+    assert_eq!(run.pull, PullPolicyArg::Always);
+    assert_eq!(run.exec_mode, ExecModeArg::Sync);
+    assert_eq!(run.image, "busybox");
+    assert_eq!(run.command, vec!["echo", "ok"]);
+}
+
+#[test]
+fn parses_remaining_command_groups() {
+    let args =
+        Args::try_parse_from(["crs", "metrics", "scrape"]).expect("metrics scrape should parse");
+    assert!(matches!(args.command, Command::Metrics(_)));
+
+    let args = Args::try_parse_from(["crs", "recovery", "repair", "--dry-run"])
+        .expect("recovery repair --dry-run should parse");
+    let Command::Recovery(recovery) = args.command else {
+        panic!("expected recovery command");
+    };
+    let RecoveryCommand::Repair(mode) = recovery.command else {
+        panic!("expected recovery repair command");
+    };
+    assert!(mode.dry_run);
+    assert!(!mode.execute);
+
+    let args = Args::try_parse_from(["crs", "gc", "run", "--execute"])
+        .expect("gc run --execute should parse");
+    let Command::Gc(gc) = args.command else {
+        panic!("expected gc command");
+    };
+    let GcCommand::Run(mode) = gc.command else {
+        panic!("expected gc run command");
+    };
+    assert!(!mode.dry_run);
+    assert!(mode.execute);
+
+    let args = Args::try_parse_from(["crs", "debug", "rootless"])
+        .expect("debug rootless should parse");
+    assert!(matches!(args.command, Command::Debug(_)));
+
+    let args =
+        Args::try_parse_from(["crs", "completion", "bash"]).expect("completion should parse");
+    assert!(matches!(args.command, Command::Completion(_)));
+}
+
+#[test]
+fn rejects_execute_mode_without_explicit_choice() {
+    let recovery_error = Args::try_parse_from(["crs", "recovery", "repair"])
+        .expect_err("recovery repair requires dry-run or execute");
+    assert_eq!(recovery_error.kind(), ErrorKind::MissingRequiredArgument);
+
+    let gc_error = Args::try_parse_from(["crs", "gc", "run"])
+        .expect_err("gc run requires dry-run or execute");
+    assert_eq!(gc_error.kind(), ErrorKind::MissingRequiredArgument);
 }
