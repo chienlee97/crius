@@ -25,7 +25,10 @@ fn parses_version_help() {
 fn parses_minimal_version_command() {
     let args = Args::try_parse_from(["crs", "version"]).expect("version should parse");
 
-    assert!(matches!(args.command, crius::crs::args::Command::Version(_)));
+    assert!(matches!(
+        args.command,
+        crius::crs::args::Command::Version(_)
+    ));
 }
 
 #[test]
@@ -73,22 +76,40 @@ fn rejects_invalid_output_value() {
 #[test]
 fn parses_top_level_shortcut_commands() {
     let cases: &[(&[&str], fn(&Command) -> bool)] = &[
-        (&["crs", "version"], |command| matches!(command, Command::Version(_))),
-        (&["crs", "status"], |command| matches!(command, Command::Status(_))),
-        (&["crs", "doctor"], |command| matches!(command, Command::Doctor(_))),
+        (&["crs", "version"], |command| {
+            matches!(command, Command::Version(_))
+        }),
+        (&["crs", "status"], |command| {
+            matches!(command, Command::Status(_))
+        }),
+        (&["crs", "doctor"], |command| {
+            matches!(command, Command::Doctor(_))
+        }),
         (&["crs", "ps"], |command| matches!(command, Command::Ps(_))),
-        (&["crs", "pods"], |command| matches!(command, Command::Pods(_))),
-        (&["crs", "images"], |command| matches!(command, Command::Images(_))),
-        (&["crs", "pull", "busybox"], |command| matches!(command, Command::Pull(_))),
+        (&["crs", "pods"], |command| {
+            matches!(command, Command::Pods(_))
+        }),
+        (&["crs", "images"], |command| {
+            matches!(command, Command::Images(_))
+        }),
+        (&["crs", "pull", "busybox"], |command| {
+            matches!(command, Command::Pull(_))
+        }),
         (&["crs", "inspect", "abc123"], |command| {
             matches!(command, Command::Inspect(_))
         }),
-        (&["crs", "logs", "abc123"], |command| matches!(command, Command::Logs(_))),
+        (&["crs", "logs", "abc123"], |command| {
+            matches!(command, Command::Logs(_))
+        }),
         (&["crs", "exec", "abc123", "--", "echo"], |command| {
             matches!(command, Command::Exec(_))
         }),
-        (&["crs", "stop", "abc123"], |command| matches!(command, Command::Stop(_))),
-        (&["crs", "rm", "abc123"], |command| matches!(command, Command::Rm(_))),
+        (&["crs", "stop", "abc123"], |command| {
+            matches!(command, Command::Stop(_))
+        }),
+        (&["crs", "rm", "abc123"], |command| {
+            matches!(command, Command::Rm(_))
+        }),
     ];
 
     for (argv, assert_command) in cases {
@@ -96,33 +117,52 @@ fn parses_top_level_shortcut_commands() {
             panic!("failed to parse {argv:?}: {error}");
         });
 
-        assert!(assert_command(&args.command), "unexpected command for {argv:?}");
+        assert!(
+            assert_command(&args.command),
+            "unexpected command for {argv:?}"
+        );
     }
 }
 
 #[test]
 fn parses_top_level_command_groups() {
     let cases: &[(&[&str], fn(&Command) -> bool)] = &[
-        (&["crs", "config", "show"], |command| matches!(command, Command::Config(_))),
+        (&["crs", "config", "show"], |command| {
+            matches!(command, Command::Config(_))
+        }),
         (&["crs", "runtime", "config"], |command| {
             matches!(command, Command::Runtime(_))
         }),
-        (&["crs", "image", "list"], |command| matches!(command, Command::Image(_))),
-        (&["crs", "pod", "list"], |command| matches!(command, Command::Pod(_))),
+        (&["crs", "image", "list"], |command| {
+            matches!(command, Command::Image(_))
+        }),
+        (&["crs", "pod", "list"], |command| {
+            matches!(command, Command::Pod(_))
+        }),
         (&["crs", "container", "list"], |command| {
             matches!(command, Command::Container(_))
         }),
-        (&["crs", "run", "busybox"], |command| matches!(command, Command::Run(_))),
-        (&["crs", "events"], |command| matches!(command, Command::Events(_))),
-        (&["crs", "stats"], |command| matches!(command, Command::Stats(_))),
+        (&["crs", "run", "busybox"], |command| {
+            matches!(command, Command::Run(_))
+        }),
+        (&["crs", "events"], |command| {
+            matches!(command, Command::Events(_))
+        }),
+        (&["crs", "stats"], |command| {
+            matches!(command, Command::Stats(_))
+        }),
         (&["crs", "metrics", "descriptors"], |command| {
             matches!(command, Command::Metrics(_))
         }),
         (&["crs", "recovery", "status"], |command| {
             matches!(command, Command::Recovery(_))
         }),
-        (&["crs", "gc", "candidates"], |command| matches!(command, Command::Gc(_))),
-        (&["crs", "debug", "network"], |command| matches!(command, Command::Debug(_))),
+        (&["crs", "gc", "candidates"], |command| {
+            matches!(command, Command::Gc(_))
+        }),
+        (&["crs", "debug", "network"], |command| {
+            matches!(command, Command::Debug(_))
+        }),
         (&["crs", "completion", "bash"], |command| {
             matches!(command, Command::Completion(_))
         }),
@@ -133,22 +173,17 @@ fn parses_top_level_command_groups() {
             panic!("failed to parse {argv:?}: {error}");
         });
 
-        assert!(assert_command(&args.command), "unexpected command for {argv:?}");
+        assert!(
+            assert_command(&args.command),
+            "unexpected command for {argv:?}"
+        );
     }
 }
 
 #[test]
 fn parses_pod_command_arguments() {
     let args = Args::try_parse_from([
-        "crs",
-        "pod",
-        "list",
-        "--id",
-        "pod1",
-        "--state",
-        "ready",
-        "--label",
-        "app=test",
+        "crs", "pod", "list", "--id", "pod1", "--state", "ready", "--label", "app=test",
     ])
     .expect("pod list filters should parse");
     let Command::Pod(pod) = args.command else {
@@ -212,7 +247,10 @@ fn parses_pod_create_arguments() {
     assert!(run.host_network);
     assert_eq!(run.dns_servers, vec!["1.1.1.1"]);
     assert_eq!(run.publish, vec!["8080:80"]);
-    assert_eq!(run.security.sandbox_seccomp.as_deref(), Some("runtime/default"));
+    assert_eq!(
+        run.security.sandbox_seccomp.as_deref(),
+        Some("runtime/default")
+    );
 }
 
 #[test]
@@ -255,7 +293,7 @@ fn parses_container_command_arguments() {
         "echo",
         "ok",
     ])
-        .expect("container exec command should parse");
+    .expect("container exec command should parse");
     let Command::Container(container) = args.command else {
         panic!("expected container command");
     };
@@ -307,9 +345,8 @@ fn parses_container_create_arguments() {
 
 #[test]
 fn parses_base_and_multitype_shortcut_args() {
-    let args =
-        Args::try_parse_from(["crs", "inspect", "--type", "image", "busybox:latest"])
-            .expect("inspect object type should parse");
+    let args = Args::try_parse_from(["crs", "inspect", "--type", "image", "busybox:latest"])
+        .expect("inspect object type should parse");
     let Command::Inspect(inspect) = args.command else {
         panic!("expected inspect command");
     };
@@ -325,9 +362,8 @@ fn parses_base_and_multitype_shortcut_args() {
     assert_eq!(stop.timeout, Some(10));
     assert_eq!(stop.target, "pod1");
 
-    let args =
-        Args::try_parse_from(["crs", "rm", "--force", "--type", "container", "container1"])
-            .expect("remove force should parse");
+    let args = Args::try_parse_from(["crs", "rm", "--force", "--type", "container", "container1"])
+        .expect("remove force should parse");
     let Command::Rm(remove) = args.command else {
         panic!("expected rm command");
     };
@@ -429,8 +465,8 @@ fn parses_image_commands_and_auth_args() {
     };
     assert_eq!(list.image.as_deref(), Some("busybox"));
 
-    let args = Args::try_parse_from(["crs", "image", "fs-info"])
-        .expect("image fs-info should parse");
+    let args =
+        Args::try_parse_from(["crs", "image", "fs-info"]).expect("image fs-info should parse");
     let Command::Image(image) = args.command else {
         panic!("expected image command");
     };
@@ -451,6 +487,79 @@ fn parses_run_command_arguments() {
         "always",
         "--exec-mode",
         "sync",
+        "--pod-name",
+        "sandbox1",
+        "--uid",
+        "uid1",
+        "--pod-attempt",
+        "2",
+        "--hostname",
+        "host1",
+        "--log-dir",
+        "/var/log/pods/sandbox1",
+        "--dns-server",
+        "1.1.1.1",
+        "--dns-search",
+        "svc.cluster.local",
+        "--dns-option",
+        "ndots:5",
+        "--publish",
+        "8080:80",
+        "--runtime-handler",
+        "runc",
+        "--cgroup-parent",
+        "/kubepods",
+        "--sysctl",
+        "net.ipv4.ip_forward=1",
+        "--host-network",
+        "--host-pid",
+        "--host-ipc",
+        "--userns",
+        "pod",
+        "--uid-map",
+        "0:100000:65536",
+        "--gid-map",
+        "0:100000:65536",
+        "--sandbox-seccomp",
+        "runtime/default",
+        "--sandbox-apparmor",
+        "localhost/crius",
+        "--sandbox-selinux",
+        "system_u:system_r:container_t:s0",
+        "--overhead",
+        "memory=16MiB",
+        "--pod-resource",
+        "cpu=100m",
+        "--container-attempt",
+        "3",
+        "--command",
+        "/bin/sh",
+        "--arg",
+        "-c",
+        "--workdir",
+        "/work",
+        "--env",
+        "A=B",
+        "--env-file",
+        "/tmp/env",
+        "--mount",
+        "type=bind,src=/x,dst=/y",
+        "--device",
+        "/dev/fuse",
+        "--cdi-device",
+        "vendor.com/device=name",
+        "--log-path",
+        "container.log",
+        "--memory",
+        "64MiB",
+        "--cpu-quota",
+        "100000",
+        "--cap-add",
+        "NET_ADMIN",
+        "--user",
+        "1000:1000",
+        "--seccomp",
+        "localhost/container.json",
         "busybox",
         "echo",
         "ok",
@@ -465,6 +574,74 @@ fn parses_run_command_arguments() {
     assert_eq!(run.pod.as_deref(), Some("pod1"));
     assert_eq!(run.pull, PullPolicyArg::Always);
     assert_eq!(run.exec_mode, ExecModeArg::Sync);
+    assert_eq!(run.pod_options.pod_name.as_deref(), Some("sandbox1"));
+    assert_eq!(run.pod_options.uid.as_deref(), Some("uid1"));
+    assert_eq!(run.pod_options.pod_attempt, Some(2));
+    assert_eq!(run.pod_options.hostname.as_deref(), Some("host1"));
+    assert_eq!(
+        run.pod_options.log_dir.as_deref(),
+        Some("/var/log/pods/sandbox1")
+    );
+    assert_eq!(run.pod_options.dns_servers, vec!["1.1.1.1"]);
+    assert_eq!(run.pod_options.dns_searches, vec!["svc.cluster.local"]);
+    assert_eq!(run.pod_options.dns_options, vec!["ndots:5"]);
+    assert_eq!(run.pod_options.publish, vec!["8080:80"]);
+    assert_eq!(run.pod_options.runtime_handler.as_deref(), Some("runc"));
+    assert_eq!(run.pod_options.cgroup_parent.as_deref(), Some("/kubepods"));
+    assert_eq!(run.pod_options.sysctls, vec!["net.ipv4.ip_forward=1"]);
+    assert!(run.pod_options.host_network);
+    assert!(run.pod_options.host_pid);
+    assert!(run.pod_options.host_ipc);
+    assert_eq!(run.pod_options.userns.as_deref(), Some("pod"));
+    assert_eq!(run.pod_options.uid_maps, vec!["0:100000:65536"]);
+    assert_eq!(run.pod_options.gid_maps, vec!["0:100000:65536"]);
+    assert_eq!(
+        run.pod_options.security.sandbox_seccomp.as_deref(),
+        Some("runtime/default")
+    );
+    assert_eq!(
+        run.pod_options.security.sandbox_apparmor.as_deref(),
+        Some("localhost/crius")
+    );
+    assert_eq!(
+        run.pod_options.security.sandbox_selinux.as_deref(),
+        Some("system_u:system_r:container_t:s0")
+    );
+    assert_eq!(run.pod_options.overhead, vec!["memory=16MiB"]);
+    assert_eq!(run.pod_options.pod_resources, vec!["cpu=100m"]);
+    assert_eq!(run.container_options.container_attempt, Some(3));
+    assert_eq!(run.container_options.commands, vec!["/bin/sh"]);
+    assert_eq!(run.container_options.args, vec!["-c"]);
+    assert_eq!(run.container_options.workdir.as_deref(), Some("/work"));
+    assert_eq!(run.container_options.env, vec!["A=B"]);
+    assert_eq!(run.container_options.env_files, vec!["/tmp/env"]);
+    assert_eq!(
+        run.container_options.mounts,
+        vec!["type=bind,src=/x,dst=/y"]
+    );
+    assert_eq!(run.container_options.devices, vec!["/dev/fuse"]);
+    assert_eq!(
+        run.container_options.cdi_devices,
+        vec!["vendor.com/device=name"]
+    );
+    assert_eq!(
+        run.container_options.log_path.as_deref(),
+        Some("container.log")
+    );
+    assert_eq!(
+        run.container_options.resources.memory.as_deref(),
+        Some("64MiB")
+    );
+    assert_eq!(run.container_options.resources.cpu_quota, Some(100000));
+    assert_eq!(run.container_options.security.cap_add, vec!["NET_ADMIN"]);
+    assert_eq!(
+        run.container_options.security.user.as_deref(),
+        Some("1000:1000")
+    );
+    assert_eq!(
+        run.container_options.security.seccomp.as_deref(),
+        Some("localhost/container.json")
+    );
     assert_eq!(run.image, "busybox");
     assert_eq!(run.command, vec!["echo", "ok"]);
 }
@@ -497,8 +674,8 @@ fn parses_remaining_command_groups() {
     assert!(!mode.dry_run);
     assert!(mode.execute);
 
-    let args = Args::try_parse_from(["crs", "debug", "rootless"])
-        .expect("debug rootless should parse");
+    let args =
+        Args::try_parse_from(["crs", "debug", "rootless"]).expect("debug rootless should parse");
     assert!(matches!(args.command, Command::Debug(_)));
 
     let args =
@@ -512,8 +689,8 @@ fn rejects_execute_mode_without_explicit_choice() {
         .expect_err("recovery repair requires dry-run or execute");
     assert_eq!(recovery_error.kind(), ErrorKind::MissingRequiredArgument);
 
-    let gc_error = Args::try_parse_from(["crs", "gc", "run"])
-        .expect_err("gc run requires dry-run or execute");
+    let gc_error =
+        Args::try_parse_from(["crs", "gc", "run"]).expect_err("gc run requires dry-run or execute");
     assert_eq!(gc_error.kind(), ErrorKind::MissingRequiredArgument);
 }
 
@@ -580,7 +757,14 @@ fn parses_every_public_command_minimal_arguments() {
         &["crs", "container", "exec-sync", "ctr", "--", "sh"],
         &["crs", "container", "attach", "ctr"],
         &["crs", "container", "stats"],
-        &["crs", "container", "checkpoint", "ctr", "--location", "/tmp/checkpoint"],
+        &[
+            "crs",
+            "container",
+            "checkpoint",
+            "ctr",
+            "--location",
+            "/tmp/checkpoint",
+        ],
         &["crs", "container", "update", "ctr"],
         &["crs", "container", "reopen-log", "ctr"],
         &["crs", "container", "logs", "ctr"],
@@ -616,14 +800,9 @@ fn parses_every_public_command_minimal_arguments() {
 
 #[test]
 fn rejects_mutually_exclusive_execute_modes() {
-    let recovery_error = Args::try_parse_from([
-        "crs",
-        "recovery",
-        "repair",
-        "--dry-run",
-        "--execute",
-    ])
-    .expect_err("recovery repair cannot be dry-run and execute");
+    let recovery_error =
+        Args::try_parse_from(["crs", "recovery", "repair", "--dry-run", "--execute"])
+            .expect_err("recovery repair cannot be dry-run and execute");
     assert_eq!(recovery_error.kind(), ErrorKind::ArgumentConflict);
 
     let gc_error = Args::try_parse_from(["crs", "gc", "run", "--dry-run", "--execute"])

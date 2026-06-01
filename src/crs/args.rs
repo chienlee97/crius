@@ -260,8 +260,14 @@ pub struct RuntimeArgs {
 #[derive(Debug, Subcommand)]
 pub enum RuntimeCommand {
     Config,
-    Update { #[arg(long)] pod_cidr: String },
-    Handlers { #[arg(long)] verbose: bool },
+    Update {
+        #[arg(long)]
+        pod_cidr: String,
+    },
+    Handlers {
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 #[derive(Debug, ClapArgs)]
@@ -290,14 +296,18 @@ pub struct PodArgs {
 #[derive(Debug, Subcommand)]
 pub enum PodCommand {
     List(PodListArgs),
-    Inspect { pod: String },
+    Inspect {
+        pod: String,
+    },
     Run(PodCreateArgs),
     Stop {
         pod: String,
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u32>,
     },
-    Remove { pod: String },
+    Remove {
+        pod: String,
+    },
     Stats(PodStatsArgs),
     Metrics,
     UpdateResources {
@@ -307,7 +317,11 @@ pub enum PodCommand {
         #[arg(long = "pod-resource")]
         pod_resource: Vec<String>,
     },
-    PortForward { pod: String, #[arg(long)] forward: Vec<String> },
+    PortForward {
+        pod: String,
+        #[arg(long)]
+        forward: Vec<String>,
+    },
 }
 
 #[derive(Debug, Default, ClapArgs)]
@@ -406,15 +420,21 @@ pub struct ContainerArgs {
 #[derive(Debug, Subcommand)]
 pub enum ContainerCommand {
     List(ContainerListArgs),
-    Inspect { id: String },
+    Inspect {
+        id: String,
+    },
     Create(ContainerCreateArgs),
-    Start { id: String },
+    Start {
+        id: String,
+    },
     Stop {
         id: String,
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u32>,
     },
-    Remove { id: String },
+    Remove {
+        id: String,
+    },
     Exec(ExecArgs),
     ExecSync(ExecArgs),
     Attach {
@@ -423,9 +443,17 @@ pub enum ContainerCommand {
         stream: StreamOptions,
     },
     Stats(ContainerStatsArgs),
-    Checkpoint { id: String, #[arg(long)] location: String },
-    Update { id: String },
-    ReopenLog { id: String },
+    Checkpoint {
+        id: String,
+        #[arg(long)]
+        location: String,
+    },
+    Update {
+        id: String,
+    },
+    ReopenLog {
+        id: String,
+    },
     Logs(ContainerLogsArgs),
 }
 
@@ -461,7 +489,7 @@ pub struct ContainerCreateOptions {
     pub attempt: Option<u32>,
     #[arg(long = "command")]
     pub commands: Vec<String>,
-    #[arg(long = "arg")]
+    #[arg(long = "arg", allow_hyphen_values = true)]
     pub args: Vec<String>,
     #[arg(long)]
     pub workdir: Option<String>,
@@ -582,8 +610,86 @@ pub struct RunArgs {
     pub pull: PullPolicyArg,
     #[arg(long, value_enum, default_value_t = ExecModeArg::Attach)]
     pub exec_mode: ExecModeArg,
+    #[command(flatten)]
+    pub pod_options: RunPodCreateOptions,
+    #[command(flatten)]
+    pub container_options: RunContainerCreateOptions,
     pub image: String,
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct RunPodCreateOptions {
+    #[arg(long = "pod-name")]
+    pub pod_name: Option<String>,
+    #[arg(long)]
+    pub uid: Option<String>,
+    #[arg(long = "pod-attempt")]
+    pub pod_attempt: Option<u32>,
+    #[arg(long)]
+    pub hostname: Option<String>,
+    #[arg(long)]
+    pub log_dir: Option<String>,
+    #[arg(long = "dns-server")]
+    pub dns_servers: Vec<String>,
+    #[arg(long = "dns-search")]
+    pub dns_searches: Vec<String>,
+    #[arg(long = "dns-option")]
+    pub dns_options: Vec<String>,
+    #[arg(long = "publish")]
+    pub publish: Vec<String>,
+    #[arg(long)]
+    pub runtime_handler: Option<String>,
+    #[arg(long)]
+    pub cgroup_parent: Option<String>,
+    #[arg(long = "sysctl")]
+    pub sysctls: Vec<String>,
+    #[arg(long)]
+    pub host_network: bool,
+    #[arg(long)]
+    pub host_pid: bool,
+    #[arg(long)]
+    pub host_ipc: bool,
+    #[arg(long)]
+    pub userns: Option<String>,
+    #[arg(long = "uid-map")]
+    pub uid_maps: Vec<String>,
+    #[arg(long = "gid-map")]
+    pub gid_maps: Vec<String>,
+    #[command(flatten)]
+    pub security: SandboxSecurityArgs,
+    #[arg(long = "overhead")]
+    pub overhead: Vec<String>,
+    #[arg(long = "pod-resource")]
+    pub pod_resources: Vec<String>,
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct RunContainerCreateOptions {
+    #[arg(long = "container-attempt")]
+    pub container_attempt: Option<u32>,
+    #[arg(long = "command")]
+    pub commands: Vec<String>,
+    #[arg(long = "arg", allow_hyphen_values = true)]
+    pub args: Vec<String>,
+    #[arg(long)]
+    pub workdir: Option<String>,
+    #[arg(long = "env")]
+    pub env: Vec<String>,
+    #[arg(long = "env-file")]
+    pub env_files: Vec<String>,
+    #[arg(long = "mount")]
+    pub mounts: Vec<String>,
+    #[arg(long = "device")]
+    pub devices: Vec<String>,
+    #[arg(long = "cdi-device")]
+    pub cdi_devices: Vec<String>,
+    #[arg(long)]
+    pub log_path: Option<String>,
+    #[command(flatten)]
+    pub resources: ContainerResourceArgs,
+    #[command(flatten)]
+    pub security: ContainerSecurityArgs,
 }
 
 #[derive(Debug, Default, ClapArgs)]
