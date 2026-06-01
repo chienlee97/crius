@@ -533,3 +533,100 @@ fn rejects_conflicting_auth_sources() {
 
     assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
 }
+
+#[test]
+fn parses_every_public_command_minimal_arguments() {
+    let commands: &[&[&str]] = &[
+        &["crs", "version"],
+        &["crs", "status"],
+        &["crs", "doctor"],
+        &["crs", "ps"],
+        &["crs", "pods"],
+        &["crs", "images"],
+        &["crs", "pull", "busybox"],
+        &["crs", "inspect", "target"],
+        &["crs", "logs", "ctr"],
+        &["crs", "exec", "ctr", "--", "sh"],
+        &["crs", "stop", "target"],
+        &["crs", "rm", "target"],
+        &["crs", "config", "show"],
+        &["crs", "config", "reload-status"],
+        &["crs", "runtime", "config"],
+        &["crs", "runtime", "update", "--pod-cidr", "10.244.0.0/16"],
+        &["crs", "runtime", "handlers"],
+        &["crs", "image", "list"],
+        &["crs", "image", "pull", "busybox"],
+        &["crs", "image", "inspect", "busybox"],
+        &["crs", "image", "remove", "busybox"],
+        &["crs", "image", "fs-info"],
+        &["crs", "image", "transfers"],
+        &["crs", "image", "config"],
+        &["crs", "pod", "list"],
+        &["crs", "pod", "inspect", "pod"],
+        &["crs", "pod", "run"],
+        &["crs", "pod", "stop", "pod"],
+        &["crs", "pod", "remove", "pod"],
+        &["crs", "pod", "stats"],
+        &["crs", "pod", "metrics"],
+        &["crs", "pod", "update-resources", "pod"],
+        &["crs", "pod", "port-forward", "pod", "--forward", "8080:80"],
+        &["crs", "container", "list"],
+        &["crs", "container", "inspect", "ctr"],
+        &["crs", "container", "create", "pod", "busybox"],
+        &["crs", "container", "start", "ctr"],
+        &["crs", "container", "stop", "ctr"],
+        &["crs", "container", "remove", "ctr"],
+        &["crs", "container", "exec", "ctr", "--", "sh"],
+        &["crs", "container", "exec-sync", "ctr", "--", "sh"],
+        &["crs", "container", "attach", "ctr"],
+        &["crs", "container", "stats"],
+        &["crs", "container", "checkpoint", "ctr", "--location", "/tmp/checkpoint"],
+        &["crs", "container", "update", "ctr"],
+        &["crs", "container", "reopen-log", "ctr"],
+        &["crs", "container", "logs", "ctr"],
+        &["crs", "run", "busybox"],
+        &["crs", "events"],
+        &["crs", "stats"],
+        &["crs", "metrics", "descriptors"],
+        &["crs", "metrics", "scrape"],
+        &["crs", "recovery", "status"],
+        &["crs", "recovery", "check"],
+        &["crs", "recovery", "repair", "--dry-run"],
+        &["crs", "gc", "candidates"],
+        &["crs", "gc", "run", "--dry-run"],
+        &["crs", "debug", "network"],
+        &["crs", "debug", "runtime"],
+        &["crs", "debug", "shims"],
+        &["crs", "debug", "nri"],
+        &["crs", "debug", "security"],
+        &["crs", "debug", "cgroups"],
+        &["crs", "debug", "streaming"],
+        &["crs", "debug", "metrics"],
+        &["crs", "debug", "tracing"],
+        &["crs", "debug", "rootless"],
+        &["crs", "completion", "bash"],
+    ];
+
+    for argv in commands {
+        Args::try_parse_from(*argv).unwrap_or_else(|error| {
+            panic!("failed to parse {argv:?}: {error}");
+        });
+    }
+}
+
+#[test]
+fn rejects_mutually_exclusive_execute_modes() {
+    let recovery_error = Args::try_parse_from([
+        "crs",
+        "recovery",
+        "repair",
+        "--dry-run",
+        "--execute",
+    ])
+    .expect_err("recovery repair cannot be dry-run and execute");
+    assert_eq!(recovery_error.kind(), ErrorKind::ArgumentConflict);
+
+    let gc_error = Args::try_parse_from(["crs", "gc", "run", "--dry-run", "--execute"])
+        .expect_err("gc run cannot be dry-run and execute");
+    assert_eq!(gc_error.kind(), ErrorKind::ArgumentConflict);
+}
