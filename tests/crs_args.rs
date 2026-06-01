@@ -1,5 +1,5 @@
 use clap::{error::ErrorKind, Parser};
-use crius::crs::args::{Args, Command};
+use crius::crs::args::{Args, Command, ObjectType, StopObjectType};
 use std::time::Duration;
 
 #[test]
@@ -52,10 +52,9 @@ fn parses_global_options_before_command() {
 
 #[test]
 fn parses_global_options_after_command() {
-    let args = Args::try_parse_from(["crs", "version", "--timeout", "5s", "--debug"])
+    let args = Args::try_parse_from(["crs", "version", "--debug"])
         .expect("global options should parse after the command");
 
-    assert_eq!(args.timeout, Duration::from_secs(5));
     assert!(args.debug);
 }
 
@@ -132,4 +131,35 @@ fn parses_top_level_command_groups() {
 
         assert!(assert_command(&args.command), "unexpected command for {argv:?}");
     }
+}
+
+#[test]
+fn parses_base_and_multitype_shortcut_args() {
+    let args =
+        Args::try_parse_from(["crs", "inspect", "--type", "image", "busybox:latest"])
+            .expect("inspect object type should parse");
+    let Command::Inspect(inspect) = args.command else {
+        panic!("expected inspect command");
+    };
+    assert_eq!(inspect.object_type, Some(ObjectType::Image));
+    assert_eq!(inspect.target, "busybox:latest");
+
+    let args = Args::try_parse_from(["crs", "stop", "--type", "pod", "--timeout", "10", "pod1"])
+        .expect("stop object type and timeout should parse");
+    let Command::Stop(stop) = args.command else {
+        panic!("expected stop command");
+    };
+    assert_eq!(stop.object_type, Some(StopObjectType::Pod));
+    assert_eq!(stop.timeout, Some(10));
+    assert_eq!(stop.target, "pod1");
+
+    let args =
+        Args::try_parse_from(["crs", "rm", "--force", "--type", "container", "container1"])
+            .expect("remove force should parse");
+    let Command::Rm(remove) = args.command else {
+        panic!("expected rm command");
+    };
+    assert!(remove.force);
+    assert_eq!(remove.object_type, Some(ObjectType::Container));
+    assert_eq!(remove.target, "container1");
 }

@@ -11,7 +11,7 @@ pub struct Args {
     pub address: String,
     #[arg(long, default_value = "5s", value_parser = parse_duration, global = true)]
     pub connect_timeout: Duration,
-    #[arg(long, default_value = "30s", value_parser = parse_duration, global = true)]
+    #[arg(long, default_value = "30s", value_parser = parse_duration)]
     pub timeout: Duration,
     #[arg(long, global = true)]
     pub debug: bool,
@@ -126,6 +126,8 @@ pub enum StopObjectType {
 pub struct StopArgs {
     #[arg(long = "type", value_enum)]
     pub object_type: Option<StopObjectType>,
+    #[arg(long, id = "stop-timeout", value_name = "SECONDS")]
+    pub timeout: Option<u32>,
     pub target: String,
 }
 
