@@ -1,5 +1,13 @@
-use std::{future::Future, time::Duration};
+use std::{future::Future, path::Path, time::Duration};
 
+use hyper::Uri;
+use tokio::net::UnixStream;
+use tonic::transport::{Channel, Endpoint as TonicEndpoint};
+use tower::service_fn;
+
+use crate::proto::runtime::v1::{
+    image_service_client::ImageServiceClient, runtime_service_client::RuntimeServiceClient,
+};
 use crate::crs::{context::CliContext, error::CliError, parsers::Endpoint};
 
 #[derive(Clone, Debug)]
@@ -8,6 +16,8 @@ pub(crate) struct CrsClient {
     endpoint_display: String,
     connect_timeout: Duration,
     rpc_timeout: Duration,
+    runtime: Option<RuntimeServiceClient<Channel>>,
+    image: Option<ImageServiceClient<Channel>>,
 }
 
 impl CrsClient {
@@ -20,7 +30,32 @@ impl CrsClient {
             endpoint_display,
             connect_timeout: ctx.connect_timeout(),
             rpc_timeout: ctx.rpc_timeout(),
+            runtime: None,
+            image: None,
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn connect(ctx: &CliContext) -> Result<Self, CliError> {
+        let mut client = Self::new(ctx);
+        let channel = client.connect_channel().await?;
+        client.runtime = Some(RuntimeServiceClient::new(channel.clone()));
+        client.image = Some(ImageServiceClient::new(channel));
+        Ok(client)
+    }
+
+    #[allow(dead_code)]
+    async fn connect_channel(&self) -> Result<Channel, CliError> {
+        let connect = async {
+            match self.endpoint_kind() {
+                Endpoint::Unix(path) => connect_unix_channel(path).await,
+                Endpoint::Tcp(uri) => connect_tcp_channel(uri).await,
+            }
+        };
+
+        tokio::time::timeout(self.connect_timeout, connect)
+            .await
+            .map_err(|_| CliError::timeout("connection timed out", self.endpoint()))?
     }
 
     pub(crate) fn endpoint(&self) -> &str {
@@ -56,6 +91,35 @@ impl CrsClient {
     pub(crate) fn diagnostics_unavailable(&self) -> CliError {
         CliError::diagnostics_unavailable(self.endpoint())
     }
+}
+
+async fn connect_unix_channel(path: &str) -> Result<Channel, CliError> {
+    if !Path::new(path).exists() {
+        return Err(CliError::daemon_unavailable(
+            format!("unix://{path}"),
+            format!("socket {path} does not exist"),
+        ));
+    }
+
+    let path = path.to_string();
+    TonicEndpoint::try_from("http://[::]:50051")
+        .map_err(|source| CliError::internal(format!("failed to build unix channel: {source}")))?
+        .connect_with_connector(service_fn(move |_uri: Uri| {
+            let path = path.clone();
+            async move { UnixStream::connect(path).await }
+        }))
+        .await
+        .map_err(|source| {
+            CliError::daemon_unavailable("unix socket", format!("failed to connect: {source}"))
+        })
+}
+
+async fn connect_tcp_channel(uri: &str) -> Result<Channel, CliError> {
+    TonicEndpoint::from_shared(uri.to_string())
+        .map_err(|source| CliError::internal(format!("invalid TCP endpoint {uri}: {source}")))?
+        .connect()
+        .await
+        .map_err(|source| CliError::daemon_unavailable(uri, format!("failed to connect: {source}")))
 }
 
 #[cfg(test)]
@@ -118,5 +182,28 @@ mod tests {
         let error = client.diagnostics_unavailable();
 
         assert!(error.to_string().contains("diagnostics service is not available"));
+    }
+
+    #[tokio::test]
+    async fn missing_unix_socket_is_daemon_unavailable() {
+        let socket_path = tempfile::tempdir()
+            .expect("tempdir should be created")
+            .path()
+            .join("missing.sock");
+        let args = Args::try_parse_from([
+            "crs",
+            "--address",
+            socket_path.to_str().expect("path should be utf8"),
+            "version",
+        ])
+        .expect("args should parse");
+        let ctx = CliContext::from_args(&args).expect("context should build");
+
+        let error = CrsClient::connect(&ctx)
+            .await
+            .expect_err("missing socket should fail");
+
+        assert_eq!(error.exit_status().code(), 125);
+        assert!(error.to_string().contains("does not exist"));
     }
 }

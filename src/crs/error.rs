@@ -6,6 +6,7 @@ pub enum ExitStatus {
     General,
     Usage,
     Timeout,
+    Unavailable,
 }
 
 impl ExitStatus {
@@ -15,6 +16,7 @@ impl ExitStatus {
             Self::General => 1,
             Self::Usage => 2,
             Self::Timeout => 124,
+            Self::Unavailable => 125,
         }
     }
 }
@@ -54,6 +56,10 @@ pub enum CliError {
     Timeout { message: String, endpoint: String },
     #[error("diagnostics service is not available from this crius daemon at {endpoint}")]
     DiagnosticsUnavailable { endpoint: String },
+    #[error("daemon is unavailable at {endpoint}: {message}")]
+    DaemonUnavailable { endpoint: String, message: String },
+    #[error("{message}")]
+    Internal { message: String },
 }
 
 impl CliError {
@@ -76,11 +82,29 @@ impl CliError {
         }
     }
 
+    pub(crate) fn daemon_unavailable(
+        endpoint: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::DaemonUnavailable {
+            endpoint: endpoint.into(),
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self::Internal {
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn exit_status(&self) -> ExitStatus {
         match self {
             Self::NotImplemented { .. } => ExitStatus::General,
             Self::Timeout { .. } => ExitStatus::Timeout,
             Self::DiagnosticsUnavailable { .. } => ExitStatus::General,
+            Self::DaemonUnavailable { .. } => ExitStatus::Unavailable,
+            Self::Internal { .. } => ExitStatus::General,
         }
     }
 
