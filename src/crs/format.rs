@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::crs::{args::OutputArg, ids::truncate_field};
 
@@ -158,6 +159,33 @@ pub(crate) fn format_bool(value: bool) -> &'static str {
         "true"
     } else {
         "false"
+    }
+}
+
+pub(crate) fn format_unix_nanos(unix_nanos: i64, now: SystemTime) -> String {
+    let timestamp = if unix_nanos >= 0 {
+        UNIX_EPOCH + Duration::from_nanos(unix_nanos as u64)
+    } else {
+        UNIX_EPOCH
+    };
+
+    let age = now.duration_since(timestamp).unwrap_or_default();
+    if age < Duration::from_secs(24 * 60 * 60) {
+        return format_relative_duration(age);
+    }
+
+    let seconds = unix_nanos.div_euclid(1_000_000_000).max(0) as u64;
+    chrono::DateTime::<chrono::Local>::from(UNIX_EPOCH + Duration::from_secs(seconds))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+fn format_relative_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds {
+        0..=59 => format!("{seconds}s ago"),
+        60..=3_599 => format!("{}m ago", seconds / 60),
+        _ => format!("{}h ago", seconds / 3_600),
     }
 }
 
@@ -415,6 +443,18 @@ mod tests {
         assert_eq!(format_cpu_millis(125_000_000), "125m");
         assert_eq!(format_bool(true), "true");
         assert_eq!(format_bool(false), "false");
+    }
+
+    #[test]
+    fn formats_times() {
+        let now = UNIX_EPOCH + Duration::from_secs(3_600);
+
+        assert_eq!(format_unix_nanos(3_590_000_000_000, now), "10s ago");
+        assert_eq!(format_unix_nanos(3_000_000_000_000, now), "10m ago");
+        assert_eq!(format_unix_nanos(0, now), "1h ago");
+
+        let old_now = UNIX_EPOCH + Duration::from_secs(3 * 24 * 60 * 60);
+        assert!(format_unix_nanos(0, old_now).starts_with("1970-"));
     }
 
     #[test]
