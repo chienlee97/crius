@@ -1,5 +1,5 @@
 [Unit]
-Description=CRIUS Container Runtime
+Description=crius CRI container runtime
 Wants=network-online.target
 After=network-online.target dbus.service
 
@@ -13,8 +13,8 @@ KillMode=process
 StateDirectory=crius
 LogsDirectory=crius
 
-# Having non-zero Limit*s causes performance problems due to accounting overhead
-# in the kernel. We recommend using cgroups to do container-local accounting.
+# Keep process limits out of the daemon accounting path; use cgroups for
+# container-local accounting.
 LimitNPROC=infinity
 LimitCORE=infinity
 TasksMax=infinity

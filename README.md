@@ -1,73 +1,114 @@
 # crius
 
-`crius` 是一个使用 Rust 实现的 Kubernetes Container Runtime Interface（CRI）运行时。它提供 CRI v1 gRPC 服务，并负责把 kubelet 的 Pod / Container 请求编排到 OCI runtime、镜像存储、CNI 网络、流式连接与本地状态恢复链路。
+English | [中文](README.zh-CN.md)
 
-项目当前适合以下场景：
+`crius` is a Rust implementation of the Kubernetes Container Runtime Interface
+(CRI). It exposes CRI v1 `RuntimeService` and `ImageService` gRPC APIs, and
+coordinates OCI runtime execution, image storage, CNI networking, streaming I/O,
+local persistence, restart recovery, metrics, tracing, NRI, and rootless-related
+paths.
 
-- CRI / OCI / kubelet 协议研究
-- 运行时功能验证与集成测试
-- 面向 Rust 的容器运行时实现探索
+The project is currently best suited for:
 
-当前不建议直接作为生产集群默认运行时使用。公开发布前，仍建议补充长期稳定性测试、异常恢复回归、Kubernetes 版本兼容矩阵与更完整的运维文档。
+- CRI, OCI, kubelet, and container runtime research
+- Runtime feature validation and integration testing
+- Exploring a Rust implementation of a Kubernetes CRI runtime
 
-## 功能概览
+`crius` is not positioned as a production replacement for established container
+runtimes. Production evaluation should add a Kubernetes compatibility matrix,
+long-running stability tests, failure recovery regressions, security review, and
+operational runbooks.
 
-- CRI v1 `RuntimeService` 与 `ImageService`
-- 基于 `runc` 的 Pod Sandbox / Container 生命周期管理
-- 流式 `exec`、`exec_sync`、`attach`、`port-forward`
-- 基于 CNI 的 Pod 网络配置与 hostPort 处理
-- `crius-shim` 容器进程、IO 与退出状态管理
-- 镜像拉取、查询、删除与镜像文件系统统计
-- SQLite 持久化与守护进程重启恢复
-- NRI 集成与插件生命周期接线
-- 独立 metrics 端点与 tracing 导出入口
+## Status
 
-## 项目状态
+The current package version is `0.1.0`. Public users should treat this
+repository as an experimental runtime implementation:
 
-`crius` 当前版本号为 `0.1.0`，整体状态更接近实验性实现而非稳定发行版。公开仓库使用者应默认理解为：
+- API behavior and configuration fields may still change.
+- Defaults are oriented toward development, debugging, and node validation.
+- Several advanced paths are wired but still need broader real-cluster
+  validation.
 
-- API 行为和配置字段仍可能调整
-- 默认配置偏向开发与调试，而不是生产硬化
-- 某些能力虽然已经接线，但仍需要更多真实环境验证
+## Features
 
-## 支持范围
+- CRI v1 `RuntimeService` and `ImageService`
+- Pod sandbox and container lifecycle management through OCI runtime backends
+- Default `runc` backend with runtime-handler-specific configuration
+- Optional `wasm-direct` backend wiring for handler experiments
+- `crius-shim` for process, I/O, attach socket, task RPC, and exit coordination
+- `exec`, `exec_sync`, `attach`, and `port-forward` streaming
+- CNI networking, hostPort handling, PodCIDR template rendering, and CNI
+  teardown timeouts
+- Image pull, local metadata, removal, filesystem stats, registry auth,
+  signature and decryption configuration, pinned images, and image volumes
+- Internal snapshotters and external snapshotter configuration references
+- SQLite persistence, daemon restart recovery, and orphan artifact cleanup
+- CRI checkpoint and restore paths backed by CRIU-capable runtimes
+- NRI plugin registration, lifecycle dispatch, adjustment merge, built-in
+  validation, unsolicited update, eviction, and synchronize support
+- Rootless configuration resolution, rootless network helpers, and rootless
+  status reporting
+- CRI events, pod metrics, resource stats, metrics endpoint, and tracing export
 
-当前文档与实现主要面向以下范围：
+## Supported Scope
 
-- Linux 主机环境
-- 基于 `runc` 的 OCI runtime 路径
-- 以 `root` 权限运行的节点级 CRI 守护进程
-- 面向开发验证、集成测试与实现研究的使用场景
+The current implementation and documentation focus on:
 
-当前不承诺：
+- Linux hosts
+- Source-based builds and validation
+- `runc` as the default OCI runtime path
+- Rootful node-level daemon integration with kubelet
+- Development, integration testing, and runtime implementation research
 
-- 生产级 SLA 或长期兼容性保证
-- 完整的 Kubernetes 版本兼容矩阵
-- 多发行版、异构运行时或大规模集群环境的充分验证
+The project does not currently claim:
 
-相关技术说明见：
+- Production SLA or long-term compatibility guarantees
+- A published Kubernetes version compatibility matrix
+- Complete distribution packaging
+- Broad validation across large clusters, heterogeneous runtimes, or host
+  distributions
 
-- [架构设计](docs/architecture.md)
-- [kubeadm / kubelet 接入](docs/kubeadm.md)
-- [配置参考](docs/config-matrix.md)
+## Repository Layout
 
-## 依赖与运行前提
+| Path | Description |
+| --- | --- |
+| `src/main.rs` | Daemon entrypoint, CLI, configuration loading, service assembly |
+| `src/server/` | CRI `RuntimeService`, lifecycle, status, stats, events, recovery |
+| `src/image/` | CRI `ImageService`, registry pull, local image metadata, image storage |
+| `src/runtime/` | Runtime backend abstraction, `runc`, `wasm-direct`, shim manager |
+| `src/shim/` | `crius-shim` implementation |
+| `src/pod/` | Pod sandbox state and pause container handling |
+| `src/network/` | CNI, netns, hostPort, rootless network helpers |
+| `src/streaming/` | HTTP streaming server for exec, attach, and port-forward |
+| `src/storage/` | SQLite persistence and runtime state recovery |
+| `src/nri/` | NRI manager, transport, conversion, merge, adjustment, domain logic |
+| `src/security/` | seccomp, AppArmor, SELinux, CDI, devices, resource classes |
+| `proto/` | CRI, NRI, and protobuf inputs |
+| `tests/` | Integration tests and release gates |
 
-建议在 Linux 主机上使用，并准备以下依赖：
+## Prerequisites
 
-- Rust 稳定版工具链
+Recommended host dependencies:
+
+- Linux
+- Rust stable toolchain
 - `runc`
 - `protobuf-compiler`
-- `zlib-devel`
+- `zlib-devel` or the distribution equivalent
 - `tar`
 - CNI plugins
-- 可选：`crictl`
+- Optional: `crictl`, `kubelet`, `kubeadm`
+- Optional for checkpoint/restore: `criu` and a runtime with CRIU support
+- Optional for rootless validation: `newuidmap`, `newgidmap`, `slirp4netns` or
+  `pasta`, and `fuse-overlayfs`
 
-多数真实运行路径以及部分测试需要 `root` 权限。
+Most real runtime, mount, CNI, cgroup, and kubelet integration paths require
+root privileges.
 
-## 构建
+## Build
 
-仓库当前使用 `vendor/` 依赖，并包含补丁检查与应用逻辑。首次构建推荐执行：
+The repository uses vendored dependencies through `.cargo/config.toml`. Some
+vendored crates need local patches before a complete build.
 
 ```bash
 make check-patch
@@ -75,48 +116,55 @@ make apply-patch
 cargo build --features shim --bins
 ```
 
-如果只想做一次基础构建，也可以直接运行：
+Standard project build:
 
 ```bash
 make build
 ```
 
-## 快速开始
+`make build` currently builds the default `crius` binary. Use
+`cargo build --features shim --bins` when you also need `crius-shim`.
 
-### 1. 构建二进制
+## Quick Start
+
+Build daemon and shim:
 
 ```bash
 cargo build --features shim --bins
 ```
 
-### 2. 生成配置文件
+Install on a validation node:
 
-推荐直接导出当前版本内置默认配置，而不是手工复制旧样例：
+```bash
+sudo install -Dm755 target/debug/crius /usr/bin/crius
+sudo install -Dm755 target/debug/crius-shim /usr/bin/crius-shim
+sudo install -Dm644 crius.service /etc/systemd/system/crius.service
+```
+
+Export configuration from the current binary:
 
 ```bash
 sudo mkdir -p /etc/crius
-sudo ./target/debug/crius --write-default-config /etc/crius/crius.conf
+sudo /usr/bin/crius --write-default-config /etc/crius/crius.conf
 ```
 
-也可以先打印到终端查看：
+Review `/etc/crius/crius.conf` before connecting kubelet. Pay special attention
+to runtime paths, shim path, CNI paths, pause image, and cgroup driver.
+
+Start the service:
 
 ```bash
-./target/debug/crius --dump-default-config
+sudo systemctl daemon-reload
+sudo systemctl enable --now crius
 ```
 
-### 3. 启动服务
-
-```bash
-sudo ./target/debug/crius --config /etc/crius/crius.conf
-```
-
-默认 CRI socket 为：
+Default CRI endpoint:
 
 ```text
 unix:///run/crius/crius.sock
 ```
 
-### 4. 用 `crictl` 验证
+Validate with `crictl`:
 
 ```bash
 sudo crictl --runtime-endpoint unix:///run/crius/crius.sock version
@@ -124,73 +172,93 @@ sudo crictl --runtime-endpoint unix:///run/crius/crius.sock info
 sudo crictl --runtime-endpoint unix:///run/crius/crius.sock images
 ```
 
-## 部署到节点
+## Configuration
 
-[docs/kubeadm.md](docs/kubeadm.md) 说明了 `crius` 接入 kubelet 与 kubeadm 的基本流程，覆盖：
+Configuration precedence:
 
-- 二进制与 systemd 安装方式
-- 推荐节点配置
-- kubelet `--container-runtime-endpoint`
-- `kubeadm init` / `kubeadm join`
-- `RuntimeClass` 与 runtime handler
-- 常见排障项
-
-## 文档
-
-| 文档 | 说明 |
-| --- | --- |
-| [docs/architecture.md](docs/architecture.md) | 整体架构、主链路与设计边界 |
-| [docs/kubeadm.md](docs/kubeadm.md) | kubelet / kubeadm 节点接入 |
-| [docs/config-matrix.md](docs/config-matrix.md) | 配置优先级、重载策略与关键字段参考 |
-| [docs/nri.md](docs/nri.md) | NRI 能力、配置与排障 |
-
-## 代码布局
-
-| 路径 | 说明 |
-| --- | --- |
-| `src/main.rs` | 守护进程入口与服务装配 |
-| `src/server/` | CRI `RuntimeService` 实现 |
-| `src/image/` | CRI `ImageService` 实现 |
-| `src/runtime/` | OCI / `runc` 集成、bundle 与 shim 协作 |
-| `src/pod/` | Pod Sandbox 管理 |
-| `src/network/` | CNI 与 hostPort 处理 |
-| `src/streaming/` | `exec` / `attach` / `port-forward` 流式服务 |
-| `src/storage/` | SQLite 持久化与恢复 |
-| `src/nri/` | NRI manager、transport、merge、adjust |
-| `src/shim/` | `crius-shim` 实现 |
-| `tests/` | 集成测试 |
-
-## 开发与验证
-
-基础命令：
-
-```bash
-cargo fmt
-cargo test
-make test
+```text
+CLI > environment variables > configuration file > built-in defaults
 ```
 
-说明：
+Not every field has a CLI or environment override. Exact defaults and field
+names are defined by the current binary:
 
-- `cargo test` 主要覆盖单元测试与集成测试。
-- `make test` 会做一次基础的 `crictl version` 联通性验证。
-- 涉及真实 runtime、CNI、挂载、网络命名空间的路径通常需要 root 环境。
+```bash
+crius --dump-default-config
+crius --write-default-config /etc/crius/crius.conf
+```
 
-## 已知边界
+The repository [crius.conf](crius.conf) is a curated node-validation sample.
 
-- 当前默认围绕 Linux + `runc` 路径设计
-- 节点部署流程仍以源码构建为主，尚未提供稳定发行包
-- 文档已按公开仓库标准重构，但不代表所有能力都已完成生产级验证
+## Kubernetes Integration
 
-## 生产边界
+See [docs/en/kubeadm.md](docs/en/kubeadm.md) for the full kubelet and kubeadm
+flow. The kubelet runtime endpoint is:
 
-在当前阶段，`crius` 更适合作为开发与验证项目，而不是直接替代成熟生产运行时。对于任何面向生产的评估，至少还应补充以下工作：
+```text
+unix:///run/crius/crius.sock
+```
 
-- Kubernetes 版本兼容矩阵
-- 长时间稳定性与资源压力测试
-- 异常退出、节点重启与状态恢复回归
-- 安全基线、审计与运维流程验证
+kubeadm init example:
+
+```bash
+sudo kubeadm init --cri-socket unix:///run/crius/crius.sock
+```
+
+kubeadm join example:
+
+```bash
+sudo kubeadm join <control-plane>:6443 --token <token> \
+  --discovery-token-ca-cert-hash <hash> \
+  --cri-socket unix:///run/crius/crius.sock
+```
+
+## Development And Validation
+
+Common commands:
+
+```bash
+cargo fmt --check
+cargo test
+make release-gate
+```
+
+Additional gated tests are available when the environment has the required
+external dependencies:
+
+```bash
+make crictl-smoke
+make kubelet-smoke
+make fault-injection
+make release-soak
+```
+
+`make test` starts a local daemon on `unix:///tmp/crius.sock` and runs a basic
+`crictl version` smoke test.
+
+## Documentation
+
+| Document | Description |
+| --- | --- |
+| [docs/en/architecture.md](docs/en/architecture.md) | Architecture, module boundaries, and core request flows |
+| [docs/en/config-matrix.md](docs/en/config-matrix.md) | Configuration precedence, reload policy, and important fields |
+| [docs/en/kubeadm.md](docs/en/kubeadm.md) | kubelet and kubeadm node integration |
+| [docs/en/nri.md](docs/en/nri.md) | NRI configuration, lifecycle, adjustments, validators, and operations |
+| [docs/en/rootless.md](docs/en/rootless.md) | Rootless configuration, behavior, limitations, and validation |
+| [docs/en/checkpoint-restore.md](docs/en/checkpoint-restore.md) | CRI checkpoint and restore behavior |
+
+Chinese documentation is available under [docs/zh](docs/zh/architecture.md).
+
+## Known Boundaries
+
+- The default execution path is Linux + `runc`.
+- Deployment is still source-build oriented.
+- The sample systemd unit is suitable for validation nodes and should be
+  reviewed against production security baselines before production use.
+- Rootless mode has explicit limitations and is not a direct replacement for
+  rootful kubelet integration.
+- Checkpoint/restore depends on host, CRIU, and runtime support.
 
 ## License
 
-项目采用 [Apache-2.0](LICENSE) 许可证。
+`crius` is licensed under [Apache-2.0](LICENSE).
