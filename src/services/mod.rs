@@ -1,7 +1,9 @@
+pub mod diagnostics;
 pub mod event;
 pub mod health;
 pub mod introspection;
 
+pub use diagnostics::{DiagnosticsServiceImpl, DiagnosticsState};
 pub use event::{EventService, InternalEvent, InternalEventSeverity, LedgerInternalEventSink};
 pub use health::{
     HealthCondition, HealthService, InternalHealthCondition, RecoveryLedgerHealthSummary,
