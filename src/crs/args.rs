@@ -1,21 +1,25 @@
+use std::time::Duration;
+
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+
+use crate::crs::parsers::{parse_duration, DEFAULT_ENDPOINT};
 
 #[derive(Debug, Parser)]
 #[command(name = "crs", version, about = "Local command-line client for crius")]
 pub struct Args {
-    #[arg(long, default_value = "unix:///run/crius/crius.sock")]
+    #[arg(long, env = "CRIUS_ADDRESS", default_value = DEFAULT_ENDPOINT, global = true)]
     pub address: String,
-    #[arg(long, default_value = "5s")]
-    pub connect_timeout: String,
-    #[arg(long, default_value = "30s")]
-    pub timeout: String,
-    #[arg(long)]
+    #[arg(long, default_value = "5s", value_parser = parse_duration, global = true)]
+    pub connect_timeout: Duration,
+    #[arg(long, default_value = "30s", value_parser = parse_duration, global = true)]
+    pub timeout: Duration,
+    #[arg(long, global = true)]
     pub debug: bool,
-    #[arg(long, value_enum, default_value_t = OutputArg::Table)]
+    #[arg(long, value_enum, default_value_t = OutputArg::Table, global = true)]
     pub output: OutputArg,
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub quiet: bool,
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_trunc: bool,
     #[command(subcommand)]
     pub command: Command,

@@ -1,10 +1,11 @@
 use crate::crs::args::{Args, OutputArg};
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub(crate) struct CliContext {
     endpoint: String,
-    connect_timeout: String,
-    rpc_timeout: String,
+    connect_timeout: Duration,
+    rpc_timeout: Duration,
     output: OutputArg,
     quiet: bool,
     no_trunc: bool,
@@ -33,13 +34,13 @@ impl CliContext {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn connect_timeout(&self) -> &str {
-        &self.connect_timeout
+    pub(crate) fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
     }
 
     #[allow(dead_code)]
-    pub(crate) fn rpc_timeout(&self) -> &str {
-        &self.rpc_timeout
+    pub(crate) fn rpc_timeout(&self) -> Duration {
+        self.rpc_timeout
     }
 
     #[allow(dead_code)]
