@@ -37,8 +37,14 @@ where
         }
     };
 
-    let ctx = CliContext::from_args(&args);
-    let client = CrsClient::new(ctx.endpoint());
+    let ctx = match CliContext::from_args(&args) {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return CommandResult::failure(ExitStatus::Usage);
+        }
+    };
+    let client = CrsClient::new(ctx.endpoint_display());
 
     match commands::dispatch(&ctx, &client, args.command).await {
         Ok(result) => result,
