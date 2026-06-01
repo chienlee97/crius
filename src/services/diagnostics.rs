@@ -7,8 +7,9 @@ use crate::proto::diagnostics::v1::{
     ContentGcRequest, ContentGcResponse, EffectiveConfigRequest, EffectiveConfigResponse,
     ImageTransfersRequest, ImageTransfersResponse, NriStatusRequest, NriStatusResponse,
     RecoveryCheckRequest, RecoveryCheckResponse, RecoveryStatusRequest, RecoveryStatusResponse,
-    RuntimeHandlersRequest, RuntimeHandlersResponse, SecurityStatusRequest, SecurityStatusResponse,
-    ServerInfoRequest, ServerInfoResponse, ShimStatusRequest, ShimStatusResponse,
+    RuntimeHandlerInfo, RuntimeHandlersRequest, RuntimeHandlersResponse, SecurityStatusRequest,
+    SecurityStatusResponse, ServerInfoRequest, ServerInfoResponse, ShimStatusRequest,
+    ShimStatusResponse,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -21,6 +22,8 @@ pub struct DiagnosticsState {
     config_json: String,
     redacted_config_json: String,
     redacted_fields: Vec<String>,
+    runtime_handlers: Vec<RuntimeHandlerInfo>,
+    runtime_handler_warnings: Vec<String>,
 }
 
 impl DiagnosticsState {
@@ -43,6 +46,7 @@ impl DiagnosticsState {
         redact_sensitive_config(&mut redacted_config, "", &mut redacted_fields);
         let redacted_config_json =
             serde_json::to_string(&redacted_config).unwrap_or_else(|_| "{}".into());
+        let (runtime_handlers, runtime_handler_warnings) = runtime_handlers_from_config(config);
 
         Self {
             version: version.into(),
@@ -53,6 +57,8 @@ impl DiagnosticsState {
             config_json,
             redacted_config_json,
             redacted_fields,
+            runtime_handlers,
+            runtime_handler_warnings,
         }
     }
 }
@@ -115,7 +121,14 @@ impl DiagnosticsService for DiagnosticsServiceImpl {
         &self,
         _request: Request<RuntimeHandlersRequest>,
     ) -> Result<Response<RuntimeHandlersResponse>, Status> {
-        Err(unimplemented("RuntimeHandlers"))
+        let mut handlers = self.state.runtime_handlers.clone();
+        for handler in &mut handlers {
+            handler
+                .warnings
+                .extend(self.state.runtime_handler_warnings.clone());
+        }
+
+        Ok(Response::new(RuntimeHandlersResponse { handlers }))
     }
 
     async fn image_transfers(
@@ -211,6 +224,32 @@ fn is_sensitive_key(key: &str) -> bool {
         || key.contains("auth")
 }
 
+fn runtime_handlers_from_config(
+    config: &crate::config::Config,
+) -> (Vec<RuntimeHandlerInfo>, Vec<String>) {
+    match config.runtime.resolved_runtimes() {
+        Ok(resolved) => {
+            let mut handlers = resolved
+                .into_iter()
+                .map(|(name, handler)| RuntimeHandlerInfo {
+                    name,
+                    runtime_type: handler.backend,
+                    runtime_path: handler.runtime_path,
+                    runtime_config_path: handler.runtime_config_path,
+                    features: vec![format!("snapshotter={}", handler.snapshotter)],
+                    warnings: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            handlers.sort_by(|left, right| left.name.cmp(&right.name));
+            (handlers, Vec::new())
+        }
+        Err(err) => (
+            Vec::new(),
+            vec![format!("failed to resolve runtime handlers: {err}")],
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tonic::Code;
@@ -222,12 +261,14 @@ mod tests {
         let service = DiagnosticsServiceImpl::new(DiagnosticsState::empty());
 
         let error = service
-            .runtime_handlers(Request::new(RuntimeHandlersRequest {}))
+            .image_transfers(Request::new(ImageTransfersRequest {
+                include_completed: false,
+            }))
             .await
             .expect_err("stub should be unimplemented");
 
         assert_eq!(error.code(), Code::Unimplemented);
-        assert!(error.message().contains("RuntimeHandlers"));
+        assert!(error.message().contains("ImageTransfers"));
     }
 
     #[tokio::test]
@@ -280,5 +321,33 @@ mod tests {
             .redacted_fields
             .iter()
             .any(|field| field.contains("global_auth_file")));
+    }
+
+    #[tokio::test]
+    async fn runtime_handlers_returns_configured_handlers() {
+        let config = crate::config::Config::default();
+        let service = DiagnosticsServiceImpl::new(DiagnosticsState::new(
+            "0.1.0",
+            "abc123",
+            "/etc/crius/crius.conf",
+            "/var/lib/crius",
+            "/run/crius/crius.sock",
+            &config,
+        ));
+
+        let response = service
+            .runtime_handlers(Request::new(RuntimeHandlersRequest {}))
+            .await
+            .expect("runtime handlers should succeed")
+            .into_inner();
+
+        assert!(response
+            .handlers
+            .iter()
+            .any(|handler| handler.runtime_type == "runc"
+                && handler
+                    .features
+                    .iter()
+                    .any(|feature| feature.starts_with("snapshotter="))));
     }
 }
