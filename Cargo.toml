@@ -15,6 +15,10 @@ name = "crius"
 path = "src/main.rs"
 
 [[bin]]
+name = "crs"
+path = "src/crs/main.rs"
+
+[[bin]]
 name = "crius-shim"
 path = "src/shim/main.rs"
 required-features = ["shim"]
