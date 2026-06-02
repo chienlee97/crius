@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::{path::Path, time::Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -8,10 +9,10 @@ use crate::proto::diagnostics::v1::{
     ContentGcCandidate as ProtoContentGcCandidate, ContentGcRequest, ContentGcResponse,
     EffectiveConfigRequest, EffectiveConfigResponse, ImageTransferInfo, ImageTransfersRequest,
     ImageTransfersResponse, NriStatusRequest, NriStatusResponse, RecoveryAction,
-    RecoveryCheckRequest, RecoveryCheckResponse,
-    RecoveryStatusRequest, RecoveryStatusResponse, RuntimeHandlerInfo, RuntimeHandlersRequest,
-    RuntimeHandlersResponse, SecurityStatusRequest, SecurityStatusResponse, ServerInfoRequest,
-    ServerInfoResponse, ShimInfo, ShimStatusRequest, ShimStatusResponse,
+    RecoveryCheckRequest, RecoveryCheckResponse, RecoveryStatusRequest, RecoveryStatusResponse,
+    RuntimeHandlerInfo, RuntimeHandlersRequest, RuntimeHandlersResponse, SecurityStatusRequest,
+    SecurityStatusResponse, ServerInfoRequest, ServerInfoResponse, ShimInfo, ShimStatusRequest,
+    ShimStatusResponse,
 };
 
 #[derive(Clone, Default)]
@@ -107,10 +108,6 @@ impl DiagnosticsServiceImpl {
     pub fn state(&self) -> &DiagnosticsState {
         &self.state
     }
-}
-
-fn unimplemented(method: &str) -> Status {
-    Status::unimplemented(format!("diagnostics {method} is not implemented yet"))
 }
 
 #[tonic::async_trait]
@@ -412,10 +409,119 @@ impl DiagnosticsService for DiagnosticsServiceImpl {
 
     async fn container_log(
         &self,
-        _request: Request<ContainerLogRequest>,
+        request: Request<ContainerLogRequest>,
     ) -> Result<Response<Self::ContainerLogStream>, Status> {
-        Err(unimplemented("ContainerLog"))
+        let request = request.into_inner();
+        if request.container_id.trim().is_empty() {
+            return Err(Status::invalid_argument("container_id must not be empty"));
+        }
+        let Some(runtime) = self.state.runtime_service.as_ref() else {
+            return Err(Status::failed_precondition(
+                "runtime diagnostics state is not available",
+            ));
+        };
+        let log_path = runtime.container_log_path(&request.container_id).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+        tokio::spawn(async move {
+            if let Err(status) = stream_container_log(log_path, request, tx.clone()).await {
+                let _ = tx.send(Err(status)).await;
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
+}
+
+async fn stream_container_log(
+    log_path: std::path::PathBuf,
+    request: ContainerLogRequest,
+    tx: tokio::sync::mpsc::Sender<Result<ContainerLogChunk, Status>>,
+) -> Result<(), Status> {
+    let mut offset = stream_existing_container_log(&log_path, &request, &tx).await?;
+    if !request.follow {
+        return Ok(());
+    }
+
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let bytes = match tokio::fs::read(&log_path).await {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(Status::internal(format!(
+                    "failed to read container log: {err}"
+                )));
+            }
+        };
+        if bytes.len() <= offset {
+            continue;
+        }
+        let appended = &bytes[offset..];
+        offset = bytes.len();
+        for line in String::from_utf8_lossy(appended).lines() {
+            if let Some(chunk) = parse_container_log_line(line, request.timestamps) {
+                if chunk.timestamp_unix_nanos >= request.since_unix_nanos
+                    && tx.send(Ok(chunk)).await.is_err()
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn stream_existing_container_log(
+    log_path: &Path,
+    request: &ContainerLogRequest,
+    tx: &tokio::sync::mpsc::Sender<Result<ContainerLogChunk, Status>>,
+) -> Result<usize, Status> {
+    let bytes = tokio::fs::read(log_path)
+        .await
+        .map_err(|err| Status::not_found(format!("failed to read container log: {err}")))?;
+    let mut chunks = String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter_map(|line| parse_container_log_line(line, request.timestamps))
+        .filter(|chunk| chunk.timestamp_unix_nanos >= request.since_unix_nanos)
+        .collect::<Vec<_>>();
+    if request.tail_lines >= 0 {
+        let tail = request.tail_lines as usize;
+        if tail < chunks.len() {
+            chunks = chunks.split_off(chunks.len() - tail);
+        }
+    }
+
+    for chunk in chunks {
+        if tx.send(Ok(chunk)).await.is_err() {
+            break;
+        }
+    }
+
+    Ok(bytes.len())
+}
+
+fn parse_container_log_line(line: &str, timestamps: bool) -> Option<ContainerLogChunk> {
+    let mut parts = line.splitn(4, ' ');
+    let timestamp = parts.next()?;
+    let stream = parts.next()?.to_string();
+    let _tag = parts.next()?;
+    let payload = parts.next().unwrap_or_default();
+    let data = if timestamps {
+        format!("{timestamp} {payload}\n").into_bytes()
+    } else {
+        format!("{payload}\n").into_bytes()
+    };
+    Some(ContainerLogChunk {
+        data,
+        stream,
+        timestamp_unix_nanos: parse_rfc3339_nanos(timestamp).unwrap_or_default(),
+    })
+}
+
+fn parse_rfc3339_nanos(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .and_then(|timestamp| timestamp.timestamp_nanos_opt())
 }
 
 fn redact_sensitive_config(value: &mut Value, path: &str, redacted_fields: &mut Vec<String>) {
@@ -544,7 +650,8 @@ mod tests {
     use super::*;
     use crate::image::{ImageServiceOptions, TestPullResponse};
     use crate::proto::runtime::v1::{
-        image_service_server::ImageService, ImageSpec, PullImageRequest,
+        image_service_server::ImageService, Container, ContainerMetadata, ContainerState,
+        ImageSpec, PullImageRequest,
     };
 
     #[tokio::test]
@@ -1059,6 +1166,80 @@ mod tests {
         assert_eq!(executed.reclaimed_bytes, 0);
     }
 
+    #[tokio::test]
+    async fn container_log_streams_registered_log_path() {
+        use tokio_stream::StreamExt;
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let root_dir = tempdir.path().join("state");
+        let log_dir = root_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).expect("log directory should be created");
+        let log_path = log_dir.join("container.log");
+        std::fs::write(&log_path, "2026-06-02T01:02:03.000000004Z stdout F hello\n")
+            .expect("log should be written");
+        let runtime = runtime_with_container_log(&root_dir, "container-log", &log_path).await;
+        let state = DiagnosticsState::from_runtime(
+            "0.1.0",
+            "abc123",
+            &crate::config::Config::default(),
+            &runtime,
+            "/run/crius/crius.sock",
+        );
+        let service = DiagnosticsServiceImpl::new(state);
+
+        let mut stream = service
+            .container_log(Request::new(ContainerLogRequest {
+                container_id: "container-log".to_string(),
+                tail_lines: -1,
+                ..Default::default()
+            }))
+            .await
+            .expect("container log should stream")
+            .into_inner();
+
+        let chunk = stream
+            .next()
+            .await
+            .expect("first log chunk should be present")
+            .expect("first log chunk should be ok");
+        assert_eq!(chunk.stream, "stdout");
+        assert_eq!(chunk.data, b"hello\n");
+        assert_eq!(chunk.timestamp_unix_nanos, 1_780_362_123_000_000_004);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn container_log_rejects_unowned_host_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let root_dir = tempdir.path().join("state");
+        std::fs::create_dir_all(&root_dir).expect("state directory should be created");
+        let outside_log = tempdir.path().join("outside.log");
+        std::fs::write(&outside_log, "2026-06-02T01:02:03Z stdout F nope\n")
+            .expect("outside log should be written");
+        let runtime = runtime_with_container_log(&root_dir, "container-log", &outside_log).await;
+        let state = DiagnosticsState::from_runtime(
+            "0.1.0",
+            "abc123",
+            &crate::config::Config::default(),
+            &runtime,
+            "/run/crius/crius.sock",
+        );
+        let service = DiagnosticsServiceImpl::new(state);
+
+        let error = service
+            .container_log(Request::new(ContainerLogRequest {
+                container_id: "container-log".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("unowned log path should be rejected");
+
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert!(!error
+            .message()
+            .contains(outside_log.to_string_lossy().as_ref()));
+    }
+
     fn test_image_service(storage_path: PathBuf) -> ImageServiceImpl {
         test_image_service_with_ledger(storage_path, None)
     }
@@ -1095,5 +1276,41 @@ mod tests {
             pull_cgroup_root: None,
         })
         .expect("image service should be created")
+    }
+
+    async fn runtime_with_container_log(
+        root_dir: &std::path::Path,
+        container_id: &str,
+        log_path: &std::path::Path,
+    ) -> crate::server::RuntimeServiceImpl {
+        let mut runtime_config = crate::server::RuntimeConfig::default();
+        runtime_config.root_dir = root_dir.to_path_buf();
+        let runtime = crate::server::RuntimeServiceImpl::new(runtime_config);
+        let annotations = std::collections::HashMap::from([(
+            "io.crius.internal/container-state".to_string(),
+            serde_json::json!({ "log_path": log_path.display().to_string() }).to_string(),
+        )]);
+        runtime
+            .insert_diagnostics_test_container(Container {
+                id: container_id.to_string(),
+                pod_sandbox_id: "pod-1".to_string(),
+                state: ContainerState::ContainerRunning as i32,
+                metadata: Some(ContainerMetadata {
+                    name: format!("{container_id}-name"),
+                    attempt: 1,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }),
+                image_ref: "busybox:latest".to_string(),
+                annotations,
+                created_at: chrono::Utc::now()
+                    .timestamp_nanos_opt()
+                    .expect("current timestamp should fit in nanos"),
+                ..Default::default()
+            })
+            .await;
+        runtime
     }
 }

@@ -1389,6 +1389,61 @@ impl RuntimeServiceImpl {
 
         Ok(shims)
     }
+
+    pub async fn container_log_path(&self, container_id: &str) -> Result<PathBuf, tonic::Status> {
+        let container = {
+            let containers = self.containers.lock().await;
+            containers.get(container_id).cloned()
+        }
+        .ok_or_else(|| tonic::Status::not_found("container not found"))?;
+
+        let log_path = Self::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        )
+        .and_then(|state| state.log_path)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            tonic::Status::failed_precondition(format!(
+                "container {container_id} does not have a configured log path"
+            ))
+        })?;
+        let path = PathBuf::from(log_path);
+        if !path.is_absolute() {
+            return Err(tonic::Status::failed_precondition(
+                "container log path is not absolute",
+            ));
+        }
+
+        let allowed_root = self.config.root_dir.clone();
+        let parent = path.parent().ok_or_else(|| {
+            tonic::Status::failed_precondition("container log path does not have a parent")
+        })?;
+        let canonical_parent = parent
+            .canonicalize()
+            .map_err(|err| tonic::Status::not_found(format!("container log parent: {err}")))?;
+        let canonical_root = allowed_root
+            .canonicalize()
+            .unwrap_or_else(|_| allowed_root.clone());
+        if !canonical_parent.starts_with(&canonical_root) {
+            return Err(tonic::Status::permission_denied(
+                "container log path is outside daemon state directory",
+            ));
+        }
+
+        Ok(path)
+    }
+
+    #[cfg(test)]
+    pub async fn insert_diagnostics_test_container(
+        &self,
+        container: crate::proto::runtime::v1::Container,
+    ) {
+        self.containers
+            .lock()
+            .await
+            .insert(container.id.clone(), container);
+    }
 }
 
 impl Drop for RuntimeServiceImpl {
