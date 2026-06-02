@@ -4,7 +4,7 @@ use crate::crs::{
     context::CliContext,
     error::CliError,
     error::CommandResult,
-    format::{print_envelope, print_table, CommandOutput, RuntimeVersionView},
+    format::{render_output, CommandOutput, FormatOptions, RuntimeVersionView},
 };
 use crate::proto::runtime::v1::VersionRequest;
 
@@ -32,19 +32,15 @@ pub(crate) async fn handle(
         runtime_api_version: response.runtime_api_version,
     };
     let output = CommandOutput::new("RuntimeVersion", client.endpoint(), vec![view]);
+    let rendered = render_output(&output, FormatOptions::from_context(ctx)).map_err(|source| {
+        CliError::internal(format!("failed to render command output: {source}"))
+    })?;
 
-    match ctx.output() {
-        crate::crs::args::OutputArg::Json => {
-            println!(
-                "{}",
-                print_envelope(&output).map_err(|source| CliError::internal(format!(
-                    "failed to render JSON: {source}"
-                )))?
-            );
-        }
-        crate::crs::args::OutputArg::Table | crate::crs::args::OutputArg::Text => {
-            println!("{}", print_table(&output.items, ctx.no_trunc()));
-        }
+    if !rendered.stdout.is_empty() {
+        println!("{}", rendered.stdout);
+    }
+    if !rendered.stderr.is_empty() {
+        eprintln!("{}", rendered.stderr);
     }
 
     Ok(CommandResult::success())

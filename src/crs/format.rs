@@ -95,6 +95,32 @@ where
     serde_json::to_string_pretty(output)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RenderedOutput {
+    pub stdout: String,
+    pub stderr: String,
+}
+
+pub(crate) fn render_output<T>(
+    output: &CommandOutput<T>,
+    options: FormatOptions,
+) -> Result<RenderedOutput, serde_json::Error>
+where
+    T: Serialize + TableRow,
+{
+    let stdout = match options.output() {
+        OutputArg::Json => print_envelope(output)?,
+        OutputArg::Table | OutputArg::Text if options.quiet() => {
+            print_quiet(&output.items, options.no_trunc())
+        }
+        OutputArg::Table | OutputArg::Text => print_table(&output.items, options.no_trunc()),
+    };
+
+    let stderr = render_warnings(&output.warnings, options.output()).unwrap_or_default();
+
+    Ok(RenderedOutput { stdout, stderr })
+}
+
 pub(crate) fn print_table<T>(items: &[T], no_trunc: bool) -> String
 where
     T: TableRow,
@@ -125,7 +151,10 @@ where
 
     let mut lines = Vec::with_capacity(rows.len() + 1);
     lines.push(format_row(
-        &headers.iter().map(|value| value.to_string()).collect::<Vec<_>>(),
+        &headers
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>(),
         &widths,
     ));
     lines.extend(rows.iter().map(|row| format_row(row, &widths)));
@@ -318,7 +347,15 @@ pub(crate) struct PodView {
 
 impl TableRow for PodView {
     fn headers() -> &'static [&'static str] {
-        &["POD ID", "NAME", "NAMESPACE", "STATE", "IP", "CREATED", "ATTEMPT"]
+        &[
+            "POD ID",
+            "NAME",
+            "NAMESPACE",
+            "STATE",
+            "IP",
+            "CREATED",
+            "ATTEMPT",
+        ]
     }
 
     fn cells(&self) -> Vec<String> {
@@ -348,7 +385,15 @@ pub(crate) struct ContainerView {
 
 impl TableRow for ContainerView {
     fn headers() -> &'static [&'static str] {
-        &["CONTAINER ID", "POD", "IMAGE", "STATE", "CREATED", "NAME", "ATTEMPT"]
+        &[
+            "CONTAINER ID",
+            "POD",
+            "IMAGE",
+            "STATE",
+            "CREATED",
+            "NAME",
+            "ATTEMPT",
+        ]
     }
 
     fn cells(&self) -> Vec<String> {
@@ -404,7 +449,11 @@ impl TableRow for OperationView {
     }
 
     fn cells(&self) -> Vec<String> {
-        vec![self.target.clone(), self.status.clone(), self.message.clone()]
+        vec![
+            self.target.clone(),
+            self.status.clone(),
+            self.message.clone(),
+        ]
     }
 }
 
@@ -496,6 +545,46 @@ mod tests {
     }
 
     #[test]
+    fn renders_output_with_warnings_in_the_expected_stream() {
+        let output = CommandOutput::new(
+            "TestKind",
+            "unix:///tmp/crius.sock",
+            vec![TestView {
+                id: "abc".into(),
+                name: "first".into(),
+            }],
+        )
+        .with_warnings(vec!["fallback used".into()]);
+
+        let human = render_output(
+            &output,
+            FormatOptions {
+                output: OutputArg::Table,
+                quiet: false,
+                no_trunc: false,
+            },
+        )
+        .expect("table should render");
+
+        assert_eq!(human.stdout, "ID   NAME\nabc  first");
+        assert_eq!(human.stderr, "warning: fallback used");
+
+        let json = render_output(
+            &output,
+            FormatOptions {
+                output: OutputArg::Json,
+                quiet: false,
+                no_trunc: false,
+            },
+        )
+        .expect("json should render");
+        let value: Value = serde_json::from_str(&json.stdout).expect("json should parse");
+
+        assert_eq!(json.stderr, "");
+        assert_eq!(value["warnings"][0], "fallback used");
+    }
+
+    #[test]
     fn formats_numbers() {
         assert_eq!(format_bytes(0), "0B");
         assert_eq!(format_bytes(64 * 1024 * 1024), "64.0MiB");
@@ -518,20 +607,42 @@ mod tests {
 
     #[test]
     fn basic_views_have_expected_headers() {
-        assert_eq!(RuntimeVersionView::headers(), &["RUNTIME", "VERSION", "API VERSION"]);
+        assert_eq!(
+            RuntimeVersionView::headers(),
+            &["RUNTIME", "VERSION", "API VERSION"]
+        );
         assert_eq!(
             ImageView::headers(),
             &["IMAGE", "IMAGE ID", "SIZE", "USER SPEC", "PINNED"]
         );
         assert_eq!(
             PodView::headers(),
-            &["POD ID", "NAME", "NAMESPACE", "STATE", "IP", "CREATED", "ATTEMPT"]
+            &[
+                "POD ID",
+                "NAME",
+                "NAMESPACE",
+                "STATE",
+                "IP",
+                "CREATED",
+                "ATTEMPT"
+            ]
         );
         assert_eq!(
             ContainerView::headers(),
-            &["CONTAINER ID", "POD", "IMAGE", "STATE", "CREATED", "NAME", "ATTEMPT"]
+            &[
+                "CONTAINER ID",
+                "POD",
+                "IMAGE",
+                "STATE",
+                "CREATED",
+                "NAME",
+                "ATTEMPT"
+            ]
         );
-        assert_eq!(ResourceUsageView::headers(), &["ID", "NAME", "CPU", "MEMORY", "PIDS"]);
+        assert_eq!(
+            ResourceUsageView::headers(),
+            &["ID", "NAME", "CPU", "MEMORY", "PIDS"]
+        );
     }
 
     #[test]
