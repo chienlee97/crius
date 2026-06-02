@@ -1318,6 +1318,12 @@ impl Drop for RuntimeServiceImpl {
     }
 }
 
+impl Clone for RuntimeServiceImpl {
+    fn clone(&self) -> Self {
+        self.clone_for_background()
+    }
+}
+
 impl RuntimeMetricsProvider {
     pub async fn snapshot(&self) -> crate::metrics::RuntimeMetricsSnapshot {
         let runtime_ready = RuntimeServiceImpl::runtime_binary_ready(&self.config.runtime_path);

@@ -26,6 +26,7 @@ pub struct DiagnosticsState {
     runtime_handlers: Vec<RuntimeHandlerInfo>,
     runtime_handler_warnings: Vec<String>,
     image_service: Option<ImageServiceImpl>,
+    runtime_service: Option<crate::server::RuntimeServiceImpl>,
 }
 
 impl DiagnosticsState {
@@ -62,6 +63,7 @@ impl DiagnosticsState {
             runtime_handlers,
             runtime_handler_warnings,
             image_service: None,
+            runtime_service: None,
         }
     }
 
@@ -86,6 +88,7 @@ impl DiagnosticsState {
             config,
         );
         state.image_service = Some(snapshot.image_service);
+        state.runtime_service = Some(runtime.clone());
         state
     }
 }
@@ -191,7 +194,44 @@ impl DiagnosticsService for DiagnosticsServiceImpl {
         &self,
         _request: Request<RecoveryStatusRequest>,
     ) -> Result<Response<RecoveryStatusResponse>, Status> {
-        Err(unimplemented("RecoveryStatus"))
+        let Some(runtime) = self.state.runtime_service.as_ref() else {
+            return Ok(Response::new(RecoveryStatusResponse {
+                status: "unknown".to_string(),
+                last_startup: "unknown".to_string(),
+                unhealthy_object_count: 0,
+                ledger_summary_json: "{}".to_string(),
+                warnings: vec!["runtime diagnostics state is not available".to_string()],
+            }));
+        };
+
+        let mut warnings = Vec::new();
+        let (status, unhealthy_object_count, ledger_summary_json) =
+            match runtime.recovery_ledger_health_summary().await {
+                Ok(summary) => {
+                    let status = if summary.is_healthy() {
+                        "healthy"
+                    } else {
+                        "degraded"
+                    };
+                    let unhealthy = summary.unhealthy_object_count() as u64;
+                    let json = serde_json::to_string(&summary).map_err(|err| {
+                        Status::internal(format!("failed to encode recovery ledger summary: {err}"))
+                    })?;
+                    (status.to_string(), unhealthy, json)
+                }
+                Err(err) => {
+                    warnings.push(err);
+                    ("unknown".to_string(), 0, "{}".to_string())
+                }
+            };
+
+        Ok(Response::new(RecoveryStatusResponse {
+            status,
+            last_startup: last_startup_summary(runtime),
+            unhealthy_object_count,
+            ledger_summary_json,
+            warnings,
+        }))
     }
 
     async fn recovery_check(
@@ -299,6 +339,51 @@ fn runtime_handlers_from_config(
     }
 }
 
+fn last_startup_summary(runtime: &crate::server::RuntimeServiceImpl) -> String {
+    let mut parts = Vec::new();
+    if let Some(clean) = runtime.last_startup_clean_shutdown() {
+        parts.push(if clean {
+            "clean_shutdown"
+        } else {
+            "unclean_shutdown"
+        });
+    }
+    if let Some(reboot) = runtime.last_startup_detected_reboot() {
+        parts.push(if reboot {
+            "reboot_detected"
+        } else {
+            "no_reboot"
+        });
+    }
+    if let Some(upgrade) = runtime.last_startup_detected_upgrade() {
+        parts.push(if upgrade {
+            "upgrade_detected"
+        } else {
+            "no_upgrade"
+        });
+    }
+    if let Some(attempted) = runtime.last_startup_attempted_repair() {
+        parts.push(if attempted {
+            "repair_attempted"
+        } else {
+            "repair_not_attempted"
+        });
+    }
+    if let Some(succeeded) = runtime.last_startup_repair_succeeded() {
+        parts.push(if succeeded {
+            "repair_succeeded"
+        } else {
+            "repair_failed"
+        });
+    }
+
+    if parts.is_empty() {
+        "unknown".to_string()
+    } else {
+        parts.join(",")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -316,12 +401,12 @@ mod tests {
         let service = DiagnosticsServiceImpl::new(DiagnosticsState::empty());
 
         let error = service
-            .recovery_status(Request::new(RecoveryStatusRequest {}))
+            .recovery_check(Request::new(RecoveryCheckRequest { execute: false }))
             .await
             .expect_err("stub should be unimplemented");
 
         assert_eq!(error.code(), Code::Unimplemented);
-        assert!(error.message().contains("RecoveryStatus"));
+        assert!(error.message().contains("RecoveryCheck"));
     }
 
     #[tokio::test]
@@ -514,6 +599,43 @@ mod tests {
             .transfers
             .iter()
             .all(|transfer| transfer.updated_at_unix_nanos > 0));
+    }
+
+    #[tokio::test]
+    async fn recovery_status_reports_startup_and_ledger_summary() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut runtime_config = crate::server::RuntimeConfig::default();
+        runtime_config.root_dir = tempdir.path().join("state");
+        let runtime = crate::server::RuntimeServiceImpl::new(runtime_config);
+        runtime.record_startup_clean_shutdown(false);
+        runtime.record_startup_detected_reboot(true);
+        runtime.record_startup_detected_upgrade(false);
+        runtime.record_startup_attempted_repair(true, Some(true));
+
+        let state = DiagnosticsState::from_runtime(
+            "0.1.0",
+            "abc123",
+            &crate::config::Config::default(),
+            &runtime,
+            "/run/crius/crius.sock",
+        );
+        let service = DiagnosticsServiceImpl::new(state);
+
+        let response = service
+            .recovery_status(Request::new(RecoveryStatusRequest {}))
+            .await
+            .expect("recovery status should succeed")
+            .into_inner();
+
+        assert_eq!(response.status, "healthy");
+        assert_eq!(response.unhealthy_object_count, 0);
+        assert!(response.last_startup.contains("unclean_shutdown"));
+        assert!(response.last_startup.contains("reboot_detected"));
+        assert!(response.last_startup.contains("repair_succeeded"));
+        let ledger_summary: Value = serde_json::from_str(&response.ledger_summary_json)
+            .expect("ledger summary should be valid json");
+        assert_eq!(ledger_summary["brokenContainers"], 0);
+        assert!(response.warnings.is_empty());
     }
 
     fn test_image_service(storage_path: PathBuf) -> ImageServiceImpl {

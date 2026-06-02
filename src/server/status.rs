@@ -432,7 +432,7 @@ impl RuntimeServiceImpl {
         )
     }
 
-    pub(super) async fn recovery_ledger_health_summary(
+    pub async fn recovery_ledger_health_summary(
         &self,
     ) -> Result<crate::services::RecoveryLedgerHealthSummary, String> {
         let snapshot = {
@@ -516,7 +516,7 @@ impl RuntimeServiceImpl {
         })
     }
 
-    pub(super) async fn recovery_ledger_check_report(
+    pub async fn recovery_ledger_check_report(
         &self,
     ) -> Result<crate::state::LedgerCheckReport, String> {
         let persistence = self.persistence.lock().await;
