@@ -256,6 +256,19 @@ pub struct RuntimeDiagnosticsSnapshot {
     pub image_service: ImageServiceImpl,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSecurityDiagnosticsSnapshot {
+    pub selinux_enabled: bool,
+    pub rootless_enabled: bool,
+    pub allowed_device_count: usize,
+    pub additional_device_count: usize,
+    pub device_ownership_from_security_context: bool,
+    pub default_capability_count: usize,
+    pub privileged_seccomp_profile: String,
+    pub apparmor_default_profile: String,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct CachedStatsEntry<T> {
     pub(super) collected_at: Instant,
@@ -2492,6 +2505,21 @@ impl RuntimeServiceImpl {
 
     pub fn nri_config_snapshot(&self) -> NriConfig {
         self.nri_config.clone()
+    }
+
+    pub fn security_diagnostics_snapshot(&self) -> RuntimeSecurityDiagnosticsSnapshot {
+        RuntimeSecurityDiagnosticsSnapshot {
+            selinux_enabled: self.config.enable_selinux,
+            rootless_enabled: self.config.rootless.enabled,
+            allowed_device_count: self.config.allowed_devices.len(),
+            additional_device_count: self.config.additional_devices.len(),
+            device_ownership_from_security_context: self
+                .config
+                .device_ownership_from_security_context,
+            default_capability_count: self.config.default_capabilities.len(),
+            privileged_seccomp_profile: self.config.privileged_seccomp_profile.clone(),
+            apparmor_default_profile: self.config.apparmor_default_profile.clone(),
+        }
     }
 
     pub async fn set_streaming_server(&self, streaming_server: StreamingServer) {

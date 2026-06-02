@@ -309,7 +309,38 @@ impl DiagnosticsService for DiagnosticsServiceImpl {
         &self,
         _request: Request<SecurityStatusRequest>,
     ) -> Result<Response<SecurityStatusResponse>, Status> {
-        Err(unimplemented("SecurityStatus"))
+        let Some(runtime) = self.state.runtime_service.as_ref() else {
+            return Ok(Response::new(SecurityStatusResponse {
+                seccomp_available: false,
+                seccomp_notifier_supported: false,
+                apparmor_available: false,
+                selinux_enabled: false,
+                rootless_enabled: false,
+                devices_policy_json: "{}".to_string(),
+                warnings: vec!["runtime diagnostics state is not available".to_string()],
+            }));
+        };
+        let security = crate::security::SecurityManager::new();
+        let snapshot = runtime.security_diagnostics_snapshot();
+        let devices_policy_json = serde_json::to_string(&serde_json::json!({
+            "allowedDeviceCount": snapshot.allowed_device_count,
+            "additionalDeviceCount": snapshot.additional_device_count,
+            "deviceOwnershipFromSecurityContext": snapshot.device_ownership_from_security_context,
+            "defaultCapabilityCount": snapshot.default_capability_count,
+            "privilegedSeccompProfile": snapshot.privileged_seccomp_profile,
+            "apparmorDefaultProfile": snapshot.apparmor_default_profile,
+        }))
+        .map_err(|err| Status::internal(format!("failed to encode devices policy: {err}")))?;
+
+        Ok(Response::new(SecurityStatusResponse {
+            seccomp_available: security.is_seccomp_available(),
+            seccomp_notifier_supported: security.is_seccomp_available(),
+            apparmor_available: security.is_apparmor_available(),
+            selinux_enabled: snapshot.selinux_enabled && security.is_selinux_available(),
+            rootless_enabled: snapshot.rootless_enabled,
+            devices_policy_json,
+            warnings: Vec::new(),
+        }))
     }
 
     async fn shim_status(
@@ -472,12 +503,14 @@ mod tests {
         let service = DiagnosticsServiceImpl::new(DiagnosticsState::empty());
 
         let error = service
-            .security_status(Request::new(SecurityStatusRequest {}))
+            .shim_status(Request::new(ShimStatusRequest {
+                container_id: String::new(),
+            }))
             .await
             .expect_err("stub should be unimplemented");
 
         assert_eq!(error.code(), Code::Unimplemented);
-        assert!(error.message().contains("SecurityStatus"));
+        assert!(error.message().contains("ShimStatus"));
     }
 
     #[tokio::test]
@@ -834,6 +867,41 @@ mod tests {
             blockio_config.display().to_string()
         );
         assert!(response.blockio_supported);
+    }
+
+    #[tokio::test]
+    async fn security_status_returns_capability_summary_without_device_paths() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut runtime_config = crate::server::RuntimeConfig::default();
+        runtime_config.root_dir = tempdir.path().join("state");
+        runtime_config.allowed_devices = vec!["/dev/fuse".into()];
+        runtime_config.privileged_seccomp_profile = "runtime/default".to_string();
+        runtime_config.apparmor_default_profile = "crius-default".to_string();
+        let runtime = crate::server::RuntimeServiceImpl::new(runtime_config);
+        let state = DiagnosticsState::from_runtime(
+            "0.1.0",
+            "abc123",
+            &crate::config::Config::default(),
+            &runtime,
+            "/run/crius/crius.sock",
+        );
+        let service = DiagnosticsServiceImpl::new(state);
+
+        let response = service
+            .security_status(Request::new(SecurityStatusRequest {}))
+            .await
+            .expect("security status should succeed")
+            .into_inner();
+
+        let devices_policy: Value = serde_json::from_str(&response.devices_policy_json)
+            .expect("devices policy should be valid json");
+        assert_eq!(devices_policy["allowedDeviceCount"], 1);
+        assert_eq!(
+            devices_policy["privilegedSeccompProfile"],
+            "runtime/default"
+        );
+        assert!(!response.devices_policy_json.contains("/dev/fuse"));
+        assert!(response.warnings.is_empty());
     }
 
     fn test_image_service(storage_path: PathBuf) -> ImageServiceImpl {
