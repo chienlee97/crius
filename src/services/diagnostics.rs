@@ -10,7 +10,7 @@ use crate::proto::diagnostics::v1::{
     NriStatusResponse, RecoveryAction, RecoveryCheckRequest, RecoveryCheckResponse,
     RecoveryStatusRequest, RecoveryStatusResponse, RuntimeHandlerInfo, RuntimeHandlersRequest,
     RuntimeHandlersResponse, SecurityStatusRequest, SecurityStatusResponse, ServerInfoRequest,
-    ServerInfoResponse, ShimStatusRequest, ShimStatusResponse,
+    ServerInfoResponse, ShimInfo, ShimStatusRequest, ShimStatusResponse,
 };
 
 #[derive(Clone, Default)]
@@ -345,9 +345,28 @@ impl DiagnosticsService for DiagnosticsServiceImpl {
 
     async fn shim_status(
         &self,
-        _request: Request<ShimStatusRequest>,
+        request: Request<ShimStatusRequest>,
     ) -> Result<Response<ShimStatusResponse>, Status> {
-        Err(unimplemented("ShimStatus"))
+        let container_id = request.into_inner().container_id;
+        let Some(runtime) = self.state.runtime_service.as_ref() else {
+            return Ok(Response::new(ShimStatusResponse { shims: Vec::new() }));
+        };
+        let shims = runtime
+            .shim_diagnostics((!container_id.is_empty()).then_some(container_id.as_str()))
+            .await
+            .map_err(|err| Status::internal(redact_host_paths(&err)))?
+            .into_iter()
+            .map(|shim| ShimInfo {
+                container_id: shim.container_id,
+                pid: i64::from(shim.pid),
+                task_socket: shim.task_socket,
+                attach_socket: shim.attach_socket,
+                state: shim.state,
+                error: shim.error.unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(Response::new(ShimStatusResponse { shims }))
     }
 
     async fn content_gc(
@@ -490,28 +509,11 @@ fn redact_host_paths(message: &str) -> String {
 mod tests {
     use std::{path::PathBuf, sync::Arc, time::Duration};
 
-    use tonic::Code;
-
     use super::*;
     use crate::image::{ImageServiceOptions, TestPullResponse};
     use crate::proto::runtime::v1::{
         image_service_server::ImageService, ImageSpec, PullImageRequest,
     };
-
-    #[tokio::test]
-    async fn service_still_reports_unimplemented_methods_for_future_rpcs() {
-        let service = DiagnosticsServiceImpl::new(DiagnosticsState::empty());
-
-        let error = service
-            .shim_status(Request::new(ShimStatusRequest {
-                container_id: String::new(),
-            }))
-            .await
-            .expect_err("stub should be unimplemented");
-
-        assert_eq!(error.code(), Code::Unimplemented);
-        assert!(error.message().contains("ShimStatus"));
-    }
 
     #[tokio::test]
     async fn server_info_returns_state() {
@@ -902,6 +904,75 @@ mod tests {
         );
         assert!(!response.devices_policy_json.contains("/dev/fuse"));
         assert!(response.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shim_status_filters_by_container_id() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let root_dir = tempdir.path().join("state");
+        let mut runtime_config = crate::server::RuntimeConfig::default();
+        runtime_config.root_dir = root_dir.clone();
+        let runtime = crate::server::RuntimeServiceImpl::new(runtime_config);
+        let task_socket = root_dir.join("shims").join("target").join("task.sock");
+        let mut storage = crate::storage::StorageManager::new(root_dir.join("crius.db"))
+            .expect("storage should open");
+        for id in ["target", "other"] {
+            storage
+                .save_shim_process(&crate::storage::ShimProcessRecord {
+                    container_id: id.to_string(),
+                    shim_pid: std::process::id(),
+                    work_dir: root_dir.join("shims").join(id).display().to_string(),
+                    socket_path: if id == "target" {
+                        task_socket.display().to_string()
+                    } else {
+                        root_dir
+                            .join("shims")
+                            .join(id)
+                            .join("task.sock")
+                            .display()
+                            .to_string()
+                    },
+                    exit_code_file: root_dir.join("exits").join(id).display().to_string(),
+                    log_file: root_dir
+                        .join("shims")
+                        .join(id)
+                        .join("shim.log")
+                        .display()
+                        .to_string(),
+                    bundle_path: root_dir.join("runtime").join(id).display().to_string(),
+                    state: "running".to_string(),
+                    last_seen_at: chrono::Utc::now()
+                        .timestamp_nanos_opt()
+                        .expect("current timestamp should fit in nanos"),
+                })
+                .expect("shim process record should be stored");
+        }
+
+        let state = DiagnosticsState::from_runtime(
+            "0.1.0",
+            "abc123",
+            &crate::config::Config::default(),
+            &runtime,
+            "/run/crius/crius.sock",
+        );
+        let service = DiagnosticsServiceImpl::new(state);
+
+        let response = service
+            .shim_status(Request::new(ShimStatusRequest {
+                container_id: "target".to_string(),
+            }))
+            .await
+            .expect("shim status should succeed")
+            .into_inner();
+
+        assert_eq!(response.shims.len(), 1);
+        let shim = &response.shims[0];
+        assert_eq!(shim.container_id, "target");
+        assert_eq!(shim.pid, i64::from(std::process::id()));
+        assert_eq!(shim.task_socket, task_socket.display().to_string());
+        assert!(shim.attach_socket.ends_with("target/attach.sock"));
+        assert_eq!(shim.state, "running");
+        assert!(shim.error.contains("task socket is missing"));
     }
 
     fn test_image_service(storage_path: PathBuf) -> ImageServiceImpl {

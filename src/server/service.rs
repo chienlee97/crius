@@ -202,6 +202,16 @@ pub struct RecoveryShimCleanupSummary {
     pub failures: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeShimDiagnostics {
+    pub container_id: String,
+    pub pid: u32,
+    pub task_socket: String,
+    pub attach_socket: String,
+    pub state: String,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryCleanupCounter {
@@ -1322,6 +1332,62 @@ impl RuntimeServiceImpl {
             socket_path: socket_path.into(),
             image_service: self.image_service.clone(),
         }
+    }
+
+    pub async fn shim_diagnostics(
+        &self,
+        container_id: Option<&str>,
+    ) -> Result<Vec<RuntimeShimDiagnostics>, String> {
+        let mut records = self
+            .persistence
+            .lock()
+            .await
+            .list_shim_process_records()
+            .map_err(|err| format!("failed to inspect shim ledger: {err}"))?;
+        records.sort_by(|left, right| left.container_id.cmp(&right.container_id));
+
+        let shims = records
+            .into_iter()
+            .filter(|record| {
+                container_id
+                    .map(|id| record.container_id == id)
+                    .unwrap_or(true)
+            })
+            .map(|record| {
+                let task_socket = if record.socket_path.is_empty() {
+                    self.task_socket_path(&record.container_id)
+                        .display()
+                        .to_string()
+                } else {
+                    record.socket_path.clone()
+                };
+                let mut errors = Vec::new();
+                if !task_socket.is_empty() && !PathBuf::from(&task_socket).exists() {
+                    errors.push("task socket is missing".to_string());
+                }
+                if record.shim_pid > 0
+                    && !PathBuf::from("/proc")
+                        .join(record.shim_pid.to_string())
+                        .exists()
+                {
+                    errors.push("shim process is not running".to_string());
+                }
+
+                RuntimeShimDiagnostics {
+                    container_id: record.container_id.clone(),
+                    pid: record.shim_pid,
+                    task_socket,
+                    attach_socket: self
+                        .attach_socket_path(&record.container_id)
+                        .display()
+                        .to_string(),
+                    state: record.state,
+                    error: (!errors.is_empty()).then(|| errors.join("; ")),
+                }
+            })
+            .collect();
+
+        Ok(shims)
     }
 }
 
