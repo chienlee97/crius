@@ -634,9 +634,18 @@ fn redact_host_paths(message: &str) -> String {
         .split_whitespace()
         .map(|part| {
             if part.starts_with('/') {
-                "<path>"
+                "<path>".to_string()
+            } else if let Some(index) = part.find('/') {
+                let (prefix, _) = part.split_at(index);
+                if prefix
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphabetic() || matches!(ch, ':' | '='))
+                {
+                    return format!("{prefix}<path>");
+                }
+                part.to_string()
             } else {
-                part
+                part.to_string()
             }
         })
         .collect::<Vec<_>>()
@@ -1238,6 +1247,87 @@ mod tests {
         assert!(!error
             .message()
             .contains(outside_log.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_error_mapping_contract_is_stable_and_redacted() {
+        let empty_service = DiagnosticsServiceImpl::new(DiagnosticsState::empty());
+        let invalid = empty_service
+            .container_log(Request::new(ContainerLogRequest {
+                container_id: String::new(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("empty container id should be rejected");
+        assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+
+        let failed_precondition = empty_service
+            .container_log(Request::new(ContainerLogRequest {
+                container_id: "container-log".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("missing runtime state should be a precondition error");
+        assert_eq!(failed_precondition.code(), tonic::Code::FailedPrecondition);
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let root_dir = tempdir.path().join("state");
+        std::fs::create_dir_all(&root_dir).expect("state directory should be created");
+        let runtime = runtime_with_container_log(
+            &root_dir,
+            "known-container",
+            &root_dir.join("logs").join("known.log"),
+        )
+        .await;
+        let state = DiagnosticsState::from_runtime(
+            "0.1.0",
+            "abc123",
+            &crate::config::Config::default(),
+            &runtime,
+            "/run/crius/crius.sock",
+        );
+        let service = DiagnosticsServiceImpl::new(state);
+        let not_found = service
+            .container_log(Request::new(ContainerLogRequest {
+                container_id: "missing-container".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("missing container should be not found");
+        assert_eq!(not_found.code(), tonic::Code::NotFound);
+
+        let outside_log = tempdir.path().join("outside.log");
+        std::fs::write(&outside_log, "2026-06-02T01:02:03Z stdout F nope\n")
+            .expect("outside log should be written");
+        let runtime = runtime_with_container_log(&root_dir, "outside-container", &outside_log).await;
+        let state = DiagnosticsState::from_runtime(
+            "0.1.0",
+            "abc123",
+            &crate::config::Config::default(),
+            &runtime,
+            "/run/crius/crius.sock",
+        );
+        let service = DiagnosticsServiceImpl::new(state);
+        let permission_denied = service
+            .container_log(Request::new(ContainerLogRequest {
+                container_id: "outside-container".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("outside log path should be permission denied");
+        assert_eq!(permission_denied.code(), tonic::Code::PermissionDenied);
+        assert!(!permission_denied
+            .message()
+            .contains(tempdir.path().to_string_lossy().as_ref()));
+
+        let internal = Status::internal(redact_host_paths(&format!(
+            "failed to open {}",
+            tempdir.path().join("secret.db").display()
+        )));
+        assert_eq!(internal.code(), tonic::Code::Internal);
+        assert!(!internal
+            .message()
+            .contains(tempdir.path().to_string_lossy().as_ref()));
     }
 
     fn test_image_service(storage_path: PathBuf) -> ImageServiceImpl {
