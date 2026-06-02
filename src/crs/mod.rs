@@ -14,7 +14,7 @@ use std::ffi::OsString;
 use clap::{error::ErrorKind, Parser};
 
 use crate::crs::{
-    args::Args,
+    args::{Args, Command},
     client::CrsClient,
     context::CliContext,
     error::{CommandResult, ExitStatus},
@@ -27,7 +27,12 @@ where
 {
     let args = match Args::try_parse_from(args) {
         Ok(args) => args,
-        Err(error) if matches!(error.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
             let _ = error.print();
             return CommandResult::success();
         }
@@ -44,7 +49,17 @@ where
             return CommandResult::failure(ExitStatus::Usage);
         }
     };
-    let client = CrsClient::new(&ctx);
+    let client = if matches!(args.command, Command::Completion(_)) {
+        CrsClient::new(&ctx)
+    } else {
+        match CrsClient::connect(&ctx).await {
+            Ok(client) => client,
+            Err(error) => {
+                error.render(ctx.output());
+                return CommandResult::failure(error.exit_status());
+            }
+        }
+    };
 
     match commands::dispatch(&ctx, &client, args.command).await {
         Ok(result) => result,
