@@ -211,6 +211,70 @@ async fn version_command_reaches_mock_runtime_service() {
     assert!(stdout.contains("v1"));
 }
 
+#[test]
+fn json_error_is_written_to_stderr_with_empty_stdout() {
+    let socket_dir = tempfile::tempdir().expect("tempdir should be created");
+    let missing_socket = socket_dir.path().join("missing.sock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_crs"))
+        .args([
+            "--address",
+            missing_socket.to_str().expect("socket path should be utf8"),
+            "--output",
+            "json",
+            "version",
+        ])
+        .output()
+        .expect("crs process should run");
+
+    assert_eq!(output.status.code(), Some(125));
+    assert!(
+        output.stdout.is_empty(),
+        "stdout should be empty for JSON errors, got:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).expect("json error");
+
+    assert_eq!(value["error"]["exitCode"], 125);
+    assert_eq!(
+        value["error"]["context"]["endpoint"],
+        format!("unix://{}", missing_socket.display())
+    );
+    assert!(value["error"]["suggestion"]
+        .as_str()
+        .expect("suggestion should be a string")
+        .contains("--address"));
+}
+
+#[test]
+fn text_error_includes_endpoint_and_next_step() {
+    let socket_dir = tempfile::tempdir().expect("tempdir should be created");
+    let missing_socket = socket_dir.path().join("missing.sock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_crs"))
+        .args([
+            "--address",
+            missing_socket.to_str().expect("socket path should be utf8"),
+            "version",
+        ])
+        .output()
+        .expect("crs process should run");
+
+    assert_eq!(output.status.code(), Some(125));
+    assert!(
+        output.stdout.is_empty(),
+        "stdout should be empty for errors, got:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("error: daemon is unavailable"));
+    assert!(stderr.contains(&format!("endpoint: unix://{}", missing_socket.display())));
+    assert!(stderr.contains("next step: verify that crius is running"));
+}
+
 async fn spawn_runtime_service(service: MockRuntimeService) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
