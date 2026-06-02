@@ -248,6 +248,14 @@ pub struct RuntimeMetricsProvider {
         Arc<Mutex<HashMap<String, CachedStatsEntry<crate::proto::runtime::v1::PodSandboxMetrics>>>>,
 }
 
+#[derive(Clone)]
+pub struct RuntimeDiagnosticsSnapshot {
+    pub config_path: Option<PathBuf>,
+    pub state_dir: PathBuf,
+    pub socket_path: String,
+    pub image_service: ImageServiceImpl,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct CachedStatsEntry<T> {
     pub(super) collected_at: Instant,
@@ -1289,6 +1297,18 @@ impl RuntimeServiceImpl {
 
     pub fn image_service(&self) -> ImageServiceImpl {
         self.image_service.clone()
+    }
+
+    pub fn diagnostics_snapshot(
+        &self,
+        socket_path: impl Into<String>,
+    ) -> RuntimeDiagnosticsSnapshot {
+        RuntimeDiagnosticsSnapshot {
+            config_path: self.config.config_path.clone(),
+            state_dir: self.config.root_dir.clone(),
+            socket_path: socket_path.into(),
+            image_service: self.image_service.clone(),
+        }
     }
 }
 

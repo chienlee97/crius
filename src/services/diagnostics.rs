@@ -1,7 +1,8 @@
+use serde_json::Value;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use serde_json::Value;
 
+use crate::image::ImageServiceImpl;
 use crate::proto::diagnostics::v1::{
     diagnostics_service_server::DiagnosticsService, ContainerLogChunk, ContainerLogRequest,
     ContentGcRequest, ContentGcResponse, EffectiveConfigRequest, EffectiveConfigResponse,
@@ -12,7 +13,7 @@ use crate::proto::diagnostics::v1::{
     ShimStatusResponse,
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct DiagnosticsState {
     version: String,
     git_commit: String,
@@ -24,6 +25,7 @@ pub struct DiagnosticsState {
     redacted_fields: Vec<String>,
     runtime_handlers: Vec<RuntimeHandlerInfo>,
     runtime_handler_warnings: Vec<String>,
+    image_service: Option<ImageServiceImpl>,
 }
 
 impl DiagnosticsState {
@@ -59,11 +61,36 @@ impl DiagnosticsState {
             redacted_fields,
             runtime_handlers,
             runtime_handler_warnings,
+            image_service: None,
         }
+    }
+
+    pub fn from_runtime(
+        version: impl Into<String>,
+        git_commit: impl Into<String>,
+        config: &crate::config::Config,
+        runtime: &crate::server::RuntimeServiceImpl,
+        socket_path: impl Into<String>,
+    ) -> Self {
+        let snapshot = runtime.diagnostics_snapshot(socket_path);
+        let mut state = Self::new(
+            version,
+            git_commit,
+            snapshot
+                .config_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            snapshot.state_dir.display().to_string(),
+            snapshot.socket_path,
+            config,
+        );
+        state.image_service = Some(snapshot.image_service);
+        state
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DiagnosticsServiceImpl {
     state: DiagnosticsState,
 }
@@ -349,5 +376,42 @@ mod tests {
                     .features
                     .iter()
                     .any(|feature| feature.starts_with("snapshotter="))));
+    }
+
+    #[tokio::test]
+    async fn state_from_runtime_uses_runtime_diagnostics_snapshot() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut runtime_config = crate::server::RuntimeConfig::default();
+        runtime_config.root_dir = tempdir.path().join("state");
+        runtime_config.config_path = Some(tempdir.path().join("crius.conf"));
+        let runtime = crate::server::RuntimeServiceImpl::new(runtime_config);
+
+        let state = DiagnosticsState::from_runtime(
+            "0.1.0",
+            "abc123",
+            &crate::config::Config::default(),
+            &runtime,
+            "/run/crius/crius.sock",
+        );
+        let service = DiagnosticsServiceImpl::new(state);
+
+        let response = service
+            .server_info(Request::new(ServerInfoRequest {}))
+            .await
+            .expect("server info should succeed")
+            .into_inner();
+
+        assert_eq!(response.version, "0.1.0");
+        assert_eq!(response.git_commit, "abc123");
+        assert_eq!(
+            response.config_path,
+            tempdir.path().join("crius.conf").display().to_string()
+        );
+        assert_eq!(
+            response.state_dir,
+            tempdir.path().join("state").display().to_string()
+        );
+        assert_eq!(response.socket_path, "/run/crius/crius.sock");
+        assert!(service.state().image_service.is_some());
     }
 }
