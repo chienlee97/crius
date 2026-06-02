@@ -275,7 +275,34 @@ impl DiagnosticsService for DiagnosticsServiceImpl {
         &self,
         _request: Request<NriStatusRequest>,
     ) -> Result<Response<NriStatusResponse>, Status> {
-        Err(unimplemented("NriStatus"))
+        let Some(runtime) = self.state.runtime_service.as_ref() else {
+            return Ok(Response::new(NriStatusResponse {
+                enabled: false,
+                cdi_enabled: false,
+                cdi_spec_dirs: Vec::new(),
+                plugin_path: String::new(),
+                plugin_config_path: String::new(),
+                blockio_config_path: String::new(),
+                blockio_supported: false,
+                rdt_supported: false,
+                warnings: vec!["runtime diagnostics state is not available".to_string()],
+            }));
+        };
+        let config = runtime.nri_config_snapshot();
+        let resource_support =
+            crate::security::resource_classes::feature_support(Some(&config.blockio_config_path));
+
+        Ok(Response::new(NriStatusResponse {
+            enabled: config.enable,
+            cdi_enabled: config.enable && config.enable_cdi,
+            cdi_spec_dirs: config.cdi_spec_dirs,
+            plugin_path: config.plugin_path,
+            plugin_config_path: config.plugin_config_path,
+            blockio_config_path: config.blockio_config_path,
+            blockio_supported: resource_support.blockio_supported,
+            rdt_supported: resource_support.rdt_supported,
+            warnings: Vec::new(),
+        }))
     }
 
     async fn security_status(
@@ -445,12 +472,12 @@ mod tests {
         let service = DiagnosticsServiceImpl::new(DiagnosticsState::empty());
 
         let error = service
-            .nri_status(Request::new(NriStatusRequest {}))
+            .security_status(Request::new(SecurityStatusRequest {}))
             .await
             .expect_err("stub should be unimplemented");
 
         assert_eq!(error.code(), Code::Unimplemented);
-        assert!(error.message().contains("NriStatus"));
+        assert!(error.message().contains("SecurityStatus"));
     }
 
     #[tokio::test]
@@ -740,6 +767,73 @@ mod tests {
             snapshots[0].state,
             crate::state::SnapshotLedgerState::Prepared.as_str()
         );
+    }
+
+    #[tokio::test]
+    async fn nri_status_reports_disabled_nri_without_error() {
+        let runtime =
+            crate::server::RuntimeServiceImpl::new(crate::server::RuntimeConfig::default());
+        let state = DiagnosticsState::from_runtime(
+            "0.1.0",
+            "abc123",
+            &crate::config::Config::default(),
+            &runtime,
+            "/run/crius/crius.sock",
+        );
+        let service = DiagnosticsServiceImpl::new(state);
+
+        let response = service
+            .nri_status(Request::new(NriStatusRequest {}))
+            .await
+            .expect("nri status should succeed")
+            .into_inner();
+
+        assert!(!response.enabled);
+        assert!(!response.cdi_enabled);
+        assert!(response.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nri_status_reports_configured_paths_and_resource_support() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let blockio_config = tempdir.path().join("blockio.json");
+        std::fs::write(&blockio_config, "{}").expect("blockio config should be written");
+        let mut nri_config = crate::config::NriConfig::default();
+        nri_config.enable = true;
+        nri_config.enable_cdi = true;
+        nri_config.cdi_spec_dirs = vec!["/etc/cdi".to_string(), "/var/run/cdi".to_string()];
+        nri_config.plugin_path = "/opt/nri/plugins".to_string();
+        nri_config.plugin_config_path = "/etc/nri/conf.d".to_string();
+        nri_config.blockio_config_path = blockio_config.display().to_string();
+        let runtime = crate::server::RuntimeServiceImpl::new_with_nri_config(
+            crate::server::RuntimeConfig::default(),
+            nri_config,
+        );
+        let state = DiagnosticsState::from_runtime(
+            "0.1.0",
+            "abc123",
+            &crate::config::Config::default(),
+            &runtime,
+            "/run/crius/crius.sock",
+        );
+        let service = DiagnosticsServiceImpl::new(state);
+
+        let response = service
+            .nri_status(Request::new(NriStatusRequest {}))
+            .await
+            .expect("nri status should succeed")
+            .into_inner();
+
+        assert!(response.enabled);
+        assert!(response.cdi_enabled);
+        assert_eq!(response.cdi_spec_dirs, vec!["/etc/cdi", "/var/run/cdi"]);
+        assert_eq!(response.plugin_path, "/opt/nri/plugins");
+        assert_eq!(response.plugin_config_path, "/etc/nri/conf.d");
+        assert_eq!(
+            response.blockio_config_path,
+            blockio_config.display().to_string()
+        );
+        assert!(response.blockio_supported);
     }
 
     fn test_image_service(storage_path: PathBuf) -> ImageServiceImpl {

@@ -2490,6 +2490,10 @@ impl RuntimeServiceImpl {
         self.nri.clone()
     }
 
+    pub fn nri_config_snapshot(&self) -> NriConfig {
+        self.nri_config.clone()
+    }
+
     pub async fn set_streaming_server(&self, streaming_server: StreamingServer) {
         let mut streaming = self.streaming.lock().await;
         *streaming = Some(streaming_server);
