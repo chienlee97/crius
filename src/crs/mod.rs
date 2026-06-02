@@ -69,3 +69,49 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_cli_maps_help_and_version_to_success() {
+        assert_eq!(run_cli(["crs", "--help"]).await.code(), 0);
+        assert_eq!(run_cli(["crs", "--version"]).await.code(), 0);
+        assert_eq!(run_cli(["crs", "version", "--help"]).await.code(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_cli_maps_clap_errors_to_usage_exit_code() {
+        assert_eq!(run_cli(["crs"]).await.code(), 2);
+        assert_eq!(
+            run_cli(["crs", "--output", "xml", "version"]).await.code(),
+            2
+        );
+        assert_eq!(
+            run_cli([
+                "crs",
+                "image",
+                "pull",
+                "--auth-json",
+                "{}",
+                "--username",
+                "user",
+                "busybox"
+            ])
+            .await
+            .code(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cli_maps_context_validation_to_usage_exit_code() {
+        assert_eq!(
+            run_cli(["crs", "--address", "ftp://127.0.0.1:1234", "version"])
+                .await
+                .code(),
+            2
+        );
+    }
+}
