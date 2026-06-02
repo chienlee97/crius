@@ -4,9 +4,38 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::crs::{args::OutputArg, ids::truncate_field};
+use crate::crs::{args::OutputArg, context::CliContext, ids::truncate_field};
 
 pub(crate) const API_VERSION: &str = "crius.io/crs/v1";
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FormatOptions {
+    output: OutputArg,
+    quiet: bool,
+    no_trunc: bool,
+}
+
+impl FormatOptions {
+    pub(crate) fn from_context(ctx: &CliContext) -> Self {
+        Self {
+            output: ctx.output(),
+            quiet: ctx.quiet(),
+            no_trunc: ctx.no_trunc(),
+        }
+    }
+
+    pub(crate) fn output(self) -> OutputArg {
+        self.output
+    }
+
+    pub(crate) fn quiet(self) -> bool {
+        self.quiet
+    }
+
+    pub(crate) fn no_trunc(self) -> bool {
+        self.no_trunc
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -473,5 +502,27 @@ mod tests {
             &["CONTAINER ID", "POD", "IMAGE", "STATE", "CREATED", "NAME", "ATTEMPT"]
         );
         assert_eq!(ResourceUsageView::headers(), &["ID", "NAME", "CPU", "MEMORY", "PIDS"]);
+    }
+
+    #[test]
+    fn adapts_format_options_from_context() {
+        use clap::Parser;
+
+        let args = crate::crs::args::Args::try_parse_from([
+            "crs",
+            "--output",
+            "json",
+            "--quiet",
+            "--no-trunc",
+            "version",
+        ])
+        .expect("args should parse");
+        let ctx = CliContext::from_args(&args).expect("context should build");
+
+        let options = FormatOptions::from_context(&ctx);
+
+        assert_eq!(options.output(), OutputArg::Json);
+        assert!(options.quiet());
+        assert!(options.no_trunc());
     }
 }
