@@ -52,6 +52,25 @@ pub struct ContentGcSummary {
     pub bytes_deleted: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentGcDiagnostics {
+    pub dry_run: bool,
+    pub candidates: Vec<ContentGcCandidateDiagnostics>,
+    pub reclaimed_bytes: u64,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentGcCandidateDiagnostics {
+    pub object_type: String,
+    pub object_id: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub reason: String,
+    pub deleted: bool,
+    pub error: Option<String>,
+}
+
 /// crius镜像
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -255,6 +274,28 @@ fn content_gc_blocker_detail(blocker: &ContentGcBlocker) -> serde_json::Value {
             "source": source,
         }),
     }
+}
+
+fn content_gc_candidate_reason(blockers: &[ContentGcBlocker]) -> String {
+    if blockers.is_empty() {
+        return "unreferenced content blob".to_string();
+    }
+
+    serde_json::to_string(
+        &blockers
+            .iter()
+            .map(content_gc_blocker_detail)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "blocked content blob".to_string())
+}
+
+fn redact_path_like_words(message: &str) -> String {
+    message
+        .split_whitespace()
+        .map(|part| if part.starts_with('/') { "<path>" } else { part })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Debug, Clone)]
@@ -620,6 +661,55 @@ impl ImageServiceImpl {
         }
 
         Ok(summary)
+    }
+
+    pub fn content_gc_diagnostics(&self, execute: bool) -> Result<ContentGcDiagnostics, Error> {
+        let dry_run = !execute;
+        let Some(db_path) = self.ledger_db_path.as_ref() else {
+            return Ok(ContentGcDiagnostics {
+                dry_run,
+                warnings: vec!["content GC ledger is not configured".to_string()],
+                ..Default::default()
+            });
+        };
+        let storage = StorageManager::new(db_path)
+            .map_err(|err| Error::Storage(format!("failed to open content GC ledger: {err}")))?;
+        let candidates = storage.list_content_gc_candidates().map_err(|err| {
+            Error::Storage(format!("failed to list content GC candidates: {err}"))
+        })?;
+        let mut diagnostics = ContentGcDiagnostics {
+            dry_run,
+            ..Default::default()
+        };
+
+        for candidate in candidates {
+            let mut item = ContentGcCandidateDiagnostics {
+                object_type: "content_blob".to_string(),
+                object_id: candidate.blob.digest.clone(),
+                path: candidate.blob.relative_path.clone(),
+                size_bytes: candidate.blob.size,
+                reason: content_gc_candidate_reason(&candidate.blockers),
+                ..Default::default()
+            };
+
+            if execute && candidate.blockers.is_empty() {
+                match self.content_store.delete_blob(&candidate.blob.digest) {
+                    Ok(()) => {
+                        item.deleted = true;
+                        diagnostics.reclaimed_bytes = diagnostics
+                            .reclaimed_bytes
+                            .saturating_add(candidate.blob.size);
+                    }
+                    Err(err) => {
+                        item.error = Some(redact_path_like_words(&err.to_string()));
+                    }
+                }
+            }
+
+            diagnostics.candidates.push(item);
+        }
+
+        Ok(diagnostics)
     }
 
     fn should_retry_pull_status(status: &Status) -> bool {

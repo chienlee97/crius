@@ -5,9 +5,10 @@ use tonic::{Request, Response, Status};
 use crate::image::{content_store::TransferState, ImageServiceImpl};
 use crate::proto::diagnostics::v1::{
     diagnostics_service_server::DiagnosticsService, ContainerLogChunk, ContainerLogRequest,
-    ContentGcRequest, ContentGcResponse, EffectiveConfigRequest, EffectiveConfigResponse,
-    ImageTransferInfo, ImageTransfersRequest, ImageTransfersResponse, NriStatusRequest,
-    NriStatusResponse, RecoveryAction, RecoveryCheckRequest, RecoveryCheckResponse,
+    ContentGcCandidate as ProtoContentGcCandidate, ContentGcRequest, ContentGcResponse,
+    EffectiveConfigRequest, EffectiveConfigResponse, ImageTransferInfo, ImageTransfersRequest,
+    ImageTransfersResponse, NriStatusRequest, NriStatusResponse, RecoveryAction,
+    RecoveryCheckRequest, RecoveryCheckResponse,
     RecoveryStatusRequest, RecoveryStatusResponse, RuntimeHandlerInfo, RuntimeHandlersRequest,
     RuntimeHandlersResponse, SecurityStatusRequest, SecurityStatusResponse, ServerInfoRequest,
     ServerInfoResponse, ShimInfo, ShimStatusRequest, ShimStatusResponse,
@@ -371,9 +372,40 @@ impl DiagnosticsService for DiagnosticsServiceImpl {
 
     async fn content_gc(
         &self,
-        _request: Request<ContentGcRequest>,
+        request: Request<ContentGcRequest>,
     ) -> Result<Response<ContentGcResponse>, Status> {
-        Err(unimplemented("ContentGc"))
+        let execute = request.into_inner().execute;
+        let Some(image_service) = self.state.image_service.as_ref() else {
+            return Ok(Response::new(ContentGcResponse {
+                dry_run: !execute,
+                candidates: Vec::new(),
+                reclaimed_bytes: 0,
+                warnings: vec!["image diagnostics state is not available".to_string()],
+            }));
+        };
+        let diagnostics = image_service
+            .content_gc_diagnostics(execute)
+            .map_err(|err| Status::internal(redact_host_paths(&err.to_string())))?;
+        let candidates = diagnostics
+            .candidates
+            .into_iter()
+            .map(|candidate| ProtoContentGcCandidate {
+                object_type: candidate.object_type,
+                object_id: candidate.object_id,
+                path: candidate.path,
+                size_bytes: candidate.size_bytes,
+                reason: candidate.reason,
+                deleted: candidate.deleted,
+                error: candidate.error.unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(Response::new(ContentGcResponse {
+            dry_run: diagnostics.dry_run,
+            candidates,
+            reclaimed_bytes: diagnostics.reclaimed_bytes,
+            warnings: diagnostics.warnings,
+        }))
     }
 
     type ContainerLogStream = ReceiverStream<Result<ContainerLogChunk, Status>>;
@@ -975,10 +1007,69 @@ mod tests {
         assert!(shim.error.contains("task socket is missing"));
     }
 
+    #[tokio::test]
+    async fn content_gc_returns_candidates_and_item_errors() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let storage_path = tempdir.path().join("images");
+        let db_path = tempdir.path().join("crius.db");
+        let image_service = test_image_service_with_ledger(storage_path.clone(), db_path.clone());
+        let digest = "sha256:001122334455";
+        let relative_path =
+            crate::image::content_store::FsContentStore::relative_blob_path_for_digest(digest);
+        let blob_path = storage_path.join(&relative_path);
+        std::fs::create_dir_all(&blob_path).expect("directory should force delete failure");
+        let mut storage =
+            crate::storage::StorageManager::new(&db_path).expect("storage should open");
+        storage
+            .save_content_blob(&crate::storage::ContentBlobRecord {
+                digest: digest.to_string(),
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                size: 64,
+                relative_path: relative_path.display().to_string(),
+                created_at: 1,
+                last_used_at: 1,
+            })
+            .expect("content blob should be recorded");
+
+        let mut state = DiagnosticsState::empty();
+        state.image_service = Some(image_service);
+        let service = DiagnosticsServiceImpl::new(state);
+
+        let dry_run = service
+            .content_gc(Request::new(ContentGcRequest { execute: false }))
+            .await
+            .expect("content gc dry-run should succeed")
+            .into_inner();
+
+        assert!(dry_run.dry_run);
+        assert_eq!(dry_run.candidates.len(), 1);
+        assert_eq!(dry_run.candidates[0].object_id, digest);
+        assert!(!dry_run.candidates[0].deleted);
+
+        let executed = service
+            .content_gc(Request::new(ContentGcRequest { execute: true }))
+            .await
+            .expect("content gc execute should keep item failures in response")
+            .into_inner();
+
+        assert!(!executed.dry_run);
+        assert_eq!(executed.candidates.len(), 1);
+        assert!(!executed.candidates[0].deleted);
+        assert!(!executed.candidates[0].error.is_empty());
+        assert_eq!(executed.reclaimed_bytes, 0);
+    }
+
     fn test_image_service(storage_path: PathBuf) -> ImageServiceImpl {
+        test_image_service_with_ledger(storage_path, None)
+    }
+
+    fn test_image_service_with_ledger(
+        storage_path: PathBuf,
+        ledger_db_path: impl Into<Option<PathBuf>>,
+    ) -> ImageServiceImpl {
         ImageServiceImpl::new_with_options(ImageServiceOptions {
             storage_path,
-            ledger_db_path: None,
+            ledger_db_path: ledger_db_path.into(),
             storage_driver: "overlay".to_string(),
             storage_options: Vec::new(),
             global_auth_file: None,
