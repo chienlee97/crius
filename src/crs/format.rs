@@ -83,6 +83,9 @@ pub(crate) trait TableRow {
     where
         Self: Sized;
     fn cells(&self) -> Vec<String>;
+    fn quiet_cell(&self) -> String {
+        self.cells().into_iter().next().unwrap_or_default()
+    }
 }
 
 pub(crate) fn print_envelope<T>(output: &CommandOutput<T>) -> Result<String, serde_json::Error>
@@ -127,6 +130,17 @@ where
     ));
     lines.extend(rows.iter().map(|row| format_row(row, &widths)));
     lines.join("\n")
+}
+
+pub(crate) fn print_quiet<T>(items: &[T], no_trunc: bool) -> String
+where
+    T: TableRow,
+{
+    items
+        .iter()
+        .map(|item| truncate_field(&normalize_cell(&item.quiet_cell()), no_trunc))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub(crate) fn render_warnings(warnings: &[String], output: OutputArg) -> Option<String> {
@@ -430,6 +444,22 @@ mod tests {
         let rendered = print_table(&rows, false);
 
         assert_eq!(rendered, "ID   NAME\nabc  first\n-    two lines");
+    }
+
+    #[test]
+    fn renders_quiet_without_header_or_envelope() {
+        let rows = vec![
+            TestView {
+                id: "abc".into(),
+                name: "first".into(),
+            },
+            TestView {
+                id: "def".into(),
+                name: "second".into(),
+            },
+        ];
+
+        assert_eq!(print_quiet(&rows, false), "abc\ndef");
     }
 
     #[test]
