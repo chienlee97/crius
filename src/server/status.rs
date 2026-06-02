@@ -525,6 +525,22 @@ impl RuntimeServiceImpl {
             .map_err(|err| format!("failed to check recovery ledger: {err}"))
     }
 
+    pub async fn recovery_check_report(
+        &self,
+        execute: bool,
+    ) -> Result<crate::state::LedgerCheckReport, String> {
+        let mut persistence = self.persistence.lock().await;
+        crate::state::StateLedgerWriter::new(&mut persistence)
+            .repair(crate::state::LedgerRepairOptions::default(), !execute)
+            .map_err(|err| {
+                if execute {
+                    format!("failed to repair recovery ledger: {err}")
+                } else {
+                    format!("failed to check recovery ledger: {err}")
+                }
+            })
+    }
+
     pub(super) async fn probe_cni_load_status(&self) -> crate::network::CniLoadStatus {
         let cni_config = self.current_cni_config();
         if let Some(status) = cni_config.rootless_load_status() {

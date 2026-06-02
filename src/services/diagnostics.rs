@@ -7,10 +7,10 @@ use crate::proto::diagnostics::v1::{
     diagnostics_service_server::DiagnosticsService, ContainerLogChunk, ContainerLogRequest,
     ContentGcRequest, ContentGcResponse, EffectiveConfigRequest, EffectiveConfigResponse,
     ImageTransferInfo, ImageTransfersRequest, ImageTransfersResponse, NriStatusRequest,
-    NriStatusResponse, RecoveryCheckRequest, RecoveryCheckResponse, RecoveryStatusRequest,
-    RecoveryStatusResponse, RuntimeHandlerInfo, RuntimeHandlersRequest, RuntimeHandlersResponse,
-    SecurityStatusRequest, SecurityStatusResponse, ServerInfoRequest, ServerInfoResponse,
-    ShimStatusRequest, ShimStatusResponse,
+    NriStatusResponse, RecoveryAction, RecoveryCheckRequest, RecoveryCheckResponse,
+    RecoveryStatusRequest, RecoveryStatusResponse, RuntimeHandlerInfo, RuntimeHandlersRequest,
+    RuntimeHandlersResponse, SecurityStatusRequest, SecurityStatusResponse, ServerInfoRequest,
+    ServerInfoResponse, ShimStatusRequest, ShimStatusResponse,
 };
 
 #[derive(Clone, Default)]
@@ -236,9 +236,39 @@ impl DiagnosticsService for DiagnosticsServiceImpl {
 
     async fn recovery_check(
         &self,
-        _request: Request<RecoveryCheckRequest>,
+        request: Request<RecoveryCheckRequest>,
     ) -> Result<Response<RecoveryCheckResponse>, Status> {
-        Err(unimplemented("RecoveryCheck"))
+        let execute = request.into_inner().execute;
+        let Some(runtime) = self.state.runtime_service.as_ref() else {
+            return Ok(Response::new(RecoveryCheckResponse {
+                dry_run: !execute,
+                actions: Vec::new(),
+                warnings: vec!["runtime diagnostics state is not available".to_string()],
+            }));
+        };
+
+        let report = runtime
+            .recovery_check_report(execute)
+            .await
+            .map_err(|err| Status::internal(redact_host_paths(&err)))?;
+        let actions = report
+            .actions
+            .into_iter()
+            .map(|action| RecoveryAction {
+                object_type: action.subject_kind,
+                object_id: action.subject_id,
+                action: action.action,
+                reason: action.message,
+                executed: action.applied,
+                error: String::new(),
+            })
+            .collect();
+
+        Ok(Response::new(RecoveryCheckResponse {
+            dry_run: report.dry_run,
+            actions,
+            warnings: Vec::new(),
+        }))
     }
 
     async fn nri_status(
@@ -384,6 +414,20 @@ fn last_startup_summary(runtime: &crate::server::RuntimeServiceImpl) -> String {
     }
 }
 
+fn redact_host_paths(message: &str) -> String {
+    message
+        .split_whitespace()
+        .map(|part| {
+            if part.starts_with('/') {
+                "<path>"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -401,12 +445,12 @@ mod tests {
         let service = DiagnosticsServiceImpl::new(DiagnosticsState::empty());
 
         let error = service
-            .recovery_check(Request::new(RecoveryCheckRequest { execute: false }))
+            .nri_status(Request::new(NriStatusRequest {}))
             .await
             .expect_err("stub should be unimplemented");
 
         assert_eq!(error.code(), Code::Unimplemented);
-        assert!(error.message().contains("RecoveryCheck"));
+        assert!(error.message().contains("NriStatus"));
     }
 
     #[tokio::test]
@@ -636,6 +680,66 @@ mod tests {
             .expect("ledger summary should be valid json");
         assert_eq!(ledger_summary["brokenContainers"], 0);
         assert!(response.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_check_dry_run_reports_actions_without_mutating_ledger() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let root_dir = tempdir.path().join("state");
+        let mut runtime_config = crate::server::RuntimeConfig::default();
+        runtime_config.root_dir = root_dir.clone();
+        let runtime = crate::server::RuntimeServiceImpl::new(runtime_config);
+        let db_path = root_dir.join("crius.db");
+        {
+            let mut storage =
+                crate::storage::StorageManager::new(&db_path).expect("storage should open");
+            storage
+                .save_snapshot(&crate::storage::SnapshotRecord {
+                    key: "snapshot-repair".to_string(),
+                    image_id: "missing-image".to_string(),
+                    owner_kind: "image".to_string(),
+                    owner_id: "missing-image".to_string(),
+                    state: crate::state::SnapshotLedgerState::Prepared
+                        .as_str()
+                        .to_string(),
+                    mountpoint: "/tmp/rootfs".to_string(),
+                    snapshotter: "internal-overlay-untar".to_string(),
+                    runtime_managed: true,
+                })
+                .expect("snapshot record should be stored");
+        }
+
+        let state = DiagnosticsState::from_runtime(
+            "0.1.0",
+            "abc123",
+            &crate::config::Config::default(),
+            &runtime,
+            "/run/crius/crius.sock",
+        );
+        let service = DiagnosticsServiceImpl::new(state);
+
+        let response = service
+            .recovery_check(Request::new(RecoveryCheckRequest { execute: false }))
+            .await
+            .expect("recovery check should succeed")
+            .into_inner();
+
+        assert!(response.dry_run);
+        assert!(response
+            .actions
+            .iter()
+            .any(|action| action.object_id == "snapshot-repair"
+                && action.action == "markSnapshotBroken"
+                && !action.executed));
+
+        let storage = crate::storage::StorageManager::new(&db_path).expect("storage should open");
+        let snapshots = storage
+            .list_snapshots()
+            .expect("snapshots should be listed");
+        assert_eq!(
+            snapshots[0].state,
+            crate::state::SnapshotLedgerState::Prepared.as_str()
+        );
     }
 
     fn test_image_service(storage_path: PathBuf) -> ImageServiceImpl {
