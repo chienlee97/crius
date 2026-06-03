@@ -1,4 +1,4 @@
-use std::{fs, path::Path, time::Duration};
+use std::{fs, net::IpAddr, path::Path, time::Duration};
 
 use base64::Engine;
 
@@ -275,6 +275,48 @@ fn decode_docker_auth(source: &str, auth: &str) -> Result<(String, String), Stri
     Ok((username.to_string(), password.to_string()))
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_cidr_list(value: &str) -> Result<Vec<String>, String> {
+    value
+        .split(',')
+        .map(|segment| {
+            let cidr = segment.trim();
+            if cidr.is_empty() {
+                return Err(format!(
+                    "invalid CIDR list \"{value}\": entries must not be empty"
+                ));
+            }
+            validate_cidr(value, cidr)?;
+            Ok(cidr.to_string())
+        })
+        .collect()
+}
+
+fn validate_cidr(source: &str, cidr: &str) -> Result<(), String> {
+    let Some((addr, prefix)) = cidr.split_once('/') else {
+        return Err(format!(
+            "invalid CIDR list \"{source}\": expected address/prefix"
+        ));
+    };
+    let addr = addr
+        .parse::<IpAddr>()
+        .map_err(|error| format!("invalid CIDR list \"{source}\": {error}"))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|error| format!("invalid CIDR list \"{source}\": {error}"))?;
+    let max_prefix = match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max_prefix {
+        return Err(format!(
+            "invalid CIDR list \"{source}\": prefix {prefix} exceeds {max_prefix}"
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +498,21 @@ mod tests {
 
         assert!(error.contains("inline"), "{error}");
         assert!(!error.contains("not a secret token"), "{error}");
+    }
+
+    #[test]
+    fn parses_cidr_lists() {
+        assert_eq!(
+            parse_cidr_list("10.244.0.0/16,fd00::/64").unwrap(),
+            vec!["10.244.0.0/16".to_string(), "fd00::/64".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_cidr_lists() {
+        for input in ["", "10.244.0.0", "10.0.0.0/8,,fd00::/64", "not-cidr"] {
+            let error = parse_cidr_list(input).expect_err("CIDR list should be rejected");
+            assert!(error.contains(&format!("invalid CIDR list \"{input}\"")), "{error}");
+        }
     }
 }
