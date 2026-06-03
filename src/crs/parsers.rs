@@ -35,6 +35,12 @@ pub(crate) struct ResourceFragment {
     pub(crate) unified: Vec<KeyValuePair>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ParsedUser {
+    Id { uid: i64, gid: Option<i64> },
+    Name(String),
+}
+
 impl std::fmt::Display for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -795,6 +801,43 @@ pub(crate) fn parse_selinux_option(value: &str) -> Result<SeLinuxOption, String>
     })
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_user(value: &str) -> Result<ParsedUser, String> {
+    if value.is_empty() {
+        return Err("invalid user \"\": expected UID, UID:GID, or username".into());
+    }
+
+    if let Some((uid, gid)) = value.split_once(':') {
+        if uid.is_empty() || gid.is_empty() {
+            return Err(format!(
+                "invalid user \"{value}\": UID and GID must not be empty"
+            ));
+        }
+        return Ok(ParsedUser::Id {
+            uid: parse_user_id(value, uid)?,
+            gid: Some(parse_user_id(value, gid)?),
+        });
+    }
+
+    match value.parse::<i64>() {
+        Ok(uid) if uid >= 0 => Ok(ParsedUser::Id { uid, gid: None }),
+        Ok(_) => Err(format!("invalid user \"{value}\": UID must be non-negative")),
+        Err(_) => Ok(ParsedUser::Name(value.to_string())),
+    }
+}
+
+fn parse_user_id(source: &str, value: &str) -> Result<i64, String> {
+    let id = value
+        .parse::<i64>()
+        .map_err(|_| format!("invalid user \"{source}\": UID and GID must be numeric"))?;
+    if id < 0 {
+        return Err(format!(
+            "invalid user \"{source}\": UID and GID must be non-negative"
+        ));
+    }
+    Ok(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1168,6 +1211,27 @@ mod tests {
                 error.contains(&format!("invalid SELinux option \"{input}\"")),
                 "{error}"
             );
+        }
+    }
+
+    #[test]
+    fn parses_users() {
+        assert_eq!(parse_user("1000").unwrap(), ParsedUser::Id { uid: 1000, gid: None });
+        assert_eq!(
+            parse_user("1000:1000").unwrap(),
+            ParsedUser::Id {
+                uid: 1000,
+                gid: Some(1000)
+            }
+        );
+        assert_eq!(parse_user("nobody").unwrap(), ParsedUser::Name("nobody".into()));
+    }
+
+    #[test]
+    fn rejects_invalid_users() {
+        for input in ["", "1000:", "-1", "1000:group"] {
+            let error = parse_user(input).expect_err("user should fail");
+            assert!(error.contains(&format!("invalid user \"{input}\"")), "{error}");
         }
     }
 }
