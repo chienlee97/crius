@@ -21,6 +21,20 @@ pub(crate) struct KeyValuePair {
     pub(crate) value: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ResourceFragment {
+    pub(crate) cpu_period: Option<i64>,
+    pub(crate) cpu_quota: Option<i64>,
+    pub(crate) cpu_shares: Option<i64>,
+    pub(crate) memory_limit_in_bytes: Option<i64>,
+    pub(crate) memory_swap_limit_in_bytes: Option<i64>,
+    pub(crate) oom_score_adj: Option<i64>,
+    pub(crate) cpuset_cpus: Option<String>,
+    pub(crate) cpuset_mems: Option<String>,
+    pub(crate) hugepages: Vec<HugepageLimit>,
+    pub(crate) unified: Vec<KeyValuePair>,
+}
+
 impl std::fmt::Display for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -678,6 +692,62 @@ pub(crate) fn parse_hugepage(value: &str) -> Result<HugepageLimit, String> {
     })
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_resource_spec(value: &str) -> Result<ResourceFragment, String> {
+    let mut fragment = ResourceFragment::default();
+    if value.is_empty() {
+        return Err("invalid resource spec \"\": expected comma-separated KEY=VALUE".into());
+    }
+
+    for part in value.split(',') {
+        let pair = parse_key_value("resource spec", part)?;
+        match pair.key.as_str() {
+            "cpu-period" | "cpu_period" => {
+                fragment.cpu_period = Some(parse_i64_field("resource spec", value, &pair.value)?)
+            }
+            "cpu-quota" | "cpu_quota" | "cpu" => {
+                fragment.cpu_quota = Some(parse_i64_field("resource spec", value, &pair.value)?)
+            }
+            "cpu-shares" | "cpu_shares" => {
+                fragment.cpu_shares = Some(parse_i64_field("resource spec", value, &pair.value)?)
+            }
+            "memory" => {
+                fragment.memory_limit_in_bytes =
+                    Some(parse_byte_size_as_i64("resource spec", value, &pair.value)?)
+            }
+            "swap" | "memory-swap" | "memory_swap" => {
+                fragment.memory_swap_limit_in_bytes =
+                    Some(parse_byte_size_as_i64("resource spec", value, &pair.value)?)
+            }
+            "oom" | "oom-score-adj" | "oom_score_adj" => {
+                fragment.oom_score_adj = Some(parse_i64_field("resource spec", value, &pair.value)?)
+            }
+            "cpuset" | "cpuset-cpus" | "cpuset_cpus" => fragment.cpuset_cpus = Some(pair.value),
+            "cpuset-mems" | "cpuset_mems" => fragment.cpuset_mems = Some(pair.value),
+            "hugepage" => fragment.hugepages.push(parse_hugepage(&pair.value)?),
+            "unified" => fragment.unified.push(parse_key_value("resource unified", &pair.value)?),
+            key => {
+                return Err(format!(
+                    "invalid resource spec \"{value}\": unsupported key \"{key}\""
+                ));
+            }
+        }
+    }
+
+    Ok(fragment)
+}
+
+fn parse_i64_field(kind: &str, source: &str, value: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .map_err(|_| format!("invalid {kind} \"{source}\": expected integer"))
+}
+
+fn parse_byte_size_as_i64(kind: &str, source: &str, value: &str) -> Result<i64, String> {
+    let bytes = parse_byte_size(value)?;
+    i64::try_from(bytes).map_err(|_| format!("invalid {kind} \"{source}\": value is out of range"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -970,6 +1040,34 @@ mod tests {
         for input in ["", "2Mi", "=64MiB", "2Mi="] {
             let error = parse_hugepage(input).expect_err("hugepage should be rejected");
             assert!(error.contains(&format!("invalid hugepage \"{input}\"")), "{error}");
+        }
+    }
+
+    #[test]
+    fn parses_resource_specs() {
+        let fragment = parse_resource_spec(
+            "cpu=50000,memory=64MiB,swap=128MiB,oom=-10,cpuset=0-1,hugepage=2Mi=64MiB,unified=memory.max=67108864",
+        )
+        .unwrap();
+
+        assert_eq!(fragment.cpu_quota, Some(50_000));
+        assert_eq!(fragment.memory_limit_in_bytes, Some(67_108_864));
+        assert_eq!(fragment.memory_swap_limit_in_bytes, Some(134_217_728));
+        assert_eq!(fragment.oom_score_adj, Some(-10));
+        assert_eq!(fragment.cpuset_cpus.as_deref(), Some("0-1"));
+        assert_eq!(fragment.hugepages[0].limit, 67_108_864);
+        assert_eq!(fragment.unified[0].key, "memory.max");
+    }
+
+    #[test]
+    fn rejects_invalid_resource_specs() {
+        for input in ["", "unknown=1", "memory=64MB", "unified=missing-value"] {
+            let error = parse_resource_spec(input).expect_err("resource spec should be rejected");
+            assert!(
+                error.contains("resource spec") || error.contains("byte size"),
+                "{error}"
+            );
+            assert!(error.contains(input) || input == "unified=missing-value", "{error}");
         }
     }
 }
