@@ -2,7 +2,7 @@ use std::{fs, net::IpAddr, path::Path, time::Duration};
 
 use base64::Engine;
 
-use crate::proto::runtime::v1::AuthConfig;
+use crate::proto::runtime::v1::{AuthConfig, PortMapping, Protocol};
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "unix:///run/crius/crius.sock";
 
@@ -317,6 +317,92 @@ fn validate_cidr(source: &str, cidr: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_port_mapping(value: &str) -> Result<PortMapping, String> {
+    parse_port_mapping_with_host_ip(value, None)
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_port_mapping_with_host_ip(
+    value: &str,
+    default_host_ip: Option<&str>,
+) -> Result<PortMapping, String> {
+    let (mapping, protocol) = value.split_once('/').unwrap_or((value, "tcp"));
+    let protocol = parse_protocol(value, protocol)?;
+    let (host_ip, ports) = split_mapping_host_ip(value, mapping, default_host_ip)?;
+    let (host_port, container_port) = ports.split_once(':').ok_or_else(|| {
+        format!("invalid port mapping \"{value}\": expected HOST:CONTAINER[/PROTO]")
+    })?;
+
+    Ok(PortMapping {
+        protocol,
+        container_port: parse_port(value, container_port)?,
+        host_port: parse_port(value, host_port)?,
+        host_ip,
+    })
+}
+
+fn parse_protocol(source: &str, protocol: &str) -> Result<i32, String> {
+    match protocol.to_ascii_lowercase().as_str() {
+        "tcp" => Ok(Protocol::Tcp as i32),
+        "udp" => Ok(Protocol::Udp as i32),
+        "sctp" => Ok(Protocol::Sctp as i32),
+        _ => Err(format!(
+            "invalid port mapping \"{source}\": protocol must be tcp, udp, or sctp"
+        )),
+    }
+}
+
+fn split_mapping_host_ip<'a>(
+    source: &str,
+    mapping: &'a str,
+    default_host_ip: Option<&str>,
+) -> Result<(String, &'a str), String> {
+    if let Some(rest) = mapping.strip_prefix('[') {
+        let Some((host_ip, ports)) = rest.split_once("]:") else {
+            return Err(format!(
+                "invalid port mapping \"{source}\": bracket IPv6 host IP must be followed by :HOST:CONTAINER"
+            ));
+        };
+        host_ip
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|error| format!("invalid port mapping \"{source}\": {error}"))?;
+        return Ok((host_ip.to_string(), ports));
+    }
+
+    let colon_count = mapping.matches(':').count();
+    match colon_count {
+        1 => Ok((default_host_ip.unwrap_or_default().to_string(), mapping)),
+        2 => {
+            let Some((host_ip, ports)) = mapping.split_once(':') else {
+                unreachable!("colon_count checked above")
+            };
+            host_ip
+                .parse::<IpAddr>()
+                .map_err(|error| format!("invalid port mapping \"{source}\": {error}"))?;
+            Ok((host_ip.to_string(), ports))
+        }
+        count if count > 2 => Err(format!(
+            "invalid port mapping \"{source}\": IPv6 host IP must be enclosed in brackets"
+        )),
+        _ => Err(format!(
+            "invalid port mapping \"{source}\": expected HOST:CONTAINER[/PROTO]"
+        )),
+    }
+}
+
+fn parse_port(source: &str, value: &str) -> Result<i32, String> {
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| format!("invalid port mapping \"{source}\": port must be 1-65535"))?;
+    if port == 0 {
+        return Err(format!(
+            "invalid port mapping \"{source}\": port must be 1-65535"
+        ));
+    }
+    Ok(i32::from(port))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +599,32 @@ mod tests {
         for input in ["", "10.244.0.0", "10.0.0.0/8,,fd00::/64", "not-cidr"] {
             let error = parse_cidr_list(input).expect_err("CIDR list should be rejected");
             assert!(error.contains(&format!("invalid CIDR list \"{input}\"")), "{error}");
+        }
+    }
+
+    #[test]
+    fn parses_port_mappings() {
+        let mapping = parse_port_mapping("8080:80/UDP").unwrap();
+        assert_eq!(mapping.host_port, 8080);
+        assert_eq!(mapping.container_port, 80);
+        assert_eq!(mapping.protocol, Protocol::Udp as i32);
+        assert_eq!(mapping.host_ip, "");
+
+        let mapping = parse_port_mapping("[fd00::1]:8443:443").unwrap();
+        assert_eq!(mapping.host_ip, "fd00::1");
+        assert_eq!(mapping.host_port, 8443);
+        assert_eq!(mapping.container_port, 443);
+        assert_eq!(mapping.protocol, Protocol::Tcp as i32);
+
+        let mapping = parse_port_mapping_with_host_ip("8080:80", Some("127.0.0.1")).unwrap();
+        assert_eq!(mapping.host_ip, "127.0.0.1");
+    }
+
+    #[test]
+    fn rejects_invalid_port_mappings() {
+        for input in ["", "80", "0:80", "8080:0", "8080:80/http", "fd00::1:8080:80"] {
+            let error = parse_port_mapping(input).expect_err("port mapping should be rejected");
+            assert!(error.contains(&format!("invalid port mapping \"{input}\"")), "{error}");
         }
     }
 }
