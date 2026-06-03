@@ -4,7 +4,7 @@ use base64::Engine;
 
 use crate::proto::runtime::v1::{
     AuthConfig, Device, HugepageLimit, IdMapping, ImageSpec, Mount, MountPropagation, PortMapping,
-    Protocol, SecurityProfile,
+    Protocol, SeLinuxOption, SecurityProfile,
 };
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "unix:///run/crius/crius.sock";
@@ -778,6 +778,23 @@ pub(crate) fn parse_security_profile(value: &str) -> Result<SecurityProfile, Str
     })
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_selinux_option(value: &str) -> Result<SeLinuxOption, String> {
+    let parts: Vec<_> = value.split(':').collect();
+    if parts.len() != 4 {
+        return Err(format!(
+            "invalid SELinux option \"{value}\": expected user:role:type:level"
+        ));
+    }
+
+    Ok(SeLinuxOption {
+        user: parts[0].to_string(),
+        role: parts[1].to_string(),
+        r#type: parts[2].to_string(),
+        level: parts[3].to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1123,6 +1140,32 @@ mod tests {
             let error = parse_security_profile(input).expect_err("security profile should fail");
             assert!(
                 error.contains(&format!("invalid security profile \"{input}\"")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_selinux_options() {
+        let option = parse_selinux_option("user:role:type:level").unwrap();
+        assert_eq!(option.user, "user");
+        assert_eq!(option.role, "role");
+        assert_eq!(option.r#type, "type");
+        assert_eq!(option.level, "level");
+
+        let option = parse_selinux_option("::type:").unwrap();
+        assert_eq!(option.user, "");
+        assert_eq!(option.role, "");
+        assert_eq!(option.r#type, "type");
+        assert_eq!(option.level, "");
+    }
+
+    #[test]
+    fn rejects_invalid_selinux_options() {
+        for input in ["user:role:type", "user:role:type:level:extra"] {
+            let error = parse_selinux_option(input).expect_err("SELinux option should fail");
+            assert!(
+                error.contains(&format!("invalid SELinux option \"{input}\"")),
                 "{error}"
             );
         }
