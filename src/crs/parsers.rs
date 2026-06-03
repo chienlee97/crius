@@ -838,6 +838,36 @@ fn parse_user_id(source: &str, value: &str) -> Result<i64, String> {
     Ok(id)
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_id_mapping(value: &str) -> Result<IdMapping, String> {
+    let parts: Vec<_> = value.split(':').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "invalid ID mapping \"{value}\": expected HOST:CONTAINER:LENGTH"
+        ));
+    }
+    let host_id = parse_id_mapping_field(value, parts[0])?;
+    let container_id = parse_id_mapping_field(value, parts[1])?;
+    let length = parse_id_mapping_field(value, parts[2])?;
+    if length == 0 {
+        return Err(format!(
+            "invalid ID mapping \"{value}\": length must be greater than 0"
+        ));
+    }
+
+    Ok(IdMapping {
+        host_id,
+        container_id,
+        length,
+    })
+}
+
+fn parse_id_mapping_field(source: &str, value: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid ID mapping \"{source}\": fields must be non-negative integers"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1232,6 +1262,22 @@ mod tests {
         for input in ["", "1000:", "-1", "1000:group"] {
             let error = parse_user(input).expect_err("user should fail");
             assert!(error.contains(&format!("invalid user \"{input}\"")), "{error}");
+        }
+    }
+
+    #[test]
+    fn parses_id_mappings() {
+        let mapping = parse_id_mapping("1000:0:65536").unwrap();
+        assert_eq!(mapping.host_id, 1000);
+        assert_eq!(mapping.container_id, 0);
+        assert_eq!(mapping.length, 65_536);
+    }
+
+    #[test]
+    fn rejects_invalid_id_mappings() {
+        for input in ["", "1:2", "1:2:0", "-1:0:1", "1:x:1"] {
+            let error = parse_id_mapping(input).expect_err("ID mapping should fail");
+            assert!(error.contains(&format!("invalid ID mapping \"{input}\"")), "{error}");
         }
     }
 }
