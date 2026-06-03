@@ -868,6 +868,40 @@ fn parse_id_mapping_field(source: &str, value: &str) -> Result<u32, String> {
         .map_err(|_| format!("invalid ID mapping \"{source}\": fields must be non-negative integers"))
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_since(value: &str) -> Result<i64, String> {
+    parse_since_at(value, chrono::Utc::now())
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_since_at(value: &str, now: chrono::DateTime<chrono::Utc>) -> Result<i64, String> {
+    if value.trim().is_empty() {
+        return Err("invalid since \"\": expected RFC3339 timestamp or duration".into());
+    }
+
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return timestamp_to_unix_nanos(timestamp.with_timezone(&chrono::Utc), value);
+    }
+
+    let duration = parse_duration(value)
+        .map_err(|_| format!("invalid since \"{value}\": expected RFC3339 timestamp or duration"))?;
+    let chrono_duration = chrono::Duration::from_std(duration)
+        .map_err(|_| format!("invalid since \"{value}\": duration is out of range"))?;
+    let since = now
+        .checked_sub_signed(chrono_duration)
+        .ok_or_else(|| format!("invalid since \"{value}\": duration is out of range"))?;
+    timestamp_to_unix_nanos(since, value)
+}
+
+fn timestamp_to_unix_nanos(
+    timestamp: chrono::DateTime<chrono::Utc>,
+    source: &str,
+) -> Result<i64, String> {
+    timestamp
+        .timestamp_nanos_opt()
+        .ok_or_else(|| format!("invalid since \"{source}\": timestamp is out of range"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1278,6 +1312,26 @@ mod tests {
         for input in ["", "1:2", "1:2:0", "-1:0:1", "1:x:1"] {
             let error = parse_id_mapping(input).expect_err("ID mapping should fail");
             assert!(error.contains(&format!("invalid ID mapping \"{input}\"")), "{error}");
+        }
+    }
+
+    #[test]
+    fn parses_since_values() {
+        let timestamp = parse_since("2026-06-03T12:00:00Z").unwrap();
+        assert_eq!(timestamp, 1_780_488_000_000_000_000);
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let timestamp = parse_since_at("10m", now).unwrap();
+        assert_eq!(timestamp, 1_780_487_400_000_000_000);
+    }
+
+    #[test]
+    fn rejects_invalid_since_values() {
+        for input in ["", "not-time", "1.5s"] {
+            let error = parse_since(input).expect_err("since should fail");
+            assert!(error.contains(&format!("invalid since \"{input}\"")), "{error}");
         }
     }
 }
