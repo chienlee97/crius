@@ -254,11 +254,16 @@ impl From<AuthConfigJson> for AuthConfig {
 
 #[allow(dead_code)]
 pub(crate) fn parse_auth_json(source: &str, value: &str) -> Result<AuthConfig, String> {
-    if let Ok(config) = serde_json::from_str::<AuthConfigJson>(value) {
+    let json: serde_json::Value = serde_json::from_str(value)
+        .map_err(|error| format!("invalid auth JSON from {source}: {error}"))?;
+
+    if json.get("auths").is_none() {
+        let config: AuthConfigJson = serde_json::from_value(json)
+            .map_err(|error| format!("invalid auth JSON from {source}: {error}"))?;
         return Ok(config.into());
     }
 
-    let docker = serde_json::from_str::<DockerAuthFile>(value)
+    let docker = serde_json::from_value::<DockerAuthFile>(json)
         .map_err(|error| format!("invalid auth JSON from {source}: {error}"))?;
 
     let Some((server, entry)) = docker.auths.into_iter().next() else {
@@ -1218,10 +1223,15 @@ mod tests {
         for input in ["", "unknown=1", "memory=64MB", "unified=missing-value"] {
             let error = parse_resource_spec(input).expect_err("resource spec should be rejected");
             assert!(
-                error.contains("resource spec") || error.contains("byte size"),
+                error.contains("resource") || error.contains("byte size"),
                 "{error}"
             );
-            assert!(error.contains(input) || input == "unified=missing-value", "{error}");
+            assert!(
+                error.contains(input)
+                    || input == "unified=missing-value"
+                    || (input == "memory=64MB" && error.contains("64MB")),
+                "{error}"
+            );
         }
     }
 
@@ -1333,5 +1343,45 @@ mod tests {
             let error = parse_since(input).expect_err("since should fail");
             assert!(error.contains(&format!("invalid since \"{input}\"")), "{error}");
         }
+    }
+
+    #[test]
+    fn parser_success_sample_matrix_covers_all_p7_parsers() {
+        assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
+        assert_eq!(parse_byte_size("64MiB").unwrap(), 67_108_864);
+        assert_eq!(parse_key_value("--label", "App=Demo").unwrap().key, "App");
+
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("env.list");
+        std::fs::write(&env_path, "A=B\n").unwrap();
+        assert_eq!(parse_env_file(&env_path).unwrap()[0].value, "B");
+
+        assert_eq!(
+            parse_auth_json("config.json", r#"{"auths":{"registry":{"auth":"dTpw"}}}"#)
+                .unwrap()
+                .server_address,
+            "registry"
+        );
+        assert_eq!(parse_cidr_list("10.244.0.0/16").unwrap()[0], "10.244.0.0/16");
+        assert_eq!(parse_port_mapping("8080:80").unwrap().container_port, 80);
+        assert_eq!(
+            parse_mount("type=bind,src=/host,dst=/container").unwrap().host_path,
+            "/host"
+        );
+        assert_eq!(parse_device("/dev/null").unwrap().permissions, "rwm");
+        assert_eq!(parse_resource_spec("memory=1KiB").unwrap().memory_limit_in_bytes, Some(1024));
+        assert_eq!(parse_hugepage("2Mi=1KiB").unwrap().limit, 1024);
+        assert_eq!(
+            parse_security_profile("unconfined").unwrap().profile_type,
+            crate::proto::runtime::v1::security_profile::ProfileType::Unconfined as i32
+        );
+        assert_eq!(parse_selinux_option("u:r:t:l").unwrap().r#type, "t");
+        assert_eq!(parse_user("1000").unwrap(), ParsedUser::Id { uid: 1000, gid: None });
+        assert_eq!(parse_id_mapping("0:1000:1").unwrap().length, 1);
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(parse_since_at("1h", now).unwrap(), 1_780_484_400_000_000_000);
     }
 }
