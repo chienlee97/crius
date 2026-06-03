@@ -1,5 +1,9 @@
 use std::{fs, path::Path, time::Duration};
 
+use base64::Engine;
+
+use crate::proto::runtime::v1::AuthConfig;
+
 pub(crate) const DEFAULT_ENDPOINT: &str = "unix:///run/crius/crius.sock";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,6 +179,102 @@ pub(crate) fn parse_env_file(path: impl AsRef<Path>) -> Result<Vec<KeyValuePair>
         .collect()
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthConfigJson {
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    auth: String,
+    #[serde(default, alias = "server")]
+    server_address: String,
+    #[serde(default)]
+    identity_token: String,
+    #[serde(default)]
+    registry_token: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DockerAuthFile {
+    auths: std::collections::BTreeMap<String, DockerAuthEntry>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DockerAuthEntry {
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    auth: String,
+    #[serde(default)]
+    identity_token: String,
+    #[serde(default)]
+    registry_token: String,
+}
+
+impl From<AuthConfigJson> for AuthConfig {
+    fn from(value: AuthConfigJson) -> Self {
+        Self {
+            username: value.username,
+            password: value.password,
+            auth: value.auth,
+            server_address: value.server_address,
+            identity_token: value.identity_token,
+            registry_token: value.registry_token,
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_auth_json(source: &str, value: &str) -> Result<AuthConfig, String> {
+    if let Ok(config) = serde_json::from_str::<AuthConfigJson>(value) {
+        return Ok(config.into());
+    }
+
+    let docker = serde_json::from_str::<DockerAuthFile>(value)
+        .map_err(|error| format!("invalid auth JSON from {source}: {error}"))?;
+
+    let Some((server, entry)) = docker.auths.into_iter().next() else {
+        return Err(format!("invalid auth JSON from {source}: auths must not be empty"));
+    };
+
+    let (username, password) = if !entry.auth.is_empty()
+        && (entry.username.is_empty() || entry.password.is_empty())
+    {
+        decode_docker_auth(source, &entry.auth)?
+    } else {
+        (entry.username, entry.password)
+    };
+
+    Ok(AuthConfig {
+        username,
+        password,
+        auth: entry.auth,
+        server_address: server,
+        identity_token: entry.identity_token,
+        registry_token: entry.registry_token,
+    })
+}
+
+fn decode_docker_auth(source: &str, auth: &str) -> Result<(String, String), String> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(auth)
+        .map_err(|error| format!("invalid auth JSON from {source}: invalid docker auth: {error}"))?;
+    let decoded = String::from_utf8(decoded)
+        .map_err(|error| format!("invalid auth JSON from {source}: invalid docker auth: {error}"))?;
+    let Some((username, password)) = decoded.split_once(':') else {
+        return Err(format!(
+            "invalid auth JSON from {source}: docker auth must decode to username:password"
+        ));
+    };
+
+    Ok((username.to_string(), password.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +418,43 @@ mod tests {
         let missing = dir.path().join("missing.env");
         let error = parse_env_file(&missing).expect_err("missing env file should be rejected");
         assert!(error.contains("failed to read env file"), "{error}");
+    }
+
+    #[test]
+    fn parses_cri_auth_json() {
+        let auth = parse_auth_json(
+            "inline",
+            r#"{"username":"u","password":"p","serverAddress":"registry.example","identityToken":"id","registryToken":"rt"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(auth.username, "u");
+        assert_eq!(auth.password, "p");
+        assert_eq!(auth.server_address, "registry.example");
+        assert_eq!(auth.identity_token, "id");
+        assert_eq!(auth.registry_token, "rt");
+    }
+
+    #[test]
+    fn parses_docker_auth_json() {
+        let auth = parse_auth_json(
+            "config.json",
+            r#"{"auths":{"registry.example":{"auth":"dXNlcjpzZWNyZXQ="}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(auth.server_address, "registry.example");
+        assert_eq!(auth.username, "user");
+        assert_eq!(auth.password, "secret");
+        assert_eq!(auth.auth, "dXNlcjpzZWNyZXQ=");
+    }
+
+    #[test]
+    fn rejects_invalid_auth_json_without_leaking_secret() {
+        let error = parse_auth_json("inline", r#"{"auths":{"r":{"auth":"not a secret token"}}}"#)
+            .expect_err("invalid auth JSON should be rejected");
+
+        assert!(error.contains("inline"), "{error}");
+        assert!(!error.contains("not a secret token"), "{error}");
     }
 }
