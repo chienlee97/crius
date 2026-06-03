@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{fs, path::Path, time::Duration};
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "unix:///run/crius/crius.sock";
 
@@ -149,6 +149,32 @@ pub(crate) fn parse_key_value(flag: &str, value: &str) -> Result<KeyValuePair, S
     })
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_env_file(path: impl AsRef<Path>) -> Result<Vec<KeyValuePair>, String> {
+    let path = path.as_ref();
+    let source = path.display().to_string();
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read env file \"{source}\": {error}"))?;
+
+    content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                None
+            } else {
+                Some((index + 1, line))
+            }
+        })
+        .map(|(line_number, line)| {
+            parse_key_value("env file", line).map_err(|error| {
+                format!("invalid env file \"{source}\" line {line_number}: {error}")
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +276,47 @@ mod tests {
             assert!(error.contains("--env"), "{error}");
             assert!(error.contains(input), "{error}");
         }
+    }
+
+    #[test]
+    fn parses_env_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env.list");
+        std::fs::write(&path, "# comment\n\nFOO=bar\nEMPTY=\nName=Value\n").unwrap();
+
+        let entries = parse_env_file(&path).unwrap();
+
+        assert_eq!(
+            entries,
+            vec![
+                KeyValuePair {
+                    key: "FOO".into(),
+                    value: "bar".into(),
+                },
+                KeyValuePair {
+                    key: "EMPTY".into(),
+                    value: "".into(),
+                },
+                KeyValuePair {
+                    key: "Name".into(),
+                    value: "Value".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_env_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env.list");
+        std::fs::write(&path, "=secret\n").unwrap();
+
+        let error = parse_env_file(&path).expect_err("invalid env file should be rejected");
+        assert!(error.contains("env file"), "{error}");
+        assert!(error.contains("=secret"), "{error}");
+
+        let missing = dir.path().join("missing.env");
+        let error = parse_env_file(&missing).expect_err("missing env file should be rejected");
+        assert!(error.contains("failed to read env file"), "{error}");
     }
 }
