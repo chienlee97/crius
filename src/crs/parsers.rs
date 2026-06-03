@@ -1384,4 +1384,46 @@ mod tests {
             .with_timezone(&chrono::Utc);
         assert_eq!(parse_since_at("1h", now).unwrap(), 1_780_484_400_000_000_000);
     }
+
+    #[test]
+    fn parser_failure_sample_matrix_covers_all_p7_parsers() {
+        let cases: Vec<(&str, String)> = vec![
+            ("duration", parse_duration("1.5s").unwrap_err()),
+            ("byte size", parse_byte_size("64MB").unwrap_err()),
+            ("key/value", parse_key_value("--env", "=x").unwrap_err()),
+            ("env file", {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("bad.env");
+                std::fs::write(&path, "=x\n").unwrap();
+                parse_env_file(&path).unwrap_err()
+            }),
+            ("auth JSON", parse_auth_json("inline", "not-json-secret").unwrap_err()),
+            ("CIDR list", parse_cidr_list("10.244.0.0").unwrap_err()),
+            ("port mapping", parse_port_mapping("fd00::1:8080:80").unwrap_err()),
+            ("mount", parse_mount("type=bind,dst=/container").unwrap_err()),
+            ("device", parse_device("/dev/fuse:/dev/fuse:rx").unwrap_err()),
+            ("resource spec", parse_resource_spec("unknown=1").unwrap_err()),
+            ("hugepage", parse_hugepage("2Mi=").unwrap_err()),
+            ("security profile", parse_security_profile("localhost:").unwrap_err()),
+            ("SELinux option", parse_selinux_option("user:role:type").unwrap_err()),
+            ("user", parse_user("1000:").unwrap_err()),
+            ("ID mapping", parse_id_mapping("1:2:0").unwrap_err()),
+            ("since", parse_since("not-time").unwrap_err()),
+        ];
+
+        for (parser, error) in cases {
+            assert!(
+                error.contains("invalid") || error.contains("failed to read"),
+                "{parser}: {error}"
+            );
+            assert!(
+                error.contains('"') || parser == "env file" || parser == "auth JSON",
+                "{parser}: {error}"
+            );
+        }
+
+        let secret_error = parse_auth_json("inline", r#"{"auths":{"r":{"auth":"secret text" }}}"#)
+            .unwrap_err();
+        assert!(!secret_error.contains("secret text"), "{secret_error}");
+    }
 }
