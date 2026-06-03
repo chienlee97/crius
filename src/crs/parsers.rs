@@ -3,7 +3,8 @@ use std::{fs, net::IpAddr, path::Path, time::Duration};
 use base64::Engine;
 
 use crate::proto::runtime::v1::{
-    AuthConfig, Device, IdMapping, ImageSpec, Mount, MountPropagation, PortMapping, Protocol,
+    AuthConfig, Device, HugepageLimit, IdMapping, ImageSpec, Mount, MountPropagation, PortMapping,
+    Protocol,
 };
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "unix:///run/crius/crius.sock";
@@ -658,6 +659,25 @@ fn validate_device_permissions(source: &str, permissions: &str) -> Result<(), St
     Ok(())
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_hugepage(value: &str) -> Result<HugepageLimit, String> {
+    let Some((page_size, limit)) = value.split_once('=') else {
+        return Err(format!(
+            "invalid hugepage \"{value}\": expected SIZE=BYTES"
+        ));
+    };
+    if page_size.is_empty() || limit.is_empty() {
+        return Err(format!(
+            "invalid hugepage \"{value}\": size and bytes must not be empty"
+        ));
+    }
+
+    Ok(HugepageLimit {
+        page_size: page_size.to_string(),
+        limit: parse_byte_size(limit)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,6 +955,21 @@ mod tests {
         for input in ["", ":/dev/null", "/dev/fuse:/dev/fuse:rx", "/dev/null:/x:rr"] {
             let error = parse_device(input).expect_err("device should be rejected");
             assert!(error.contains(&format!("invalid device \"{input}\"")), "{error}");
+        }
+    }
+
+    #[test]
+    fn parses_hugepages() {
+        let hugepage = parse_hugepage("2Mi=64MiB").unwrap();
+        assert_eq!(hugepage.page_size, "2Mi");
+        assert_eq!(hugepage.limit, 67_108_864);
+    }
+
+    #[test]
+    fn rejects_invalid_hugepages() {
+        for input in ["", "2Mi", "=64MiB", "2Mi="] {
+            let error = parse_hugepage(input).expect_err("hugepage should be rejected");
+            assert!(error.contains(&format!("invalid hugepage \"{input}\"")), "{error}");
         }
     }
 }
