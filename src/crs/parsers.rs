@@ -111,4 +111,25 @@ mod tests {
             assert!(error.contains(endpoint));
         }
     }
+
+    #[test]
+    fn parses_durations_with_supported_units() {
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3_600));
+    }
+
+    #[test]
+    fn rejects_invalid_durations() {
+        for input in ["", "10", "1.5s", "5d", "ms"] {
+            let error = parse_duration(input).expect_err("duration should be rejected");
+            assert!(error.contains(&format!("invalid duration \"{input}\"")));
+        }
+
+        let overflow = format!("{}h", u64::MAX);
+        let error = parse_duration(&overflow).expect_err("duration overflow should be rejected");
+        assert!(error.contains("value is out of range"));
+    }
+
 }
