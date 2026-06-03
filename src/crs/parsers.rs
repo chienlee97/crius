@@ -4,7 +4,7 @@ use base64::Engine;
 
 use crate::proto::runtime::v1::{
     AuthConfig, Device, HugepageLimit, IdMapping, ImageSpec, Mount, MountPropagation, PortMapping,
-    Protocol,
+    Protocol, SecurityProfile,
 };
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "unix:///run/crius/crius.sock";
@@ -748,6 +748,36 @@ fn parse_byte_size_as_i64(kind: &str, source: &str, value: &str) -> Result<i64, 
     i64::try_from(bytes).map_err(|_| format!("invalid {kind} \"{source}\": value is out of range"))
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_security_profile(value: &str) -> Result<SecurityProfile, String> {
+    let profile_type = match value {
+        "runtime/default" => crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault,
+        "unconfined" => crate::proto::runtime::v1::security_profile::ProfileType::Unconfined,
+        _ => {
+            let Some(localhost_ref) = value.strip_prefix("localhost:") else {
+                return Err(format!(
+                    "invalid security profile \"{value}\": expected runtime/default, unconfined, or localhost:VALUE"
+                ));
+            };
+            if localhost_ref.is_empty() {
+                return Err(format!(
+                    "invalid security profile \"{value}\": localhost value must not be empty"
+                ));
+            }
+            return Ok(SecurityProfile {
+                profile_type:
+                    crate::proto::runtime::v1::security_profile::ProfileType::Localhost as i32,
+                localhost_ref: localhost_ref.to_string(),
+            });
+        }
+    };
+
+    Ok(SecurityProfile {
+        profile_type: profile_type as i32,
+        localhost_ref: String::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,6 +1098,33 @@ mod tests {
                 "{error}"
             );
             assert!(error.contains(input) || input == "unified=missing-value", "{error}");
+        }
+    }
+
+    #[test]
+    fn parses_security_profiles() {
+        let profile = parse_security_profile("runtime/default").unwrap();
+        assert_eq!(
+            profile.profile_type,
+            crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault as i32
+        );
+
+        let profile = parse_security_profile("localhost:profiles/default.json").unwrap();
+        assert_eq!(
+            profile.profile_type,
+            crate::proto::runtime::v1::security_profile::ProfileType::Localhost as i32
+        );
+        assert_eq!(profile.localhost_ref, "profiles/default.json");
+    }
+
+    #[test]
+    fn rejects_invalid_security_profiles() {
+        for input in ["", "default", "localhost:"] {
+            let error = parse_security_profile(input).expect_err("security profile should fail");
+            assert!(
+                error.contains(&format!("invalid security profile \"{input}\"")),
+                "{error}"
+            );
         }
     }
 }
