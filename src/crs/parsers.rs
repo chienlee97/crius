@@ -3,7 +3,7 @@ use std::{fs, net::IpAddr, path::Path, time::Duration};
 use base64::Engine;
 
 use crate::proto::runtime::v1::{
-    AuthConfig, IdMapping, ImageSpec, Mount, MountPropagation, PortMapping, Protocol,
+    AuthConfig, Device, IdMapping, ImageSpec, Mount, MountPropagation, PortMapping, Protocol,
 };
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "unix:///run/crius/crius.sock";
@@ -615,6 +615,49 @@ fn parse_u32_field(kind: &str, source: &str, value: &str) -> Result<u32, String>
         .map_err(|_| format!("invalid {kind} \"{source}\": expected non-negative integer"))
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_device(value: &str) -> Result<Device, String> {
+    let parts: Vec<_> = value.split(':').collect();
+    if parts.is_empty() || parts.len() > 3 || parts[0].is_empty() {
+        return Err(format!(
+            "invalid device \"{value}\": expected HOST[:CONTAINER[:PERMS]]"
+        ));
+    }
+
+    let host_path = parts[0].to_string();
+    let container_path = parts
+        .get(1)
+        .filter(|path| !path.is_empty())
+        .copied()
+        .unwrap_or(parts[0])
+        .to_string();
+    let permissions = parts.get(2).copied().unwrap_or("rwm");
+    validate_device_permissions(value, permissions)?;
+
+    Ok(Device {
+        container_path,
+        host_path,
+        permissions: permissions.to_string(),
+    })
+}
+
+fn validate_device_permissions(source: &str, permissions: &str) -> Result<(), String> {
+    if permissions.is_empty() {
+        return Err(format!(
+            "invalid device \"{source}\": permissions must contain r, w, and/or m"
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for permission in permissions.chars() {
+        if !matches!(permission, 'r' | 'w' | 'm') || !seen.insert(permission) {
+            return Err(format!(
+                "invalid device \"{source}\": permissions must contain unique r, w, and/or m"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,6 +916,25 @@ mod tests {
         ] {
             let error = parse_mount(input).expect_err("mount should be rejected");
             assert!(error.contains(&format!("invalid mount \"{input}\"")), "{error}");
+        }
+    }
+
+    #[test]
+    fn parses_devices() {
+        assert_eq!(parse_device("/dev/null").unwrap().container_path, "/dev/null");
+        assert_eq!(parse_device("/dev/null").unwrap().permissions, "rwm");
+
+        let device = parse_device("/dev/fuse:/dev/fuse:rwm").unwrap();
+        assert_eq!(device.host_path, "/dev/fuse");
+        assert_eq!(device.container_path, "/dev/fuse");
+        assert_eq!(device.permissions, "rwm");
+    }
+
+    #[test]
+    fn rejects_invalid_devices() {
+        for input in ["", ":/dev/null", "/dev/fuse:/dev/fuse:rx", "/dev/null:/x:rr"] {
+            let error = parse_device(input).expect_err("device should be rejected");
+            assert!(error.contains(&format!("invalid device \"{input}\"")), "{error}");
         }
     }
 }
