@@ -79,6 +79,50 @@ pub(crate) fn parse_duration(value: &str) -> Result<Duration, String> {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_byte_size(value: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "invalid byte size \"{value}\": expected an integer optionally followed by B, KiB, MiB, GiB, or TiB"
+        ));
+    }
+
+    let split_at = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, unit) = trimmed.split_at(split_at);
+
+    if digits.is_empty() {
+        return Err(format!(
+            "invalid byte size \"{value}\": expected an integer optionally followed by B, KiB, MiB, GiB, or TiB"
+        ));
+    }
+
+    let amount = digits
+        .parse::<u64>()
+        .map_err(|_| format!("invalid byte size \"{value}\": value is out of range"))?;
+
+    match unit {
+        "" | "B" => Ok(amount),
+        "KiB" => amount
+            .checked_mul(1024)
+            .ok_or_else(|| format!("invalid byte size \"{value}\": value is out of range")),
+        "MiB" => amount
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| format!("invalid byte size \"{value}\": value is out of range")),
+        "GiB" => amount
+            .checked_mul(1024 * 1024 * 1024)
+            .ok_or_else(|| format!("invalid byte size \"{value}\": value is out of range")),
+        "TiB" => amount
+            .checked_mul(1024 * 1024 * 1024 * 1024)
+            .ok_or_else(|| format!("invalid byte size \"{value}\": value is out of range")),
+        _ => Err(format!(
+            "invalid byte size \"{value}\": expected an integer optionally followed by B, KiB, MiB, GiB, or TiB"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,4 +176,26 @@ mod tests {
         assert!(error.contains("value is out of range"));
     }
 
+    #[test]
+    fn parses_byte_sizes() {
+        assert_eq!(parse_byte_size("0").unwrap(), 0);
+        assert_eq!(parse_byte_size("512").unwrap(), 512);
+        assert_eq!(parse_byte_size("512B").unwrap(), 512);
+        assert_eq!(parse_byte_size("1KiB").unwrap(), 1024);
+        assert_eq!(parse_byte_size("64MiB").unwrap(), 67_108_864);
+        assert_eq!(parse_byte_size("1GiB").unwrap(), 1_073_741_824);
+        assert_eq!(parse_byte_size("1TiB").unwrap(), 1_099_511_627_776);
+    }
+
+    #[test]
+    fn rejects_invalid_byte_sizes() {
+        for input in ["", "KiB", "abc", "64Mi", "64 MB", "-1"] {
+            let error = parse_byte_size(input).expect_err(&format!("{input} should be rejected"));
+            assert!(error.contains(&format!("invalid byte size \"{input}\"")), "{error}");
+        }
+
+        let overflow = format!("{}TiB", u64::MAX);
+        let error = parse_byte_size(&overflow).expect_err("byte size overflow should be rejected");
+        assert!(error.contains("value is out of range"));
+    }
 }
