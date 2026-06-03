@@ -8,6 +8,12 @@ pub(crate) enum Endpoint {
     Tcp(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KeyValuePair {
+    pub(crate) key: String,
+    pub(crate) value: String,
+}
+
 impl std::fmt::Display for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -123,6 +129,26 @@ pub(crate) fn parse_byte_size(value: &str) -> Result<u64, String> {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_key_value(flag: &str, value: &str) -> Result<KeyValuePair, String> {
+    let Some((key, parsed_value)) = value.split_once('=') else {
+        return Err(format!(
+            "invalid {flag} value \"{value}\": expected KEY=VALUE"
+        ));
+    };
+
+    if key.is_empty() {
+        return Err(format!(
+            "invalid {flag} value \"{value}\": key must not be empty"
+        ));
+    }
+
+    Ok(KeyValuePair {
+        key: key.to_string(),
+        value: parsed_value.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +223,32 @@ mod tests {
         let overflow = format!("{}TiB", u64::MAX);
         let error = parse_byte_size(&overflow).expect_err("byte size overflow should be rejected");
         assert!(error.contains("value is out of range"));
+    }
+
+    #[test]
+    fn parses_key_value_pairs() {
+        assert_eq!(
+            parse_key_value("--env", "Name=").unwrap(),
+            KeyValuePair {
+                key: "Name".into(),
+                value: "".into()
+            }
+        );
+        assert_eq!(
+            parse_key_value("--label", "App=Demo").unwrap(),
+            KeyValuePair {
+                key: "App".into(),
+                value: "Demo".into()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_key_value_pairs() {
+        for input in ["", "missing-equals", "=x"] {
+            let error = parse_key_value("--env", input).expect_err("key/value should be rejected");
+            assert!(error.contains("--env"), "{error}");
+            assert!(error.contains(input), "{error}");
+        }
     }
 }
