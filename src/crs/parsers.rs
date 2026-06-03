@@ -2,7 +2,9 @@ use std::{fs, net::IpAddr, path::Path, time::Duration};
 
 use base64::Engine;
 
-use crate::proto::runtime::v1::{AuthConfig, PortMapping, Protocol};
+use crate::proto::runtime::v1::{
+    AuthConfig, IdMapping, ImageSpec, Mount, MountPropagation, PortMapping, Protocol,
+};
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "unix:///run/crius/crius.sock";
 
@@ -403,6 +405,216 @@ fn parse_port(source: &str, value: &str) -> Result<i32, String> {
     Ok(i32::from(port))
 }
 
+#[allow(dead_code)]
+pub(crate) fn parse_mount(value: &str) -> Result<Mount, String> {
+    let mut mount_type: Option<String> = None;
+    let mut source: Option<String> = None;
+    let mut destination: Option<String> = None;
+    let mut image: Option<String> = None;
+    let mut image_sub_path = String::new();
+    let mut readonly = false;
+    let mut selinux_relabel = false;
+    let mut recursive_read_only = false;
+    let mut propagation = MountPropagation::PropagationPrivate as i32;
+    let mut uid_mappings = Vec::new();
+    let mut gid_mappings = Vec::new();
+
+    for part in value.split(',') {
+        if part.is_empty() {
+            return Err(format!("invalid mount \"{value}\": entries must not be empty"));
+        }
+        let Some((key, raw_value)) = part.split_once('=') else {
+            match part {
+                "ro" | "readonly" => readonly = true,
+                "rw" => readonly = false,
+                "z" | "Z" => selinux_relabel = true,
+                "recursive-ro" | "recursive_read_only" => recursive_read_only = true,
+                _ => {
+                    return Err(format!(
+                        "invalid mount \"{value}\": option \"{part}\" must be KEY=VALUE or a supported flag"
+                    ));
+                }
+            }
+            continue;
+        };
+
+        match key {
+            "type" => mount_type = Some(raw_value.to_string()),
+            "src" | "source" => source = Some(raw_value.to_string()),
+            "dst" | "target" | "destination" => destination = Some(raw_value.to_string()),
+            "image" => image = Some(raw_value.to_string()),
+            "subpath" | "image-subpath" | "image_sub_path" => {
+                image_sub_path = raw_value.to_string()
+            }
+            "options" | "option" => {
+                for option in raw_value.split(':') {
+                    apply_mount_option(value, option, &mut readonly, &mut selinux_relabel)?;
+                }
+            }
+            "readonly" | "ro" => readonly = parse_bool("mount", value, raw_value)?,
+            "recursive-ro" | "recursive_read_only" => {
+                recursive_read_only = parse_bool("mount", value, raw_value)?
+            }
+            "propagation" => propagation = parse_mount_propagation(value, raw_value)?,
+            "uidmap" | "uid-map" => uid_mappings.push(parse_mount_id_mapping(value, raw_value)?),
+            "gidmap" | "gid-map" => gid_mappings.push(parse_mount_id_mapping(value, raw_value)?),
+            _ => {
+                return Err(format!(
+                    "invalid mount \"{value}\": unsupported key \"{key}\""
+                ));
+            }
+        }
+    }
+
+    let mount_type = mount_type.ok_or_else(|| {
+        format!("invalid mount \"{value}\": type must be bind or image")
+    })?;
+    let container_path = destination.ok_or_else(|| {
+        format!("invalid mount \"{value}\": dst/target is required")
+    })?;
+
+    if recursive_read_only
+        && (!readonly || propagation != MountPropagation::PropagationPrivate as i32)
+    {
+        return Err(format!(
+            "invalid mount \"{value}\": recursive-ro requires readonly=true and private propagation"
+        ));
+    }
+
+    match mount_type.as_str() {
+        "bind" => {
+            let host_path = source.ok_or_else(|| {
+                format!("invalid mount \"{value}\": bind mount requires src/source")
+            })?;
+            if image.is_some() {
+                return Err(format!(
+                    "invalid mount \"{value}\": bind mount must not include image"
+                ));
+            }
+            Ok(Mount {
+                container_path,
+                host_path,
+                readonly,
+                selinux_relabel,
+                propagation,
+                uid_mappings,
+                gid_mappings,
+                recursive_read_only,
+                image: None,
+                image_sub_path,
+            })
+        }
+        "image" => {
+            if source.is_some() {
+                return Err(format!(
+                    "invalid mount \"{value}\": image mount must not include src/source"
+                ));
+            }
+            let image = image.ok_or_else(|| {
+                format!("invalid mount \"{value}\": image mount requires image")
+            })?;
+            Ok(Mount {
+                container_path,
+                host_path: String::new(),
+                readonly: true,
+                selinux_relabel,
+                propagation,
+                uid_mappings,
+                gid_mappings,
+                recursive_read_only,
+                image: Some(ImageSpec {
+                    image,
+                    annotations: Default::default(),
+                    user_specified_image: String::new(),
+                    runtime_handler: String::new(),
+                }),
+                image_sub_path,
+            })
+        }
+        _ => Err(format!(
+            "invalid mount \"{value}\": type must be bind or image"
+        )),
+    }
+}
+
+fn apply_mount_option(
+    source: &str,
+    option: &str,
+    readonly: &mut bool,
+    selinux_relabel: &mut bool,
+) -> Result<(), String> {
+    match option {
+        "ro" | "readonly" => {
+            *readonly = true;
+            Ok(())
+        }
+        "rw" => {
+            *readonly = false;
+            Ok(())
+        }
+        "z" | "Z" => {
+            *selinux_relabel = true;
+            Ok(())
+        }
+        "" => Err(format!("invalid mount \"{source}\": empty mount option")),
+        _ => Err(format!(
+            "invalid mount \"{source}\": unsupported mount option \"{option}\""
+        )),
+    }
+}
+
+fn parse_bool(kind: &str, source: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!(
+            "invalid {kind} \"{source}\": expected boolean true or false"
+        )),
+    }
+}
+
+fn parse_mount_propagation(source: &str, value: &str) -> Result<i32, String> {
+    match value {
+        "private" | "rprivate" => Ok(MountPropagation::PropagationPrivate as i32),
+        "host-to-container" | "rslave" => {
+            Ok(MountPropagation::PropagationHostToContainer as i32)
+        }
+        "bidirectional" | "rshared" => Ok(MountPropagation::PropagationBidirectional as i32),
+        _ => Err(format!(
+            "invalid mount \"{source}\": propagation must be private, host-to-container, or bidirectional"
+        )),
+    }
+}
+
+fn parse_mount_id_mapping(source: &str, value: &str) -> Result<IdMapping, String> {
+    let parts: Vec<_> = value.split(':').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "invalid mount \"{source}\": ID mapping must be HOST:CONTAINER:LENGTH"
+        ));
+    }
+    let host_id = parse_u32_field("mount", source, parts[0])?;
+    let container_id = parse_u32_field("mount", source, parts[1])?;
+    let length = parse_u32_field("mount", source, parts[2])?;
+    if length == 0 {
+        return Err(format!(
+            "invalid mount \"{source}\": ID mapping length must be greater than 0"
+        ));
+    }
+
+    Ok(IdMapping {
+        host_id,
+        container_id,
+        length,
+    })
+}
+
+fn parse_u32_field(kind: &str, source: &str, value: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid {kind} \"{source}\": expected non-negative integer"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,6 +837,42 @@ mod tests {
         for input in ["", "80", "0:80", "8080:0", "8080:80/http", "fd00::1:8080:80"] {
             let error = parse_port_mapping(input).expect_err("port mapping should be rejected");
             assert!(error.contains(&format!("invalid port mapping \"{input}\"")), "{error}");
+        }
+    }
+
+    #[test]
+    fn parses_mounts() {
+        let mount = parse_mount(
+            "type=bind,src=/host,dst=/container,readonly=true,uidmap=0:1000:1,gidmap=0:1000:1",
+        )
+        .unwrap();
+        assert_eq!(mount.host_path, "/host");
+        assert_eq!(mount.container_path, "/container");
+        assert!(mount.readonly);
+        assert_eq!(mount.uid_mappings[0].host_id, 0);
+        assert_eq!(mount.gid_mappings[0].container_id, 1000);
+
+        let mount =
+            parse_mount("type=image,image=busybox,dst=/rootfs,subpath=bin,src=/bad")
+                .expect_err("image mount with source should fail");
+        assert!(mount.contains("image mount must not include src/source"), "{mount}");
+
+        let mount = parse_mount("type=image,image=busybox,dst=/rootfs,subpath=bin").unwrap();
+        assert_eq!(mount.image.unwrap().image, "busybox");
+        assert_eq!(mount.image_sub_path, "bin");
+        assert!(mount.readonly);
+    }
+
+    #[test]
+    fn rejects_invalid_mounts() {
+        for input in [
+            "type=bind,dst=/container",
+            "type=image,image=busybox,dst=/rootfs,src=/host",
+            "type=bind,src=/host,dst=/container,recursive-ro",
+            "type=tmpfs,dst=/x",
+        ] {
+            let error = parse_mount(input).expect_err("mount should be rejected");
+            assert!(error.contains(&format!("invalid mount \"{input}\"")), "{error}");
         }
     }
 }
