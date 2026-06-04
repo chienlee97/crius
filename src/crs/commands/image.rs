@@ -1,14 +1,15 @@
 use crate::crs::{
     args::{ImageArgs, ImageCommand, ImageListArgs},
+    builders::build_auth_config,
     client::CrsClient,
     commands::status::{parse_info_map, render_and_print},
     context::CliContext,
     error::{CliError, CommandResult},
-    format::{CommandOutput, FilesystemUsageView, ImageView, InspectView},
+    format::{CommandOutput, FilesystemUsageView, ImageOperationView, ImageView, InspectView},
 };
 use crate::proto::runtime::v1::{
     FilesystemUsage, Image, ImageFilter, ImageFsInfoRequest, ImageSpec, ImageStatusRequest,
-    ListImagesRequest,
+    ListImagesRequest, PodSandboxStatusRequest, PullImageRequest, RemoveImageRequest,
 };
 
 pub(crate) async fn handle(
@@ -18,10 +19,10 @@ pub(crate) async fn handle(
 ) -> Result<CommandResult, CliError> {
     match args.command {
         ImageCommand::List(args) => handle_list(ctx, client, args).await,
+        ImageCommand::Pull(args) => handle_pull(ctx, client, args, "crs image pull").await,
         ImageCommand::Inspect { image } => handle_inspect(ctx, client, image).await,
+        ImageCommand::Remove { image } => handle_remove(ctx, client, image).await,
         ImageCommand::FsInfo => handle_fs_info(ctx, client).await,
-        ImageCommand::Pull(_) => Err(CliError::not_implemented("crs image pull")),
-        ImageCommand::Remove { .. } => Err(CliError::not_implemented("crs image remove")),
         ImageCommand::Transfers => Err(CliError::not_implemented("crs image transfers")),
         ImageCommand::Config => Err(CliError::not_implemented("crs image config")),
     }
@@ -58,6 +59,113 @@ pub(crate) async fn handle_list(
     render_and_print(
         ctx,
         CommandOutput::new("ImageList", client.endpoint(), views),
+    )
+}
+
+pub(crate) async fn handle_pull(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: crate::crs::args::ImagePullArgs,
+    command_name: &'static str,
+) -> Result<CommandResult, CliError> {
+    if args.image.is_empty() {
+        return Err(CliError::invalid_input("image must not be empty").with_command(command_name));
+    }
+
+    let auth = build_auth_config(&args.auth)
+        .map_err(CliError::invalid_input)?
+        .filter(|auth| !auth_is_empty(auth));
+    let sandbox_config = if let Some(pod) = args.pod.as_deref() {
+        Some(fetch_sandbox_config(client, pod, command_name).await?)
+    } else {
+        None
+    };
+
+    let mut image_client = client.image()?;
+    let request = PullImageRequest {
+        image: Some(ImageSpec {
+            image: args.image.clone(),
+            user_specified_image: args.image.clone(),
+            ..Default::default()
+        }),
+        auth,
+        sandbox_config,
+    };
+    let response = client
+        .with_rpc_timeout(async {
+            image_client.pull_image(request).await.map_err(|status| {
+                CliError::from_tonic_status(status)
+                    .with_command(command_name)
+                    .with_endpoint(client.endpoint())
+                    .with_object(format!("image {}", args.image))
+            })
+        })
+        .await?
+        .into_inner();
+
+    let view = ImageOperationView {
+        image: args.image.clone(),
+        image_ref: response.image_ref,
+        action: "pulled".to_string(),
+        success: true,
+    };
+    render_and_print(
+        ctx,
+        CommandOutput::new("ImagePull", client.endpoint(), vec![view]).with_summary(
+            serde_json::json!({
+                "image": args.image,
+                "pulled": true,
+            }),
+        ),
+    )
+}
+
+pub(crate) async fn handle_remove(
+    ctx: &CliContext,
+    client: &CrsClient,
+    image: String,
+) -> Result<CommandResult, CliError> {
+    if image.is_empty() {
+        return Err(
+            CliError::invalid_input("image must not be empty").with_command("crs image remove")
+        );
+    }
+
+    let mut image_client = client.image()?;
+    client
+        .with_rpc_timeout(async {
+            image_client
+                .remove_image(RemoveImageRequest {
+                    image: Some(ImageSpec {
+                        image: image.clone(),
+                        user_specified_image: image.clone(),
+                        ..Default::default()
+                    }),
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs image remove")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("image {image}"))
+                })
+        })
+        .await?;
+
+    let view = ImageOperationView {
+        image: image.clone(),
+        image_ref: String::new(),
+        action: "removed".to_string(),
+        success: true,
+    };
+    render_and_print(
+        ctx,
+        CommandOutput::new("ImageRemove", client.endpoint(), vec![view]).with_summary(
+            serde_json::json!({
+                "image": image,
+                "removed": true,
+            }),
+        ),
     )
 }
 
@@ -162,6 +270,55 @@ async fn handle_fs_info(ctx: &CliContext, client: &CrsClient) -> Result<CommandR
             }),
         ),
     )
+}
+
+async fn fetch_sandbox_config(
+    client: &CrsClient,
+    pod: &str,
+    command_name: &'static str,
+) -> Result<crate::proto::runtime::v1::PodSandboxConfig, CliError> {
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .pod_sandbox_status(PodSandboxStatusRequest {
+                    pod_sandbox_id: pod.to_string(),
+                    verbose: false,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command(command_name)
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("pod {pod}"))
+                })
+        })
+        .await?
+        .into_inner();
+
+    response
+        .status
+        .and_then(|status| status.metadata)
+        .map(|metadata| crate::proto::runtime::v1::PodSandboxConfig {
+            metadata: Some(metadata),
+            ..Default::default()
+        })
+        .ok_or_else(|| {
+            CliError::invalid_input(format!(
+                "daemon did not return sandbox metadata for pod {pod}"
+            ))
+            .with_command(command_name)
+            .with_object(format!("pod {pod}"))
+        })
+}
+
+fn auth_is_empty(auth: &crate::proto::runtime::v1::AuthConfig) -> bool {
+    auth.username.is_empty()
+        && auth.password.is_empty()
+        && auth.auth.is_empty()
+        && auth.server_address.is_empty()
+        && auth.identity_token.is_empty()
+        && auth.registry_token.is_empty()
 }
 
 pub(crate) fn image_view(image: Image) -> ImageView {

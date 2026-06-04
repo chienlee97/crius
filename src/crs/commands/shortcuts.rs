@@ -50,11 +50,11 @@ pub(crate) async fn handle_images(
 }
 
 pub(crate) async fn handle_pull(
-    _ctx: &CliContext,
-    _client: &CrsClient,
-    _args: ImagePullArgs,
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: ImagePullArgs,
 ) -> Result<CommandResult, CliError> {
-    Err(CliError::not_implemented("crs pull"))
+    image::handle_pull(ctx, client, args, "crs pull").await
 }
 
 pub(crate) async fn handle_inspect(

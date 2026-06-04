@@ -375,6 +375,38 @@ impl TableRow for ImageView {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct ImageOperationView {
+    pub image: String,
+    pub image_ref: String,
+    pub action: String,
+    pub success: bool,
+}
+
+impl TableRow for ImageOperationView {
+    fn headers() -> &'static [&'static str] {
+        &["IMAGE", "IMAGE REF", "ACTION", "SUCCESS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.image.clone(),
+            self.image_ref.clone(),
+            self.action.clone(),
+            format_bool(self.success).to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        if self.image_ref.is_empty() {
+            self.image.clone()
+        } else {
+            self.image_ref.clone()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct InspectView {
     pub object_type: String,
     pub id: String,

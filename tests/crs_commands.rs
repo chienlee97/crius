@@ -3,7 +3,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -58,6 +58,10 @@ struct MockState {
     list_image_requests: Arc<AtomicUsize>,
     image_inspect_requests: Arc<AtomicUsize>,
     image_fs_info_requests: Arc<AtomicUsize>,
+    pull_image_requests: Arc<AtomicUsize>,
+    remove_image_requests: Arc<AtomicUsize>,
+    last_pull_image: Arc<Mutex<Option<PullImageRequest>>>,
+    last_remove_image: Arc<Mutex<Option<RemoveImageRequest>>>,
 }
 
 #[tonic::async_trait]
@@ -93,7 +97,6 @@ impl RuntimeService for MockRuntimeService {
         request: Request<PodSandboxStatusRequest>,
     ) -> Result<Response<PodSandboxStatusResponse>, Status> {
         let request = request.into_inner();
-        assert!(request.verbose);
         self.state
             .pod_inspect_requests
             .fetch_add(1, Ordering::SeqCst);
@@ -418,20 +421,64 @@ impl ImageService for MockImageService {
 
     async fn pull_image(
         &self,
-        _request: Request<PullImageRequest>,
+        request: Request<PullImageRequest>,
     ) -> Result<Response<PullImageResponse>, Status> {
-        Err(Status::unimplemented(
-            "mock only implements read-only image RPCs",
-        ))
+        let request = request.into_inner();
+        let image = request
+            .image
+            .as_ref()
+            .map(|image| image.image.as_str())
+            .unwrap_or_default()
+            .to_string();
+        self.state
+            .pull_image_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_pull_image
+            .lock()
+            .expect("last pull image lock") = Some(request);
+
+        if image == "missing" {
+            return Err(Status::not_found("image not found"));
+        }
+        if image == "denied" {
+            return Err(Status::permission_denied("registry denied"));
+        }
+
+        Ok(Response::new(PullImageResponse {
+            image_ref: format!("sha256:pulled-{image}"),
+        }))
     }
 
     async fn remove_image(
         &self,
-        _request: Request<RemoveImageRequest>,
+        request: Request<RemoveImageRequest>,
     ) -> Result<Response<RemoveImageResponse>, Status> {
-        Err(Status::unimplemented(
-            "mock only implements read-only image RPCs",
-        ))
+        let request = request.into_inner();
+        let image = request
+            .image
+            .as_ref()
+            .map(|image| image.image.as_str())
+            .unwrap_or_default()
+            .to_string();
+        self.state
+            .remove_image_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_remove_image
+            .lock()
+            .expect("last remove image lock") = Some(request);
+
+        if image == "missing" {
+            return Err(Status::not_found("image not found"));
+        }
+        if image == "used" {
+            return Err(Status::failed_precondition("image is used by a container"));
+        }
+
+        Ok(Response::new(RemoveImageResponse {}))
     }
 
     async fn image_fs_info(
@@ -583,6 +630,181 @@ async fn image_read_only_commands_return_expected_kinds() {
     assert_eq!(list_requests.load(Ordering::SeqCst), 2);
     assert_eq!(inspect_requests.load(Ordering::SeqCst), 1);
     assert_eq!(fs_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_pull_sends_auth_only_in_request_and_reports_ref() {
+    let state = MockState::default();
+    let pull_requests = Arc::clone(&state.pull_image_requests);
+    let last_pull = Arc::clone(&state.last_pull_image);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "image",
+            "pull",
+            "--username",
+            "user-a",
+            "--password",
+            "secret-password",
+            "--registry-token",
+            "secret-token",
+            "registry.example/app:1",
+        ],
+    );
+
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(!stdout.contains("secret-password"));
+    assert!(!stdout.contains("secret-token"));
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("stdout json");
+    assert_eq!(value["kind"], "ImagePull");
+    assert_eq!(value["items"][0]["image"], "registry.example/app:1");
+    assert_eq!(
+        value["items"][0]["imageRef"],
+        "sha256:pulled-registry.example/app:1"
+    );
+    assert_eq!(pull_requests.load(Ordering::SeqCst), 1);
+
+    let request = last_pull
+        .lock()
+        .expect("last pull image lock")
+        .clone()
+        .expect("pull request should be recorded");
+    assert_eq!(
+        request.image.expect("image spec").image,
+        "registry.example/app:1"
+    );
+    let auth = request.auth.expect("auth should be forwarded");
+    assert_eq!(auth.username, "user-a");
+    assert_eq!(auth.password, "secret-password");
+    assert_eq!(auth.registry_token, "secret-token");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_pull_with_pod_checks_pod_before_pull() {
+    let state = MockState::default();
+    let pod_status_requests = Arc::clone(&state.pod_inspect_requests);
+    let pull_requests = Arc::clone(&state.pull_image_requests);
+    let last_pull = Arc::clone(&state.last_pull_image);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "image",
+            "pull",
+            "--pod",
+            "pod123",
+            "busybox:latest",
+        ],
+    );
+
+    assert_success(&output);
+    assert_eq!(pod_status_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(pull_requests.load(Ordering::SeqCst), 1);
+    let request = last_pull
+        .lock()
+        .expect("last pull image lock")
+        .clone()
+        .expect("pull request should be recorded");
+    let sandbox_metadata = request
+        .sandbox_config
+        .expect("sandbox config should be forwarded")
+        .metadata
+        .expect("sandbox metadata should be forwarded");
+    assert_eq!(sandbox_metadata.name, "pod-a");
+    assert_eq!(sandbox_metadata.namespace, "default");
+
+    let missing = run_crs(
+        endpoint,
+        ["image", "pull", "--pod", "missing", "busybox:latest"],
+    );
+    assert_eq!(missing.status.code(), Some(4));
+    assert_eq!(pull_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shortcut_pull_reuses_image_pull_request_shape() {
+    let state = MockState::default();
+    let pull_requests = Arc::clone(&state.pull_image_requests);
+    let last_pull = Arc::clone(&state.last_pull_image);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["--quiet", "pull", "busybox:latest"]);
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .expect("stdout should be utf8")
+            .trim_end(),
+        "sha256:pulled-busybox:latest"
+    );
+    assert_eq!(pull_requests.load(Ordering::SeqCst), 1);
+    let request = last_pull
+        .lock()
+        .expect("last pull image lock")
+        .clone()
+        .expect("pull request should be recorded");
+    let image = request.image.expect("image spec");
+    assert_eq!(image.image, "busybox:latest");
+    assert_eq!(image.user_specified_image, "busybox:latest");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_remove_reports_removed_summary_and_quiet_value() {
+    let state = MockState::default();
+    let remove_requests = Arc::clone(&state.remove_image_requests);
+    let last_remove = Arc::clone(&state.last_remove_image);
+    let endpoint = spawn_mock_services(state).await;
+
+    let json = run_crs(
+        endpoint,
+        ["--output", "json", "image", "remove", "busybox:latest"],
+    );
+    assert_success(&json);
+    let value = stdout_json(&json);
+    assert_eq!(value["kind"], "ImageRemove");
+    assert_eq!(value["summary"]["removed"], true);
+    assert_eq!(value["items"][0]["image"], "busybox:latest");
+
+    let quiet = run_crs(endpoint, ["--quiet", "image", "remove", "busybox:latest"]);
+    assert_success(&quiet);
+    assert_eq!(
+        String::from_utf8(quiet.stdout)
+            .expect("stdout should be utf8")
+            .trim_end(),
+        "busybox:latest"
+    );
+    assert_eq!(remove_requests.load(Ordering::SeqCst), 2);
+
+    let request = last_remove
+        .lock()
+        .expect("last remove image lock")
+        .clone()
+        .expect("remove request should be recorded");
+    assert_eq!(request.image.expect("image spec").image, "busybox:latest");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_write_errors_map_to_documented_exit_codes() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+
+    let not_found = run_crs(endpoint, ["image", "remove", "missing"]);
+    assert_eq!(not_found.status.code(), Some(4));
+
+    let precondition = run_crs(endpoint, ["image", "remove", "used"]);
+    assert_eq!(precondition.status.code(), Some(6));
+    let stderr = String::from_utf8(precondition.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("image is used by a container"));
+
+    let denied = run_crs(endpoint, ["image", "pull", "denied"]);
+    assert_eq!(denied.status.code(), Some(13));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
