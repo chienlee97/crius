@@ -1,18 +1,25 @@
-use std::collections::HashMap;
+#![allow(dead_code)]
+
+use std::collections::{BTreeMap, HashMap};
 
 use crate::{
     crs::{
-        args::{PodCreateArgs, SandboxSecurityArgs},
+        args::{
+            ContainerCreateArgs, ContainerCreateOptions, ContainerResourceArgs,
+            ContainerSecurityArgs, PodCreateArgs, SandboxSecurityArgs,
+        },
         parsers::{
-            parse_id_mapping, parse_key_value, parse_port_mapping, parse_resource_spec,
+            parse_byte_size, parse_device, parse_env_file, parse_hugepage, parse_id_mapping,
+            parse_key_value, parse_mount, parse_port_mapping, parse_resource_spec,
             parse_security_profile, parse_selinux_option, parse_user, KeyValuePair, ParsedUser,
             ResourceFragment,
         },
     },
     proto::runtime::v1::{
-        DnsConfig, Int64Value, LinuxContainerResources, LinuxPodSandboxConfig,
-        LinuxSandboxSecurityContext, NamespaceMode, NamespaceOption, PodSandboxConfig,
-        PodSandboxMetadata, UserNamespace,
+        Capability, CdiDevice, ContainerConfig, ContainerMetadata, DnsConfig, ImageSpec,
+        Int64Value, KeyValue, LinuxContainerConfig, LinuxContainerResources,
+        LinuxContainerSecurityContext, LinuxPodSandboxConfig, LinuxSandboxSecurityContext,
+        NamespaceMode, NamespaceOption, PodSandboxConfig, PodSandboxMetadata, UserNamespace,
     },
 };
 
@@ -53,17 +60,273 @@ pub(crate) fn build_pod_sandbox_config(args: &PodCreateArgs) -> Result<PodSandbo
     })
 }
 
+pub(crate) fn build_container_config(
+    args: &ContainerCreateArgs,
+) -> Result<ContainerConfig, String> {
+    build_container_config_from_parts(&args.image, &args.command, &args.options)
+}
+
+fn build_container_config_from_parts(
+    image: &str,
+    positional_command: &[String],
+    options: &ContainerCreateOptions,
+) -> Result<ContainerConfig, String> {
+    if image.is_empty() {
+        return Err("container image must not be empty".into());
+    }
+
+    let metadata = ContainerMetadata {
+        name: options
+            .name
+            .clone()
+            .unwrap_or_else(|| default_container_name(image)),
+        attempt: options.attempt.unwrap_or_default(),
+    };
+    if metadata.name.is_empty() {
+        return Err("container name must not be empty".into());
+    }
+
+    let (command, args) = container_command_and_args(options, positional_command);
+    let linux = LinuxContainerConfig {
+        resources: build_container_resources(&options.resources)?,
+        security_context: Some(build_container_security_context(&options.security)?),
+    };
+
+    Ok(ContainerConfig {
+        metadata: Some(metadata),
+        image: Some(ImageSpec {
+            image: image.to_string(),
+            user_specified_image: image.to_string(),
+            ..Default::default()
+        }),
+        command,
+        args,
+        working_dir: options.workdir.clone().unwrap_or_default(),
+        envs: build_envs(options)?,
+        mounts: options
+            .mounts
+            .iter()
+            .map(|mount| parse_mount(mount))
+            .collect::<Result<Vec<_>, _>>()?,
+        devices: options
+            .devices
+            .iter()
+            .map(|device| parse_device(device))
+            .collect::<Result<Vec<_>, _>>()?,
+        labels: key_value_map("--label", &options.labels)?,
+        annotations: build_container_annotations(options)?,
+        log_path: options.log_path.clone().unwrap_or_default(),
+        stdin: options.stdin,
+        stdin_once: options.stdin,
+        tty: options.tty,
+        linux: Some(linux),
+        windows: None,
+        cdi_devices: options
+            .cdi_devices
+            .iter()
+            .cloned()
+            .map(|name| CdiDevice { name })
+            .collect(),
+    })
+}
+
+fn default_container_name(image: &str) -> String {
+    image
+        .rsplit(['/', ':', '@'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("container")
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn container_command_and_args(
+    options: &ContainerCreateOptions,
+    positional_command: &[String],
+) -> (Vec<String>, Vec<String>) {
+    if !options.commands.is_empty() {
+        let mut args = options.args.clone();
+        args.extend_from_slice(positional_command);
+        (options.commands.clone(), args)
+    } else if !positional_command.is_empty() {
+        (positional_command.to_vec(), options.args.clone())
+    } else {
+        (Vec::new(), options.args.clone())
+    }
+}
+
+fn build_envs(options: &ContainerCreateOptions) -> Result<Vec<KeyValue>, String> {
+    let mut envs = BTreeMap::new();
+    for file in &options.env_files {
+        for pair in parse_env_file(file)? {
+            envs.insert(pair.key, pair.value);
+        }
+    }
+    for pair in options
+        .env
+        .iter()
+        .map(|value| parse_key_value("--env", value))
+        .collect::<Result<Vec<_>, _>>()?
+    {
+        envs.insert(pair.key, pair.value);
+    }
+
+    Ok(envs
+        .into_iter()
+        .map(|(key, value)| KeyValue { key, value })
+        .collect())
+}
+
+fn build_container_annotations(
+    options: &ContainerCreateOptions,
+) -> Result<HashMap<String, String>, String> {
+    let mut annotations = key_value_map("--annotation", &options.annotations)?;
+    if let Some(value) = &options.security.blockio_class {
+        annotations.insert("crius.io/blockio-class".into(), value.clone());
+    }
+    if let Some(value) = &options.security.rdt_class {
+        annotations.insert("crius.io/rdt-class".into(), value.clone());
+    }
+    Ok(annotations)
+}
+
+fn build_container_resources(
+    args: &ContainerResourceArgs,
+) -> Result<Option<LinuxContainerResources>, String> {
+    let mut fragment = ResourceFragment {
+        cpu_period: args.cpu_period,
+        cpu_quota: args.cpu_quota,
+        cpu_shares: args.cpu_shares,
+        memory_limit_in_bytes: args
+            .memory
+            .as_deref()
+            .map(|value| parse_byte_size_as_i64("--memory", value))
+            .transpose()?,
+        memory_swap_limit_in_bytes: args
+            .memory_swap
+            .as_deref()
+            .map(|value| parse_byte_size_as_i64("--memory-swap", value))
+            .transpose()?,
+        oom_score_adj: args.oom_score_adj,
+        cpuset_cpus: args.cpuset_cpus.clone(),
+        cpuset_mems: args.cpuset_mems.clone(),
+        hugepages: args
+            .hugepages
+            .iter()
+            .map(|value| parse_hugepage(value))
+            .collect::<Result<Vec<_>, _>>()?,
+        unified: args
+            .unified
+            .iter()
+            .map(|value| parse_key_value("--unified", value))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+
+    dedupe_resource_keys(&mut fragment);
+    for value in &args.resources {
+        merge_resource_fragment(&mut fragment, parse_resource_spec(value)?);
+    }
+    validate_resource_fragment(&fragment)?;
+    if is_empty_resource_fragment(&fragment) {
+        return Ok(None);
+    }
+
+    Ok(Some(resources_from_fragment(fragment)))
+}
+
+fn build_container_security_context(
+    args: &ContainerSecurityArgs,
+) -> Result<LinuxContainerSecurityContext, String> {
+    let (run_as_user, run_as_group_from_user, run_as_username) = match args.user.as_deref() {
+        Some(user) => match parse_user(user)? {
+            ParsedUser::Id { uid, gid } => (
+                Some(Int64Value { value: uid }),
+                gid.map(|value| Int64Value { value }),
+                String::new(),
+            ),
+            ParsedUser::Name(name) => (None, None, name),
+        },
+        None => (None, None, String::new()),
+    };
+
+    if args.group.is_some() && run_as_user.is_none() && run_as_username.is_empty() {
+        return Err("--group requires --user".into());
+    }
+
+    Ok(LinuxContainerSecurityContext {
+        capabilities: if args.cap_add.is_empty()
+            && args.cap_drop.is_empty()
+            && args.ambient_cap_add.is_empty()
+        {
+            None
+        } else {
+            Some(Capability {
+                add_capabilities: args.cap_add.clone(),
+                drop_capabilities: args.cap_drop.clone(),
+                add_ambient_capabilities: args.ambient_cap_add.clone(),
+            })
+        },
+        privileged: args.privileged,
+        namespace_options: Some(build_container_namespace_options(args)?),
+        selinux_options: optional_profile(args.selinux.as_deref(), parse_selinux_option)?,
+        run_as_user,
+        run_as_group: args
+            .group
+            .as_deref()
+            .map(|value| parse_non_negative_i64("--group", value))
+            .transpose()?
+            .map(|value| Int64Value { value })
+            .or(run_as_group_from_user),
+        run_as_username,
+        readonly_rootfs: args.readonly_rootfs,
+        supplemental_groups: args
+            .supplemental_groups
+            .iter()
+            .map(|value| parse_non_negative_i64("--supplemental-group", value))
+            .collect::<Result<Vec<_>, _>>()?,
+        no_new_privs: args.no_new_privs,
+        masked_paths: args.masked_paths.clone(),
+        readonly_paths: args.readonly_paths.clone(),
+        seccomp: optional_profile(args.seccomp.as_deref(), parse_security_profile)?,
+        apparmor: optional_profile(args.apparmor.as_deref(), parse_security_profile)?,
+        ..Default::default()
+    })
+}
+
+fn build_container_namespace_options(
+    args: &ContainerSecurityArgs,
+) -> Result<NamespaceOption, String> {
+    Ok(NamespaceOption {
+        network: NamespaceMode::Pod as i32,
+        pid: parse_namespace_mode("--pid", args.pid.as_deref(), NamespaceMode::Container)?,
+        ipc: parse_namespace_mode("--ipc", args.ipc.as_deref(), NamespaceMode::Pod)?,
+        target_id: String::new(),
+        userns_options: None,
+    })
+}
+
 fn build_sandbox_security_context(
     args: &PodCreateArgs,
     security: &SandboxSecurityArgs,
 ) -> Result<LinuxSandboxSecurityContext, String> {
-    let (run_as_user, run_as_username) = match security.sandbox_user.as_deref() {
-        Some(user) => match parse_user(user)? {
-            ParsedUser::Id { uid, gid: _ } => (Some(Int64Value { value: uid }), String::new()),
-            ParsedUser::Name(name) => (None, name),
-        },
-        None => (None, String::new()),
-    };
+    let (run_as_user, run_as_group_from_user, run_as_username) =
+        match security.sandbox_user.as_deref() {
+            Some(user) => match parse_user(user)? {
+                ParsedUser::Id { uid, gid } => (
+                    Some(Int64Value { value: uid }),
+                    gid.map(|value| Int64Value { value }),
+                    String::new(),
+                ),
+                ParsedUser::Name(name) => (None, None, name),
+            },
+            None => (None, None, String::new()),
+        };
 
     if security.sandbox_group.is_some() && run_as_user.is_none() && run_as_username.is_empty() {
         return Err("--sandbox-group requires --sandbox-user".into());
@@ -76,9 +339,12 @@ fn build_sandbox_security_context(
             parse_selinux_option,
         )?,
         run_as_user,
-        run_as_group: security.sandbox_group.map(|group| Int64Value {
-            value: i64::from(group),
-        }),
+        run_as_group: security
+            .sandbox_group
+            .map(|group| Int64Value {
+                value: i64::from(group),
+            })
+            .or(run_as_group_from_user),
         readonly_rootfs: security.sandbox_readonly_rootfs,
         supplemental_groups: security
             .sandbox_supplemental_groups
@@ -179,6 +445,19 @@ fn validate_resource_fragment(fragment: &ResourceFragment) -> Result<(), String>
     Ok(())
 }
 
+fn is_empty_resource_fragment(fragment: &ResourceFragment) -> bool {
+    fragment.cpu_period.is_none()
+        && fragment.cpu_quota.is_none()
+        && fragment.cpu_shares.is_none()
+        && fragment.memory_limit_in_bytes.is_none()
+        && fragment.memory_swap_limit_in_bytes.is_none()
+        && fragment.oom_score_adj.is_none()
+        && fragment.cpuset_cpus.is_none()
+        && fragment.cpuset_mems.is_none()
+        && fragment.hugepages.is_empty()
+        && fragment.unified.is_empty()
+}
+
 fn merge_resource_fragment(target: &mut ResourceFragment, fragment: ResourceFragment) {
     if fragment.cpu_period.is_some() {
         target.cpu_period = fragment.cpu_period;
@@ -210,6 +489,15 @@ fn merge_resource_fragment(target: &mut ResourceFragment, fragment: ResourceFrag
     merge_keyed(&mut target.unified, fragment.unified, |item| {
         item.key.as_str()
     });
+}
+
+fn dedupe_resource_keys(fragment: &mut ResourceFragment) {
+    let hugepages = std::mem::take(&mut fragment.hugepages);
+    merge_keyed(&mut fragment.hugepages, hugepages, |item| {
+        item.page_size.as_str()
+    });
+    let unified = std::mem::take(&mut fragment.unified);
+    merge_keyed(&mut fragment.unified, unified, |item| item.key.as_str());
 }
 
 fn resources_from_fragment(fragment: ResourceFragment) -> LinuxContainerResources {
@@ -271,10 +559,47 @@ fn merge_keyed<T>(target: &mut Vec<T>, values: Vec<T>, key: impl Fn(&T) -> &str)
     }
 }
 
+fn parse_namespace_mode(
+    flag: &str,
+    value: Option<&str>,
+    default: NamespaceMode,
+) -> Result<i32, String> {
+    let mode = match value {
+        None => default,
+        Some("pod") => NamespaceMode::Pod,
+        Some("container") => NamespaceMode::Container,
+        Some("node") => NamespaceMode::Node,
+        Some(value) => {
+            return Err(format!(
+                "invalid {flag} \"{value}\": expected pod, container, or node"
+            ));
+        }
+    };
+    Ok(mode as i32)
+}
+
+fn parse_non_negative_i64(flag: &str, value: &str) -> Result<i64, String> {
+    let parsed = value
+        .parse::<i64>()
+        .map_err(|_| format!("invalid {flag} \"{value}\": expected non-negative integer"))?;
+    if parsed < 0 {
+        return Err(format!(
+            "invalid {flag} \"{value}\": expected non-negative integer"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_byte_size_as_i64(flag: &str, value: &str) -> Result<i64, String> {
+    let bytes = parse_byte_size(value)?;
+    i64::try_from(bytes).map_err(|_| format!("invalid {flag} \"{value}\": value is out of range"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::runtime::v1::{security_profile::ProfileType, Protocol};
+    use crate::proto::runtime::v1::{security_profile::ProfileType, MountPropagation, Protocol};
+    use tempfile::NamedTempFile;
 
     #[test]
     fn builds_pod_basic_fields_and_maps() {
@@ -441,5 +766,238 @@ mod tests {
 
         let error = build_pod_sandbox_config(&args).unwrap_err();
         assert!(error.contains("must be non-negative") || error.contains("expected"));
+    }
+
+    #[test]
+    fn builds_container_basic_fields() {
+        let args = ContainerCreateArgs {
+            pod: "pod1".into(),
+            image: "registry.example.com/library/busybox:latest".into(),
+            command: vec!["echo".into(), "ok".into()],
+            options: ContainerCreateOptions {
+                name: Some("ctr".into()),
+                attempt: Some(2),
+                commands: vec!["/bin/sh".into()],
+                args: vec!["-c".into()],
+                workdir: Some("/work".into()),
+                stdin: true,
+                tty: true,
+                ..Default::default()
+            },
+        };
+
+        let config = build_container_config(&args).unwrap();
+        let metadata = config.metadata.unwrap();
+        let image = config.image.unwrap();
+
+        assert_eq!(metadata.name, "ctr");
+        assert_eq!(metadata.attempt, 2);
+        assert_eq!(image.image, "registry.example.com/library/busybox:latest");
+        assert_eq!(image.user_specified_image, image.image);
+        assert_eq!(config.command, ["/bin/sh"]);
+        assert_eq!(config.args, ["-c", "echo", "ok"]);
+        assert_eq!(config.working_dir, "/work");
+        assert!(config.stdin);
+        assert!(config.stdin_once);
+        assert!(config.tty);
+    }
+
+    #[test]
+    fn builds_container_default_name_from_image() {
+        let args = ContainerCreateArgs {
+            pod: "pod1".into(),
+            image: "registry.example.com/ns/app@sha256:abcd".into(),
+            command: Vec::new(),
+            options: ContainerCreateOptions::default(),
+        };
+
+        let config = build_container_config(&args).unwrap();
+
+        assert_eq!(config.metadata.unwrap().name, "abcd");
+    }
+
+    #[test]
+    fn builds_container_env_labels_and_annotations() {
+        let mut file = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, b"A=file\nB=file\n# ignored\n").unwrap();
+
+        let args = ContainerCreateArgs {
+            pod: "pod1".into(),
+            image: "busybox".into(),
+            command: Vec::new(),
+            options: ContainerCreateOptions {
+                env_files: vec![file.path().display().to_string()],
+                env: vec!["B=flag".into(), "C=flag".into()],
+                labels: vec!["app=old".into(), "app=new".into()],
+                annotations: vec!["anno=old".into(), "anno=new".into()],
+                ..Default::default()
+            },
+        };
+
+        let config = build_container_config(&args).unwrap();
+        let envs: BTreeMap<_, _> = config
+            .envs
+            .into_iter()
+            .map(|env| (env.key, env.value))
+            .collect();
+
+        assert_eq!(envs["A"], "file");
+        assert_eq!(envs["B"], "flag");
+        assert_eq!(envs["C"], "flag");
+        assert_eq!(config.labels["app"], "new");
+        assert_eq!(config.annotations["anno"], "new");
+    }
+
+    #[test]
+    fn builds_container_mounts_devices_cdi_and_log_path() {
+        let args = ContainerCreateArgs {
+            pod: "pod1".into(),
+            image: "busybox".into(),
+            command: Vec::new(),
+            options: ContainerCreateOptions {
+                mounts: vec![
+                    "type=bind,src=/host,dst=/ctr,ro,recursive-ro".into(),
+                    "type=image,image=alpine,dst=/image,subpath=bin".into(),
+                ],
+                devices: vec!["/dev/fuse:/dev/fuse:rwm".into()],
+                cdi_devices: vec!["vendor.com/device=name".into()],
+                log_path: Some("ctr/0.log".into()),
+                ..Default::default()
+            },
+        };
+
+        let config = build_container_config(&args).unwrap();
+
+        assert_eq!(config.mounts[0].host_path, "/host");
+        assert_eq!(config.mounts[0].container_path, "/ctr");
+        assert!(config.mounts[0].readonly);
+        assert!(config.mounts[0].recursive_read_only);
+        assert_eq!(
+            config.mounts[0].propagation,
+            MountPropagation::PropagationPrivate as i32
+        );
+        assert_eq!(config.mounts[1].image.as_ref().unwrap().image, "alpine");
+        assert_eq!(config.mounts[1].image_sub_path, "bin");
+        assert_eq!(config.devices[0].permissions, "rwm");
+        assert_eq!(config.cdi_devices[0].name, "vendor.com/device=name");
+        assert_eq!(config.log_path, "ctr/0.log");
+    }
+
+    #[test]
+    fn builds_container_resources() {
+        let args = ContainerCreateArgs {
+            pod: "pod1".into(),
+            image: "busybox".into(),
+            command: Vec::new(),
+            options: ContainerCreateOptions {
+                resources: ContainerResourceArgs {
+                    resources: vec!["cpu=3000,unified=memory.max=33554432".into()],
+                    cpu_period: Some(1000),
+                    cpu_quota: Some(2000),
+                    cpu_shares: Some(512),
+                    memory: Some("64MiB".into()),
+                    memory_swap: Some("128MiB".into()),
+                    oom_score_adj: Some(10),
+                    cpuset_cpus: Some("0-1".into()),
+                    cpuset_mems: Some("0".into()),
+                    hugepages: vec!["2MiB=1MiB".into()],
+                    unified: vec!["memory.max=67108864".into()],
+                },
+                ..Default::default()
+            },
+        };
+
+        let config = build_container_config(&args).unwrap();
+        let resources = config.linux.unwrap().resources.unwrap();
+
+        assert_eq!(resources.cpu_period, 1000);
+        assert_eq!(resources.cpu_quota, 3000);
+        assert_eq!(resources.cpu_shares, 512);
+        assert_eq!(resources.memory_limit_in_bytes, 64 * 1024 * 1024);
+        assert_eq!(resources.memory_swap_limit_in_bytes, 128 * 1024 * 1024);
+        assert_eq!(resources.oom_score_adj, 10);
+        assert_eq!(resources.cpuset_cpus, "0-1");
+        assert_eq!(resources.cpuset_mems, "0");
+        assert_eq!(resources.hugepage_limits[0].page_size, "2MiB");
+        assert_eq!(resources.unified["memory.max"], "33554432");
+    }
+
+    #[test]
+    fn builds_container_security_context() {
+        let args = ContainerCreateArgs {
+            pod: "pod1".into(),
+            image: "busybox".into(),
+            command: Vec::new(),
+            options: ContainerCreateOptions {
+                security: ContainerSecurityArgs {
+                    privileged: true,
+                    cap_add: vec!["NET_ADMIN".into()],
+                    cap_drop: vec!["MKNOD".into()],
+                    ambient_cap_add: vec!["CHOWN".into()],
+                    user: Some("1000:1001".into()),
+                    group: Some("1002".into()),
+                    supplemental_groups: vec!["44".into(), "55".into()],
+                    readonly_rootfs: true,
+                    no_new_privs: true,
+                    masked_paths: vec!["/proc/acpi".into()],
+                    readonly_paths: vec!["/proc/sys".into()],
+                    seccomp: Some("runtime/default".into()),
+                    apparmor: Some("localhost:profile".into()),
+                    selinux: Some("user:role:type:level".into()),
+                    pid: Some("node".into()),
+                    ipc: Some("container".into()),
+                    blockio_class: Some("latency".into()),
+                    rdt_class: Some("gold".into()),
+                },
+                ..Default::default()
+            },
+        };
+
+        let config = build_container_config(&args).unwrap();
+        let annotations = config.annotations;
+        let security = config.linux.unwrap().security_context.unwrap();
+        let capabilities = security.capabilities.unwrap();
+        let namespaces = security.namespace_options.unwrap();
+
+        assert!(security.privileged);
+        assert_eq!(capabilities.add_capabilities, ["NET_ADMIN"]);
+        assert_eq!(capabilities.drop_capabilities, ["MKNOD"]);
+        assert_eq!(capabilities.add_ambient_capabilities, ["CHOWN"]);
+        assert_eq!(security.run_as_user.unwrap().value, 1000);
+        assert_eq!(security.run_as_group.unwrap().value, 1002);
+        assert_eq!(security.supplemental_groups, [44, 55]);
+        assert!(security.readonly_rootfs);
+        assert!(security.no_new_privs);
+        assert_eq!(security.masked_paths, ["/proc/acpi"]);
+        assert_eq!(security.readonly_paths, ["/proc/sys"]);
+        assert_eq!(
+            security.seccomp.unwrap().profile_type,
+            ProfileType::RuntimeDefault as i32
+        );
+        assert_eq!(security.apparmor.unwrap().localhost_ref, "profile");
+        assert_eq!(security.selinux_options.unwrap().level, "level");
+        assert_eq!(namespaces.pid, NamespaceMode::Node as i32);
+        assert_eq!(namespaces.ipc, NamespaceMode::Container as i32);
+        assert_eq!(annotations["crius.io/blockio-class"], "latency");
+        assert_eq!(annotations["crius.io/rdt-class"], "gold");
+    }
+
+    #[test]
+    fn rejects_container_group_without_user() {
+        let args = ContainerCreateArgs {
+            pod: "pod1".into(),
+            image: "busybox".into(),
+            command: Vec::new(),
+            options: ContainerCreateOptions {
+                security: ContainerSecurityArgs {
+                    group: Some("1000".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+
+        let error = build_container_config(&args).unwrap_err();
+        assert!(error.contains("--group requires --user"));
     }
 }

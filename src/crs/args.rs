@@ -501,9 +501,9 @@ pub struct ContainerCreateOptions {
     pub env: Vec<String>,
     #[arg(long = "env-file")]
     pub env_files: Vec<String>,
-    #[arg(long = "label")]
+    #[arg(long = "pod-label")]
     pub labels: Vec<String>,
-    #[arg(long = "annotation")]
+    #[arg(long = "pod-annotation")]
     pub annotations: Vec<String>,
     #[arg(long = "mount")]
     pub mounts: Vec<String>,
@@ -525,6 +525,8 @@ pub struct ContainerCreateOptions {
 
 #[derive(Debug, Default, ClapArgs)]
 pub struct ContainerResourceArgs {
+    #[arg(long = "resource")]
+    pub resources: Vec<String>,
     #[arg(long)]
     pub cpu_period: Option<i64>,
     #[arg(long)]
@@ -646,9 +648,9 @@ pub struct RunPodCreateOptions {
     pub dns_options: Vec<String>,
     #[arg(long = "publish")]
     pub publish: Vec<String>,
-    #[arg(long = "label")]
+    #[arg(long = "pod-label", id = "run-pod-label")]
     pub labels: Vec<String>,
-    #[arg(long = "annotation")]
+    #[arg(long = "pod-annotation", id = "run-pod-annotation")]
     pub annotations: Vec<String>,
     #[arg(long)]
     pub runtime_handler: Option<String>,
