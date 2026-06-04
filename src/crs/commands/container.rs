@@ -1,15 +1,19 @@
 use crate::crs::{
-    args::{ContainerCommand, ContainerListArgs, ContainerStateArg},
+    args::{ContainerCommand, ContainerCreateArgs, ContainerListArgs, ContainerStateArg},
+    builders::{build_container_config, build_resources_from_specs},
     client::CrsClient,
     commands::status::{parse_info_map, render_and_print},
     context::CliContext,
     error::{CliError, CommandResult},
-    format::{CommandOutput, ContainerView, InspectView},
+    format::{CommandOutput, ContainerOperationView, ContainerView, InspectView},
     parsers::parse_key_value,
 };
 use crate::proto::runtime::v1::{
-    Container, ContainerFilter, ContainerState, ContainerStateValue, ContainerStatus,
-    ContainerStatusRequest, ListContainersRequest,
+    CheckpointContainerRequest, Container, ContainerFilter, ContainerState, ContainerStateValue,
+    ContainerStatus, ContainerStatusRequest, CreateContainerRequest, ListContainersRequest,
+    PodSandboxConfig, PodSandboxMetadata, PodSandboxStatusRequest, RemoveContainerRequest,
+    ReopenContainerLogRequest, StartContainerRequest, StopContainerRequest,
+    UpdateContainerResourcesRequest,
 };
 
 pub(crate) async fn handle(
@@ -20,21 +24,25 @@ pub(crate) async fn handle(
     match command {
         ContainerCommand::List(args) => handle_list(ctx, client, args).await,
         ContainerCommand::Inspect { id } => handle_inspect(ctx, client, id).await,
-        ContainerCommand::Create(_) => Err(CliError::not_implemented("crs container create")),
-        ContainerCommand::Start { .. } => Err(CliError::not_implemented("crs container start")),
-        ContainerCommand::Stop { .. } => Err(CliError::not_implemented("crs container stop")),
-        ContainerCommand::Remove { .. } => Err(CliError::not_implemented("crs container remove")),
+        ContainerCommand::Create(args) => handle_create(ctx, client, *args).await,
+        ContainerCommand::Start { id } => handle_start(ctx, client, id).await,
+        ContainerCommand::Stop { id, timeout } => handle_stop(ctx, client, id, timeout).await,
+        ContainerCommand::Remove { id } => handle_remove(ctx, client, id).await,
         ContainerCommand::Exec(_) => Err(CliError::not_implemented("crs container exec")),
         ContainerCommand::ExecSync(_) => Err(CliError::not_implemented("crs container exec-sync")),
         ContainerCommand::Attach { .. } => Err(CliError::not_implemented("crs container attach")),
         ContainerCommand::Stats(_) => Err(CliError::not_implemented("crs container stats")),
-        ContainerCommand::Checkpoint { .. } => {
-            Err(CliError::not_implemented("crs container checkpoint"))
-        }
-        ContainerCommand::Update { .. } => Err(CliError::not_implemented("crs container update")),
-        ContainerCommand::ReopenLog { .. } => {
-            Err(CliError::not_implemented("crs container reopen-log"))
-        }
+        ContainerCommand::Checkpoint {
+            id,
+            location,
+            timeout,
+        } => handle_checkpoint(ctx, client, id, location, timeout).await,
+        ContainerCommand::Update {
+            id,
+            resources,
+            annotations,
+        } => handle_update(ctx, client, id, resources, annotations).await,
+        ContainerCommand::ReopenLog { id } => handle_reopen_log(ctx, client, id).await,
         ContainerCommand::Logs(_) => Err(CliError::not_implemented("crs container logs")),
     }
 }
@@ -121,6 +129,295 @@ pub(crate) async fn handle_inspect(
     )
 }
 
+pub(crate) async fn handle_create(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: ContainerCreateArgs,
+) -> Result<CommandResult, CliError> {
+    let sandbox_config = fetch_sandbox_config(client, &args.pod, "crs container create").await?;
+    let container_config = build_container_config(&args).map_err(CliError::invalid_input)?;
+    let image = args.image.clone();
+    let pod = args.pod.clone();
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .create_container(CreateContainerRequest {
+                    pod_sandbox_id: pod.clone(),
+                    config: Some(container_config),
+                    sandbox_config: Some(sandbox_config),
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs container create")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("pod {pod}"))
+                })
+        })
+        .await?
+        .into_inner();
+
+    render_container_operation(
+        ctx,
+        client,
+        "ContainerCreate",
+        response.container_id.clone(),
+        pod,
+        image,
+        "created",
+        serde_json::json!({
+            "containerId": response.container_id,
+            "created": true,
+        }),
+    )
+}
+
+pub(crate) async fn handle_start(
+    ctx: &CliContext,
+    client: &CrsClient,
+    id: String,
+) -> Result<CommandResult, CliError> {
+    ensure_container_id(&id, "crs container start")?;
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .start_container(StartContainerRequest {
+                    container_id: id.clone(),
+                })
+                .await
+                .map_err(|status| {
+                    container_status_error(status, client, "crs container start", &id)
+                })
+        })
+        .await?;
+
+    render_container_operation(
+        ctx,
+        client,
+        "ContainerStart",
+        id.clone(),
+        String::new(),
+        String::new(),
+        "started",
+        serde_json::json!({
+            "containerId": id,
+            "started": true,
+        }),
+    )
+}
+
+pub(crate) async fn handle_stop(
+    ctx: &CliContext,
+    client: &CrsClient,
+    id: String,
+    timeout: Option<u32>,
+) -> Result<CommandResult, CliError> {
+    ensure_container_id(&id, "crs container stop")?;
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .stop_container(StopContainerRequest {
+                    container_id: id.clone(),
+                    timeout: timeout.map(i64::from).unwrap_or_default(),
+                })
+                .await
+                .map_err(|status| container_status_error(status, client, "crs container stop", &id))
+        })
+        .await?;
+
+    render_container_operation(
+        ctx,
+        client,
+        "ContainerStop",
+        id.clone(),
+        String::new(),
+        String::new(),
+        "stopped",
+        serde_json::json!({
+            "containerId": id,
+            "stopped": true,
+            "timeoutSeconds": timeout.unwrap_or_default(),
+        }),
+    )
+}
+
+pub(crate) async fn handle_remove(
+    ctx: &CliContext,
+    client: &CrsClient,
+    id: String,
+) -> Result<CommandResult, CliError> {
+    ensure_container_id(&id, "crs container remove")?;
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .remove_container(RemoveContainerRequest {
+                    container_id: id.clone(),
+                })
+                .await
+                .map_err(|status| {
+                    container_status_error(status, client, "crs container remove", &id)
+                })
+        })
+        .await?;
+
+    render_container_operation(
+        ctx,
+        client,
+        "ContainerRemove",
+        id.clone(),
+        String::new(),
+        String::new(),
+        "removed",
+        serde_json::json!({
+            "containerId": id,
+            "removed": true,
+        }),
+    )
+}
+
+pub(crate) async fn handle_update(
+    ctx: &CliContext,
+    client: &CrsClient,
+    id: String,
+    resources: Vec<String>,
+    annotations: Vec<String>,
+) -> Result<CommandResult, CliError> {
+    ensure_container_id(&id, "crs container update")?;
+    if resources.is_empty() && annotations.is_empty() {
+        return Err(CliError::invalid_input(
+            "container update requires at least one --resource or --annotation field",
+        )
+        .with_command("crs container update"));
+    }
+
+    let linux = build_resources_from_specs(&resources).map_err(CliError::invalid_input)?;
+    let annotations = annotations
+        .iter()
+        .map(|annotation| {
+            parse_key_value("--annotation", annotation).map(|pair| (pair.key, pair.value))
+        })
+        .collect::<Result<std::collections::HashMap<_, _>, _>>()
+        .map_err(CliError::invalid_input)?;
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .update_container_resources(UpdateContainerResourcesRequest {
+                    container_id: id.clone(),
+                    linux,
+                    windows: None,
+                    annotations,
+                })
+                .await
+                .map_err(|status| {
+                    container_status_error(status, client, "crs container update", &id)
+                })
+        })
+        .await?;
+
+    render_container_operation(
+        ctx,
+        client,
+        "ContainerUpdate",
+        id.clone(),
+        String::new(),
+        String::new(),
+        "updated",
+        serde_json::json!({
+            "containerId": id,
+            "updated": true,
+        }),
+    )
+}
+
+pub(crate) async fn handle_checkpoint(
+    ctx: &CliContext,
+    client: &CrsClient,
+    id: String,
+    location: String,
+    timeout: Option<u32>,
+) -> Result<CommandResult, CliError> {
+    ensure_container_id(&id, "crs container checkpoint")?;
+    if location.is_empty() {
+        return Err(
+            CliError::invalid_input("checkpoint location must not be empty")
+                .with_command("crs container checkpoint")
+                .with_object(format!("container {id}")),
+        );
+    }
+
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .checkpoint_container(CheckpointContainerRequest {
+                    container_id: id.clone(),
+                    location: location.clone(),
+                    timeout: timeout.map(i64::from).unwrap_or_default(),
+                })
+                .await
+                .map_err(|status| {
+                    container_status_error(status, client, "crs container checkpoint", &id)
+                })
+        })
+        .await?;
+
+    render_container_operation(
+        ctx,
+        client,
+        "ContainerCheckpoint",
+        id.clone(),
+        String::new(),
+        String::new(),
+        "checkpointed",
+        serde_json::json!({
+            "containerId": id,
+            "location": location,
+            "checkpointed": true,
+            "timeoutSeconds": timeout.unwrap_or_default(),
+        }),
+    )
+}
+
+pub(crate) async fn handle_reopen_log(
+    ctx: &CliContext,
+    client: &CrsClient,
+    id: String,
+) -> Result<CommandResult, CliError> {
+    ensure_container_id(&id, "crs container reopen-log")?;
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .reopen_container_log(ReopenContainerLogRequest {
+                    container_id: id.clone(),
+                })
+                .await
+                .map_err(|status| {
+                    container_status_error(status, client, "crs container reopen-log", &id)
+                })
+        })
+        .await?;
+
+    render_container_operation(
+        ctx,
+        client,
+        "ContainerReopenLog",
+        id.clone(),
+        String::new(),
+        String::new(),
+        "reopened",
+        serde_json::json!({
+            "containerId": id,
+            "reopened": true,
+        }),
+    )
+}
+
 pub(crate) fn container_filter_from_args(
     args: ContainerListArgs,
 ) -> Result<Option<ContainerFilter>, CliError> {
@@ -148,6 +445,98 @@ pub(crate) fn container_filter_from_args(
         pod_sandbox_id: args.pod.unwrap_or_default(),
         label_selector: labels,
     }))
+}
+
+async fn fetch_sandbox_config(
+    client: &CrsClient,
+    pod: &str,
+    command_name: &'static str,
+) -> Result<PodSandboxConfig, CliError> {
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .pod_sandbox_status(PodSandboxStatusRequest {
+                    pod_sandbox_id: pod.to_string(),
+                    verbose: false,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command(command_name)
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("pod {pod}"))
+                })
+        })
+        .await?
+        .into_inner();
+
+    response
+        .status
+        .and_then(|status| status.metadata)
+        .map(sandbox_config_from_metadata)
+        .ok_or_else(|| {
+            CliError::invalid_input(format!(
+                "daemon did not return sandbox metadata for pod {pod}"
+            ))
+            .with_command(command_name)
+            .with_object(format!("pod {pod}"))
+        })
+}
+
+fn sandbox_config_from_metadata(metadata: PodSandboxMetadata) -> PodSandboxConfig {
+    PodSandboxConfig {
+        metadata: Some(metadata),
+        ..Default::default()
+    }
+}
+
+fn ensure_container_id(id: &str, command_name: &'static str) -> Result<(), CliError> {
+    if id.is_empty() {
+        return Err(
+            CliError::invalid_input("container ID must not be empty").with_command(command_name)
+        );
+    }
+    Ok(())
+}
+
+fn container_status_error(
+    status: tonic::Status,
+    client: &CrsClient,
+    command_name: &'static str,
+    id: &str,
+) -> CliError {
+    CliError::from_tonic_status(status)
+        .with_command(command_name)
+        .with_endpoint(client.endpoint())
+        .with_object(format!("container {id}"))
+}
+
+fn render_container_operation(
+    ctx: &CliContext,
+    client: &CrsClient,
+    kind: &'static str,
+    container_id: String,
+    pod_id: String,
+    image: String,
+    action: &'static str,
+    summary: serde_json::Value,
+) -> Result<CommandResult, CliError> {
+    render_and_print(
+        ctx,
+        CommandOutput::new(
+            kind,
+            client.endpoint(),
+            vec![ContainerOperationView {
+                container_id,
+                pod_id,
+                image,
+                action: action.to_string(),
+                success: true,
+            }],
+        )
+        .with_summary(summary),
+    )
 }
 
 pub(crate) fn container_view(container: Container) -> ContainerView {

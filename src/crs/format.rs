@@ -587,6 +587,36 @@ impl TableRow for ContainerView {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct ContainerOperationView {
+    pub container_id: String,
+    pub pod_id: String,
+    pub image: String,
+    pub action: String,
+    pub success: bool,
+}
+
+impl TableRow for ContainerOperationView {
+    fn headers() -> &'static [&'static str] {
+        &["CONTAINER ID", "POD ID", "IMAGE", "ACTION", "SUCCESS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.container_id.clone(),
+            self.pod_id.clone(),
+            self.image.clone(),
+            self.action.clone(),
+            format_bool(self.success).to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.container_id.clone()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ResourceUsageView {
     pub id: String,
     pub name: String,

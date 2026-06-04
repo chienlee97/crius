@@ -56,6 +56,13 @@ struct MockState {
     stop_pod_requests: Arc<AtomicUsize>,
     remove_pod_requests: Arc<AtomicUsize>,
     update_pod_resources_requests: Arc<AtomicUsize>,
+    create_container_requests: Arc<AtomicUsize>,
+    start_container_requests: Arc<AtomicUsize>,
+    stop_container_requests: Arc<AtomicUsize>,
+    remove_container_requests: Arc<AtomicUsize>,
+    update_container_resources_requests: Arc<AtomicUsize>,
+    checkpoint_container_requests: Arc<AtomicUsize>,
+    reopen_container_log_requests: Arc<AtomicUsize>,
     list_pod_requests: Arc<AtomicUsize>,
     pod_inspect_requests: Arc<AtomicUsize>,
     list_container_requests: Arc<AtomicUsize>,
@@ -70,6 +77,13 @@ struct MockState {
     last_stop_pod: Arc<Mutex<Option<StopPodSandboxRequest>>>,
     last_remove_pod: Arc<Mutex<Option<RemovePodSandboxRequest>>>,
     last_update_pod_resources: Arc<Mutex<Option<UpdatePodSandboxResourcesRequest>>>,
+    last_create_container: Arc<Mutex<Option<CreateContainerRequest>>>,
+    last_start_container: Arc<Mutex<Option<StartContainerRequest>>>,
+    last_stop_container: Arc<Mutex<Option<StopContainerRequest>>>,
+    last_remove_container: Arc<Mutex<Option<RemoveContainerRequest>>>,
+    last_update_container_resources: Arc<Mutex<Option<UpdateContainerResourcesRequest>>>,
+    last_checkpoint_container: Arc<Mutex<Option<CheckpointContainerRequest>>>,
+    last_reopen_container_log: Arc<Mutex<Option<ReopenContainerLogRequest>>>,
     last_pull_image: Arc<Mutex<Option<PullImageRequest>>>,
     last_remove_image: Arc<Mutex<Option<RemoveImageRequest>>>,
 }
@@ -226,22 +240,111 @@ impl RuntimeService for MockRuntimeService {
             }],
         }))
     }
-    unimplemented_runtime_rpc!(
-        create_container,
-        CreateContainerRequest,
-        CreateContainerResponse
-    );
-    unimplemented_runtime_rpc!(
-        start_container,
-        StartContainerRequest,
-        StartContainerResponse
-    );
-    unimplemented_runtime_rpc!(stop_container, StopContainerRequest, StopContainerResponse);
-    unimplemented_runtime_rpc!(
-        remove_container,
-        RemoveContainerRequest,
-        RemoveContainerResponse
-    );
+    async fn create_container(
+        &self,
+        request: Request<CreateContainerRequest>,
+    ) -> Result<Response<CreateContainerResponse>, Status> {
+        let request = request.into_inner();
+        let pod = request.pod_sandbox_id.clone();
+        let image = request
+            .config
+            .as_ref()
+            .and_then(|config| config.image.as_ref())
+            .map(|image| image.image.as_str())
+            .unwrap_or_default()
+            .to_string();
+        self.state
+            .create_container_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_create_container
+            .lock()
+            .expect("last create container lock") = Some(request);
+
+        if pod == "missing" {
+            return Err(Status::not_found("pod not found"));
+        }
+        if image == "bad-config" {
+            return Err(Status::failed_precondition("container config rejected"));
+        }
+
+        Ok(Response::new(CreateContainerResponse {
+            container_id: format!("ctr-{pod}-{image}"),
+        }))
+    }
+
+    async fn start_container(
+        &self,
+        request: Request<StartContainerRequest>,
+    ) -> Result<Response<StartContainerResponse>, Status> {
+        let request = request.into_inner();
+        let id = request.container_id.clone();
+        self.state
+            .start_container_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_start_container
+            .lock()
+            .expect("last start container lock") = Some(request);
+
+        if id == "missing" {
+            return Err(Status::not_found("container not found"));
+        }
+        if id == "running" {
+            return Err(Status::failed_precondition("container is already running"));
+        }
+
+        Ok(Response::new(StartContainerResponse {}))
+    }
+
+    async fn stop_container(
+        &self,
+        request: Request<StopContainerRequest>,
+    ) -> Result<Response<StopContainerResponse>, Status> {
+        let request = request.into_inner();
+        let id = request.container_id.clone();
+        self.state
+            .stop_container_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_stop_container
+            .lock()
+            .expect("last stop container lock") = Some(request);
+
+        if id == "missing" {
+            return Err(Status::not_found("container not found"));
+        }
+
+        Ok(Response::new(StopContainerResponse {}))
+    }
+
+    async fn remove_container(
+        &self,
+        request: Request<RemoveContainerRequest>,
+    ) -> Result<Response<RemoveContainerResponse>, Status> {
+        let request = request.into_inner();
+        let id = request.container_id.clone();
+        self.state
+            .remove_container_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_remove_container
+            .lock()
+            .expect("last remove container lock") = Some(request);
+
+        if id == "missing" {
+            return Err(Status::not_found("container not found"));
+        }
+        if id == "running" {
+            return Err(Status::failed_precondition("container is running"));
+        }
+
+        Ok(Response::new(RemoveContainerResponse {}))
+    }
     async fn list_containers(
         &self,
         request: Request<ListContainersRequest>,
@@ -322,16 +425,56 @@ impl RuntimeService for MockRuntimeService {
             info: [("pid".to_string(), "1234".to_string())].into(),
         }))
     }
-    unimplemented_runtime_rpc!(
-        update_container_resources,
-        UpdateContainerResourcesRequest,
-        UpdateContainerResourcesResponse
-    );
-    unimplemented_runtime_rpc!(
-        reopen_container_log,
-        ReopenContainerLogRequest,
-        ReopenContainerLogResponse
-    );
+    async fn update_container_resources(
+        &self,
+        request: Request<UpdateContainerResourcesRequest>,
+    ) -> Result<Response<UpdateContainerResourcesResponse>, Status> {
+        let request = request.into_inner();
+        let id = request.container_id.clone();
+        self.state
+            .update_container_resources_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_update_container_resources
+            .lock()
+            .expect("last update container resources lock") = Some(request);
+
+        if id == "missing" {
+            return Err(Status::not_found("container not found"));
+        }
+        if id == "unsupported" {
+            return Err(Status::failed_precondition(
+                "container update is unsupported",
+            ));
+        }
+
+        Ok(Response::new(UpdateContainerResourcesResponse {}))
+    }
+
+    async fn reopen_container_log(
+        &self,
+        request: Request<ReopenContainerLogRequest>,
+    ) -> Result<Response<ReopenContainerLogResponse>, Status> {
+        let request = request.into_inner();
+        let id = request.container_id.clone();
+        self.state
+            .reopen_container_log_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_reopen_container_log
+            .lock()
+            .expect("last reopen container log lock") = Some(request);
+
+        if id == "missing-log" {
+            return Err(Status::failed_precondition(
+                "container log is not configured",
+            ));
+        }
+
+        Ok(Response::new(ReopenContainerLogResponse {}))
+    }
     unimplemented_runtime_rpc!(exec_sync, ExecSyncRequest, ExecSyncResponse);
     unimplemented_runtime_rpc!(exec, ExecRequest, ExecResponse);
     unimplemented_runtime_rpc!(attach, AttachRequest, AttachResponse);
@@ -423,11 +566,27 @@ impl RuntimeService for MockRuntimeService {
             },
         }))
     }
-    unimplemented_runtime_rpc!(
-        checkpoint_container,
-        CheckpointContainerRequest,
-        CheckpointContainerResponse
-    );
+    async fn checkpoint_container(
+        &self,
+        request: Request<CheckpointContainerRequest>,
+    ) -> Result<Response<CheckpointContainerResponse>, Status> {
+        let request = request.into_inner();
+        let id = request.container_id.clone();
+        self.state
+            .checkpoint_container_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_checkpoint_container
+            .lock()
+            .expect("last checkpoint container lock") = Some(request);
+
+        if id == "unsupported" {
+            return Err(Status::failed_precondition("checkpoint is unsupported"));
+        }
+
+        Ok(Response::new(CheckpointContainerResponse {}))
+    }
 
     type GetContainerEventsStream = ReceiverStream<Result<ContainerEventResponse, Status>>;
 
@@ -1133,6 +1292,268 @@ async fn pod_write_errors_map_to_documented_exit_codes() {
         ["runtime", "update", "--pod-cidr", "10.250.0.0/16"],
     );
     assert_eq!(runtime_reject.status.code(), Some(6));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn container_write_commands_call_runtime_rpcs() {
+    let state = MockState::default();
+    let create_requests = Arc::clone(&state.create_container_requests);
+    let start_requests = Arc::clone(&state.start_container_requests);
+    let stop_requests = Arc::clone(&state.stop_container_requests);
+    let remove_requests = Arc::clone(&state.remove_container_requests);
+    let update_requests = Arc::clone(&state.update_container_resources_requests);
+    let checkpoint_requests = Arc::clone(&state.checkpoint_container_requests);
+    let reopen_requests = Arc::clone(&state.reopen_container_log_requests);
+    let pod_status_requests = Arc::clone(&state.pod_inspect_requests);
+    let last_create = Arc::clone(&state.last_create_container);
+    let last_start = Arc::clone(&state.last_start_container);
+    let last_stop = Arc::clone(&state.last_stop_container);
+    let last_remove = Arc::clone(&state.last_remove_container);
+    let last_update = Arc::clone(&state.last_update_container_resources);
+    let last_checkpoint = Arc::clone(&state.last_checkpoint_container);
+    let last_reopen = Arc::clone(&state.last_reopen_container_log);
+    let endpoint = spawn_mock_services(state).await;
+
+    let create = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "container",
+            "create",
+            "--name",
+            "demo-ctr",
+            "--env",
+            "A=B",
+            "--memory",
+            "4KiB",
+            "pod123",
+            "busybox:latest",
+            "--",
+            "sh",
+        ],
+    );
+    assert_success(&create);
+    let value = stdout_json(&create);
+    assert_eq!(value["kind"], "ContainerCreate");
+    assert_eq!(value["summary"]["created"], true);
+    assert_eq!(pod_status_requests.load(Ordering::SeqCst), 1);
+    let request = last_create
+        .lock()
+        .expect("last create container lock")
+        .clone()
+        .expect("create container request");
+    assert_eq!(request.pod_sandbox_id, "pod123");
+    assert_eq!(
+        request
+            .sandbox_config
+            .expect("sandbox config")
+            .metadata
+            .expect("sandbox metadata")
+            .name,
+        "pod-a"
+    );
+    let config = request.config.expect("container config");
+    assert_eq!(
+        config.metadata.expect("container metadata").name,
+        "demo-ctr"
+    );
+    assert_eq!(config.command, ["sh"]);
+    assert_eq!(
+        config
+            .linux
+            .expect("linux config")
+            .resources
+            .expect("resources")
+            .memory_limit_in_bytes,
+        4096
+    );
+
+    let start = run_crs(endpoint, ["--output", "json", "container", "start", "ctr1"]);
+    assert_success(&start);
+    assert_eq!(stdout_json(&start)["kind"], "ContainerStart");
+    assert_eq!(
+        last_start
+            .lock()
+            .expect("last start container lock")
+            .clone()
+            .expect("start container request")
+            .container_id,
+        "ctr1"
+    );
+
+    let stop = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "container",
+            "stop",
+            "--timeout",
+            "7",
+            "ctr1",
+        ],
+    );
+    assert_success(&stop);
+    assert_eq!(stdout_json(&stop)["summary"]["timeoutSeconds"], 7);
+    let stop_request = last_stop
+        .lock()
+        .expect("last stop container lock")
+        .clone()
+        .expect("stop container request");
+    assert_eq!(stop_request.container_id, "ctr1");
+    assert_eq!(stop_request.timeout, 7);
+
+    let remove = run_crs(endpoint, ["--quiet", "container", "remove", "ctr1"]);
+    assert_success(&remove);
+    assert_eq!(
+        String::from_utf8(remove.stdout)
+            .expect("stdout should be utf8")
+            .trim_end(),
+        "ctr1"
+    );
+    assert_eq!(
+        last_remove
+            .lock()
+            .expect("last remove container lock")
+            .clone()
+            .expect("remove container request")
+            .container_id,
+        "ctr1"
+    );
+
+    let update = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "container",
+            "update",
+            "ctr1",
+            "--resource",
+            "cpu-quota=3000,memory=8KiB",
+            "--annotation",
+            "resize=true",
+        ],
+    );
+    assert_success(&update);
+    assert_eq!(stdout_json(&update)["kind"], "ContainerUpdate");
+    let update_request = last_update
+        .lock()
+        .expect("last update container resources lock")
+        .clone()
+        .expect("update container request");
+    assert_eq!(update_request.container_id, "ctr1");
+    assert_eq!(update_request.annotations["resize"], "true");
+    let resources = update_request.linux.expect("linux resources");
+    assert_eq!(resources.cpu_quota, 3000);
+    assert_eq!(resources.memory_limit_in_bytes, 8192);
+
+    let checkpoint = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "container",
+            "checkpoint",
+            "--location",
+            "/tmp/ctr1.checkpoint",
+            "--timeout",
+            "5",
+            "ctr1",
+        ],
+    );
+    assert_success(&checkpoint);
+    assert_eq!(stdout_json(&checkpoint)["kind"], "ContainerCheckpoint");
+    let checkpoint_request = last_checkpoint
+        .lock()
+        .expect("last checkpoint container lock")
+        .clone()
+        .expect("checkpoint container request");
+    assert_eq!(checkpoint_request.container_id, "ctr1");
+    assert_eq!(checkpoint_request.location, "/tmp/ctr1.checkpoint");
+    assert_eq!(checkpoint_request.timeout, 5);
+
+    let reopen = run_crs(
+        endpoint,
+        ["--output", "json", "container", "reopen-log", "ctr1"],
+    );
+    assert_success(&reopen);
+    assert_eq!(stdout_json(&reopen)["kind"], "ContainerReopenLog");
+    assert_eq!(
+        last_reopen
+            .lock()
+            .expect("last reopen container log lock")
+            .clone()
+            .expect("reopen container log request")
+            .container_id,
+        "ctr1"
+    );
+
+    assert_eq!(create_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(start_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(stop_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(remove_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(update_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(checkpoint_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(reopen_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn container_write_errors_map_to_documented_exit_codes() {
+    let state = MockState::default();
+    let create_requests = Arc::clone(&state.create_container_requests);
+    let update_requests = Arc::clone(&state.update_container_resources_requests);
+    let endpoint = spawn_mock_services(state).await;
+
+    let missing_pod = run_crs(
+        endpoint,
+        ["container", "create", "missing", "busybox:latest"],
+    );
+    assert_eq!(missing_pod.status.code(), Some(4));
+    assert_eq!(create_requests.load(Ordering::SeqCst), 0);
+
+    let already_running = run_crs(endpoint, ["container", "start", "running"]);
+    assert_eq!(already_running.status.code(), Some(6));
+
+    let missing_stop = run_crs(endpoint, ["container", "stop", "missing"]);
+    assert_eq!(missing_stop.status.code(), Some(4));
+
+    let running_remove = run_crs(endpoint, ["container", "remove", "running"]);
+    assert_eq!(running_remove.status.code(), Some(6));
+    let stderr = String::from_utf8(running_remove.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("container is running"));
+
+    let no_update = run_crs(endpoint, ["container", "update", "ctr1"]);
+    assert_eq!(no_update.status.code(), Some(2));
+    assert_eq!(update_requests.load(Ordering::SeqCst), 0);
+
+    let unsupported_update = run_crs(
+        endpoint,
+        [
+            "container",
+            "update",
+            "unsupported",
+            "--resource",
+            "memory=1KiB",
+        ],
+    );
+    assert_eq!(unsupported_update.status.code(), Some(6));
+
+    let unsupported_checkpoint = run_crs(
+        endpoint,
+        [
+            "container",
+            "checkpoint",
+            "unsupported",
+            "--location",
+            "/tmp/checkpoint",
+        ],
+    );
+    assert_eq!(unsupported_checkpoint.status.code(), Some(6));
+
+    let missing_log = run_crs(endpoint, ["container", "reopen-log", "missing-log"]);
+    assert_eq!(missing_log.status.code(), Some(6));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

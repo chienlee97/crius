@@ -451,9 +451,15 @@ pub enum ContainerCommand {
         id: String,
         #[arg(long)]
         location: String,
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u32>,
     },
     Update {
         id: String,
+        #[arg(long = "resource")]
+        resources: Vec<String>,
+        #[arg(long = "annotation")]
+        annotations: Vec<String>,
     },
     ReopenLog {
         id: String,
