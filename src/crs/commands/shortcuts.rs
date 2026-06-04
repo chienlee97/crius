@@ -1,32 +1,52 @@
 use crate::crs::{
-    args::{ImageListArgs, ImagePullArgs, InspectArgs, ListArgs, RemoveArgs, StopArgs},
+    args::{
+        ContainerListArgs, ImageListArgs, ImagePullArgs, InspectArgs, ListArgs, PodListArgs,
+        RemoveArgs, StopArgs,
+    },
     client::CrsClient,
+    commands::{container, image, pod},
     context::CliContext,
     error::{CliError, CommandResult},
 };
 
 pub(crate) async fn handle_ps(
-    _ctx: &CliContext,
-    _client: &CrsClient,
-    _args: ListArgs,
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: ListArgs,
 ) -> Result<CommandResult, CliError> {
-    Err(CliError::not_implemented("crs ps"))
+    container::handle_list(
+        ctx,
+        client,
+        ContainerListArgs {
+            all: args.all,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 pub(crate) async fn handle_pods(
-    _ctx: &CliContext,
-    _client: &CrsClient,
-    _args: ListArgs,
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: ListArgs,
 ) -> Result<CommandResult, CliError> {
-    Err(CliError::not_implemented("crs pods"))
+    pod::handle_list(
+        ctx,
+        client,
+        PodListArgs {
+            all: args.all,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 pub(crate) async fn handle_images(
-    _ctx: &CliContext,
-    _client: &CrsClient,
-    _args: ImageListArgs,
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: ImageListArgs,
 ) -> Result<CommandResult, CliError> {
-    Err(CliError::not_implemented("crs images"))
+    image::handle_list(ctx, client, args).await
 }
 
 pub(crate) async fn handle_pull(

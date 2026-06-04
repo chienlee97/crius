@@ -285,6 +285,30 @@ impl TableRow for RuntimeVersionView {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeStatusView {
+    pub runtime_ready: bool,
+    pub network_ready: bool,
+    pub conditions: Vec<ConditionView>,
+    pub info_json: Value,
+    pub info_raw: Value,
+}
+
+impl TableRow for RuntimeStatusView {
+    fn headers() -> &'static [&'static str] {
+        &["RUNTIME READY", "NETWORK READY", "CONDITIONS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            format_bool(self.runtime_ready).to_string(),
+            format_bool(self.network_ready).to_string(),
+            self.conditions.len().to_string(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ConditionView {
     pub kind: String,
     pub status: bool,
@@ -304,6 +328,22 @@ impl TableRow for ConditionView {
             self.reason.clone(),
             self.message.clone(),
         ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeConfigView {
+    pub cgroup_driver: String,
+}
+
+impl TableRow for RuntimeConfigView {
+    fn headers() -> &'static [&'static str] {
+        &["CGROUP DRIVER"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![self.cgroup_driver.clone()]
     }
 }
 
@@ -329,6 +369,56 @@ impl TableRow for ImageView {
             format_bytes(self.size_bytes),
             self.user_spec.clone(),
             format_bool(self.pinned).to_string(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InspectView {
+    pub object_type: String,
+    pub id: String,
+    pub response: Value,
+    pub info_json: Value,
+    pub info_raw: Value,
+}
+
+impl TableRow for InspectView {
+    fn headers() -> &'static [&'static str] {
+        &["TYPE", "ID"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![self.object_type.clone(), self.id.clone()]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.id.clone()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FilesystemUsageView {
+    pub kind: String,
+    pub mountpoint: String,
+    pub used_bytes: u64,
+    pub inodes_used: u64,
+    pub timestamp: i64,
+}
+
+impl TableRow for FilesystemUsageView {
+    fn headers() -> &'static [&'static str] {
+        &["KIND", "MOUNTPOINT", "USED", "INODES", "TIMESTAMP"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.kind.clone(),
+            self.mountpoint.clone(),
+            format_bytes(self.used_bytes),
+            self.inodes_used.to_string(),
+            self.timestamp.to_string(),
         ]
     }
 }
@@ -451,6 +541,28 @@ impl TableRow for OperationView {
     fn cells(&self) -> Vec<String> {
         vec![
             self.target.clone(),
+            self.status.clone(),
+            self.message.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DoctorCheckView {
+    pub check: String,
+    pub status: String,
+    pub message: String,
+}
+
+impl TableRow for DoctorCheckView {
+    fn headers() -> &'static [&'static str] {
+        &["CHECK", "STATUS", "MESSAGE"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.check.clone(),
             self.status.clone(),
             self.message.clone(),
         ]

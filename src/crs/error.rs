@@ -136,6 +136,11 @@ pub(crate) enum CliError {
     #[error("operation interrupted")]
     Interrupted { context: ErrorContext },
     #[error("{message}")]
+    InvalidInput {
+        message: String,
+        context: ErrorContext,
+    },
+    #[error("{message}")]
     Internal {
         message: String,
         context: ErrorContext,
@@ -182,6 +187,13 @@ impl CliError {
 
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::Internal {
+            message: message.into(),
+            context: ErrorContext::default(),
+        }
+    }
+
+    pub(crate) fn invalid_input(message: impl Into<String>) -> Self {
+        Self::InvalidInput {
             message: message.into(),
             context: ErrorContext::default(),
         }
@@ -243,6 +255,7 @@ impl CliError {
                 _ => ExitStatus::General,
             },
             Self::Interrupted { .. } => ExitStatus::Interrupted,
+            Self::InvalidInput { .. } => ExitStatus::Usage,
             Self::Internal { .. } => ExitStatus::General,
         }
     }
@@ -387,6 +400,7 @@ impl CliError {
             | Self::DaemonUnavailable { context, .. }
             | Self::Grpc { context, .. }
             | Self::Interrupted { context }
+            | Self::InvalidInput { context, .. }
             | Self::Internal { context, .. } => context,
         }
     }
@@ -399,6 +413,7 @@ impl CliError {
             | Self::DaemonUnavailable { context, .. }
             | Self::Grpc { context, .. }
             | Self::Interrupted { context }
+            | Self::InvalidInput { context, .. }
             | Self::Internal { context, .. } => context,
         }
     }
