@@ -1,6 +1,7 @@
 pub mod args;
 pub mod error;
 
+pub(crate) mod builders;
 pub(crate) mod client;
 pub(crate) mod commands;
 pub(crate) mod context;

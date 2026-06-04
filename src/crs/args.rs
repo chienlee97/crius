@@ -358,6 +358,10 @@ pub struct PodCreateArgs {
     pub dns_options: Vec<String>,
     #[arg(long = "publish")]
     pub publish: Vec<String>,
+    #[arg(long = "label")]
+    pub labels: Vec<String>,
+    #[arg(long = "annotation")]
+    pub annotations: Vec<String>,
     #[arg(long)]
     pub runtime_handler: Option<String>,
     #[arg(long)]
@@ -497,6 +501,10 @@ pub struct ContainerCreateOptions {
     pub env: Vec<String>,
     #[arg(long = "env-file")]
     pub env_files: Vec<String>,
+    #[arg(long = "label")]
+    pub labels: Vec<String>,
+    #[arg(long = "annotation")]
+    pub annotations: Vec<String>,
     #[arg(long = "mount")]
     pub mounts: Vec<String>,
     #[arg(long = "device")]
@@ -638,6 +646,10 @@ pub struct RunPodCreateOptions {
     pub dns_options: Vec<String>,
     #[arg(long = "publish")]
     pub publish: Vec<String>,
+    #[arg(long = "label")]
+    pub labels: Vec<String>,
+    #[arg(long = "annotation")]
+    pub annotations: Vec<String>,
     #[arg(long)]
     pub runtime_handler: Option<String>,
     #[arg(long)]
@@ -678,6 +690,10 @@ pub struct RunContainerCreateOptions {
     pub env: Vec<String>,
     #[arg(long = "env-file")]
     pub env_files: Vec<String>,
+    #[arg(long = "label")]
+    pub labels: Vec<String>,
+    #[arg(long = "annotation")]
+    pub annotations: Vec<String>,
     #[arg(long = "mount")]
     pub mounts: Vec<String>,
     #[arg(long = "device")]
