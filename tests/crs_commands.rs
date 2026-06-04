@@ -180,7 +180,10 @@ impl RuntimeService for MockRuntimeService {
             .pod_inspect_requests
             .fetch_add(1, Ordering::SeqCst);
 
-        if request.pod_sandbox_id == "missing" {
+        if matches!(
+            request.pod_sandbox_id.as_str(),
+            "missing" | "ctr-only" | "image-only" | "none"
+        ) {
             return Err(Status::not_found("pod not found"));
         }
 
@@ -387,12 +390,14 @@ impl RuntimeService for MockRuntimeService {
         request: Request<ContainerStatusRequest>,
     ) -> Result<Response<ContainerStatusResponse>, Status> {
         let request = request.into_inner();
-        assert!(request.verbose);
         self.state
             .container_inspect_requests
             .fetch_add(1, Ordering::SeqCst);
 
-        if request.container_id == "missing" {
+        if matches!(
+            request.container_id.as_str(),
+            "missing" | "pod-only" | "image-only" | "none"
+        ) {
             return Err(Status::not_found("container not found"));
         }
 
@@ -672,13 +677,12 @@ impl ImageService for MockImageService {
         request: Request<ImageStatusRequest>,
     ) -> Result<Response<ImageStatusResponse>, Status> {
         let request = request.into_inner();
-        assert!(request.verbose);
         self.state
             .image_inspect_requests
             .fetch_add(1, Ordering::SeqCst);
         let image = request.image.expect("image spec").image;
 
-        if image == "missing" {
+        if matches!(image.as_str(), "missing" | "ctr-only" | "pod-only" | "none") {
             return Err(Status::not_found("image not found"));
         }
 
@@ -1554,6 +1558,89 @@ async fn container_write_errors_map_to_documented_exit_codes() {
 
     let missing_log = run_crs(endpoint, ["container", "reopen-log", "missing-log"]);
     assert_eq!(missing_log.status.code(), Some(6));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shortcut_stop_resolves_unique_container_or_pod_target() {
+    let state = MockState::default();
+    let stop_container_requests = Arc::clone(&state.stop_container_requests);
+    let stop_pod_requests = Arc::clone(&state.stop_pod_requests);
+    let endpoint = spawn_mock_services(state).await;
+
+    let container_stop = run_crs(endpoint, ["--output", "json", "stop", "ctr-only"]);
+    assert_success(&container_stop);
+    assert_eq!(stdout_json(&container_stop)["kind"], "ContainerStop");
+
+    let pod_stop = run_crs(endpoint, ["--output", "json", "stop", "pod-only"]);
+    assert_success(&pod_stop);
+    assert_eq!(stdout_json(&pod_stop)["kind"], "PodStop");
+
+    assert_eq!(stop_container_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(stop_pod_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shortcut_rm_resolves_unique_container_pod_or_image_target() {
+    let state = MockState::default();
+    let remove_container_requests = Arc::clone(&state.remove_container_requests);
+    let remove_pod_requests = Arc::clone(&state.remove_pod_requests);
+    let remove_image_requests = Arc::clone(&state.remove_image_requests);
+    let endpoint = spawn_mock_services(state).await;
+
+    let container_rm = run_crs(endpoint, ["--output", "json", "rm", "ctr-only"]);
+    assert_success(&container_rm);
+    assert_eq!(stdout_json(&container_rm)["kind"], "ContainerRemove");
+
+    let pod_rm = run_crs(endpoint, ["--output", "json", "rm", "pod-only"]);
+    assert_success(&pod_rm);
+    assert_eq!(stdout_json(&pod_rm)["kind"], "PodRemove");
+
+    let image_rm = run_crs(endpoint, ["--output", "json", "rm", "image-only"]);
+    assert_success(&image_rm);
+    assert_eq!(stdout_json(&image_rm)["kind"], "ImageRemove");
+
+    assert_eq!(remove_container_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(remove_pod_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(remove_image_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shortcut_stop_and_rm_require_type_for_ambiguous_targets() {
+    let state = MockState::default();
+    let stop_container_requests = Arc::clone(&state.stop_container_requests);
+    let remove_container_requests = Arc::clone(&state.remove_container_requests);
+    let endpoint = spawn_mock_services(state).await;
+
+    let stop = run_crs(endpoint, ["stop", "ambiguous"]);
+    assert_eq!(stop.status.code(), Some(2));
+    let stderr = String::from_utf8(stop.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("--type container|pod"));
+    assert_eq!(stop_container_requests.load(Ordering::SeqCst), 0);
+
+    let rm = run_crs(endpoint, ["rm", "ambiguous"]);
+    assert_eq!(rm.status.code(), Some(2));
+    let stderr = String::from_utf8(rm.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("--type container|pod|image"));
+    assert_eq!(remove_container_requests.load(Ordering::SeqCst), 0);
+
+    let no_match = run_crs(endpoint, ["rm", "none"]);
+    assert_eq!(no_match.status.code(), Some(2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shortcut_stop_and_rm_honor_explicit_type() {
+    let state = MockState::default();
+    let stop_pod_requests = Arc::clone(&state.stop_pod_requests);
+    let remove_image_requests = Arc::clone(&state.remove_image_requests);
+    let endpoint = spawn_mock_services(state).await;
+
+    let stop = run_crs(endpoint, ["stop", "--type", "pod", "ambiguous"]);
+    assert_success(&stop);
+    assert_eq!(stop_pod_requests.load(Ordering::SeqCst), 1);
+
+    let rm = run_crs(endpoint, ["rm", "--type", "image", "ambiguous"]);
+    assert_success(&rm);
+    assert_eq!(remove_image_requests.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
