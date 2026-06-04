@@ -6,18 +6,18 @@ use crate::{
     crs::{
         args::{
             ContainerCreateArgs, ContainerCreateOptions, ContainerResourceArgs,
-            ContainerSecurityArgs, PodCreateArgs, SandboxSecurityArgs,
+            ContainerSecurityArgs, ImageAuthArgs, PodCreateArgs, SandboxSecurityArgs,
         },
         parsers::{
-            parse_byte_size, parse_device, parse_env_file, parse_hugepage, parse_id_mapping,
-            parse_key_value, parse_mount, parse_port_mapping, parse_resource_spec,
-            parse_security_profile, parse_selinux_option, parse_user, KeyValuePair, ParsedUser,
-            ResourceFragment,
+            parse_auth_json, parse_byte_size, parse_device, parse_env_file, parse_hugepage,
+            parse_id_mapping, parse_key_value, parse_mount, parse_port_mapping,
+            parse_resource_spec, parse_security_profile, parse_selinux_option, parse_user,
+            KeyValuePair, ParsedUser, ResourceFragment,
         },
     },
     proto::runtime::v1::{
-        Capability, CdiDevice, ContainerConfig, ContainerMetadata, DnsConfig, ImageSpec,
-        Int64Value, KeyValue, LinuxContainerConfig, LinuxContainerResources,
+        AuthConfig, Capability, CdiDevice, ContainerConfig, ContainerMetadata, DnsConfig,
+        ImageSpec, Int64Value, KeyValue, LinuxContainerConfig, LinuxContainerResources,
         LinuxContainerSecurityContext, LinuxPodSandboxConfig, LinuxSandboxSecurityContext,
         NamespaceMode, NamespaceOption, PodSandboxConfig, PodSandboxMetadata, UserNamespace,
     },
@@ -64,6 +64,56 @@ pub(crate) fn build_container_config(
     args: &ContainerCreateArgs,
 ) -> Result<ContainerConfig, String> {
     build_container_config_from_parts(&args.image, &args.command, &args.options)
+}
+
+pub(crate) fn build_auth_config(args: &ImageAuthArgs) -> Result<Option<AuthConfig>, String> {
+    let sources = [
+        args.auth_json.is_some(),
+        args.auth_file.is_some(),
+        args.username.is_some()
+            || args.password.is_some()
+            || args.server.is_some()
+            || args.identity_token.is_some()
+            || args.registry_token.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+
+    if sources > 1 {
+        return Err(
+            "auth options must use only one source: --auth-json, --auth-file, or username flags"
+                .into(),
+        );
+    }
+
+    if let Some(value) = &args.auth_json {
+        return parse_auth_json("--auth-json", value).map(Some);
+    }
+
+    if let Some(path) = &args.auth_file {
+        let content = std::fs::read_to_string(path)
+            .map_err(|error| format!("failed to read auth file \"{path}\": {error}"))?;
+        return parse_auth_json(path, &content).map(Some);
+    }
+
+    if args.username.is_none()
+        && args.password.is_none()
+        && args.server.is_none()
+        && args.identity_token.is_none()
+        && args.registry_token.is_none()
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(AuthConfig {
+        username: args.username.clone().unwrap_or_default(),
+        password: args.password.clone().unwrap_or_default(),
+        auth: String::new(),
+        server_address: args.server.clone().unwrap_or_default(),
+        identity_token: args.identity_token.clone().unwrap_or_default(),
+        registry_token: args.registry_token.clone().unwrap_or_default(),
+    }))
 }
 
 fn build_container_config_from_parts(
@@ -999,5 +1049,91 @@ mod tests {
 
         let error = build_container_config(&args).unwrap_err();
         assert!(error.contains("--group requires --user"));
+    }
+
+    #[test]
+    fn builds_auth_config_from_inline_json() {
+        let args = ImageAuthArgs {
+            auth_json: Some(
+                r#"{"username":"alice","password":"secret","serverAddress":"registry.example"}"#
+                    .into(),
+            ),
+            ..Default::default()
+        };
+
+        let auth = build_auth_config(&args).unwrap().unwrap();
+
+        assert_eq!(auth.username, "alice");
+        assert_eq!(auth.password, "secret");
+        assert_eq!(auth.server_address, "registry.example");
+    }
+
+    #[test]
+    fn builds_auth_config_from_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            br#"{"auths":{"registry.example":{"auth":"dXNlcjpzZWNyZXQ="}}}"#,
+        )
+        .unwrap();
+        let args = ImageAuthArgs {
+            auth_file: Some(file.path().display().to_string()),
+            ..Default::default()
+        };
+
+        let auth = build_auth_config(&args).unwrap().unwrap();
+
+        assert_eq!(auth.server_address, "registry.example");
+        assert_eq!(auth.username, "user");
+        assert_eq!(auth.password, "secret");
+    }
+
+    #[test]
+    fn builds_auth_config_from_discrete_flags() {
+        let args = ImageAuthArgs {
+            username: Some("alice".into()),
+            password: Some("secret".into()),
+            server: Some("registry.example".into()),
+            identity_token: Some("identity".into()),
+            registry_token: Some("registry-token".into()),
+            ..Default::default()
+        };
+
+        let auth = build_auth_config(&args).unwrap().unwrap();
+
+        assert_eq!(auth.username, "alice");
+        assert_eq!(auth.password, "secret");
+        assert_eq!(auth.server_address, "registry.example");
+        assert_eq!(auth.identity_token, "identity");
+        assert_eq!(auth.registry_token, "registry-token");
+    }
+
+    #[test]
+    fn rejects_auth_source_conflicts() {
+        let args = ImageAuthArgs {
+            auth_json: Some(r#"{"username":"alice"}"#.into()),
+            username: Some("bob".into()),
+            ..Default::default()
+        };
+
+        let error = build_auth_config(&args).unwrap_err();
+
+        assert!(error.contains("only one source"));
+        assert!(!error.contains("alice"));
+        assert!(!error.contains("bob"));
+    }
+
+    #[test]
+    fn auth_file_read_error_does_not_include_secret_flags() {
+        let args = ImageAuthArgs {
+            auth_file: Some("/does/not/exist".into()),
+            ..Default::default()
+        };
+
+        let error = build_auth_config(&args).unwrap_err();
+
+        assert!(error.contains("failed to read auth file"));
+        assert!(!error.contains("secret"));
+        assert!(!error.contains("token"));
     }
 }
