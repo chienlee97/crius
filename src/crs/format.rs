@@ -349,6 +349,30 @@ impl TableRow for RuntimeConfigView {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeConfigUpdateView {
+    pub pod_cidrs: Vec<String>,
+    pub updated: bool,
+}
+
+impl TableRow for RuntimeConfigUpdateView {
+    fn headers() -> &'static [&'static str] {
+        &["POD CIDRS", "UPDATED"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.pod_cidrs.join(","),
+            format_bool(self.updated).to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.pod_cidrs.join(",")
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ImageView {
     pub image: String,
     pub image_id: String,
@@ -490,6 +514,36 @@ impl TableRow for PodView {
             self.created.clone(),
             self.attempt.to_string(),
         ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PodOperationView {
+    pub pod_id: String,
+    pub name: String,
+    pub namespace: String,
+    pub action: String,
+    pub success: bool,
+}
+
+impl TableRow for PodOperationView {
+    fn headers() -> &'static [&'static str] {
+        &["POD ID", "NAME", "NAMESPACE", "ACTION", "SUCCESS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.pod_id.clone(),
+            self.name.clone(),
+            self.namespace.clone(),
+            self.action.clone(),
+            format_bool(self.success).to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.pod_id.clone()
     }
 }
 

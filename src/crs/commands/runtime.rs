@@ -4,9 +4,12 @@ use crate::crs::{
     commands::status::render_and_print,
     context::CliContext,
     error::{CliError, CommandResult},
-    format::{CommandOutput, RuntimeConfigView},
+    format::{CommandOutput, RuntimeConfigUpdateView, RuntimeConfigView},
+    parsers::parse_cidr_list,
 };
-use crate::proto::runtime::v1::{CgroupDriver, RuntimeConfigRequest};
+use crate::proto::runtime::v1::{
+    CgroupDriver, NetworkConfig, RuntimeConfig, RuntimeConfigRequest, UpdateRuntimeConfigRequest,
+};
 
 pub(crate) async fn handle(
     ctx: &CliContext,
@@ -15,7 +18,7 @@ pub(crate) async fn handle(
 ) -> Result<CommandResult, CliError> {
     match args.command {
         RuntimeCommand::Config => handle_config(ctx, client).await,
-        RuntimeCommand::Update { .. } => Err(CliError::not_implemented("crs runtime update")),
+        RuntimeCommand::Update { pod_cidr } => handle_update(ctx, client, pod_cidr).await,
         RuntimeCommand::Handlers { .. } => Err(CliError::not_implemented("crs runtime handlers")),
     }
 }
@@ -50,6 +53,52 @@ async fn handle_config(ctx: &CliContext, client: &CrsClient) -> Result<CommandRe
             client.endpoint(),
             vec![RuntimeConfigView { cgroup_driver }],
         ),
+    )
+}
+
+async fn handle_update(
+    ctx: &CliContext,
+    client: &CrsClient,
+    pod_cidr: String,
+) -> Result<CommandResult, CliError> {
+    let pod_cidrs = parse_cidr_list(&pod_cidr)
+        .map_err(CliError::invalid_input)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .update_runtime_config(UpdateRuntimeConfigRequest {
+                    runtime_config: Some(RuntimeConfig {
+                        network_config: Some(NetworkConfig {
+                            pod_cidr: pod_cidrs.join(","),
+                        }),
+                    }),
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs runtime update")
+                        .with_endpoint(client.endpoint())
+                })
+        })
+        .await?;
+
+    render_and_print(
+        ctx,
+        CommandOutput::new(
+            "RuntimeConfigUpdate",
+            client.endpoint(),
+            vec![RuntimeConfigUpdateView {
+                pod_cidrs: pod_cidrs.clone(),
+                updated: true,
+            }],
+        )
+        .with_summary(serde_json::json!({
+            "podCidrs": pod_cidrs,
+            "updated": true,
+        })),
     )
 }
 

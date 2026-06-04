@@ -1,15 +1,17 @@
 use crate::crs::{
-    args::{PodCommand, PodListArgs, PodStateArg},
+    args::{PodCommand, PodCreateArgs, PodListArgs, PodStateArg},
+    builders::{build_pod_sandbox_config, build_resources_from_specs},
     client::CrsClient,
     commands::status::{parse_info_map, render_and_print},
     context::CliContext,
     error::{CliError, CommandResult},
-    format::{CommandOutput, InspectView, PodView},
+    format::{CommandOutput, InspectView, PodOperationView, PodView},
     parsers::parse_key_value,
 };
 use crate::proto::runtime::v1::{
     ListPodSandboxRequest, PodSandbox, PodSandboxFilter, PodSandboxState, PodSandboxStateValue,
-    PodSandboxStatus, PodSandboxStatusRequest,
+    PodSandboxStatus, PodSandboxStatusRequest, RemovePodSandboxRequest, RunPodSandboxRequest,
+    StopPodSandboxRequest, UpdatePodSandboxResourcesRequest,
 };
 
 pub(crate) async fn handle(
@@ -20,14 +22,16 @@ pub(crate) async fn handle(
     match command {
         PodCommand::List(args) => handle_list(ctx, client, args).await,
         PodCommand::Inspect { pod } => handle_inspect(ctx, client, pod).await,
-        PodCommand::Run(_) => Err(CliError::not_implemented("crs pod run")),
-        PodCommand::Stop { .. } => Err(CliError::not_implemented("crs pod stop")),
-        PodCommand::Remove { .. } => Err(CliError::not_implemented("crs pod remove")),
+        PodCommand::Run(args) => handle_run(ctx, client, *args).await,
+        PodCommand::Stop { pod, timeout } => handle_stop(ctx, client, pod, timeout).await,
+        PodCommand::Remove { pod } => handle_remove(ctx, client, pod).await,
         PodCommand::Stats(_) => Err(CliError::not_implemented("crs pod stats")),
         PodCommand::Metrics => Err(CliError::not_implemented("crs pod metrics")),
-        PodCommand::UpdateResources { .. } => {
-            Err(CliError::not_implemented("crs pod update-resources"))
-        }
+        PodCommand::UpdateResources {
+            pod,
+            overhead,
+            pod_resource,
+        } => handle_update_resources(ctx, client, pod, overhead, pod_resource).await,
         PodCommand::PortForward { .. } => Err(CliError::not_implemented("crs pod port-forward")),
     }
 }
@@ -104,6 +108,205 @@ pub(crate) async fn handle_inspect(
             }],
         )
         .with_warnings(warnings),
+    )
+}
+
+pub(crate) async fn handle_run(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: PodCreateArgs,
+) -> Result<CommandResult, CliError> {
+    let config = build_pod_sandbox_config(&args).map_err(CliError::invalid_input)?;
+    let metadata = config.metadata.clone().unwrap_or_default();
+    let runtime_handler = args.runtime_handler.clone().unwrap_or_default();
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .run_pod_sandbox(RunPodSandboxRequest {
+                    config: Some(config),
+                    runtime_handler,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs pod run")
+                        .with_endpoint(client.endpoint())
+                })
+        })
+        .await?
+        .into_inner();
+
+    render_and_print(
+        ctx,
+        CommandOutput::new(
+            "PodRun",
+            client.endpoint(),
+            vec![PodOperationView {
+                pod_id: response.pod_sandbox_id.clone(),
+                name: metadata.name,
+                namespace: metadata.namespace,
+                action: "created".to_string(),
+                success: true,
+            }],
+        )
+        .with_summary(serde_json::json!({
+            "podSandboxId": response.pod_sandbox_id,
+            "created": true,
+        })),
+    )
+}
+
+pub(crate) async fn handle_stop(
+    ctx: &CliContext,
+    client: &CrsClient,
+    pod: String,
+    timeout: Option<u32>,
+) -> Result<CommandResult, CliError> {
+    if pod.is_empty() {
+        return Err(CliError::invalid_input("pod must not be empty").with_command("crs pod stop"));
+    }
+
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .stop_pod_sandbox(StopPodSandboxRequest {
+                    pod_sandbox_id: pod.clone(),
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs pod stop")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("pod {pod}"))
+                })
+        })
+        .await?;
+
+    render_and_print(
+        ctx,
+        CommandOutput::new(
+            "PodStop",
+            client.endpoint(),
+            vec![PodOperationView {
+                pod_id: pod.clone(),
+                name: String::new(),
+                namespace: String::new(),
+                action: "stopped".to_string(),
+                success: true,
+            }],
+        )
+        .with_summary(serde_json::json!({
+            "podSandboxId": pod,
+            "stopped": true,
+            "timeoutSeconds": timeout.unwrap_or_default(),
+        })),
+    )
+}
+
+pub(crate) async fn handle_remove(
+    ctx: &CliContext,
+    client: &CrsClient,
+    pod: String,
+) -> Result<CommandResult, CliError> {
+    if pod.is_empty() {
+        return Err(CliError::invalid_input("pod must not be empty").with_command("crs pod remove"));
+    }
+
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .remove_pod_sandbox(RemovePodSandboxRequest {
+                    pod_sandbox_id: pod.clone(),
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs pod remove")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("pod {pod}"))
+                })
+        })
+        .await?;
+
+    render_and_print(
+        ctx,
+        CommandOutput::new(
+            "PodRemove",
+            client.endpoint(),
+            vec![PodOperationView {
+                pod_id: pod.clone(),
+                name: String::new(),
+                namespace: String::new(),
+                action: "removed".to_string(),
+                success: true,
+            }],
+        )
+        .with_summary(serde_json::json!({
+            "podSandboxId": pod,
+            "removed": true,
+        })),
+    )
+}
+
+pub(crate) async fn handle_update_resources(
+    ctx: &CliContext,
+    client: &CrsClient,
+    pod: String,
+    overhead: Vec<String>,
+    pod_resource: Vec<String>,
+) -> Result<CommandResult, CliError> {
+    if pod.is_empty() {
+        return Err(CliError::invalid_input("pod must not be empty")
+            .with_command("crs pod update-resources"));
+    }
+    if overhead.is_empty() && pod_resource.is_empty() {
+        return Err(CliError::invalid_input(
+            "pod update-resources requires at least one --overhead or --pod-resource field",
+        )
+        .with_command("crs pod update-resources"));
+    }
+
+    let overhead = build_resources_from_specs(&overhead).map_err(CliError::invalid_input)?;
+    let resources = build_resources_from_specs(&pod_resource).map_err(CliError::invalid_input)?;
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .update_pod_sandbox_resources(UpdatePodSandboxResourcesRequest {
+                    pod_sandbox_id: pod.clone(),
+                    overhead,
+                    resources,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs pod update-resources")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("pod {pod}"))
+                })
+        })
+        .await?;
+
+    render_and_print(
+        ctx,
+        CommandOutput::new(
+            "PodResourceUpdate",
+            client.endpoint(),
+            vec![PodOperationView {
+                pod_id: pod.clone(),
+                name: String::new(),
+                namespace: String::new(),
+                action: "updated".to_string(),
+                success: true,
+            }],
+        )
+        .with_summary(serde_json::json!({
+            "podSandboxId": pod,
+            "updated": true,
+        })),
     )
 }
 

@@ -51,6 +51,11 @@ struct MockState {
     version_requests: Arc<AtomicUsize>,
     status_requests: Arc<AtomicUsize>,
     runtime_config_requests: Arc<AtomicUsize>,
+    update_runtime_config_requests: Arc<AtomicUsize>,
+    run_pod_requests: Arc<AtomicUsize>,
+    stop_pod_requests: Arc<AtomicUsize>,
+    remove_pod_requests: Arc<AtomicUsize>,
+    update_pod_resources_requests: Arc<AtomicUsize>,
     list_pod_requests: Arc<AtomicUsize>,
     pod_inspect_requests: Arc<AtomicUsize>,
     list_container_requests: Arc<AtomicUsize>,
@@ -60,6 +65,11 @@ struct MockState {
     image_fs_info_requests: Arc<AtomicUsize>,
     pull_image_requests: Arc<AtomicUsize>,
     remove_image_requests: Arc<AtomicUsize>,
+    last_update_runtime_config: Arc<Mutex<Option<UpdateRuntimeConfigRequest>>>,
+    last_run_pod: Arc<Mutex<Option<RunPodSandboxRequest>>>,
+    last_stop_pod: Arc<Mutex<Option<StopPodSandboxRequest>>>,
+    last_remove_pod: Arc<Mutex<Option<RemovePodSandboxRequest>>>,
+    last_update_pod_resources: Arc<Mutex<Option<UpdatePodSandboxResourcesRequest>>>,
     last_pull_image: Arc<Mutex<Option<PullImageRequest>>>,
     last_remove_image: Arc<Mutex<Option<RemoveImageRequest>>>,
 }
@@ -81,17 +91,72 @@ impl RuntimeService for MockRuntimeService {
         }))
     }
 
-    unimplemented_runtime_rpc!(run_pod_sandbox, RunPodSandboxRequest, RunPodSandboxResponse);
-    unimplemented_runtime_rpc!(
-        stop_pod_sandbox,
-        StopPodSandboxRequest,
-        StopPodSandboxResponse
-    );
-    unimplemented_runtime_rpc!(
-        remove_pod_sandbox,
-        RemovePodSandboxRequest,
-        RemovePodSandboxResponse
-    );
+    async fn run_pod_sandbox(
+        &self,
+        request: Request<RunPodSandboxRequest>,
+    ) -> Result<Response<RunPodSandboxResponse>, Status> {
+        let request = request.into_inner();
+        let name = request
+            .config
+            .as_ref()
+            .and_then(|config| config.metadata.as_ref())
+            .map(|metadata| metadata.name.as_str())
+            .unwrap_or_default()
+            .to_string();
+        self.state.run_pod_requests.fetch_add(1, Ordering::SeqCst);
+        *self.state.last_run_pod.lock().expect("last run pod lock") = Some(request);
+
+        if name == "bad-runtime" {
+            return Err(Status::failed_precondition(
+                "runtime handler is not available",
+            ));
+        }
+
+        Ok(Response::new(RunPodSandboxResponse {
+            pod_sandbox_id: format!("pod-{name}"),
+        }))
+    }
+
+    async fn stop_pod_sandbox(
+        &self,
+        request: Request<StopPodSandboxRequest>,
+    ) -> Result<Response<StopPodSandboxResponse>, Status> {
+        let request = request.into_inner();
+        let pod = request.pod_sandbox_id.clone();
+        self.state.stop_pod_requests.fetch_add(1, Ordering::SeqCst);
+        *self.state.last_stop_pod.lock().expect("last stop pod lock") = Some(request);
+
+        if pod == "missing" {
+            return Err(Status::not_found("pod not found"));
+        }
+
+        Ok(Response::new(StopPodSandboxResponse {}))
+    }
+
+    async fn remove_pod_sandbox(
+        &self,
+        request: Request<RemovePodSandboxRequest>,
+    ) -> Result<Response<RemovePodSandboxResponse>, Status> {
+        let request = request.into_inner();
+        let pod = request.pod_sandbox_id.clone();
+        self.state
+            .remove_pod_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_remove_pod
+            .lock()
+            .expect("last remove pod lock") = Some(request);
+
+        if pod == "missing" {
+            return Err(Status::not_found("pod not found"));
+        }
+        if pod == "busy" {
+            return Err(Status::failed_precondition("pod still has containers"));
+        }
+
+        Ok(Response::new(RemovePodSandboxResponse {}))
+    }
     async fn pod_sandbox_status(
         &self,
         request: Request<PodSandboxStatusRequest>,
@@ -291,11 +356,35 @@ impl RuntimeService for MockRuntimeService {
         ListPodSandboxStatsRequest,
         ListPodSandboxStatsResponse
     );
-    unimplemented_runtime_rpc!(
-        update_runtime_config,
-        UpdateRuntimeConfigRequest,
-        UpdateRuntimeConfigResponse
-    );
+    async fn update_runtime_config(
+        &self,
+        request: Request<UpdateRuntimeConfigRequest>,
+    ) -> Result<Response<UpdateRuntimeConfigResponse>, Status> {
+        let request = request.into_inner();
+        let pod_cidr = request
+            .runtime_config
+            .as_ref()
+            .and_then(|config| config.network_config.as_ref())
+            .map(|network| network.pod_cidr.as_str())
+            .unwrap_or_default()
+            .to_string();
+        self.state
+            .update_runtime_config_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_update_runtime_config
+            .lock()
+            .expect("last update runtime config lock") = Some(request);
+
+        if pod_cidr == "10.250.0.0/16" {
+            return Err(Status::failed_precondition(
+                "pod CIDR overlaps node network",
+            ));
+        }
+
+        Ok(Response::new(UpdateRuntimeConfigResponse {}))
+    }
     async fn status(
         &self,
         request: Request<StatusRequest>,
@@ -372,11 +461,32 @@ impl RuntimeService for MockRuntimeService {
             }),
         }))
     }
-    unimplemented_runtime_rpc!(
-        update_pod_sandbox_resources,
-        UpdatePodSandboxResourcesRequest,
-        UpdatePodSandboxResourcesResponse
-    );
+    async fn update_pod_sandbox_resources(
+        &self,
+        request: Request<UpdatePodSandboxResourcesRequest>,
+    ) -> Result<Response<UpdatePodSandboxResourcesResponse>, Status> {
+        let request = request.into_inner();
+        let pod = request.pod_sandbox_id.clone();
+        self.state
+            .update_pod_resources_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_update_pod_resources
+            .lock()
+            .expect("last update pod resources lock") = Some(request);
+
+        if pod == "missing" {
+            return Err(Status::not_found("pod not found"));
+        }
+        if pod == "unsupported" {
+            return Err(Status::failed_precondition(
+                "pod resource update is unsupported",
+            ));
+        }
+
+        Ok(Response::new(UpdatePodSandboxResourcesResponse {}))
+    }
 }
 
 #[tonic::async_trait]
@@ -578,6 +688,49 @@ async fn runtime_config_reports_cgroup_driver() {
     let value = stdout_json(&output);
     assert_eq!(value["kind"], "RuntimeConfig");
     assert_eq!(value["items"][0]["cgroupDriver"], "systemd");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_update_validates_cidr_and_calls_update_runtime_config() {
+    let state = MockState::default();
+    let requests = Arc::clone(&state.update_runtime_config_requests);
+    let last_update = Arc::clone(&state.last_update_runtime_config);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "runtime",
+            "update",
+            "--pod-cidr",
+            "10.244.0.0/16,fd00::/64",
+        ],
+    );
+
+    assert_success(&output);
+    let value = stdout_json(&output);
+    assert_eq!(value["kind"], "RuntimeConfigUpdate");
+    assert_eq!(value["summary"]["updated"], true);
+    assert_eq!(value["summary"]["podCidrs"][0], "10.244.0.0/16");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    let request = last_update
+        .lock()
+        .expect("last update runtime config lock")
+        .clone()
+        .expect("update runtime config request");
+    let pod_cidr = request
+        .runtime_config
+        .expect("runtime config")
+        .network_config
+        .expect("network config")
+        .pod_cidr;
+    assert_eq!(pod_cidr, "10.244.0.0/16,fd00::/64");
+
+    let invalid = run_crs(endpoint, ["runtime", "update", "--pod-cidr", "not-a-cidr"]);
+    assert_eq!(invalid.status.code(), Some(2));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 }
 
@@ -832,6 +985,154 @@ async fn pod_and_container_lists_and_shortcuts_use_running_filters() {
 
     assert_eq!(pod_requests.load(Ordering::SeqCst), 2);
     assert_eq!(container_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pod_run_stop_remove_and_update_resources_call_runtime_rpcs() {
+    let state = MockState::default();
+    let run_requests = Arc::clone(&state.run_pod_requests);
+    let stop_requests = Arc::clone(&state.stop_pod_requests);
+    let remove_requests = Arc::clone(&state.remove_pod_requests);
+    let update_requests = Arc::clone(&state.update_pod_resources_requests);
+    let last_run = Arc::clone(&state.last_run_pod);
+    let last_stop = Arc::clone(&state.last_stop_pod);
+    let last_remove = Arc::clone(&state.last_remove_pod);
+    let last_update = Arc::clone(&state.last_update_pod_resources);
+    let endpoint = spawn_mock_services(state).await;
+
+    let run = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "pod",
+            "run",
+            "--name",
+            "demo",
+            "--namespace",
+            "ns-a",
+            "--runtime-handler",
+            "runc",
+            "--label",
+            "app=demo",
+        ],
+    );
+    assert_success(&run);
+    let value = stdout_json(&run);
+    assert_eq!(value["kind"], "PodRun");
+    assert_eq!(value["summary"]["podSandboxId"], "pod-demo");
+    let request = last_run
+        .lock()
+        .expect("last run pod lock")
+        .clone()
+        .expect("run pod request");
+    assert_eq!(request.runtime_handler, "runc");
+    let config = request.config.expect("pod config");
+    assert_eq!(config.metadata.expect("metadata").namespace, "ns-a");
+    assert_eq!(config.labels["app"], "demo");
+
+    let stop = run_crs(endpoint, ["--output", "json", "pod", "stop", "pod-demo"]);
+    assert_success(&stop);
+    assert_eq!(stdout_json(&stop)["kind"], "PodStop");
+    assert_eq!(
+        last_stop
+            .lock()
+            .expect("last stop pod lock")
+            .clone()
+            .expect("stop pod request")
+            .pod_sandbox_id,
+        "pod-demo"
+    );
+
+    let remove = run_crs(endpoint, ["--quiet", "pod", "remove", "pod-demo"]);
+    assert_success(&remove);
+    assert_eq!(
+        String::from_utf8(remove.stdout)
+            .expect("stdout should be utf8")
+            .trim_end(),
+        "pod-demo"
+    );
+    assert_eq!(
+        last_remove
+            .lock()
+            .expect("last remove pod lock")
+            .clone()
+            .expect("remove pod request")
+            .pod_sandbox_id,
+        "pod-demo"
+    );
+
+    let update = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "pod",
+            "update-resources",
+            "pod-demo",
+            "--overhead",
+            "memory=1KiB",
+            "--pod-resource",
+            "cpu-quota=2000,memory=2KiB",
+        ],
+    );
+    assert_success(&update);
+    assert_eq!(stdout_json(&update)["kind"], "PodResourceUpdate");
+    let request = last_update
+        .lock()
+        .expect("last update pod resources lock")
+        .clone()
+        .expect("update pod resources request");
+    assert_eq!(request.pod_sandbox_id, "pod-demo");
+    assert_eq!(
+        request.overhead.expect("overhead").memory_limit_in_bytes,
+        1024
+    );
+    let resources = request.resources.expect("resources");
+    assert_eq!(resources.cpu_quota, 2000);
+    assert_eq!(resources.memory_limit_in_bytes, 2048);
+
+    assert_eq!(run_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(stop_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(remove_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(update_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pod_write_errors_map_to_documented_exit_codes() {
+    let state = MockState::default();
+    let update_requests = Arc::clone(&state.update_pod_resources_requests);
+    let endpoint = spawn_mock_services(state).await;
+
+    let missing_stop = run_crs(endpoint, ["pod", "stop", "missing"]);
+    assert_eq!(missing_stop.status.code(), Some(4));
+
+    let busy_remove = run_crs(endpoint, ["pod", "remove", "busy"]);
+    assert_eq!(busy_remove.status.code(), Some(6));
+    let stderr = String::from_utf8(busy_remove.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("pod still has containers"));
+
+    let no_fields = run_crs(endpoint, ["pod", "update-resources", "pod-demo"]);
+    assert_eq!(no_fields.status.code(), Some(2));
+    assert_eq!(update_requests.load(Ordering::SeqCst), 0);
+
+    let unsupported = run_crs(
+        endpoint,
+        [
+            "pod",
+            "update-resources",
+            "unsupported",
+            "--pod-resource",
+            "memory=1KiB",
+        ],
+    );
+    assert_eq!(unsupported.status.code(), Some(6));
+
+    let runtime_reject = run_crs(
+        endpoint,
+        ["runtime", "update", "--pod-cidr", "10.250.0.0/16"],
+    );
+    assert_eq!(runtime_reject.status.code(), Some(6));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

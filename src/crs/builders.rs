@@ -460,7 +460,7 @@ fn build_user_namespace(args: &PodCreateArgs) -> Result<Option<UserNamespace>, S
     }))
 }
 
-fn build_resources_from_specs(
+pub(crate) fn build_resources_from_specs(
     values: &[String],
 ) -> Result<Option<LinuxContainerResources>, String> {
     if values.is_empty() {
