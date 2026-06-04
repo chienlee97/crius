@@ -1,7 +1,5 @@
 use crate::crs::{
-    args::{
-        ImageListArgs, ImagePullArgs, InspectArgs, ListArgs, RemoveArgs, StopArgs,
-    },
+    args::{ImageListArgs, ImagePullArgs, InspectArgs, ListArgs, RemoveArgs, StopArgs},
     client::CrsClient,
     context::CliContext,
     error::{CliError, CommandResult},

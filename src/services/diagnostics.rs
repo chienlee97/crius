@@ -746,9 +746,11 @@ mod tests {
     #[tokio::test]
     async fn state_from_runtime_uses_runtime_diagnostics_snapshot() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let mut runtime_config = crate::server::RuntimeConfig::default();
-        runtime_config.root_dir = tempdir.path().join("state");
-        runtime_config.config_path = Some(tempdir.path().join("crius.conf"));
+        let runtime_config = crate::server::RuntimeConfig {
+            root_dir: tempdir.path().join("state"),
+            config_path: Some(tempdir.path().join("crius.conf")),
+            ..Default::default()
+        };
         let runtime = crate::server::RuntimeServiceImpl::new(runtime_config);
 
         let state = DiagnosticsState::from_runtime(
@@ -858,8 +860,10 @@ mod tests {
     #[tokio::test]
     async fn recovery_status_reports_startup_and_ledger_summary() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let mut runtime_config = crate::server::RuntimeConfig::default();
-        runtime_config.root_dir = tempdir.path().join("state");
+        let runtime_config = crate::server::RuntimeConfig {
+            root_dir: tempdir.path().join("state"),
+            ..Default::default()
+        };
         let runtime = crate::server::RuntimeServiceImpl::new(runtime_config);
         runtime.record_startup_clean_shutdown(false);
         runtime.record_startup_detected_reboot(true);
@@ -896,8 +900,10 @@ mod tests {
     async fn recovery_check_dry_run_reports_actions_without_mutating_ledger() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let root_dir = tempdir.path().join("state");
-        let mut runtime_config = crate::server::RuntimeConfig::default();
-        runtime_config.root_dir = root_dir.clone();
+        let runtime_config = crate::server::RuntimeConfig {
+            root_dir: root_dir.clone(),
+            ..Default::default()
+        };
         let runtime = crate::server::RuntimeServiceImpl::new(runtime_config);
         let db_path = root_dir.join("crius.db");
         {
@@ -981,13 +987,15 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let blockio_config = tempdir.path().join("blockio.json");
         std::fs::write(&blockio_config, "{}").expect("blockio config should be written");
-        let mut nri_config = crate::config::NriConfig::default();
-        nri_config.enable = true;
-        nri_config.enable_cdi = true;
-        nri_config.cdi_spec_dirs = vec!["/etc/cdi".to_string(), "/var/run/cdi".to_string()];
-        nri_config.plugin_path = "/opt/nri/plugins".to_string();
-        nri_config.plugin_config_path = "/etc/nri/conf.d".to_string();
-        nri_config.blockio_config_path = blockio_config.display().to_string();
+        let nri_config = crate::config::NriConfig {
+            enable: true,
+            enable_cdi: true,
+            cdi_spec_dirs: vec!["/etc/cdi".to_string(), "/var/run/cdi".to_string()],
+            plugin_path: "/opt/nri/plugins".to_string(),
+            plugin_config_path: "/etc/nri/conf.d".to_string(),
+            blockio_config_path: blockio_config.display().to_string(),
+            ..Default::default()
+        };
         let runtime = crate::server::RuntimeServiceImpl::new_with_nri_config(
             crate::server::RuntimeConfig::default(),
             nri_config,
@@ -1022,11 +1030,13 @@ mod tests {
     #[tokio::test]
     async fn security_status_returns_capability_summary_without_device_paths() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let mut runtime_config = crate::server::RuntimeConfig::default();
-        runtime_config.root_dir = tempdir.path().join("state");
-        runtime_config.allowed_devices = vec!["/dev/fuse".into()];
-        runtime_config.privileged_seccomp_profile = "runtime/default".to_string();
-        runtime_config.apparmor_default_profile = "crius-default".to_string();
+        let runtime_config = crate::server::RuntimeConfig {
+            root_dir: tempdir.path().join("state"),
+            allowed_devices: vec!["/dev/fuse".into()],
+            privileged_seccomp_profile: "runtime/default".to_string(),
+            apparmor_default_profile: "crius-default".to_string(),
+            ..Default::default()
+        };
         let runtime = crate::server::RuntimeServiceImpl::new(runtime_config);
         let state = DiagnosticsState::from_runtime(
             "0.1.0",
@@ -1058,8 +1068,10 @@ mod tests {
     async fn shim_status_filters_by_container_id() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let root_dir = tempdir.path().join("state");
-        let mut runtime_config = crate::server::RuntimeConfig::default();
-        runtime_config.root_dir = root_dir.clone();
+        let runtime_config = crate::server::RuntimeConfig {
+            root_dir: root_dir.clone(),
+            ..Default::default()
+        };
         let runtime = crate::server::RuntimeServiceImpl::new(runtime_config);
         let task_socket = root_dir.join("shims").join("target").join("task.sock");
         let mut storage = crate::storage::StorageManager::new(root_dir.join("crius.db"))
@@ -1299,7 +1311,8 @@ mod tests {
         let outside_log = tempdir.path().join("outside.log");
         std::fs::write(&outside_log, "2026-06-02T01:02:03Z stdout F nope\n")
             .expect("outside log should be written");
-        let runtime = runtime_with_container_log(&root_dir, "outside-container", &outside_log).await;
+        let runtime =
+            runtime_with_container_log(&root_dir, "outside-container", &outside_log).await;
         let state = DiagnosticsState::from_runtime(
             "0.1.0",
             "abc123",
@@ -1373,8 +1386,10 @@ mod tests {
         container_id: &str,
         log_path: &std::path::Path,
     ) -> crate::server::RuntimeServiceImpl {
-        let mut runtime_config = crate::server::RuntimeConfig::default();
-        runtime_config.root_dir = root_dir.to_path_buf();
+        let runtime_config = crate::server::RuntimeConfig {
+            root_dir: root_dir.to_path_buf(),
+            ..Default::default()
+        };
         let runtime = crate::server::RuntimeServiceImpl::new(runtime_config);
         let annotations = std::collections::HashMap::from([(
             "io.crius.internal/container-state".to_string(),

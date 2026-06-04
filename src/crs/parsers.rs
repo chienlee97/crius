@@ -53,7 +53,9 @@ impl std::fmt::Display for Endpoint {
 pub(crate) fn parse_endpoint(value: &str) -> Result<Endpoint, String> {
     let value = value.trim();
     if value.is_empty() {
-        return Err("invalid endpoint \"\": expected unix path, unix://, http://, or https://".into());
+        return Err(
+            "invalid endpoint \"\": expected unix path, unix://, http://, or https://".into(),
+        );
     }
 
     if let Some(path) = value.strip_prefix("unix://") {
@@ -267,16 +269,17 @@ pub(crate) fn parse_auth_json(source: &str, value: &str) -> Result<AuthConfig, S
         .map_err(|error| format!("invalid auth JSON from {source}: {error}"))?;
 
     let Some((server, entry)) = docker.auths.into_iter().next() else {
-        return Err(format!("invalid auth JSON from {source}: auths must not be empty"));
+        return Err(format!(
+            "invalid auth JSON from {source}: auths must not be empty"
+        ));
     };
 
-    let (username, password) = if !entry.auth.is_empty()
-        && (entry.username.is_empty() || entry.password.is_empty())
-    {
-        decode_docker_auth(source, &entry.auth)?
-    } else {
-        (entry.username, entry.password)
-    };
+    let (username, password) =
+        if !entry.auth.is_empty() && (entry.username.is_empty() || entry.password.is_empty()) {
+            decode_docker_auth(source, &entry.auth)?
+        } else {
+            (entry.username, entry.password)
+        };
 
     Ok(AuthConfig {
         username,
@@ -291,9 +294,12 @@ pub(crate) fn parse_auth_json(source: &str, value: &str) -> Result<AuthConfig, S
 fn decode_docker_auth(source: &str, auth: &str) -> Result<(String, String), String> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(auth)
-        .map_err(|error| format!("invalid auth JSON from {source}: invalid docker auth: {error}"))?;
-    let decoded = String::from_utf8(decoded)
-        .map_err(|error| format!("invalid auth JSON from {source}: invalid docker auth: {error}"))?;
+        .map_err(|error| {
+            format!("invalid auth JSON from {source}: invalid docker auth: {error}")
+        })?;
+    let decoded = String::from_utf8(decoded).map_err(|error| {
+        format!("invalid auth JSON from {source}: invalid docker auth: {error}")
+    })?;
     let Some((username, password)) = decoded.split_once(':') else {
         return Err(format!(
             "invalid auth JSON from {source}: docker auth must decode to username:password"
@@ -447,7 +453,9 @@ pub(crate) fn parse_mount(value: &str) -> Result<Mount, String> {
 
     for part in value.split(',') {
         if part.is_empty() {
-            return Err(format!("invalid mount \"{value}\": entries must not be empty"));
+            return Err(format!(
+                "invalid mount \"{value}\": entries must not be empty"
+            ));
         }
         let Some((key, raw_value)) = part.split_once('=') else {
             match part {
@@ -492,12 +500,10 @@ pub(crate) fn parse_mount(value: &str) -> Result<Mount, String> {
         }
     }
 
-    let mount_type = mount_type.ok_or_else(|| {
-        format!("invalid mount \"{value}\": type must be bind or image")
-    })?;
-    let container_path = destination.ok_or_else(|| {
-        format!("invalid mount \"{value}\": dst/target is required")
-    })?;
+    let mount_type = mount_type
+        .ok_or_else(|| format!("invalid mount \"{value}\": type must be bind or image"))?;
+    let container_path =
+        destination.ok_or_else(|| format!("invalid mount \"{value}\": dst/target is required"))?;
 
     if recursive_read_only
         && (!readonly || propagation != MountPropagation::PropagationPrivate as i32)
@@ -536,9 +542,8 @@ pub(crate) fn parse_mount(value: &str) -> Result<Mount, String> {
                     "invalid mount \"{value}\": image mount must not include src/source"
                 ));
             }
-            let image = image.ok_or_else(|| {
-                format!("invalid mount \"{value}\": image mount requires image")
-            })?;
+            let image = image
+                .ok_or_else(|| format!("invalid mount \"{value}\": image mount requires image"))?;
             Ok(Mount {
                 container_path,
                 host_path: String::new(),
@@ -687,9 +692,7 @@ fn validate_device_permissions(source: &str, permissions: &str) -> Result<(), St
 #[allow(dead_code)]
 pub(crate) fn parse_hugepage(value: &str) -> Result<HugepageLimit, String> {
     let Some((page_size, limit)) = value.split_once('=') else {
-        return Err(format!(
-            "invalid hugepage \"{value}\": expected SIZE=BYTES"
-        ));
+        return Err(format!("invalid hugepage \"{value}\": expected SIZE=BYTES"));
     };
     if page_size.is_empty() || limit.is_empty() {
         return Err(format!(
@@ -736,7 +739,9 @@ pub(crate) fn parse_resource_spec(value: &str) -> Result<ResourceFragment, Strin
             "cpuset" | "cpuset-cpus" | "cpuset_cpus" => fragment.cpuset_cpus = Some(pair.value),
             "cpuset-mems" | "cpuset_mems" => fragment.cpuset_mems = Some(pair.value),
             "hugepage" => fragment.hugepages.push(parse_hugepage(&pair.value)?),
-            "unified" => fragment.unified.push(parse_key_value("resource unified", &pair.value)?),
+            "unified" => fragment
+                .unified
+                .push(parse_key_value("resource unified", &pair.value)?),
             key => {
                 return Err(format!(
                     "invalid resource spec \"{value}\": unsupported key \"{key}\""
@@ -762,7 +767,9 @@ fn parse_byte_size_as_i64(kind: &str, source: &str, value: &str) -> Result<i64, 
 #[allow(dead_code)]
 pub(crate) fn parse_security_profile(value: &str) -> Result<SecurityProfile, String> {
     let profile_type = match value {
-        "runtime/default" => crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault,
+        "runtime/default" => {
+            crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
+        }
         "unconfined" => crate::proto::runtime::v1::security_profile::ProfileType::Unconfined,
         _ => {
             let Some(localhost_ref) = value.strip_prefix("localhost:") else {
@@ -776,8 +783,8 @@ pub(crate) fn parse_security_profile(value: &str) -> Result<SecurityProfile, Str
                 ));
             }
             return Ok(SecurityProfile {
-                profile_type:
-                    crate::proto::runtime::v1::security_profile::ProfileType::Localhost as i32,
+                profile_type: crate::proto::runtime::v1::security_profile::ProfileType::Localhost
+                    as i32,
                 localhost_ref: localhost_ref.to_string(),
             });
         }
@@ -826,7 +833,9 @@ pub(crate) fn parse_user(value: &str) -> Result<ParsedUser, String> {
 
     match value.parse::<i64>() {
         Ok(uid) if uid >= 0 => Ok(ParsedUser::Id { uid, gid: None }),
-        Ok(_) => Err(format!("invalid user \"{value}\": UID must be non-negative")),
+        Ok(_) => Err(format!(
+            "invalid user \"{value}\": UID must be non-negative"
+        )),
         Err(_) => Ok(ParsedUser::Name(value.to_string())),
     }
 }
@@ -868,9 +877,9 @@ pub(crate) fn parse_id_mapping(value: &str) -> Result<IdMapping, String> {
 }
 
 fn parse_id_mapping_field(source: &str, value: &str) -> Result<u32, String> {
-    value
-        .parse::<u32>()
-        .map_err(|_| format!("invalid ID mapping \"{source}\": fields must be non-negative integers"))
+    value.parse::<u32>().map_err(|_| {
+        format!("invalid ID mapping \"{source}\": fields must be non-negative integers")
+    })
 }
 
 #[allow(dead_code)]
@@ -879,7 +888,10 @@ pub(crate) fn parse_since(value: &str) -> Result<i64, String> {
 }
 
 #[allow(dead_code)]
-pub(crate) fn parse_since_at(value: &str, now: chrono::DateTime<chrono::Utc>) -> Result<i64, String> {
+pub(crate) fn parse_since_at(
+    value: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<i64, String> {
     if value.trim().is_empty() {
         return Err("invalid since \"\": expected RFC3339 timestamp or duration".into());
     }
@@ -888,8 +900,9 @@ pub(crate) fn parse_since_at(value: &str, now: chrono::DateTime<chrono::Utc>) ->
         return timestamp_to_unix_nanos(timestamp.with_timezone(&chrono::Utc), value);
     }
 
-    let duration = parse_duration(value)
-        .map_err(|_| format!("invalid since \"{value}\": expected RFC3339 timestamp or duration"))?;
+    let duration = parse_duration(value).map_err(|_| {
+        format!("invalid since \"{value}\": expected RFC3339 timestamp or duration")
+    })?;
     let chrono_duration = chrono::Duration::from_std(duration)
         .map_err(|_| format!("invalid since \"{value}\": duration is out of range"))?;
     let since = now
@@ -975,7 +988,10 @@ mod tests {
     fn rejects_invalid_byte_sizes() {
         for input in ["", "KiB", "abc", "64Mi", "64 MB", "-1"] {
             let error = parse_byte_size(input).expect_err(&format!("{input} should be rejected"));
-            assert!(error.contains(&format!("invalid byte size \"{input}\"")), "{error}");
+            assert!(
+                error.contains(&format!("invalid byte size \"{input}\"")),
+                "{error}"
+            );
         }
 
         let overflow = format!("{}TiB", u64::MAX);
@@ -1102,7 +1118,10 @@ mod tests {
     fn rejects_invalid_cidr_lists() {
         for input in ["", "10.244.0.0", "10.0.0.0/8,,fd00::/64", "not-cidr"] {
             let error = parse_cidr_list(input).expect_err("CIDR list should be rejected");
-            assert!(error.contains(&format!("invalid CIDR list \"{input}\"")), "{error}");
+            assert!(
+                error.contains(&format!("invalid CIDR list \"{input}\"")),
+                "{error}"
+            );
         }
     }
 
@@ -1126,9 +1145,19 @@ mod tests {
 
     #[test]
     fn rejects_invalid_port_mappings() {
-        for input in ["", "80", "0:80", "8080:0", "8080:80/http", "fd00::1:8080:80"] {
+        for input in [
+            "",
+            "80",
+            "0:80",
+            "8080:0",
+            "8080:80/http",
+            "fd00::1:8080:80",
+        ] {
             let error = parse_port_mapping(input).expect_err("port mapping should be rejected");
-            assert!(error.contains(&format!("invalid port mapping \"{input}\"")), "{error}");
+            assert!(
+                error.contains(&format!("invalid port mapping \"{input}\"")),
+                "{error}"
+            );
         }
     }
 
@@ -1144,10 +1173,12 @@ mod tests {
         assert_eq!(mount.uid_mappings[0].host_id, 0);
         assert_eq!(mount.gid_mappings[0].container_id, 1000);
 
-        let mount =
-            parse_mount("type=image,image=busybox,dst=/rootfs,subpath=bin,src=/bad")
-                .expect_err("image mount with source should fail");
-        assert!(mount.contains("image mount must not include src/source"), "{mount}");
+        let mount = parse_mount("type=image,image=busybox,dst=/rootfs,subpath=bin,src=/bad")
+            .expect_err("image mount with source should fail");
+        assert!(
+            mount.contains("image mount must not include src/source"),
+            "{mount}"
+        );
 
         let mount = parse_mount("type=image,image=busybox,dst=/rootfs,subpath=bin").unwrap();
         assert_eq!(mount.image.unwrap().image, "busybox");
@@ -1164,13 +1195,19 @@ mod tests {
             "type=tmpfs,dst=/x",
         ] {
             let error = parse_mount(input).expect_err("mount should be rejected");
-            assert!(error.contains(&format!("invalid mount \"{input}\"")), "{error}");
+            assert!(
+                error.contains(&format!("invalid mount \"{input}\"")),
+                "{error}"
+            );
         }
     }
 
     #[test]
     fn parses_devices() {
-        assert_eq!(parse_device("/dev/null").unwrap().container_path, "/dev/null");
+        assert_eq!(
+            parse_device("/dev/null").unwrap().container_path,
+            "/dev/null"
+        );
         assert_eq!(parse_device("/dev/null").unwrap().permissions, "rwm");
 
         let device = parse_device("/dev/fuse:/dev/fuse:rwm").unwrap();
@@ -1181,9 +1218,17 @@ mod tests {
 
     #[test]
     fn rejects_invalid_devices() {
-        for input in ["", ":/dev/null", "/dev/fuse:/dev/fuse:rx", "/dev/null:/x:rr"] {
+        for input in [
+            "",
+            ":/dev/null",
+            "/dev/fuse:/dev/fuse:rx",
+            "/dev/null:/x:rr",
+        ] {
             let error = parse_device(input).expect_err("device should be rejected");
-            assert!(error.contains(&format!("invalid device \"{input}\"")), "{error}");
+            assert!(
+                error.contains(&format!("invalid device \"{input}\"")),
+                "{error}"
+            );
         }
     }
 
@@ -1198,7 +1243,10 @@ mod tests {
     fn rejects_invalid_hugepages() {
         for input in ["", "2Mi", "=64MiB", "2Mi="] {
             let error = parse_hugepage(input).expect_err("hugepage should be rejected");
-            assert!(error.contains(&format!("invalid hugepage \"{input}\"")), "{error}");
+            assert!(
+                error.contains(&format!("invalid hugepage \"{input}\"")),
+                "{error}"
+            );
         }
     }
 
@@ -1290,7 +1338,13 @@ mod tests {
 
     #[test]
     fn parses_users() {
-        assert_eq!(parse_user("1000").unwrap(), ParsedUser::Id { uid: 1000, gid: None });
+        assert_eq!(
+            parse_user("1000").unwrap(),
+            ParsedUser::Id {
+                uid: 1000,
+                gid: None
+            }
+        );
         assert_eq!(
             parse_user("1000:1000").unwrap(),
             ParsedUser::Id {
@@ -1298,14 +1352,20 @@ mod tests {
                 gid: Some(1000)
             }
         );
-        assert_eq!(parse_user("nobody").unwrap(), ParsedUser::Name("nobody".into()));
+        assert_eq!(
+            parse_user("nobody").unwrap(),
+            ParsedUser::Name("nobody".into())
+        );
     }
 
     #[test]
     fn rejects_invalid_users() {
         for input in ["", "1000:", "-1", "1000:group"] {
             let error = parse_user(input).expect_err("user should fail");
-            assert!(error.contains(&format!("invalid user \"{input}\"")), "{error}");
+            assert!(
+                error.contains(&format!("invalid user \"{input}\"")),
+                "{error}"
+            );
         }
     }
 
@@ -1321,7 +1381,10 @@ mod tests {
     fn rejects_invalid_id_mappings() {
         for input in ["", "1:2", "1:2:0", "-1:0:1", "1:x:1"] {
             let error = parse_id_mapping(input).expect_err("ID mapping should fail");
-            assert!(error.contains(&format!("invalid ID mapping \"{input}\"")), "{error}");
+            assert!(
+                error.contains(&format!("invalid ID mapping \"{input}\"")),
+                "{error}"
+            );
         }
     }
 
@@ -1341,7 +1404,10 @@ mod tests {
     fn rejects_invalid_since_values() {
         for input in ["", "not-time", "1.5s"] {
             let error = parse_since(input).expect_err("since should fail");
-            assert!(error.contains(&format!("invalid since \"{input}\"")), "{error}");
+            assert!(
+                error.contains(&format!("invalid since \"{input}\"")),
+                "{error}"
+            );
         }
     }
 
@@ -1362,27 +1428,46 @@ mod tests {
                 .server_address,
             "registry"
         );
-        assert_eq!(parse_cidr_list("10.244.0.0/16").unwrap()[0], "10.244.0.0/16");
+        assert_eq!(
+            parse_cidr_list("10.244.0.0/16").unwrap()[0],
+            "10.244.0.0/16"
+        );
         assert_eq!(parse_port_mapping("8080:80").unwrap().container_port, 80);
         assert_eq!(
-            parse_mount("type=bind,src=/host,dst=/container").unwrap().host_path,
+            parse_mount("type=bind,src=/host,dst=/container")
+                .unwrap()
+                .host_path,
             "/host"
         );
         assert_eq!(parse_device("/dev/null").unwrap().permissions, "rwm");
-        assert_eq!(parse_resource_spec("memory=1KiB").unwrap().memory_limit_in_bytes, Some(1024));
+        assert_eq!(
+            parse_resource_spec("memory=1KiB")
+                .unwrap()
+                .memory_limit_in_bytes,
+            Some(1024)
+        );
         assert_eq!(parse_hugepage("2Mi=1KiB").unwrap().limit, 1024);
         assert_eq!(
             parse_security_profile("unconfined").unwrap().profile_type,
             crate::proto::runtime::v1::security_profile::ProfileType::Unconfined as i32
         );
         assert_eq!(parse_selinux_option("u:r:t:l").unwrap().r#type, "t");
-        assert_eq!(parse_user("1000").unwrap(), ParsedUser::Id { uid: 1000, gid: None });
+        assert_eq!(
+            parse_user("1000").unwrap(),
+            ParsedUser::Id {
+                uid: 1000,
+                gid: None
+            }
+        );
         assert_eq!(parse_id_mapping("0:1000:1").unwrap().length, 1);
 
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-03T12:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        assert_eq!(parse_since_at("1h", now).unwrap(), 1_780_484_400_000_000_000);
+        assert_eq!(
+            parse_since_at("1h", now).unwrap(),
+            1_780_484_400_000_000_000
+        );
     }
 
     #[test]
@@ -1397,15 +1482,36 @@ mod tests {
                 std::fs::write(&path, "=x\n").unwrap();
                 parse_env_file(&path).unwrap_err()
             }),
-            ("auth JSON", parse_auth_json("inline", "not-json-secret").unwrap_err()),
+            (
+                "auth JSON",
+                parse_auth_json("inline", "not-json-secret").unwrap_err(),
+            ),
             ("CIDR list", parse_cidr_list("10.244.0.0").unwrap_err()),
-            ("port mapping", parse_port_mapping("fd00::1:8080:80").unwrap_err()),
-            ("mount", parse_mount("type=bind,dst=/container").unwrap_err()),
-            ("device", parse_device("/dev/fuse:/dev/fuse:rx").unwrap_err()),
-            ("resource spec", parse_resource_spec("unknown=1").unwrap_err()),
+            (
+                "port mapping",
+                parse_port_mapping("fd00::1:8080:80").unwrap_err(),
+            ),
+            (
+                "mount",
+                parse_mount("type=bind,dst=/container").unwrap_err(),
+            ),
+            (
+                "device",
+                parse_device("/dev/fuse:/dev/fuse:rx").unwrap_err(),
+            ),
+            (
+                "resource spec",
+                parse_resource_spec("unknown=1").unwrap_err(),
+            ),
             ("hugepage", parse_hugepage("2Mi=").unwrap_err()),
-            ("security profile", parse_security_profile("localhost:").unwrap_err()),
-            ("SELinux option", parse_selinux_option("user:role:type").unwrap_err()),
+            (
+                "security profile",
+                parse_security_profile("localhost:").unwrap_err(),
+            ),
+            (
+                "SELinux option",
+                parse_selinux_option("user:role:type").unwrap_err(),
+            ),
             ("user", parse_user("1000:").unwrap_err()),
             ("ID mapping", parse_id_mapping("1:2:0").unwrap_err()),
             ("since", parse_since("not-time").unwrap_err()),
@@ -1422,8 +1528,8 @@ mod tests {
             );
         }
 
-        let secret_error = parse_auth_json("inline", r#"{"auths":{"r":{"auth":"secret text" }}}"#)
-            .unwrap_err();
+        let secret_error =
+            parse_auth_json("inline", r#"{"auths":{"r":{"auth":"secret text" }}}"#).unwrap_err();
         assert!(!secret_error.contains("secret text"), "{secret_error}");
     }
 }

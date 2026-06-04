@@ -1,6 +1,5 @@
 use crate::crs::{
-    args::GcArgs, client::CrsClient, context::CliContext, error::CliError,
-    error::CommandResult,
+    args::GcArgs, client::CrsClient, context::CliContext, error::CliError, error::CommandResult,
 };
 
 pub(crate) async fn handle(

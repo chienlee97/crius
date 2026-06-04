@@ -51,6 +51,8 @@ use config::load_streaming_tls_config;
 pub use config::StreamingConfig;
 pub(crate) use config::{deserialize_duration, parse_duration, serialize_duration};
 
+type AttachStreamCloser = dyn Fn(&str, &str) -> anyhow::Result<()> + Send + Sync;
+
 #[derive(Debug)]
 enum StreamingRequest {
     Exec(ExecRequestContext),
@@ -102,7 +104,7 @@ struct ExecRequestContext {
 pub(crate) struct AttachStreamClose {
     container_id: String,
     stream_id: String,
-    close: Arc<dyn Fn(&str, &str) -> anyhow::Result<()> + Send + Sync>,
+    close: Arc<AttachStreamCloser>,
 }
 
 impl std::fmt::Debug for AttachStreamClose {

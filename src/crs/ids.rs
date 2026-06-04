@@ -41,10 +41,7 @@ mod tests {
     fn shortens_ids() {
         assert_eq!(short_id("123456789abczzz"), "123456789abc");
         assert_eq!(short_id("short"), "short");
-        assert_eq!(
-            short_image_id("sha256:abcdef1234567890"),
-            "abcdef123456"
-        );
+        assert_eq!(short_image_id("sha256:abcdef1234567890"), "abcdef123456");
     }
 
     #[test]

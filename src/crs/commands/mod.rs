@@ -60,7 +60,7 @@ pub(crate) async fn dispatch(
             ContainerCommand::Logs(args) => logs::handle(ctx, client, args).await,
             command => container::handle(ctx, client, command).await,
         },
-        Command::Run(args) => run::handle(ctx, client, args).await,
+        Command::Run(args) => run::handle(ctx, client, *args).await,
         Command::Events(args) => events::handle(ctx, client, args).await,
         Command::Stats(args) => stats::handle(ctx, client, args).await,
         Command::Metrics(args) => metrics::handle(ctx, client, args).await,

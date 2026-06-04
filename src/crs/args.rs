@@ -51,7 +51,7 @@ pub enum Command {
     Image(ImageArgs),
     Pod(PodArgs),
     Container(ContainerArgs),
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     Events(EventsArgs),
     Stats(StatsArgs),
     Metrics(MetricsArgs),
@@ -299,7 +299,7 @@ pub enum PodCommand {
     Inspect {
         pod: String,
     },
-    Run(PodCreateArgs),
+    Run(Box<PodCreateArgs>),
     Stop {
         pod: String,
         #[arg(long, value_name = "SECONDS")]
@@ -423,7 +423,7 @@ pub enum ContainerCommand {
     Inspect {
         id: String,
     },
-    Create(ContainerCreateArgs),
+    Create(Box<ContainerCreateArgs>),
     Start {
         id: String,
     },

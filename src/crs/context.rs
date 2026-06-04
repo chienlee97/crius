@@ -22,8 +22,8 @@ impl CliContext {
 
         Ok(Self {
             endpoint,
-            connect_timeout: args.connect_timeout.clone(),
-            rpc_timeout: args.timeout.clone(),
+            connect_timeout: args.connect_timeout,
+            rpc_timeout: args.timeout,
             output: args.output,
             quiet: args.quiet,
             no_trunc: args.no_trunc,

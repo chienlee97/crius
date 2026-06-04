@@ -293,7 +293,13 @@ fn content_gc_candidate_reason(blockers: &[ContentGcBlocker]) -> String {
 fn redact_path_like_words(message: &str) -> String {
     message
         .split_whitespace()
-        .map(|part| if part.starts_with('/') { "<path>" } else { part })
+        .map(|part| {
+            if part.starts_with('/') {
+                "<path>"
+            } else {
+                part
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }

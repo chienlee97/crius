@@ -9,6 +9,8 @@ use crate::oci::spec::{
 use crate::proto::runtime::v1::Capability;
 use crate::security::devices::{self, DeviceMapping};
 
+type ProcPathOverrides = (Option<Vec<String>>, Option<Vec<String>>);
+
 #[derive(Debug, Clone)]
 pub struct SpecPatchInput<'a> {
     pub privileged: bool,
@@ -264,7 +266,7 @@ pub fn effective_proc_paths(
     disable_proc_mount: bool,
     requested_masked_paths: &[String],
     requested_readonly_paths: &[String],
-) -> Result<(Option<Vec<String>>, Option<Vec<String>>)> {
+) -> Result<ProcPathOverrides> {
     if privileged {
         return Ok((None, None));
     }

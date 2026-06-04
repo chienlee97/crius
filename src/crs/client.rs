@@ -5,10 +5,10 @@ use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint as TonicEndpoint};
 use tower::service_fn;
 
+use crate::crs::{context::CliContext, error::CliError, parsers::Endpoint};
 use crate::proto::runtime::v1::{
     image_service_client::ImageServiceClient, runtime_service_client::RuntimeServiceClient,
 };
-use crate::crs::{context::CliContext, error::CliError, parsers::Endpoint};
 
 #[derive(Clone, Debug)]
 pub(crate) struct CrsClient {
@@ -77,7 +77,7 @@ impl CrsClient {
         self.rpc_timeout
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::result_large_err)]
     pub(crate) fn runtime(&self) -> Result<RuntimeServiceClient<Channel>, CliError> {
         self.runtime.clone().ok_or_else(|| {
             CliError::daemon_unavailable(
@@ -87,7 +87,7 @@ impl CrsClient {
         })
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::result_large_err)]
     pub(crate) fn image(&self) -> Result<ImageServiceClient<Channel>, CliError> {
         self.image.clone().ok_or_else(|| {
             CliError::daemon_unavailable(
@@ -97,7 +97,7 @@ impl CrsClient {
         })
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::result_large_err)]
     pub(crate) fn diagnostics(&self) -> Result<(), CliError> {
         Err(self.diagnostics_unavailable())
     }
@@ -206,7 +206,9 @@ mod tests {
 
         let error = client.diagnostics_unavailable();
 
-        assert!(error.to_string().contains("diagnostics service is not available"));
+        assert!(error
+            .to_string()
+            .contains("diagnostics service is not available"));
     }
 
     #[test]

@@ -6,6 +6,8 @@ use crius::crs::args::{
 };
 use std::time::Duration;
 
+type CommandCase = (&'static [&'static str], fn(&Command) -> bool);
+
 #[test]
 fn parses_top_level_help() {
     let error = Args::try_parse_from(["crs", "--help"]).expect_err("help should short-circuit");
@@ -75,7 +77,7 @@ fn rejects_invalid_output_value() {
 
 #[test]
 fn parses_top_level_shortcut_commands() {
-    let cases: &[(&[&str], fn(&Command) -> bool)] = &[
+    let cases: &[CommandCase] = &[
         (&["crs", "version"], |command| {
             matches!(command, Command::Version(_))
         }),
@@ -126,7 +128,7 @@ fn parses_top_level_shortcut_commands() {
 
 #[test]
 fn parses_top_level_command_groups() {
-    let cases: &[(&[&str], fn(&Command) -> bool)] = &[
+    let cases: &[CommandCase] = &[
         (&["crs", "config", "show"], |command| {
             matches!(command, Command::Config(_))
         }),
