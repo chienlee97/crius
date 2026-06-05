@@ -1,10 +1,11 @@
-use std::{collections::HashMap, io::Write};
+use std::{
+    collections::HashMap,
+    io::{Read, Write},
+};
 
 use base64::Engine;
 use nix::sys::termios::{self, SetArg, Termios};
-use tokio::io::{
-    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -181,14 +182,13 @@ pub(crate) async fn exec(options: ExecStreamOptions) -> Result<CommandResult, Cl
     let _resize_events = resize.into_receiver();
     let url = select_stream_url("exec", options.protocol, options.stream_url.as_deref())?;
     let routing = OutputRouting::exec(&options);
-    let _output = websocket_stream_with_writers(
-        url,
-        WebsocketIo::default(),
-        routing,
-        &mut LocalStreamWriters,
-    )
-    .await?;
-    Ok(CommandResult::success())
+    let stdin = local_stdin_payload(options.stdin)?;
+    let output =
+        websocket_stream_with_writers(url, WebsocketIo { stdin }, routing, &mut LocalStreamWriters)
+            .await?;
+    Ok(CommandResult::from_code(
+        output.exit_code.unwrap_or_default(),
+    ))
 }
 
 pub(crate) async fn attach(options: AttachStreamOptions) -> Result<CommandResult, CliError> {
@@ -310,6 +310,7 @@ pub(crate) struct WebsocketIo {
 pub(crate) struct WebsocketStreamOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -380,10 +381,8 @@ where
         CliError::internal(format!("failed to flush websocket handshake: {source}"))
     })?;
 
-    let mut reader = BufReader::new(stream);
-    let response = read_http_response(&mut reader).await?;
+    let response = read_http_response(&mut stream).await?;
     validate_websocket_handshake(&response, &key)?;
-    let mut stream = reader.into_inner();
 
     if let Some(stdin) = io.stdin {
         write_websocket_channel_frame(&mut stream, WS_CHANNEL_STDIN, &stdin).await?;
@@ -479,12 +478,27 @@ struct HttpResponseHead {
 
 async fn read_http_response<R>(reader: &mut R) -> Result<HttpResponseHead, CliError>
 where
-    R: AsyncBufRead + Unpin,
+    R: AsyncRead + Unpin,
 {
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line).await.map_err(|source| {
-        CliError::internal(format!("failed to read websocket response: {source}"))
-    })?;
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    while !bytes.ends_with(b"\r\n\r\n") {
+        reader.read_exact(&mut byte).await.map_err(|source| {
+            CliError::internal(format!("failed to read websocket response: {source}"))
+        })?;
+        bytes.push(byte[0]);
+        if bytes.len() > 16 * 1024 {
+            return Err(CliError::internal(
+                "websocket response headers are too large",
+            ));
+        }
+    }
+    let response = String::from_utf8(bytes)
+        .map_err(|source| CliError::internal(format!("invalid websocket response: {source}")))?;
+    let mut lines = response.split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| CliError::internal("missing websocket response status line"))?;
     let status = status_line
         .split_whitespace()
         .nth(1)
@@ -492,18 +506,11 @@ where
         .ok_or_else(|| CliError::internal("invalid websocket response status line"))?;
 
     let mut headers = HashMap::new();
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).await.map_err(|source| {
-            CliError::internal(format!(
-                "failed to read websocket response headers: {source}"
-            ))
-        })?;
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
+    for line in lines {
+        if line.is_empty() {
             break;
         }
-        if let Some((name, value)) = trimmed.split_once(':') {
+        if let Some((name, value)) = line.split_once(':') {
             headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
         }
     }
@@ -665,14 +672,60 @@ fn apply_remotecommand_frame(
             }
         }
         WS_CHANNEL_ERROR => {
-            return Err(CliError::internal(format!(
-                "remote stream error: {}",
-                String::from_utf8_lossy(payload)
-            )));
+            if let Some(exit_code) = parse_remote_exit_code(payload) {
+                output.exit_code = Some(exit_code);
+            } else {
+                return Err(CliError::internal(format!(
+                    "remote stream error: {}",
+                    String::from_utf8_lossy(payload)
+                )));
+            }
         }
         _ => {}
     }
     Ok(())
+}
+
+fn local_stdin_payload(enabled: bool) -> Result<Option<Vec<u8>>, CliError> {
+    if !enabled {
+        return Ok(None);
+    }
+
+    let mut payload = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut payload)
+        .map_err(|source| CliError::internal(format!("failed to read stdin: {source}")))?;
+    Ok(Some(payload))
+}
+
+fn parse_remote_exit_code(payload: &[u8]) -> Option<i32> {
+    let text = std::str::from_utf8(payload).ok()?.trim();
+    if let Some(code) = text
+        .strip_prefix("command terminated with non-zero exit code: ")
+        .and_then(|code| code.parse::<i32>().ok())
+    {
+        return Some(code);
+    }
+
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    value
+        .pointer("/details/causes")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|causes| {
+            causes.iter().find_map(|cause| {
+                let reason = cause.get("reason").and_then(serde_json::Value::as_str)?;
+                (reason == "ExitCode")
+                    .then(|| cause.get("message").and_then(serde_json::Value::as_str))
+                    .flatten()
+                    .and_then(|message| message.parse::<i32>().ok())
+            })
+        })
+        .or_else(|| {
+            value
+                .get("exitCode")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|code| i32::try_from(code).ok())
+        })
 }
 
 fn websocket_handshake_request(target: &WebsocketTarget, key: &str) -> String {
@@ -846,6 +899,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::TcpListener;
 
     fn stream_options() -> StreamOptions {
@@ -1069,6 +1123,42 @@ mod tests {
         assert!(error.to_string().contains("boom"));
     }
 
+    #[test]
+    fn remotecommand_error_channel_records_exit_code() {
+        let mut output = WebsocketStreamOutput::default();
+        let mut writers = MemoryStreamWriters::default();
+
+        let mut frame = vec![WS_CHANNEL_ERROR];
+        frame.extend_from_slice(b"command terminated with non-zero exit code: 3");
+
+        apply_remotecommand_frame(
+            &mut output,
+            &mut writers,
+            OutputRouting {
+                stdout: true,
+                stderr: true,
+            },
+            &frame,
+        )
+        .expect("exit code error should be recorded");
+
+        assert_eq!(output.exit_code, Some(3));
+    }
+
+    #[test]
+    fn parses_remote_exit_code_from_status_json() {
+        let payload = br#"{
+            "kind": "Status",
+            "details": {
+                "causes": [
+                    {"reason": "ExitCode", "message": "127"}
+                ]
+            }
+        }"#;
+
+        assert_eq!(parse_remote_exit_code(payload), Some(127));
+    }
+
     #[tokio::test]
     async fn websocket_stream_sends_stdin_and_receives_output_channels() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1226,6 +1316,71 @@ mod tests {
         server.await.expect("server task should finish");
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn websocket_stream_records_remote_exit_code() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr should exist");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("client should connect");
+            let mut stream = BufReader::new(stream);
+            let mut request_headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                stream
+                    .read_line(&mut line)
+                    .await
+                    .expect("request line should read");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request_headers.push(line);
+            }
+            let key = request_headers
+                .iter()
+                .find_map(|line| {
+                    line.strip_prefix("Sec-WebSocket-Key:")
+                        .map(|value| value.trim().to_string())
+                })
+                .expect("client should send websocket key");
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {}\r\nSec-WebSocket-Protocol: v4.channel.k8s.io\r\n\r\n",
+                websocket_accept_value(&key)
+            );
+            let mut stream = stream.into_inner();
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("handshake response should write");
+            let mut frame = vec![WS_CHANNEL_ERROR];
+            frame.extend_from_slice(b"command terminated with non-zero exit code: 3");
+            write_websocket_frame(&mut stream, WS_BINARY_OPCODE, &frame, false)
+                .await
+                .expect("exit code frame should write");
+            write_websocket_frame(&mut stream, WS_CLOSE_OPCODE, &[], false)
+                .await
+                .expect("close should write");
+        });
+
+        let mut writers = MemoryStreamWriters::default();
+        let output = websocket_stream_with_writers(
+            &format!("ws://{addr}/exec/token"),
+            WebsocketIo { stdin: None },
+            OutputRouting {
+                stdout: true,
+                stderr: true,
+            },
+            &mut writers,
+        )
+        .await
+        .expect("websocket stream should complete");
+
+        server.await.expect("server task should finish");
+        assert_eq!(output.exit_code, Some(3));
     }
 
     struct MockRawModeBackend {
