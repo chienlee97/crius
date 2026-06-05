@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     io::{Read, Write},
 };
 
@@ -192,20 +193,37 @@ pub(crate) async fn exec(options: ExecStreamOptions) -> Result<CommandResult, Cl
 }
 
 pub(crate) async fn attach(options: AttachStreamOptions) -> Result<CommandResult, CliError> {
+    attach_with_interrupt(options, tokio::signal::ctrl_c()).await
+}
+
+async fn attach_with_interrupt<I>(
+    options: AttachStreamOptions,
+    interrupt: I,
+) -> Result<CommandResult, CliError>
+where
+    I: Future<Output = std::io::Result<()>>,
+{
     let _raw_mode = SystemRawModeBackend.enter_raw_mode(options.tty)?;
     let resize = ResizeEvents::start(options.tty);
     let _initial_size = resize.initial();
     let _resize_events = resize.into_receiver();
     let url = select_stream_url("attach", options.protocol, options.stream_url.as_deref())?;
     let routing = OutputRouting::attach(&options);
-    let _output = websocket_stream_with_writers(
-        url,
-        WebsocketIo::default(),
-        routing,
-        &mut LocalStreamWriters,
-    )
-    .await?;
-    Ok(CommandResult::success())
+    let mut writers = LocalStreamWriters;
+    let stream = websocket_stream_with_writers(url, WebsocketIo::default(), routing, &mut writers);
+    tokio::pin!(stream);
+    tokio::pin!(interrupt);
+
+    tokio::select! {
+        result = &mut stream => {
+            let _output = result?;
+            Ok(CommandResult::success())
+        }
+        result = &mut interrupt => {
+            result.map_err(|source| CliError::internal(format!("failed to listen for interrupt: {source}")))?;
+            Ok(CommandResult::failure(crate::crs::error::ExitStatus::Interrupted))
+        }
+    }
 }
 
 fn select_stream_url<'a>(
@@ -1050,6 +1068,26 @@ mod tests {
             .expect_err("missing websocket URL should fail");
 
         assert!(error.to_string().contains("URL resolution"));
+    }
+
+    #[tokio::test]
+    async fn attach_interrupt_returns_sigint_exit_code() {
+        let options = AttachStreamOptions {
+            stream_url: Some("ws://127.0.0.1:1/attach/token".to_string()),
+            container_id: "ctr".to_string(),
+            tty: false,
+            stdin: false,
+            stdout: true,
+            stderr: true,
+            resize: None,
+            protocol: StreamProtocol::Websocket,
+        };
+
+        let result = attach_with_interrupt(options, async { Ok(()) })
+            .await
+            .expect("interrupt should produce command result");
+
+        assert_eq!(result.code(), 130);
     }
 
     #[test]
