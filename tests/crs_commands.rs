@@ -12,6 +12,7 @@ use crius::proto::runtime::v1::{
     runtime_service_server::{RuntimeService, RuntimeServiceServer},
     *,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -63,6 +64,7 @@ struct MockState {
     update_container_resources_requests: Arc<AtomicUsize>,
     checkpoint_container_requests: Arc<AtomicUsize>,
     reopen_container_log_requests: Arc<AtomicUsize>,
+    exec_requests: Arc<AtomicUsize>,
     list_pod_requests: Arc<AtomicUsize>,
     pod_inspect_requests: Arc<AtomicUsize>,
     list_container_requests: Arc<AtomicUsize>,
@@ -84,6 +86,8 @@ struct MockState {
     last_update_container_resources: Arc<Mutex<Option<UpdateContainerResourcesRequest>>>,
     last_checkpoint_container: Arc<Mutex<Option<CheckpointContainerRequest>>>,
     last_reopen_container_log: Arc<Mutex<Option<ReopenContainerLogRequest>>>,
+    last_exec: Arc<Mutex<Option<ExecRequest>>>,
+    exec_url: Arc<Mutex<Option<String>>>,
     last_pull_image: Arc<Mutex<Option<PullImageRequest>>>,
     last_remove_image: Arc<Mutex<Option<RemoveImageRequest>>>,
 }
@@ -480,8 +484,26 @@ impl RuntimeService for MockRuntimeService {
 
         Ok(Response::new(ReopenContainerLogResponse {}))
     }
+    async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ExecResponse>, Status> {
+        let request = request.into_inner();
+        let id = request.container_id.clone();
+        self.state.exec_requests.fetch_add(1, Ordering::SeqCst);
+        *self.state.last_exec.lock().expect("last exec lock") = Some(request);
+
+        if id == "missing" {
+            return Err(Status::not_found("container not found"));
+        }
+
+        let url = self
+            .state
+            .exec_url
+            .lock()
+            .expect("exec url lock")
+            .clone()
+            .unwrap_or_else(|| "ws://127.0.0.1:9/exec/mock".to_string());
+        Ok(Response::new(ExecResponse { url }))
+    }
     unimplemented_runtime_rpc!(exec_sync, ExecSyncRequest, ExecSyncResponse);
-    unimplemented_runtime_rpc!(exec, ExecRequest, ExecResponse);
     unimplemented_runtime_rpc!(attach, AttachRequest, AttachResponse);
     unimplemented_runtime_rpc!(port_forward, PortForwardRequest, PortForwardResponse);
     unimplemented_runtime_rpc!(
@@ -1504,6 +1526,44 @@ async fn container_write_commands_call_runtime_rpcs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn container_exec_calls_runtime_exec_and_streams_websocket() {
+    let state = MockState::default();
+    let exec_requests = Arc::clone(&state.exec_requests);
+    let last_exec = Arc::clone(&state.last_exec);
+    let websocket = spawn_mock_websocket().await;
+    *state.exec_url.lock().expect("exec url lock") = Some(format!("ws://{websocket}/exec/token"));
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["container", "exec", "ctr1", "--", "echo", "ok"]);
+
+    assert_success(&output);
+    assert_eq!(exec_requests.load(Ordering::SeqCst), 1);
+    let request = last_exec
+        .lock()
+        .expect("last exec lock")
+        .clone()
+        .expect("exec request");
+    assert_eq!(request.container_id, "ctr1");
+    assert_eq!(request.cmd, vec!["echo".to_string(), "ok".to_string()]);
+    assert!(request.stdout);
+    assert!(request.stderr);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn top_level_exec_reuses_container_exec() {
+    let state = MockState::default();
+    let exec_requests = Arc::clone(&state.exec_requests);
+    let websocket = spawn_mock_websocket().await;
+    *state.exec_url.lock().expect("exec url lock") = Some(format!("ws://{websocket}/exec/token"));
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["exec", "ctr1", "--", "true"]);
+
+    assert_success(&output);
+    assert_eq!(exec_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn container_write_errors_map_to_documented_exit_codes() {
     let state = MockState::default();
     let create_requests = Arc::clone(&state.create_container_requests);
@@ -1833,6 +1893,46 @@ async fn spawn_mock_services(state: MockState) -> SocketAddr {
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .expect("mock server should serve");
+    });
+
+    endpoint
+}
+
+async fn spawn_mock_websocket() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock websocket should bind");
+    let endpoint = listener
+        .local_addr()
+        .expect("mock websocket should expose addr");
+
+    tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("websocket client should connect");
+        let mut stream = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .expect("websocket request should read");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        let mut stream = stream.into_inner();
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: SuPNh+KH/O8XLfKlUV5MeIq+Nng=\r\nSec-WebSocket-Protocol: v4.channel.k8s.io\r\n\r\n",
+            )
+            .await
+            .expect("websocket response should write");
+        stream
+            .write_all(&[0x88, 0x00])
+            .await
+            .expect("websocket close should write");
     });
 
     endpoint
