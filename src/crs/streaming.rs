@@ -1,4 +1,5 @@
 use nix::sys::termios::{self, SetArg, Termios};
+use tokio::sync::mpsc;
 
 use crate::crs::{
     args::{StreamOptions, StreamProtocolArg},
@@ -164,13 +165,98 @@ fn parse_forward_port(source: &str, value: &str) -> Result<u16, String> {
 
 pub(crate) async fn exec(options: ExecStreamOptions) -> Result<CommandResult, CliError> {
     run_with_raw_mode(&SystemRawModeBackend, options.tty, || {
+        let resize = ResizeEvents::start(options.tty);
+        let _initial_size = resize.initial();
+        let _resize_events = resize.into_receiver();
         Err(CliError::not_implemented("crs streaming exec"))
     })
 }
 
 pub(crate) async fn attach(options: AttachStreamOptions) -> Result<CommandResult, CliError> {
     run_with_raw_mode(&SystemRawModeBackend, options.tty, || {
+        let resize = ResizeEvents::start(options.tty);
+        let _initial_size = resize.initial();
+        let _resize_events = resize.into_receiver();
         Err(CliError::not_implemented("crs streaming attach"))
+    })
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TerminalSize {
+    pub width: u16,
+    pub height: u16,
+}
+
+struct ResizeEvents {
+    initial: Option<TerminalSize>,
+    receiver: mpsc::Receiver<TerminalSize>,
+}
+
+impl ResizeEvents {
+    fn start(enabled: bool) -> Self {
+        if !enabled {
+            return Self::empty();
+        }
+
+        let fd = nix::libc::STDIN_FILENO;
+        if !nix::unistd::isatty(fd).unwrap_or(false) {
+            return Self::empty();
+        }
+
+        let initial = terminal_size(fd);
+        let (sender, receiver) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let Ok(mut signal) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            else {
+                return;
+            };
+
+            while signal.recv().await.is_some() {
+                let Some(size) = terminal_size(fd) else {
+                    continue;
+                };
+                if sender.send(size).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Self { initial, receiver }
+    }
+
+    fn empty() -> Self {
+        let (_sender, receiver) = mpsc::channel(1);
+        Self {
+            initial: None,
+            receiver,
+        }
+    }
+
+    fn initial(&self) -> Option<TerminalSize> {
+        self.initial
+    }
+
+    fn into_receiver(self) -> mpsc::Receiver<TerminalSize> {
+        self.receiver
+    }
+}
+
+fn terminal_size(fd: i32) -> Option<TerminalSize> {
+    let mut winsize = nix::libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCGWINSZ, &mut winsize) };
+    if rc != 0 || winsize.ws_col == 0 || winsize.ws_row == 0 {
+        return None;
+    }
+
+    Some(TerminalSize {
+        width: winsize.ws_col,
+        height: winsize.ws_row,
     })
 }
 
@@ -356,6 +442,18 @@ mod tests {
         run_with_raw_mode(&backend, false, || Ok(())).expect("body should succeed");
 
         assert_eq!(restored.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn resize_events_skip_cleanly_when_disabled() {
+        let events = ResizeEvents::start(false);
+
+        assert_eq!(events.initial(), None);
+    }
+
+    #[test]
+    fn terminal_size_returns_none_for_invalid_fd() {
+        assert_eq!(terminal_size(-1), None);
     }
 
     struct MockRawModeBackend {
