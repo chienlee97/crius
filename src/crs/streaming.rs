@@ -179,16 +179,9 @@ pub(crate) async fn exec(options: ExecStreamOptions) -> Result<CommandResult, Cl
     let resize = ResizeEvents::start(options.tty);
     let _initial_size = resize.initial();
     let _resize_events = resize.into_receiver();
-    match (options.protocol, options.stream_url.as_deref()) {
-        (StreamProtocol::Websocket, Some(url)) => {
-            let _output = websocket_stream(url, WebsocketIo::default()).await?;
-            Ok(CommandResult::success())
-        }
-        (StreamProtocol::Websocket, None) => Err(CliError::not_implemented(
-            "crs streaming exec URL resolution",
-        )),
-        (StreamProtocol::Spdy, _) => Err(CliError::not_implemented("crs streaming spdy")),
-    }
+    let url = select_stream_url("exec", options.protocol, options.stream_url.as_deref())?;
+    let _output = websocket_stream(url, WebsocketIo::default()).await?;
+    Ok(CommandResult::success())
 }
 
 pub(crate) async fn attach(options: AttachStreamOptions) -> Result<CommandResult, CliError> {
@@ -196,15 +189,23 @@ pub(crate) async fn attach(options: AttachStreamOptions) -> Result<CommandResult
     let resize = ResizeEvents::start(options.tty);
     let _initial_size = resize.initial();
     let _resize_events = resize.into_receiver();
-    match (options.protocol, options.stream_url.as_deref()) {
-        (StreamProtocol::Websocket, Some(url)) => {
-            let _output = websocket_stream(url, WebsocketIo::default()).await?;
-            Ok(CommandResult::success())
-        }
-        (StreamProtocol::Websocket, None) => Err(CliError::not_implemented(
-            "crs streaming attach URL resolution",
+    let url = select_stream_url("attach", options.protocol, options.stream_url.as_deref())?;
+    let _output = websocket_stream(url, WebsocketIo::default()).await?;
+    Ok(CommandResult::success())
+}
+
+fn select_stream_url<'a>(
+    operation: &str,
+    protocol: StreamProtocol,
+    stream_url: Option<&'a str>,
+) -> Result<&'a str, CliError> {
+    match protocol {
+        StreamProtocol::Websocket => stream_url.ok_or_else(|| {
+            CliError::not_implemented(format!("crs streaming {operation} URL resolution"))
+        }),
+        StreamProtocol::Spdy => Err(CliError::internal(
+            "SPDY streaming is not supported by crs yet; use --protocol websocket",
         )),
-        (StreamProtocol::Spdy, _) => Err(CliError::not_implemented("crs streaming spdy")),
     }
 }
 
@@ -885,6 +886,28 @@ mod tests {
     #[test]
     fn terminal_size_returns_none_for_invalid_fd() {
         assert_eq!(terminal_size(-1), None);
+    }
+
+    #[test]
+    fn select_stream_url_rejects_spdy_without_fallback() {
+        let error = select_stream_url(
+            "exec",
+            StreamProtocol::Spdy,
+            Some("ws://127.0.0.1/exec/token"),
+        )
+        .expect_err("spdy should fail clearly");
+
+        assert!(error
+            .to_string()
+            .contains("SPDY streaming is not supported by crs yet"));
+    }
+
+    #[test]
+    fn select_stream_url_requires_websocket_url() {
+        let error = select_stream_url("attach", StreamProtocol::Websocket, None)
+            .expect_err("missing websocket URL should fail");
+
+        assert!(error.to_string().contains("URL resolution"));
     }
 
     #[tokio::test]
