@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Write};
 
 use base64::Engine;
 use nix::sys::termios::{self, SetArg, Termios};
@@ -180,7 +180,14 @@ pub(crate) async fn exec(options: ExecStreamOptions) -> Result<CommandResult, Cl
     let _initial_size = resize.initial();
     let _resize_events = resize.into_receiver();
     let url = select_stream_url("exec", options.protocol, options.stream_url.as_deref())?;
-    let _output = websocket_stream(url, WebsocketIo::default()).await?;
+    let routing = OutputRouting::exec(&options);
+    let _output = websocket_stream_with_writers(
+        url,
+        WebsocketIo::default(),
+        routing,
+        &mut LocalStreamWriters,
+    )
+    .await?;
     Ok(CommandResult::success())
 }
 
@@ -190,7 +197,14 @@ pub(crate) async fn attach(options: AttachStreamOptions) -> Result<CommandResult
     let _initial_size = resize.initial();
     let _resize_events = resize.into_receiver();
     let url = select_stream_url("attach", options.protocol, options.stream_url.as_deref())?;
-    let _output = websocket_stream(url, WebsocketIo::default()).await?;
+    let routing = OutputRouting::attach(&options);
+    let _output = websocket_stream_with_writers(
+        url,
+        WebsocketIo::default(),
+        routing,
+        &mut LocalStreamWriters,
+    )
+    .await?;
     Ok(CommandResult::success())
 }
 
@@ -298,10 +312,58 @@ pub(crate) struct WebsocketStreamOutput {
     pub stderr: Vec<u8>,
 }
 
-pub(crate) async fn websocket_stream(
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct OutputRouting {
+    stdout: bool,
+    stderr: bool,
+}
+
+impl OutputRouting {
+    fn exec(options: &ExecStreamOptions) -> Self {
+        Self {
+            stdout: options.stdout,
+            stderr: options.stderr,
+        }
+    }
+
+    fn attach(options: &AttachStreamOptions) -> Self {
+        Self {
+            stdout: options.stdout,
+            stderr: options.stderr,
+        }
+    }
+}
+
+trait StreamWriters {
+    fn stdout(&mut self, payload: &[u8]) -> Result<(), CliError>;
+    fn stderr(&mut self, payload: &[u8]) -> Result<(), CliError>;
+}
+
+struct LocalStreamWriters;
+
+impl StreamWriters for LocalStreamWriters {
+    fn stdout(&mut self, payload: &[u8]) -> Result<(), CliError> {
+        std::io::stdout()
+            .write_all(payload)
+            .map_err(|source| CliError::internal(format!("failed to write stdout: {source}")))
+    }
+
+    fn stderr(&mut self, payload: &[u8]) -> Result<(), CliError> {
+        std::io::stderr()
+            .write_all(payload)
+            .map_err(|source| CliError::internal(format!("failed to write stderr: {source}")))
+    }
+}
+
+async fn websocket_stream_with_writers<W>(
     url: &str,
     io: WebsocketIo,
-) -> Result<WebsocketStreamOutput, CliError> {
+    routing: OutputRouting,
+    writers: &mut W,
+) -> Result<WebsocketStreamOutput, CliError>
+where
+    W: StreamWriters,
+{
     let target = WebsocketTarget::parse(url)?;
     let mut stream = TcpStream::connect((target.host.as_str(), target.port))
         .await
@@ -336,7 +398,9 @@ pub(crate) async fn websocket_stream(
             break;
         };
         match frame.opcode {
-            WS_BINARY_OPCODE => apply_remotecommand_frame(&mut output, &frame.payload)?,
+            WS_BINARY_OPCODE => {
+                apply_remotecommand_frame(&mut output, writers, routing, &frame.payload)?
+            }
             WS_CLOSE_OPCODE => break,
             WS_PING_OPCODE => {
                 write_websocket_frame(&mut stream, WS_PONG_OPCODE, &frame.payload, true).await?;
@@ -568,14 +632,26 @@ where
 
 fn apply_remotecommand_frame(
     output: &mut WebsocketStreamOutput,
+    writers: &mut impl StreamWriters,
+    routing: OutputRouting,
     payload: &[u8],
 ) -> Result<(), CliError> {
     let Some((&channel, payload)) = payload.split_first() else {
         return Ok(());
     };
     match channel {
-        WS_CHANNEL_STDOUT => output.stdout.extend_from_slice(payload),
-        WS_CHANNEL_STDERR => output.stderr.extend_from_slice(payload),
+        WS_CHANNEL_STDOUT => {
+            output.stdout.extend_from_slice(payload);
+            if routing.stdout {
+                writers.stdout(payload)?;
+            }
+        }
+        WS_CHANNEL_STDERR => {
+            output.stderr.extend_from_slice(payload);
+            if routing.stderr {
+                writers.stderr(payload)?;
+            }
+        }
         WS_CHANNEL_ERROR => {
             return Err(CliError::internal(format!(
                 "remote stream error: {}",
@@ -910,6 +986,77 @@ mod tests {
         assert!(error.to_string().contains("URL resolution"));
     }
 
+    #[test]
+    fn remotecommand_frame_routes_stdout_and_stderr() {
+        let mut output = WebsocketStreamOutput::default();
+        let mut writers = MemoryStreamWriters::default();
+
+        apply_remotecommand_frame(
+            &mut output,
+            &mut writers,
+            OutputRouting {
+                stdout: true,
+                stderr: true,
+            },
+            &[WS_CHANNEL_STDOUT, b'o', b'k'],
+        )
+        .expect("stdout frame should route");
+        apply_remotecommand_frame(
+            &mut output,
+            &mut writers,
+            OutputRouting {
+                stdout: true,
+                stderr: true,
+            },
+            &[WS_CHANNEL_STDERR, b'e', b'r', b'r'],
+        )
+        .expect("stderr frame should route");
+
+        assert_eq!(writers.stdout, b"ok".to_vec());
+        assert_eq!(writers.stderr, b"err".to_vec());
+        assert_eq!(output.stdout, b"ok".to_vec());
+        assert_eq!(output.stderr, b"err".to_vec());
+    }
+
+    #[test]
+    fn remotecommand_frame_respects_disabled_stderr_route() {
+        let mut output = WebsocketStreamOutput::default();
+        let mut writers = MemoryStreamWriters::default();
+
+        apply_remotecommand_frame(
+            &mut output,
+            &mut writers,
+            OutputRouting {
+                stdout: true,
+                stderr: false,
+            },
+            &[WS_CHANNEL_STDERR, b'e', b'r', b'r'],
+        )
+        .expect("stderr frame should be accepted");
+
+        assert!(writers.stderr.is_empty());
+        assert_eq!(output.stderr, b"err".to_vec());
+    }
+
+    #[test]
+    fn remotecommand_error_channel_returns_cli_error() {
+        let mut output = WebsocketStreamOutput::default();
+        let mut writers = MemoryStreamWriters::default();
+
+        let error = apply_remotecommand_frame(
+            &mut output,
+            &mut writers,
+            OutputRouting {
+                stdout: true,
+                stderr: true,
+            },
+            &[WS_CHANNEL_ERROR, b'b', b'o', b'o', b'm'],
+        )
+        .expect_err("error channel should fail");
+
+        assert!(error.to_string().contains("boom"));
+    }
+
     #[tokio::test]
     async fn websocket_stream_sends_stdin_and_receives_output_channels() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -980,11 +1127,17 @@ mod tests {
                 .expect("close should write");
         });
 
-        let output = websocket_stream(
+        let mut writers = MemoryStreamWriters::default();
+        let output = websocket_stream_with_writers(
             &format!("ws://{addr}/exec/token"),
             WebsocketIo {
                 stdin: b"input".to_vec(),
             },
+            OutputRouting {
+                stdout: true,
+                stderr: true,
+            },
+            &mut writers,
         )
         .await
         .expect("websocket stream should complete");
@@ -993,6 +1146,8 @@ mod tests {
         assert_eq!(*received_stdin.lock().await, b"input".to_vec());
         assert_eq!(output.stdout, b"ok".to_vec());
         assert_eq!(output.stderr, b"err".to_vec());
+        assert_eq!(writers.stdout, b"ok".to_vec());
+        assert_eq!(writers.stderr, b"err".to_vec());
     }
 
     struct MockRawModeBackend {
@@ -1020,6 +1175,24 @@ mod tests {
 
     struct MockRawModeGuard {
         restored: Arc<AtomicUsize>,
+    }
+
+    #[derive(Default)]
+    struct MemoryStreamWriters {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    }
+
+    impl StreamWriters for MemoryStreamWriters {
+        fn stdout(&mut self, payload: &[u8]) -> Result<(), CliError> {
+            self.stdout.extend_from_slice(payload);
+            Ok(())
+        }
+
+        fn stderr(&mut self, payload: &[u8]) -> Result<(), CliError> {
+            self.stderr.extend_from_slice(payload);
+            Ok(())
+        }
     }
 
     impl Drop for MockRawModeGuard {
