@@ -1055,6 +1055,40 @@ mod tests {
     }
 
     #[test]
+    fn raw_mode_guard_restores_after_remote_error() {
+        let restored = Arc::new(AtomicUsize::new(0));
+        let backend = MockRawModeBackend {
+            restored: Arc::clone(&restored),
+        };
+
+        let error = run_with_raw_mode(&backend, true, || -> Result<(), CliError> {
+            Err(CliError::internal("remote command failed"))
+        })
+        .expect_err("remote error should be returned");
+
+        assert!(error.to_string().contains("remote command failed"));
+        assert_eq!(restored.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn raw_mode_guard_restores_after_interrupt() {
+        let restored = Arc::new(AtomicUsize::new(0));
+        let backend = MockRawModeBackend {
+            restored: Arc::clone(&restored),
+        };
+
+        let result = run_with_raw_mode(&backend, true, || {
+            Ok(CommandResult::failure(
+                crate::crs::error::ExitStatus::Interrupted,
+            ))
+        })
+        .expect("interrupt result should be returned");
+
+        assert_eq!(result.code(), 130);
+        assert_eq!(restored.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn raw_mode_guard_skips_restore_when_disabled() {
         let restored = Arc::new(AtomicUsize::new(0));
         let backend = MockRawModeBackend {
