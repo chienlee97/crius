@@ -153,6 +153,11 @@ impl RuntimeService for MockRuntimeService {
         let request = request.into_inner();
         let pod = request.pod_sandbox_id.clone();
         self.state.stop_pod_requests.fetch_add(1, Ordering::SeqCst);
+        self.state
+            .rpc_sequence
+            .lock()
+            .expect("rpc sequence lock")
+            .push(format!("stop-pod:{pod}"));
         *self.state.last_stop_pod.lock().expect("last stop pod lock") = Some(request);
 
         if pod == "missing" {
@@ -171,6 +176,11 @@ impl RuntimeService for MockRuntimeService {
         self.state
             .remove_pod_requests
             .fetch_add(1, Ordering::SeqCst);
+        self.state
+            .rpc_sequence
+            .lock()
+            .expect("rpc sequence lock")
+            .push(format!("remove-pod:{pod}"));
         *self
             .state
             .last_remove_pod
@@ -336,6 +346,11 @@ impl RuntimeService for MockRuntimeService {
         self.state
             .stop_container_requests
             .fetch_add(1, Ordering::SeqCst);
+        self.state
+            .rpc_sequence
+            .lock()
+            .expect("rpc sequence lock")
+            .push(format!("stop-container:{id}"));
         *self
             .state
             .last_stop_container
@@ -358,6 +373,11 @@ impl RuntimeService for MockRuntimeService {
         self.state
             .remove_container_requests
             .fetch_add(1, Ordering::SeqCst);
+        self.state
+            .rpc_sequence
+            .lock()
+            .expect("rpc sequence lock")
+            .push(format!("remove-container:{id}"));
         *self
             .state
             .last_remove_container
@@ -1665,6 +1685,96 @@ async fn run_exec_mode_attach_streams_started_container() {
     assert!(request.stdout);
     assert!(request.stderr);
     assert!(!request.tty);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rm_cleans_created_resources_in_order() {
+    let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("busybox:latest".to_string());
+    let sequence = Arc::clone(&state.rpc_sequence);
+    let endpoint = spawn_mock_services(state).await;
+
+    let created = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "run",
+            "--detach",
+            "--rm",
+            "--pod-name",
+            "cleanup",
+            "busybox:latest",
+            "true",
+        ],
+    );
+    assert_success(&created);
+
+    let sequence = sequence.lock().expect("rpc sequence lock").clone();
+    assert!(
+        sequence.windows(4).any(|window| {
+            window
+                == [
+                    "stop-container:ctr-pod-cleanup-busybox:latest",
+                    "remove-container:ctr-pod-cleanup-busybox:latest",
+                    "stop-pod:pod-cleanup",
+                    "remove-pod:pod-cleanup",
+                ]
+        }),
+        "temporary pod cleanup should stop/remove container and pod in order, got {sequence:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rm_reused_pod_only_cleans_container() {
+    let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("busybox:latest".to_string());
+    let stop_pod_requests = Arc::clone(&state.stop_pod_requests);
+    let remove_pod_requests = Arc::clone(&state.remove_pod_requests);
+    let sequence = Arc::clone(&state.rpc_sequence);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "run",
+            "--detach",
+            "--rm",
+            "--pod",
+            "pod-existing",
+            "busybox:latest",
+            "true",
+        ],
+    );
+    assert_success(&output);
+    assert_eq!(stop_pod_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(remove_pod_requests.load(Ordering::SeqCst), 0);
+
+    let sequence = sequence.lock().expect("rpc sequence lock").clone();
+    assert!(
+        sequence.windows(2).any(|window| {
+            window
+                == [
+                    "stop-container:ctr-pod-existing-busybox:latest",
+                    "remove-container:ctr-pod-existing-busybox:latest",
+                ]
+        }),
+        "reused pod cleanup should only remove the created container, got {sequence:?}"
+    );
+    assert!(
+        !sequence.iter().any(|entry| entry.starts_with("stop-pod:")),
+        "reused pod cleanup must not stop pod, got {sequence:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

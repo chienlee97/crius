@@ -15,8 +15,9 @@ use crate::crs::{
 };
 use crate::proto::runtime::v1::{
     AttachRequest, CreateContainerRequest, ExecSyncRequest, ImageSpec, ImageStatusRequest,
-    PodSandboxConfig, PodSandboxStatusRequest, PullImageRequest, RunPodSandboxRequest,
-    StartContainerRequest,
+    PodSandboxConfig, PodSandboxStatusRequest, PullImageRequest, RemoveContainerRequest,
+    RemovePodSandboxRequest, RunPodSandboxRequest, StartContainerRequest, StopContainerRequest,
+    StopPodSandboxRequest,
 };
 
 #[derive(Debug)]
@@ -80,35 +81,18 @@ pub(crate) async fn handle(
     let container_id = create_container(client, &plan, &pod_id, sandbox_config).await?;
     start_container(client, &container_id).await?;
 
-    if !plan.detach {
-        return run_foreground(ctx, client, &plan, &container_id).await;
-    }
+    let outcome = if plan.detach {
+        render_detached(ctx, client, &plan, &pod_id, &container_id, pod_created)
+    } else {
+        run_foreground(ctx, client, &plan, &container_id).await
+    };
+
     if plan.rm {
-        return Err(CliError::not_implemented("crs run --rm"));
+        let warnings = cleanup_run_resources(client, &container_id, &pod_id, pod_created).await;
+        emit_cleanup_warnings(ctx, &warnings);
     }
 
-    render_and_print(
-        ctx,
-        CommandOutput::new(
-            "Run",
-            client.endpoint(),
-            vec![RunView {
-                container_id: container_id.clone(),
-                pod_id: pod_id.clone(),
-                image: plan.image.clone(),
-                action: "started".to_string(),
-                detached: true,
-                pod_created,
-            }],
-        )
-        .with_summary(serde_json::json!({
-            "containerId": container_id,
-            "podSandboxId": pod_id,
-            "image": plan.image,
-            "detached": true,
-            "podCreated": pod_created,
-        })),
-    )
+    outcome
 }
 
 impl RunPlan {
@@ -532,6 +516,186 @@ async fn run_attach(
 
     options.stream_url = Some(response.url);
     streaming::attach(options).await
+}
+
+fn render_detached(
+    ctx: &CliContext,
+    client: &CrsClient,
+    plan: &RunPlan,
+    pod_id: &str,
+    container_id: &str,
+    pod_created: bool,
+) -> Result<CommandResult, CliError> {
+    render_and_print(
+        ctx,
+        CommandOutput::new(
+            "Run",
+            client.endpoint(),
+            vec![RunView {
+                container_id: container_id.to_string(),
+                pod_id: pod_id.to_string(),
+                image: plan.image.clone(),
+                action: "started".to_string(),
+                detached: true,
+                pod_created,
+            }],
+        )
+        .with_summary(serde_json::json!({
+            "containerId": container_id,
+            "podSandboxId": pod_id,
+            "image": plan.image,
+            "detached": true,
+            "podCreated": pod_created,
+        })),
+    )
+}
+
+async fn cleanup_run_resources(
+    client: &CrsClient,
+    container_id: &str,
+    pod_id: &str,
+    pod_created: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    cleanup_stop_container(client, container_id, &mut warnings).await;
+    cleanup_remove_container(client, container_id, &mut warnings).await;
+
+    if pod_created {
+        cleanup_stop_pod(client, pod_id, &mut warnings).await;
+        cleanup_remove_pod(client, pod_id, &mut warnings).await;
+    }
+
+    warnings
+}
+
+async fn cleanup_stop_container(
+    client: &CrsClient,
+    container_id: &str,
+    warnings: &mut Vec<String>,
+) {
+    let Ok(mut runtime) = client.runtime() else {
+        warnings
+            .push("failed to stop run container during cleanup: runtime client unavailable".into());
+        return;
+    };
+    if let Err(error) = client
+        .with_rpc_timeout(async {
+            runtime
+                .stop_container(StopContainerRequest {
+                    container_id: container_id.to_string(),
+                    timeout: 0,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run --rm")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("container {container_id}"))
+                })
+        })
+        .await
+    {
+        warnings.push(format!(
+            "failed to stop run container {container_id}: {error}; run `crs container stop {container_id}`"
+        ));
+    }
+}
+
+async fn cleanup_remove_container(
+    client: &CrsClient,
+    container_id: &str,
+    warnings: &mut Vec<String>,
+) {
+    let Ok(mut runtime) = client.runtime() else {
+        warnings.push(
+            "failed to remove run container during cleanup: runtime client unavailable".into(),
+        );
+        return;
+    };
+    if let Err(error) = client
+        .with_rpc_timeout(async {
+            runtime
+                .remove_container(RemoveContainerRequest {
+                    container_id: container_id.to_string(),
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run --rm")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("container {container_id}"))
+                })
+        })
+        .await
+    {
+        warnings.push(format!(
+            "failed to remove run container {container_id}: {error}; run `crs container remove {container_id}`"
+        ));
+    }
+}
+
+async fn cleanup_stop_pod(client: &CrsClient, pod_id: &str, warnings: &mut Vec<String>) {
+    let Ok(mut runtime) = client.runtime() else {
+        warnings.push("failed to stop run pod during cleanup: runtime client unavailable".into());
+        return;
+    };
+    if let Err(error) = client
+        .with_rpc_timeout(async {
+            runtime
+                .stop_pod_sandbox(StopPodSandboxRequest {
+                    pod_sandbox_id: pod_id.to_string(),
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run --rm")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("pod {pod_id}"))
+                })
+        })
+        .await
+    {
+        warnings.push(format!(
+            "failed to stop run pod {pod_id}: {error}; run `crs pod stop {pod_id}`"
+        ));
+    }
+}
+
+async fn cleanup_remove_pod(client: &CrsClient, pod_id: &str, warnings: &mut Vec<String>) {
+    let Ok(mut runtime) = client.runtime() else {
+        warnings.push("failed to remove run pod during cleanup: runtime client unavailable".into());
+        return;
+    };
+    if let Err(error) = client
+        .with_rpc_timeout(async {
+            runtime
+                .remove_pod_sandbox(RemovePodSandboxRequest {
+                    pod_sandbox_id: pod_id.to_string(),
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run --rm")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("pod {pod_id}"))
+                })
+        })
+        .await
+    {
+        warnings.push(format!(
+            "failed to remove run pod {pod_id}: {error}; run `crs pod remove {pod_id}`"
+        ));
+    }
+}
+
+fn emit_cleanup_warnings(ctx: &CliContext, warnings: &[String]) {
+    if warnings.is_empty() || matches!(ctx.output(), crate::crs::args::OutputArg::Json) {
+        return;
+    }
+
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
 }
 
 #[allow(dead_code)]
