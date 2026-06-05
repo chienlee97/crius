@@ -1778,6 +1778,35 @@ async fn run_rm_reused_pod_only_cleans_container() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_failure_warns_about_created_pod_leftover() {
+    let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("bad-config".to_string());
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(
+        endpoint,
+        [
+            "run",
+            "--detach",
+            "--pod-name",
+            "leftover",
+            "bad-config",
+            "true",
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(6));
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("container config rejected"));
+    assert!(stderr.contains("run created pod pod-leftover before failing"));
+    assert!(stderr.contains("crs pod remove pod-leftover"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pod_write_errors_map_to_documented_exit_codes() {
     let state = MockState::default();
     let update_requests = Arc::clone(&state.update_pod_resources_requests);

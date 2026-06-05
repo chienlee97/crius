@@ -78,8 +78,20 @@ pub(crate) async fn handle(
     let plan = RunPlan::from_args(args)?;
     ensure_image(client, &plan).await?;
     let (pod_id, sandbox_config, pod_created) = prepare_pod(client, &plan).await?;
-    let container_id = create_container(client, &plan, &pod_id, sandbox_config).await?;
-    start_container(client, &container_id).await?;
+    let container_id = match create_container(client, &plan, &pod_id, sandbox_config).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            emit_leftover_warnings(&leftover_warnings(None, Some((&pod_id, pod_created))));
+            return Err(error);
+        }
+    };
+    if let Err(error) = start_container(client, &container_id).await {
+        emit_leftover_warnings(&leftover_warnings(
+            Some(&container_id),
+            Some((&pod_id, pod_created)),
+        ));
+        return Err(error);
+    }
 
     let outcome = if plan.detach {
         render_detached(ctx, client, &plan, &pod_id, &container_id, pod_created)
@@ -693,6 +705,27 @@ fn emit_cleanup_warnings(ctx: &CliContext, warnings: &[String]) {
         return;
     }
 
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+fn leftover_warnings(container_id: Option<&str>, pod: Option<(&str, bool)>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(container_id) = container_id {
+        warnings.push(format!(
+            "run created container {container_id} before failing; remove it with `crs container remove {container_id}`"
+        ));
+    }
+    if let Some((pod_id, true)) = pod {
+        warnings.push(format!(
+            "run created pod {pod_id} before failing; remove it with `crs pod remove {pod_id}`"
+        ));
+    }
+    warnings
+}
+
+fn emit_leftover_warnings(warnings: &[String]) {
     for warning in warnings {
         eprintln!("warning: {warning}");
     }
