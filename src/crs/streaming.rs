@@ -1,6 +1,8 @@
+use nix::sys::termios::{self, SetArg, Termios};
+
 use crate::crs::{
     args::{StreamOptions, StreamProtocolArg},
-    error::CliError,
+    error::{CliError, CommandResult},
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -160,9 +162,85 @@ fn parse_forward_port(source: &str, value: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+pub(crate) async fn exec(options: ExecStreamOptions) -> Result<CommandResult, CliError> {
+    run_with_raw_mode(&SystemRawModeBackend, options.tty, || {
+        Err(CliError::not_implemented("crs streaming exec"))
+    })
+}
+
+pub(crate) async fn attach(options: AttachStreamOptions) -> Result<CommandResult, CliError> {
+    run_with_raw_mode(&SystemRawModeBackend, options.tty, || {
+        Err(CliError::not_implemented("crs streaming attach"))
+    })
+}
+
+trait RawModeBackend {
+    type Guard;
+
+    fn enter_raw_mode(&self, enabled: bool) -> Result<Option<Self::Guard>, CliError>;
+}
+
+fn run_with_raw_mode<B, F, T>(backend: &B, enabled: bool, body: F) -> Result<T, CliError>
+where
+    B: RawModeBackend,
+    F: FnOnce() -> Result<T, CliError>,
+{
+    let _guard = backend.enter_raw_mode(enabled)?;
+    body()
+}
+
+struct SystemRawModeBackend;
+
+impl RawModeBackend for SystemRawModeBackend {
+    type Guard = TtyRawModeGuard;
+
+    fn enter_raw_mode(&self, enabled: bool) -> Result<Option<Self::Guard>, CliError> {
+        TtyRawModeGuard::enter(enabled)
+    }
+}
+
+struct TtyRawModeGuard {
+    fd: i32,
+    original: Termios,
+}
+
+impl TtyRawModeGuard {
+    fn enter(enabled: bool) -> Result<Option<Self>, CliError> {
+        if !enabled {
+            return Ok(None);
+        }
+
+        let fd = nix::libc::STDIN_FILENO;
+        if !nix::unistd::isatty(fd).unwrap_or(false) {
+            return Ok(None);
+        }
+
+        let original = termios::tcgetattr(fd).map_err(|source| {
+            CliError::internal(format!("failed to read terminal mode: {source}"))
+        })?;
+        let mut raw = original.clone();
+        termios::cfmakeraw(&mut raw);
+        termios::tcsetattr(fd, SetArg::TCSANOW, &raw).map_err(|source| {
+            CliError::internal(format!("failed to enter terminal raw mode: {source}"))
+        })?;
+
+        Ok(Some(Self { fd, original }))
+    }
+}
+
+impl Drop for TtyRawModeGuard {
+    fn drop(&mut self) {
+        let _ = termios::tcsetattr(self.fd, SetArg::TCSANOW, &self.original);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     fn stream_options() -> StreamOptions {
         StreamOptions {
@@ -250,5 +328,57 @@ mod tests {
 
         assert_eq!(error.exit_status().code(), 2);
         assert!(error.to_string().contains("port must be 1-65535"));
+    }
+
+    #[test]
+    fn raw_mode_guard_restores_after_error() {
+        let restored = Arc::new(AtomicUsize::new(0));
+        let backend = MockRawModeBackend {
+            restored: Arc::clone(&restored),
+        };
+
+        let error = run_with_raw_mode(&backend, true, || -> Result<(), CliError> {
+            Err(CliError::internal("streaming connection failed"))
+        })
+        .expect_err("body error should be returned");
+
+        assert!(error.to_string().contains("streaming connection failed"));
+        assert_eq!(restored.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn raw_mode_guard_skips_restore_when_disabled() {
+        let restored = Arc::new(AtomicUsize::new(0));
+        let backend = MockRawModeBackend {
+            restored: Arc::clone(&restored),
+        };
+
+        run_with_raw_mode(&backend, false, || Ok(())).expect("body should succeed");
+
+        assert_eq!(restored.load(Ordering::SeqCst), 0);
+    }
+
+    struct MockRawModeBackend {
+        restored: Arc<AtomicUsize>,
+    }
+
+    impl RawModeBackend for MockRawModeBackend {
+        type Guard = MockRawModeGuard;
+
+        fn enter_raw_mode(&self, enabled: bool) -> Result<Option<Self::Guard>, CliError> {
+            Ok(enabled.then(|| MockRawModeGuard {
+                restored: Arc::clone(&self.restored),
+            }))
+        }
+    }
+
+    struct MockRawModeGuard {
+        restored: Arc<AtomicUsize>,
+    }
+
+    impl Drop for MockRawModeGuard {
+        fn drop(&mut self) {
+            self.restored.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }

@@ -1,6 +1,6 @@
 use crate::crs::{
     args::ExecArgs, client::CrsClient, context::CliContext, error::CliError, error::CommandResult,
-    streaming::ExecStreamOptions,
+    streaming,
 };
 
 pub(crate) async fn handle(
@@ -8,6 +8,7 @@ pub(crate) async fn handle(
     _client: &CrsClient,
     args: ExecArgs,
 ) -> Result<CommandResult, CliError> {
-    let _options = ExecStreamOptions::from_args(args.container, args.command, args.stream)?;
-    Err(CliError::not_implemented("crs exec"))
+    let options =
+        streaming::ExecStreamOptions::from_args(args.container, args.command, args.stream)?;
+    streaming::exec(options).await
 }

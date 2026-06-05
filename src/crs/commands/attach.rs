@@ -1,6 +1,6 @@
 use crate::crs::{
     args::StreamOptions, client::CrsClient, context::CliContext, error::CliError,
-    error::CommandResult, streaming::AttachStreamOptions,
+    error::CommandResult, streaming,
 };
 
 pub(crate) async fn handle(
@@ -9,6 +9,6 @@ pub(crate) async fn handle(
     id: String,
     stream: StreamOptions,
 ) -> Result<CommandResult, CliError> {
-    let _options = AttachStreamOptions::from_args(id, stream)?;
-    Err(CliError::not_implemented("crs attach"))
+    let options = streaming::AttachStreamOptions::from_args(id, stream)?;
+    streaming::attach(options).await
 }
