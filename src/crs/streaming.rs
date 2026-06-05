@@ -7,7 +7,7 @@ use std::{
 use base64::Engine;
 use nix::sys::termios::{self, SetArg, Termios};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use crate::crs::{
@@ -113,6 +113,7 @@ impl AttachStreamOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PortForwardOptions {
     pub pod_id: String,
+    pub stream_url: Option<String>,
     pub forwards: Vec<PortForwardSpec>,
     pub protocol: StreamProtocol,
 }
@@ -141,6 +142,7 @@ impl PortForwardOptions {
 
         Ok(Self {
             pod_id,
+            stream_url: None,
             forwards,
             protocol: StreamProtocol::Websocket,
         })
@@ -196,6 +198,16 @@ pub(crate) async fn attach(options: AttachStreamOptions) -> Result<CommandResult
     attach_with_interrupt(options, tokio::signal::ctrl_c()).await
 }
 
+pub(crate) async fn port_forward(options: PortForwardOptions) -> Result<CommandResult, CliError> {
+    let _url = select_stream_url(
+        "port-forward",
+        options.protocol,
+        options.stream_url.as_deref(),
+    )?;
+    let _listeners = bind_port_forward_listeners(&options.forwards).await?;
+    Ok(CommandResult::success())
+}
+
 async fn attach_with_interrupt<I>(
     options: AttachStreamOptions,
     interrupt: I,
@@ -239,6 +251,24 @@ fn select_stream_url<'a>(
             "SPDY streaming is not supported by crs yet; use --protocol websocket",
         )),
     }
+}
+
+async fn bind_port_forward_listeners(
+    forwards: &[PortForwardSpec],
+) -> Result<Vec<(PortForwardSpec, TcpListener)>, CliError> {
+    let mut listeners = Vec::with_capacity(forwards.len());
+    for forward in forwards {
+        let listener = TcpListener::bind(("127.0.0.1", forward.local))
+            .await
+            .map_err(|source| {
+                CliError::internal(format!(
+                    "failed to bind local port {} for remote port {}: {source}",
+                    forward.local, forward.remote
+                ))
+            })?;
+        listeners.push((*forward, listener));
+    }
+    Ok(listeners)
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1419,6 +1449,41 @@ mod tests {
 
         server.await.expect("server task should finish");
         assert_eq!(output.exit_code, Some(3));
+    }
+
+    #[tokio::test]
+    async fn port_forward_bind_failure_releases_previous_listeners() {
+        let occupied = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("occupied listener should bind");
+        let occupied_port = occupied
+            .local_addr()
+            .expect("occupied local addr should exist")
+            .port();
+        let first = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("first listener should bind");
+        let first_port = first.local_addr().expect("first addr should exist").port();
+        drop(first);
+
+        let error = bind_port_forward_listeners(&[
+            PortForwardSpec {
+                local: first_port,
+                remote: 80,
+            },
+            PortForwardSpec {
+                local: occupied_port,
+                remote: 81,
+            },
+        ])
+        .await
+        .expect_err("second bind should fail");
+
+        assert!(error.to_string().contains("failed to bind local port"));
+        drop(occupied);
+        TcpListener::bind(("127.0.0.1", first_port))
+            .await
+            .expect("first port should be released after failure");
     }
 
     struct MockRawModeBackend {
