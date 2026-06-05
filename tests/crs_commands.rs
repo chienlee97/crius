@@ -66,6 +66,7 @@ struct MockState {
     reopen_container_log_requests: Arc<AtomicUsize>,
     exec_requests: Arc<AtomicUsize>,
     exec_sync_requests: Arc<AtomicUsize>,
+    attach_requests: Arc<AtomicUsize>,
     list_pod_requests: Arc<AtomicUsize>,
     pod_inspect_requests: Arc<AtomicUsize>,
     list_container_requests: Arc<AtomicUsize>,
@@ -89,7 +90,9 @@ struct MockState {
     last_reopen_container_log: Arc<Mutex<Option<ReopenContainerLogRequest>>>,
     last_exec: Arc<Mutex<Option<ExecRequest>>>,
     last_exec_sync: Arc<Mutex<Option<ExecSyncRequest>>>,
+    last_attach: Arc<Mutex<Option<AttachRequest>>>,
     exec_url: Arc<Mutex<Option<String>>>,
+    attach_url: Arc<Mutex<Option<String>>>,
     last_pull_image: Arc<Mutex<Option<PullImageRequest>>>,
     last_remove_image: Arc<Mutex<Option<RemoveImageRequest>>>,
 }
@@ -534,7 +537,28 @@ impl RuntimeService for MockRuntimeService {
             exit_code,
         }))
     }
-    unimplemented_runtime_rpc!(attach, AttachRequest, AttachResponse);
+    async fn attach(
+        &self,
+        request: Request<AttachRequest>,
+    ) -> Result<Response<AttachResponse>, Status> {
+        let request = request.into_inner();
+        let id = request.container_id.clone();
+        self.state.attach_requests.fetch_add(1, Ordering::SeqCst);
+        *self.state.last_attach.lock().expect("last attach lock") = Some(request);
+
+        if id == "missing" {
+            return Err(Status::not_found("container not found"));
+        }
+
+        let url = self
+            .state
+            .attach_url
+            .lock()
+            .expect("attach url lock")
+            .clone()
+            .unwrap_or_else(|| "ws://127.0.0.1:9/attach/mock".to_string());
+        Ok(Response::new(AttachResponse { url }))
+    }
     unimplemented_runtime_rpc!(port_forward, PortForwardRequest, PortForwardResponse);
     unimplemented_runtime_rpc!(
         container_stats,
@@ -1648,6 +1672,31 @@ async fn container_exec_sync_json_keeps_stderr_in_envelope() {
     assert_eq!(value["summary"]["exitCode"], 1);
     assert_eq!(value["stdout"], "sync-stdout");
     assert_eq!(value["stderr"], "sync-stderr");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn container_attach_calls_runtime_attach_and_streams_websocket() {
+    let state = MockState::default();
+    let attach_requests = Arc::clone(&state.attach_requests);
+    let last_attach = Arc::clone(&state.last_attach);
+    let websocket = spawn_mock_websocket().await;
+    *state.attach_url.lock().expect("attach url lock") =
+        Some(format!("ws://{websocket}/attach/token"));
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["container", "attach", "ctr1"]);
+
+    assert_success(&output);
+    assert_eq!(attach_requests.load(Ordering::SeqCst), 1);
+    let request = last_attach
+        .lock()
+        .expect("last attach lock")
+        .clone()
+        .expect("attach request");
+    assert_eq!(request.container_id, "ctr1");
+    assert!(request.stdout);
+    assert!(request.stderr);
+    assert!(!request.stdin);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
