@@ -65,6 +65,7 @@ struct MockState {
     checkpoint_container_requests: Arc<AtomicUsize>,
     reopen_container_log_requests: Arc<AtomicUsize>,
     exec_requests: Arc<AtomicUsize>,
+    exec_sync_requests: Arc<AtomicUsize>,
     list_pod_requests: Arc<AtomicUsize>,
     pod_inspect_requests: Arc<AtomicUsize>,
     list_container_requests: Arc<AtomicUsize>,
@@ -87,6 +88,7 @@ struct MockState {
     last_checkpoint_container: Arc<Mutex<Option<CheckpointContainerRequest>>>,
     last_reopen_container_log: Arc<Mutex<Option<ReopenContainerLogRequest>>>,
     last_exec: Arc<Mutex<Option<ExecRequest>>>,
+    last_exec_sync: Arc<Mutex<Option<ExecSyncRequest>>>,
     exec_url: Arc<Mutex<Option<String>>>,
     last_pull_image: Arc<Mutex<Option<PullImageRequest>>>,
     last_remove_image: Arc<Mutex<Option<RemoveImageRequest>>>,
@@ -503,7 +505,35 @@ impl RuntimeService for MockRuntimeService {
             .unwrap_or_else(|| "ws://127.0.0.1:9/exec/mock".to_string());
         Ok(Response::new(ExecResponse { url }))
     }
-    unimplemented_runtime_rpc!(exec_sync, ExecSyncRequest, ExecSyncResponse);
+    async fn exec_sync(
+        &self,
+        request: Request<ExecSyncRequest>,
+    ) -> Result<Response<ExecSyncResponse>, Status> {
+        let request = request.into_inner();
+        let id = request.container_id.clone();
+        let cmd = request.cmd.clone();
+        self.state.exec_sync_requests.fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_exec_sync
+            .lock()
+            .expect("last exec-sync lock") = Some(request);
+
+        if id == "missing" {
+            return Err(Status::not_found("container not found"));
+        }
+
+        let exit_code = cmd
+            .iter()
+            .find_map(|arg| arg.strip_prefix("exit-"))
+            .and_then(|code| code.parse::<i32>().ok())
+            .unwrap_or_default();
+        Ok(Response::new(ExecSyncResponse {
+            stdout: b"sync-stdout".to_vec(),
+            stderr: b"sync-stderr".to_vec(),
+            exit_code,
+        }))
+    }
     unimplemented_runtime_rpc!(attach, AttachRequest, AttachResponse);
     unimplemented_runtime_rpc!(port_forward, PortForwardRequest, PortForwardResponse);
     unimplemented_runtime_rpc!(
@@ -1561,6 +1591,63 @@ async fn top_level_exec_reuses_container_exec() {
 
     assert_success(&output);
     assert_eq!(exec_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn container_exec_sync_writes_streams_and_returns_exit_code() {
+    let state = MockState::default();
+    let exec_sync_requests = Arc::clone(&state.exec_sync_requests);
+    let last_exec_sync = Arc::clone(&state.last_exec_sync);
+    let endpoint = spawn_mock_services(state).await;
+
+    let success = run_crs(endpoint, ["container", "exec-sync", "ctr1", "--", "true"]);
+    assert_success(&success);
+    assert_eq!(success.stdout, b"sync-stdout");
+    assert_eq!(success.stderr, b"sync-stderr");
+
+    let failed = run_crs(
+        endpoint,
+        ["container", "exec-sync", "ctr1", "--", "exit-127"],
+    );
+    assert_eq!(failed.status.code(), Some(127));
+    assert_eq!(exec_sync_requests.load(Ordering::SeqCst), 2);
+    let request = last_exec_sync
+        .lock()
+        .expect("last exec-sync lock")
+        .clone()
+        .expect("exec-sync request");
+    assert_eq!(request.container_id, "ctr1");
+    assert_eq!(request.cmd, vec!["exit-127".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn container_exec_sync_json_keeps_stderr_in_envelope() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+
+    let output = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "container",
+            "exec-sync",
+            "ctr1",
+            "--",
+            "exit-1",
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stderr.is_empty(),
+        "JSON exec-sync stderr should be in envelope, got {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value = stdout_json(&output);
+    assert_eq!(value["kind"], "ContainerExecSync");
+    assert_eq!(value["summary"]["exitCode"], 1);
+    assert_eq!(value["stdout"], "sync-stdout");
+    assert_eq!(value["stderr"], "sync-stderr");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

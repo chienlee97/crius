@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use crate::crs::{
     args::{ContainerCommand, ContainerCreateArgs, ContainerListArgs, ContainerStateArg},
     builders::{build_container_config, build_resources_from_specs},
@@ -10,9 +12,9 @@ use crate::crs::{
 };
 use crate::proto::runtime::v1::{
     CheckpointContainerRequest, Container, ContainerFilter, ContainerState, ContainerStateValue,
-    ContainerStatus, ContainerStatusRequest, CreateContainerRequest, ListContainersRequest,
-    PodSandboxConfig, PodSandboxMetadata, PodSandboxStatusRequest, RemoveContainerRequest,
-    ReopenContainerLogRequest, StartContainerRequest, StopContainerRequest,
+    ContainerStatus, ContainerStatusRequest, CreateContainerRequest, ExecSyncRequest,
+    ListContainersRequest, PodSandboxConfig, PodSandboxMetadata, PodSandboxStatusRequest,
+    RemoveContainerRequest, ReopenContainerLogRequest, StartContainerRequest, StopContainerRequest,
     UpdateContainerResourcesRequest,
 };
 
@@ -29,7 +31,7 @@ pub(crate) async fn handle(
         ContainerCommand::Stop { id, timeout } => handle_stop(ctx, client, id, timeout).await,
         ContainerCommand::Remove { id } => handle_remove(ctx, client, id).await,
         ContainerCommand::Exec(_) => Err(CliError::not_implemented("crs container exec")),
-        ContainerCommand::ExecSync(_) => Err(CliError::not_implemented("crs container exec-sync")),
+        ContainerCommand::ExecSync(args) => handle_exec_sync(ctx, client, args).await,
         ContainerCommand::Attach { .. } => Err(CliError::not_implemented("crs container attach")),
         ContainerCommand::Stats(_) => Err(CliError::not_implemented("crs container stats")),
         ContainerCommand::Checkpoint {
@@ -45,6 +47,67 @@ pub(crate) async fn handle(
         ContainerCommand::ReopenLog { id } => handle_reopen_log(ctx, client, id).await,
         ContainerCommand::Logs(_) => Err(CliError::not_implemented("crs container logs")),
     }
+}
+
+pub(crate) async fn handle_exec_sync(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: crate::crs::args::ExecArgs,
+) -> Result<CommandResult, CliError> {
+    let options = crate::crs::streaming::ExecStreamOptions::from_args(
+        args.container,
+        args.command,
+        args.stream,
+    )?;
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .exec_sync(ExecSyncRequest {
+                    container_id: options.container_id.clone(),
+                    cmd: options.command.clone(),
+                    timeout: 0,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs container exec-sync")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("container {}", options.container_id))
+                })
+        })
+        .await?
+        .into_inner();
+
+    if matches!(ctx.output(), crate::crs::args::OutputArg::Json) {
+        let envelope = serde_json::json!({
+            "kind": "ContainerExecSync",
+            "apiVersion": crate::crs::format::API_VERSION,
+            "endpoint": client.endpoint(),
+            "summary": {
+                "containerId": options.container_id,
+                "exitCode": response.exit_code,
+            },
+            "stdout": String::from_utf8_lossy(&response.stdout),
+            "stderr": String::from_utf8_lossy(&response.stderr),
+            "warnings": [],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope).map_err(|source| CliError::internal(
+                format!("failed to render exec-sync JSON: {source}")
+            ))?
+        );
+    } else {
+        std::io::stdout()
+            .write_all(&response.stdout)
+            .map_err(|source| CliError::internal(format!("failed to write stdout: {source}")))?;
+        std::io::stderr()
+            .write_all(&response.stderr)
+            .map_err(|source| CliError::internal(format!("failed to write stderr: {source}")))?;
+    }
+
+    Ok(CommandResult::from_code(response.exit_code))
 }
 
 pub(crate) async fn handle_list(
