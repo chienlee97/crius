@@ -67,6 +67,7 @@ struct MockState {
     exec_requests: Arc<AtomicUsize>,
     exec_sync_requests: Arc<AtomicUsize>,
     attach_requests: Arc<AtomicUsize>,
+    port_forward_requests: Arc<AtomicUsize>,
     list_pod_requests: Arc<AtomicUsize>,
     pod_inspect_requests: Arc<AtomicUsize>,
     list_container_requests: Arc<AtomicUsize>,
@@ -91,8 +92,10 @@ struct MockState {
     last_exec: Arc<Mutex<Option<ExecRequest>>>,
     last_exec_sync: Arc<Mutex<Option<ExecSyncRequest>>>,
     last_attach: Arc<Mutex<Option<AttachRequest>>>,
+    last_port_forward: Arc<Mutex<Option<PortForwardRequest>>>,
     exec_url: Arc<Mutex<Option<String>>>,
     attach_url: Arc<Mutex<Option<String>>>,
+    port_forward_url: Arc<Mutex<Option<String>>>,
     last_pull_image: Arc<Mutex<Option<PullImageRequest>>>,
     last_remove_image: Arc<Mutex<Option<RemoveImageRequest>>>,
 }
@@ -559,7 +562,34 @@ impl RuntimeService for MockRuntimeService {
             .unwrap_or_else(|| "ws://127.0.0.1:9/attach/mock".to_string());
         Ok(Response::new(AttachResponse { url }))
     }
-    unimplemented_runtime_rpc!(port_forward, PortForwardRequest, PortForwardResponse);
+    async fn port_forward(
+        &self,
+        request: Request<PortForwardRequest>,
+    ) -> Result<Response<PortForwardResponse>, Status> {
+        let request = request.into_inner();
+        let pod = request.pod_sandbox_id.clone();
+        self.state
+            .port_forward_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_port_forward
+            .lock()
+            .expect("last port-forward lock") = Some(request);
+
+        if pod == "missing" {
+            return Err(Status::not_found("pod not found"));
+        }
+
+        let url = self
+            .state
+            .port_forward_url
+            .lock()
+            .expect("port-forward url lock")
+            .clone()
+            .unwrap_or_else(|| "ws://127.0.0.1:9/portforward/mock".to_string());
+        Ok(Response::new(PortForwardResponse { url }))
+    }
     unimplemented_runtime_rpc!(
         container_stats,
         ContainerStatsRequest,
@@ -1697,6 +1727,76 @@ async fn container_attach_calls_runtime_attach_and_streams_websocket() {
     assert!(request.stdout);
     assert!(request.stderr);
     assert!(!request.stdin);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pod_port_forward_calls_runtime_and_binds_local_port() {
+    let state = MockState::default();
+    let port_forward_requests = Arc::clone(&state.port_forward_requests);
+    let last_port_forward = Arc::clone(&state.last_port_forward);
+    *state
+        .port_forward_url
+        .lock()
+        .expect("port-forward url lock") = Some("ws://127.0.0.1:9/portforward/token".to_string());
+    let endpoint = spawn_mock_services(state).await;
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("probe listener should bind");
+    let local_port = probe.local_addr().expect("probe addr").port();
+    drop(probe);
+
+    let output = run_crs(
+        endpoint,
+        [
+            "pod",
+            "port-forward",
+            "pod1",
+            "--forward",
+            &format!("{local_port}:80"),
+        ],
+    );
+
+    assert_success(&output);
+    assert_eq!(port_forward_requests.load(Ordering::SeqCst), 1);
+    let request = last_port_forward
+        .lock()
+        .expect("last port-forward lock")
+        .clone()
+        .expect("port-forward request");
+    assert_eq!(request.pod_sandbox_id, "pod1");
+    assert_eq!(request.port, vec![80]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pod_port_forward_errors_map_to_documented_codes() {
+    let state = MockState::default();
+    *state
+        .port_forward_url
+        .lock()
+        .expect("port-forward url lock") = Some("ws://127.0.0.1:9/portforward/token".to_string());
+    let endpoint = spawn_mock_services(state).await;
+
+    let missing = run_crs(
+        endpoint,
+        ["pod", "port-forward", "missing", "--forward", "18080:80"],
+    );
+    assert_eq!(missing.status.code(), Some(4));
+
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("occupied listener should bind");
+    let occupied_port = occupied.local_addr().expect("occupied addr").port();
+    let conflict = run_crs(
+        endpoint,
+        [
+            "pod",
+            "port-forward",
+            "pod1",
+            "--forward",
+            &format!("{occupied_port}:80"),
+        ],
+    );
+    assert_eq!(conflict.status.code(), Some(1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
