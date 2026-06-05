@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     process::Command,
     sync::{
@@ -96,6 +97,8 @@ struct MockState {
     exec_url: Arc<Mutex<Option<String>>>,
     attach_url: Arc<Mutex<Option<String>>>,
     port_forward_url: Arc<Mutex<Option<String>>>,
+    existing_images: Arc<Mutex<HashSet<String>>>,
+    rpc_sequence: Arc<Mutex<Vec<String>>>,
     last_pull_image: Arc<Mutex<Option<PullImageRequest>>>,
     last_remove_image: Arc<Mutex<Option<RemoveImageRequest>>>,
 }
@@ -271,6 +274,11 @@ impl RuntimeService for MockRuntimeService {
         self.state
             .create_container_requests
             .fetch_add(1, Ordering::SeqCst);
+        self.state
+            .rpc_sequence
+            .lock()
+            .expect("rpc sequence lock")
+            .push(format!("create-container:{image}"));
         *self
             .state
             .last_create_container
@@ -298,6 +306,11 @@ impl RuntimeService for MockRuntimeService {
         self.state
             .start_container_requests
             .fetch_add(1, Ordering::SeqCst);
+        self.state
+            .rpc_sequence
+            .lock()
+            .expect("rpc sequence lock")
+            .push(format!("start-container:{id}"));
         *self
             .state
             .last_start_container
@@ -787,8 +800,20 @@ impl ImageService for MockImageService {
             .image_inspect_requests
             .fetch_add(1, Ordering::SeqCst);
         let image = request.image.expect("image spec").image;
+        self.state
+            .rpc_sequence
+            .lock()
+            .expect("rpc sequence lock")
+            .push(format!("image-status:{image}"));
 
-        if matches!(image.as_str(), "missing" | "ctr-only" | "pod-only" | "none") {
+        if matches!(image.as_str(), "missing" | "ctr-only" | "pod-only" | "none")
+            || !self
+                .state
+                .existing_images
+                .lock()
+                .expect("existing images lock")
+                .contains(&image)
+        {
             return Err(Status::not_found("image not found"));
         }
 
@@ -812,6 +837,11 @@ impl ImageService for MockImageService {
         self.state
             .pull_image_requests
             .fetch_add(1, Ordering::SeqCst);
+        self.state
+            .rpc_sequence
+            .lock()
+            .expect("rpc sequence lock")
+            .push(format!("pull-image:{image}"));
         *self
             .state
             .last_pull_image
@@ -1365,6 +1395,276 @@ async fn pod_run_stop_remove_and_update_resources_call_runtime_rpcs() {
     assert_eq!(stop_requests.load(Ordering::SeqCst), 1);
     assert_eq!(remove_requests.load(Ordering::SeqCst), 1);
     assert_eq!(update_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_pull_policy_controls_image_status_and_pull_order() {
+    let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("present:latest".to_string());
+    let image_status_requests = Arc::clone(&state.image_inspect_requests);
+    let pull_requests = Arc::clone(&state.pull_image_requests);
+    let sequence = Arc::clone(&state.rpc_sequence);
+    let endpoint = spawn_mock_services(state).await;
+
+    let present = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "run",
+            "--detach",
+            "--pull",
+            "missing",
+            "present:latest",
+            "true",
+        ],
+    );
+    assert_success(&present);
+    assert_eq!(stdout_json(&present)["kind"], "Run");
+    assert_eq!(image_status_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(pull_requests.load(Ordering::SeqCst), 0);
+
+    let absent = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "run",
+            "--detach",
+            "--pull",
+            "missing",
+            "absent:latest",
+            "true",
+        ],
+    );
+    assert_success(&absent);
+    assert_eq!(image_status_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(pull_requests.load(Ordering::SeqCst), 1);
+
+    let always = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "run",
+            "--detach",
+            "--pull",
+            "always",
+            "present:latest",
+            "true",
+        ],
+    );
+    assert_success(&always);
+    assert_eq!(image_status_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(pull_requests.load(Ordering::SeqCst), 2);
+
+    let never_missing = run_crs(
+        endpoint,
+        [
+            "run",
+            "--detach",
+            "--pull",
+            "never",
+            "still-missing:latest",
+            "true",
+        ],
+    );
+    assert_eq!(never_missing.status.code(), Some(4));
+    assert_eq!(image_status_requests.load(Ordering::SeqCst), 3);
+    assert_eq!(pull_requests.load(Ordering::SeqCst), 2);
+
+    let sequence = sequence.lock().expect("rpc sequence lock").clone();
+    assert!(
+        sequence
+            .windows(2)
+            .any(|pair| pair == ["image-status:absent:latest", "pull-image:absent:latest"]),
+        "missing policy should inspect before pulling, got {sequence:?}"
+    );
+    assert!(
+        !sequence
+            .iter()
+            .any(|entry| entry == "pull-image:still-missing:latest"),
+        "never policy must not pull missing images, got {sequence:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_detach_creates_or_reuses_pod_and_starts_container() {
+    let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("busybox:latest".to_string());
+    let run_pod_requests = Arc::clone(&state.run_pod_requests);
+    let pod_status_requests = Arc::clone(&state.pod_inspect_requests);
+    let create_container_requests = Arc::clone(&state.create_container_requests);
+    let start_container_requests = Arc::clone(&state.start_container_requests);
+    let last_run_pod = Arc::clone(&state.last_run_pod);
+    let last_create_container = Arc::clone(&state.last_create_container);
+    let last_start_container = Arc::clone(&state.last_start_container);
+    let endpoint = spawn_mock_services(state).await;
+
+    let created = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "run",
+            "--detach",
+            "--name",
+            "ctr-demo",
+            "--namespace",
+            "ns-a",
+            "--pod-name",
+            "pod-demo",
+            "busybox:latest",
+            "echo",
+            "ok",
+        ],
+    );
+    assert_success(&created);
+    let value = stdout_json(&created);
+    assert_eq!(value["kind"], "Run");
+    assert_eq!(value["summary"]["podSandboxId"], "pod-pod-demo");
+    assert_eq!(
+        value["summary"]["containerId"],
+        "ctr-pod-pod-demo-busybox:latest"
+    );
+    assert_eq!(value["summary"]["detached"], true);
+    assert_eq!(value["summary"]["podCreated"], true);
+
+    let pod_request = last_run_pod
+        .lock()
+        .expect("last run pod lock")
+        .clone()
+        .expect("run pod request");
+    let pod_config = pod_request.config.expect("pod config");
+    let pod_metadata = pod_config.metadata.expect("pod metadata");
+    assert_eq!(pod_metadata.name, "pod-demo");
+    assert_eq!(pod_metadata.namespace, "ns-a");
+
+    let create_request = last_create_container
+        .lock()
+        .expect("last create container lock")
+        .clone()
+        .expect("create container request");
+    assert_eq!(create_request.pod_sandbox_id, "pod-pod-demo");
+    assert_eq!(
+        create_request
+            .sandbox_config
+            .as_ref()
+            .and_then(|config| config.metadata.as_ref())
+            .map(|metadata| metadata.name.as_str()),
+        Some("pod-demo")
+    );
+    let container_config = create_request.config.expect("container config");
+    assert_eq!(
+        container_config.metadata.expect("container metadata").name,
+        "ctr-demo"
+    );
+    assert_eq!(container_config.command, vec!["echo", "ok"]);
+
+    assert_eq!(
+        last_start_container
+            .lock()
+            .expect("last start container lock")
+            .clone()
+            .expect("start container request")
+            .container_id,
+        "ctr-pod-pod-demo-busybox:latest"
+    );
+
+    let reused = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "run",
+            "--detach",
+            "--pod",
+            "pod-existing",
+            "busybox:latest",
+            "true",
+        ],
+    );
+    assert_success(&reused);
+    let value = stdout_json(&reused);
+    assert_eq!(value["summary"]["podSandboxId"], "pod-existing");
+    assert_eq!(value["summary"]["podCreated"], false);
+
+    assert_eq!(run_pod_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(pod_status_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(create_container_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(start_container_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_exec_mode_sync_executes_command_after_start_and_returns_exit_code() {
+    let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("busybox:latest".to_string());
+    let exec_sync_requests = Arc::clone(&state.exec_sync_requests);
+    let last_exec_sync = Arc::clone(&state.last_exec_sync);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(
+        endpoint,
+        ["run", "--exec-mode", "sync", "busybox:latest", "exit-7"],
+    );
+
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "sync-stdout");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "sync-stderr");
+    assert_eq!(exec_sync_requests.load(Ordering::SeqCst), 1);
+    let request = last_exec_sync
+        .lock()
+        .expect("last exec-sync lock")
+        .clone()
+        .expect("exec-sync request");
+    assert!(request.container_id.starts_with("ctr-pod-crius-"));
+    assert_eq!(request.cmd, vec!["exit-7"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_exec_mode_attach_streams_started_container() {
+    let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("busybox:latest".to_string());
+    let attach_requests = Arc::clone(&state.attach_requests);
+    let last_attach = Arc::clone(&state.last_attach);
+    let websocket = spawn_mock_websocket().await;
+    *state.attach_url.lock().expect("attach url lock") =
+        Some(format!("ws://{websocket}/attach/token"));
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(
+        endpoint,
+        ["run", "--exec-mode", "attach", "busybox:latest", "true"],
+    );
+
+    assert_success(&output);
+    assert_eq!(attach_requests.load(Ordering::SeqCst), 1);
+    let request = last_attach
+        .lock()
+        .expect("last attach lock")
+        .clone()
+        .expect("attach request");
+    assert!(request.container_id.starts_with("ctr-pod-crius-"));
+    assert!(!request.stdin);
+    assert!(request.stdout);
+    assert!(request.stderr);
+    assert!(!request.tty);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

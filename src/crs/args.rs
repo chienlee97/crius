@@ -205,7 +205,7 @@ impl Default for StreamProtocolArg {
     }
 }
 
-#[derive(Debug, Default, ClapArgs)]
+#[derive(Clone, Debug, Default, ClapArgs)]
 pub struct StreamOptions {
     #[arg(short = 'i', long)]
     pub stdin: bool,
@@ -388,7 +388,7 @@ pub struct PodCreateArgs {
     pub pod_resources: Vec<String>,
 }
 
-#[derive(Debug, Default, ClapArgs)]
+#[derive(Clone, Debug, Default, ClapArgs)]
 pub struct SandboxSecurityArgs {
     #[arg(long)]
     pub sandbox_user: Option<String>,
@@ -491,7 +491,7 @@ pub struct ContainerCreateArgs {
     pub command: Vec<String>,
 }
 
-#[derive(Debug, Default, ClapArgs)]
+#[derive(Clone, Debug, Default, ClapArgs)]
 pub struct ContainerCreateOptions {
     #[arg(long)]
     pub name: Option<String>,
@@ -529,7 +529,7 @@ pub struct ContainerCreateOptions {
     pub security: ContainerSecurityArgs,
 }
 
-#[derive(Debug, Default, ClapArgs)]
+#[derive(Clone, Debug, Default, ClapArgs)]
 pub struct ContainerResourceArgs {
     #[arg(long = "resource")]
     pub resources: Vec<String>,
@@ -555,7 +555,7 @@ pub struct ContainerResourceArgs {
     pub unified: Vec<String>,
 }
 
-#[derive(Debug, Default, ClapArgs)]
+#[derive(Clone, Debug, Default, ClapArgs)]
 pub struct ContainerSecurityArgs {
     #[arg(long)]
     pub privileged: bool,
@@ -634,7 +634,7 @@ pub struct RunArgs {
     pub command: Vec<String>,
 }
 
-#[derive(Debug, Default, ClapArgs)]
+#[derive(Clone, Debug, Default, ClapArgs)]
 pub struct RunPodCreateOptions {
     #[arg(long = "pod-name")]
     pub pod_name: Option<String>,
@@ -684,7 +684,7 @@ pub struct RunPodCreateOptions {
     pub pod_resources: Vec<String>,
 }
 
-#[derive(Debug, Default, ClapArgs)]
+#[derive(Clone, Debug, Default, ClapArgs)]
 pub struct RunContainerCreateOptions {
     #[arg(long = "container-attempt")]
     pub container_attempt: Option<u32>,
