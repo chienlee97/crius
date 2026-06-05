@@ -303,7 +303,7 @@ const REMOTE_COMMAND_PROTOCOLS: &[&str] = &[
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct WebsocketIo {
-    pub stdin: Vec<u8>,
+    pub stdin: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -385,11 +385,9 @@ where
     validate_websocket_handshake(&response, &key)?;
     let mut stream = reader.into_inner();
 
-    if !io.stdin.is_empty() {
-        let mut payload = Vec::with_capacity(1 + io.stdin.len());
-        payload.push(WS_CHANNEL_STDIN);
-        payload.extend_from_slice(&io.stdin);
-        write_websocket_frame(&mut stream, WS_BINARY_OPCODE, &payload, true).await?;
+    if let Some(stdin) = io.stdin {
+        write_websocket_channel_frame(&mut stream, WS_CHANNEL_STDIN, &stdin).await?;
+        write_websocket_channel_frame(&mut stream, WS_CHANNEL_STDIN, &[]).await?;
     }
 
     let mut output = WebsocketStreamOutput::default();
@@ -410,6 +408,20 @@ where
     }
 
     Ok(output)
+}
+
+async fn write_websocket_channel_frame<W>(
+    writer: &mut W,
+    channel: u8,
+    payload: &[u8],
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut frame = Vec::with_capacity(1 + payload.len());
+    frame.push(channel);
+    frame.extend_from_slice(payload);
+    write_websocket_frame(writer, WS_BINARY_OPCODE, &frame, true).await
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1105,6 +1117,11 @@ mod tests {
             assert_eq!(frame.opcode, WS_BINARY_OPCODE);
             assert_eq!(frame.payload.first().copied(), Some(WS_CHANNEL_STDIN));
             *received_stdin_for_server.lock().await = frame.payload[1..].to_vec();
+            let eof = read_websocket_frame(&mut stream)
+                .await
+                .expect("stdin EOF frame should read")
+                .expect("stdin EOF frame should exist");
+            assert_eq!(eof.payload, vec![WS_CHANNEL_STDIN]);
 
             write_websocket_frame(
                 &mut stream,
@@ -1131,7 +1148,7 @@ mod tests {
         let output = websocket_stream_with_writers(
             &format!("ws://{addr}/exec/token"),
             WebsocketIo {
-                stdin: b"input".to_vec(),
+                stdin: Some(b"input".to_vec()),
             },
             OutputRouting {
                 stdout: true,
@@ -1148,6 +1165,67 @@ mod tests {
         assert_eq!(output.stderr, b"err".to_vec());
         assert_eq!(writers.stdout, b"ok".to_vec());
         assert_eq!(writers.stderr, b"err".to_vec());
+    }
+
+    #[tokio::test]
+    async fn websocket_stream_skips_stdin_when_disabled() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr should exist");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("client should connect");
+            let mut stream = BufReader::new(stream);
+            let mut request_headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                stream
+                    .read_line(&mut line)
+                    .await
+                    .expect("request line should read");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request_headers.push(line);
+            }
+            let key = request_headers
+                .iter()
+                .find_map(|line| {
+                    line.strip_prefix("Sec-WebSocket-Key:")
+                        .map(|value| value.trim().to_string())
+                })
+                .expect("client should send websocket key");
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {}\r\nSec-WebSocket-Protocol: v4.channel.k8s.io\r\n\r\n",
+                websocket_accept_value(&key)
+            );
+            let mut stream = stream.into_inner();
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("handshake response should write");
+            write_websocket_frame(&mut stream, WS_CLOSE_OPCODE, &[], false)
+                .await
+                .expect("close should write");
+        });
+
+        let mut writers = MemoryStreamWriters::default();
+        let output = websocket_stream_with_writers(
+            &format!("ws://{addr}/attach/token"),
+            WebsocketIo { stdin: None },
+            OutputRouting {
+                stdout: true,
+                stderr: true,
+            },
+            &mut writers,
+        )
+        .await
+        .expect("websocket stream should complete");
+
+        server.await.expect("server task should finish");
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
     }
 
     struct MockRawModeBackend {
