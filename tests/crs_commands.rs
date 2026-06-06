@@ -98,6 +98,7 @@ struct MockState {
     effective_config_requests: Arc<AtomicUsize>,
     runtime_handlers_requests: Arc<AtomicUsize>,
     image_transfers_requests: Arc<AtomicUsize>,
+    container_log_requests: Arc<AtomicUsize>,
     last_update_runtime_config: Arc<Mutex<Option<UpdateRuntimeConfigRequest>>>,
     last_run_pod: Arc<Mutex<Option<RunPodSandboxRequest>>>,
     last_stop_pod: Arc<Mutex<Option<StopPodSandboxRequest>>>,
@@ -123,6 +124,7 @@ struct MockState {
     last_remove_image: Arc<Mutex<Option<RemoveImageRequest>>>,
     last_effective_config: Arc<Mutex<Option<EffectiveConfigRequest>>>,
     last_image_transfers: Arc<Mutex<Option<ImageTransfersRequest>>>,
+    last_container_log: Arc<Mutex<Option<ContainerLogRequest>>>,
 }
 
 #[tonic::async_trait]
@@ -1102,9 +1104,38 @@ impl DiagnosticsService for MockDiagnosticsService {
 
     async fn container_log(
         &self,
-        _request: Request<ContainerLogRequest>,
+        request: Request<ContainerLogRequest>,
     ) -> Result<Response<Self::ContainerLogStream>, Status> {
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let request = request.into_inner();
+        self.state
+            .container_log_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_container_log
+            .lock()
+            .expect("last container log lock") = Some(request.clone());
+        if request.container_id == "missing-log" {
+            return Err(Status::not_found("container log not found"));
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(ContainerLogChunk {
+                    data: b"hello\n".to_vec(),
+                    stream: "stdout".into(),
+                    timestamp_unix_nanos: 1_000_000_000,
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(ContainerLogChunk {
+                    data: b"warn\n".to_vec(),
+                    stream: "stderr".into(),
+                    timestamp_unix_nanos: 2_000_000_000,
+                }))
+                .await;
+        });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
@@ -2354,6 +2385,85 @@ async fn top_level_exec_reuses_container_exec() {
 
     assert_success(&output);
     assert_eq!(exec_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn container_logs_streams_text_without_json_envelope() {
+    let state = MockState::default();
+    let log_requests = Arc::clone(&state.container_log_requests);
+    let last_log = Arc::clone(&state.last_container_log);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(
+        endpoint,
+        [
+            "--output",
+            "text",
+            "container",
+            "logs",
+            "--follow",
+            "--tail",
+            "10",
+            "--since",
+            "2026-06-03T12:00:00Z",
+            "--timestamps",
+            "ctr1",
+        ],
+    );
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello\nwarn\n");
+    assert!(output.stderr.is_empty());
+    assert_eq!(log_requests.load(Ordering::SeqCst), 1);
+    let request = last_log
+        .lock()
+        .expect("last container log lock")
+        .clone()
+        .expect("container log request");
+    assert_eq!(request.container_id, "ctr1");
+    assert!(request.follow);
+    assert_eq!(request.tail_lines, 10);
+    assert!(request.since_unix_nanos > 0);
+    assert!(request.timestamps);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn container_logs_json_outputs_parseable_ndjson() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+
+    let output = run_crs(endpoint, ["--output", "json", "container", "logs", "ctr1"]);
+
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    let first: serde_json::Value = serde_json::from_str(lines[0]).expect("first log json");
+    let second: serde_json::Value = serde_json::from_str(lines[1]).expect("second log json");
+    assert_eq!(first["data"], "hello\n");
+    assert_eq!(first["stream"], "stdout");
+    assert_eq!(first["timestamp"], 1_000_000_000);
+    assert_eq!(second["stream"], "stderr");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn top_level_logs_reuses_container_logs_request_shape() {
+    let state = MockState::default();
+    let log_requests = Arc::clone(&state.container_log_requests);
+    let last_log = Arc::clone(&state.last_container_log);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["logs", "--tail", "5", "ctr1"]);
+
+    assert_success(&output);
+    assert_eq!(log_requests.load(Ordering::SeqCst), 1);
+    let request = last_log
+        .lock()
+        .expect("last container log lock")
+        .clone()
+        .expect("container log request");
+    assert_eq!(request.container_id, "ctr1");
+    assert_eq!(request.tail_lines, 5);
+    assert!(!request.follow);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

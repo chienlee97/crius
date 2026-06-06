@@ -148,6 +148,14 @@ pub struct InspectArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct ContainerLogsArgs {
+    #[arg(long)]
+    pub follow: bool,
+    #[arg(long)]
+    pub tail: Option<i64>,
+    #[arg(long)]
+    pub since: Option<String>,
+    #[arg(long)]
+    pub timestamps: bool,
     pub container: String,
 }
 

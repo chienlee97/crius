@@ -127,6 +127,30 @@ fn parses_top_level_shortcut_commands() {
 }
 
 #[test]
+fn parses_logs_options() {
+    let args = Args::try_parse_from([
+        "crs",
+        "logs",
+        "--follow",
+        "--tail",
+        "10",
+        "--since",
+        "2026-06-03T12:00:00Z",
+        "--timestamps",
+        "ctr1",
+    ])
+    .expect("logs options should parse");
+    let Command::Logs(logs) = args.command else {
+        panic!("expected logs command");
+    };
+    assert_eq!(logs.container, "ctr1");
+    assert!(logs.follow);
+    assert_eq!(logs.tail, Some(10));
+    assert_eq!(logs.since.as_deref(), Some("2026-06-03T12:00:00Z"));
+    assert!(logs.timestamps);
+}
+
+#[test]
 fn parses_top_level_command_groups() {
     let cases: &[CommandCase] = &[
         (&["crs", "config", "show"], |command| {
