@@ -721,6 +721,14 @@ fn rejects_execute_mode_without_explicit_choice() {
 }
 
 #[test]
+fn rejects_unsupported_completion_shell() {
+    let error = Args::try_parse_from(["crs", "completion", "elvish"])
+        .expect_err("unsupported completion shell should fail parsing");
+
+    assert_eq!(error.kind(), ErrorKind::InvalidValue);
+}
+
+#[test]
 fn rejects_conflicting_auth_sources() {
     let error = Args::try_parse_from([
         "crs",
