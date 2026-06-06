@@ -1,12 +1,21 @@
+use clap::CommandFactory;
+use clap_complete::{generate, Shell};
+
 use crate::crs::{
-    args::CompletionArgs, client::CrsClient, context::CliContext, error::CliError,
-    error::CommandResult,
+    args::{Args, CompletionArgs},
+    client::CrsClient,
+    context::CliContext,
+    error::{CliError, CommandResult},
 };
 
 pub(crate) async fn handle(
     _ctx: &CliContext,
     _client: &CrsClient,
-    _args: CompletionArgs,
+    args: CompletionArgs,
 ) -> Result<CommandResult, CliError> {
-    Err(CliError::not_implemented("crs completion"))
+    let mut command = Args::command();
+    let bin_name = command.get_name().to_string();
+    let shell: Shell = args.shell.into();
+    generate(shell, &mut command, bin_name, &mut std::io::stdout());
+    Ok(CommandResult::success())
 }

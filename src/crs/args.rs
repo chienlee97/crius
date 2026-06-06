@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 
 use crate::crs::parsers::{parse_duration, DEFAULT_ENDPOINT};
 
@@ -802,6 +803,17 @@ pub enum CompletionShell {
     Zsh,
     Fish,
     Powershell,
+}
+
+impl From<CompletionShell> for Shell {
+    fn from(shell: CompletionShell) -> Self {
+        match shell {
+            CompletionShell::Bash => Self::Bash,
+            CompletionShell::Zsh => Self::Zsh,
+            CompletionShell::Fish => Self::Fish,
+            CompletionShell::Powershell => Self::PowerShell,
+        }
+    }
 }
 
 #[derive(Debug, ClapArgs)]
