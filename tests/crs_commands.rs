@@ -25,6 +25,7 @@ use crius::proto::{
         *,
     },
 };
+use nix::libc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{transport::Server, Request, Response, Status};
@@ -65,6 +66,13 @@ struct MockDiagnosticsService {
     state: MockState,
 }
 
+#[derive(Copy, Clone, Debug, Default)]
+enum MockEventMode {
+    #[default]
+    TwoThenEof,
+    Pending,
+}
+
 #[derive(Clone, Default)]
 struct MockState {
     version_requests: Arc<AtomicUsize>,
@@ -86,6 +94,7 @@ struct MockState {
     exec_sync_requests: Arc<AtomicUsize>,
     attach_requests: Arc<AtomicUsize>,
     port_forward_requests: Arc<AtomicUsize>,
+    container_events_requests: Arc<AtomicUsize>,
     list_pod_requests: Arc<AtomicUsize>,
     pod_inspect_requests: Arc<AtomicUsize>,
     list_container_requests: Arc<AtomicUsize>,
@@ -102,6 +111,7 @@ struct MockState {
     recovery_status_requests: Arc<AtomicUsize>,
     recovery_check_requests: Arc<AtomicUsize>,
     content_gc_requests: Arc<AtomicUsize>,
+    event_mode: Arc<Mutex<MockEventMode>>,
     last_update_runtime_config: Arc<Mutex<Option<UpdateRuntimeConfigRequest>>>,
     last_run_pod: Arc<Mutex<Option<RunPodSandboxRequest>>>,
     last_stop_pod: Arc<Mutex<Option<StopPodSandboxRequest>>>,
@@ -767,7 +777,47 @@ impl RuntimeService for MockRuntimeService {
         &self,
         _request: Request<GetEventsRequest>,
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
-        Err(Status::unimplemented("mock only implements Version"))
+        self.state
+            .container_events_requests
+            .fetch_add(1, Ordering::SeqCst);
+        let mode = *self.state.event_mode.lock().expect("event mode lock");
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+
+        tokio::spawn(async move {
+            match mode {
+                MockEventMode::TwoThenEof => {
+                    let _ = tx
+                        .send(Ok(test_container_event(
+                            "ctr-event-a",
+                            "pod-event-a",
+                            ContainerEventType::ContainerCreatedEvent,
+                            1_000_000_000,
+                        )))
+                        .await;
+                    let _ = tx
+                        .send(Ok(test_container_event(
+                            "ctr-event-b",
+                            "pod-event-b",
+                            ContainerEventType::ContainerStartedEvent,
+                            2_000_000_000,
+                        )))
+                        .await;
+                }
+                MockEventMode::Pending => {
+                    let _ = tx
+                        .send(Ok(test_container_event(
+                            "ctr-event-pending",
+                            "pod-event-pending",
+                            ContainerEventType::ContainerStartedEvent,
+                            3_000_000_000,
+                        )))
+                        .await;
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     unimplemented_runtime_rpc!(
@@ -3171,6 +3221,70 @@ async fn doctor_uses_cri_and_warns_when_diagnostics_is_unavailable() {
     assert!(stderr.contains("diagnostics service is not available"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_table_prints_single_header_and_exits_on_eof() {
+    let state = MockState::default();
+    let event_requests = Arc::clone(&state.container_events_requests);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["events"]);
+
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert_eq!(stdout.matches("TIME").count(), 1);
+    assert!(stdout.contains("TYPE"));
+    assert!(stdout.contains("created"));
+    assert!(stdout.contains("started"));
+    assert!(stdout.contains("ctr-event-a"));
+    assert!(stdout.contains("pod-event-b"));
+    assert_eq!(event_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_json_outputs_parseable_ndjson_items() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+
+    let output = run_crs(endpoint, ["--output", "json", "events"]);
+
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    for line in lines {
+        let value: serde_json::Value = serde_json::from_str(line).expect("event JSON line");
+        assert!(value["createdAtUnixNanos"].as_i64().expect("event time") > 0);
+        assert!(value["eventType"].as_str().expect("event type").len() > 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_sigint_returns_interrupted_exit_code() {
+    let state = MockState::default();
+    *state.event_mode.lock().expect("event mode lock") = MockEventMode::Pending;
+    let endpoint = spawn_mock_services(state).await;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_crs"))
+        .args([
+            "--address",
+            &format!("http://{endpoint}"),
+            "--connect-timeout",
+            "2s",
+            "--timeout",
+            "2s",
+            "events",
+        ])
+        .spawn()
+        .expect("crs process should start");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+    let status = child.wait().expect("crs process should exit");
+
+    assert_eq!(status.code(), Some(130));
+}
+
 #[test]
 fn json_error_is_written_to_stderr_with_empty_stdout() {
     let socket_dir = tempfile::tempdir().expect("tempdir should be created");
@@ -3249,6 +3363,36 @@ fn test_image() -> Image {
             ..Default::default()
         }),
         pinned: false,
+    }
+}
+
+fn test_container_event(
+    container_id: &str,
+    pod_id: &str,
+    event_type: ContainerEventType,
+    created_at: i64,
+) -> ContainerEventResponse {
+    ContainerEventResponse {
+        container_id: container_id.to_string(),
+        container_event_type: event_type as i32,
+        created_at,
+        pod_sandbox_status: Some(PodSandboxStatus {
+            id: pod_id.to_string(),
+            metadata: Some(PodSandboxMetadata {
+                name: "pod-a".into(),
+                uid: "uid-a".into(),
+                namespace: "default".into(),
+                attempt: 1,
+            }),
+            state: PodSandboxState::SandboxReady as i32,
+            created_at,
+            network: None,
+            linux: None,
+            labels: Default::default(),
+            annotations: Default::default(),
+            runtime_handler: "runc".into(),
+        }),
+        containers_statuses: Vec::new(),
     }
 }
 

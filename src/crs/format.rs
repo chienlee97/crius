@@ -855,6 +855,35 @@ impl TableRow for ContainerOperationView {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct ContainerEventView {
+    pub time: String,
+    pub event_type: String,
+    pub container_id: String,
+    pub pod_id: String,
+    pub created_at_unix_nanos: i64,
+}
+
+impl TableRow for ContainerEventView {
+    fn headers() -> &'static [&'static str] {
+        &["TIME", "TYPE", "CONTAINER", "POD"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.time.clone(),
+            self.event_type.clone(),
+            self.container_id.clone(),
+            self.pod_id.clone(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.container_id.clone()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ResourceUsageView {
     pub id: String,
     pub name: String,
