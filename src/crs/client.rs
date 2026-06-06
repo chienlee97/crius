@@ -6,6 +6,7 @@ use tonic::transport::{Channel, Endpoint as TonicEndpoint};
 use tower::service_fn;
 
 use crate::crs::{context::CliContext, error::CliError, parsers::Endpoint};
+use crate::proto::diagnostics::v1::diagnostics_service_client::DiagnosticsServiceClient;
 use crate::proto::runtime::v1::{
     image_service_client::ImageServiceClient, runtime_service_client::RuntimeServiceClient,
 };
@@ -18,6 +19,7 @@ pub(crate) struct CrsClient {
     rpc_timeout: Duration,
     runtime: Option<RuntimeServiceClient<Channel>>,
     image: Option<ImageServiceClient<Channel>>,
+    diagnostics: Option<DiagnosticsServiceClient<Channel>>,
 }
 
 impl CrsClient {
@@ -32,6 +34,7 @@ impl CrsClient {
             rpc_timeout: ctx.rpc_timeout(),
             runtime: None,
             image: None,
+            diagnostics: None,
         }
     }
 
@@ -40,7 +43,8 @@ impl CrsClient {
         let mut client = Self::new(ctx);
         let channel = client.connect_channel().await?;
         client.runtime = Some(RuntimeServiceClient::new(channel.clone()));
-        client.image = Some(ImageServiceClient::new(channel));
+        client.image = Some(ImageServiceClient::new(channel.clone()));
+        client.diagnostics = Some(DiagnosticsServiceClient::new(channel));
         Ok(client)
     }
 
@@ -98,8 +102,10 @@ impl CrsClient {
     }
 
     #[allow(dead_code, clippy::result_large_err)]
-    pub(crate) fn diagnostics(&self) -> Result<(), CliError> {
-        Err(self.diagnostics_unavailable())
+    pub(crate) fn diagnostics(&self) -> Result<DiagnosticsServiceClient<Channel>, CliError> {
+        self.diagnostics
+            .clone()
+            .ok_or_else(|| self.diagnostics_unavailable())
     }
 
     #[allow(dead_code)]

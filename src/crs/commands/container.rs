@@ -224,15 +224,17 @@ pub(crate) async fn handle_create(
     render_container_operation(
         ctx,
         client,
-        "ContainerCreate",
-        response.container_id.clone(),
-        pod,
-        image,
-        "created",
-        serde_json::json!({
-            "containerId": response.container_id,
-            "created": true,
-        }),
+        ContainerOperationRender {
+            kind: "ContainerCreate",
+            container_id: response.container_id.clone(),
+            pod_id: pod,
+            image,
+            action: "created",
+            summary: serde_json::json!({
+                "containerId": response.container_id,
+                "created": true,
+            }),
+        },
     )
 }
 
@@ -259,15 +261,17 @@ pub(crate) async fn handle_start(
     render_container_operation(
         ctx,
         client,
-        "ContainerStart",
-        id.clone(),
-        String::new(),
-        String::new(),
-        "started",
-        serde_json::json!({
-            "containerId": id,
-            "started": true,
-        }),
+        ContainerOperationRender {
+            kind: "ContainerStart",
+            container_id: id.clone(),
+            pod_id: String::new(),
+            image: String::new(),
+            action: "started",
+            summary: serde_json::json!({
+                "containerId": id,
+                "started": true,
+            }),
+        },
     )
 }
 
@@ -294,16 +298,18 @@ pub(crate) async fn handle_stop(
     render_container_operation(
         ctx,
         client,
-        "ContainerStop",
-        id.clone(),
-        String::new(),
-        String::new(),
-        "stopped",
-        serde_json::json!({
-            "containerId": id,
-            "stopped": true,
-            "timeoutSeconds": timeout.unwrap_or_default(),
-        }),
+        ContainerOperationRender {
+            kind: "ContainerStop",
+            container_id: id.clone(),
+            pod_id: String::new(),
+            image: String::new(),
+            action: "stopped",
+            summary: serde_json::json!({
+                "containerId": id,
+                "stopped": true,
+                "timeoutSeconds": timeout.unwrap_or_default(),
+            }),
+        },
     )
 }
 
@@ -330,15 +336,17 @@ pub(crate) async fn handle_remove(
     render_container_operation(
         ctx,
         client,
-        "ContainerRemove",
-        id.clone(),
-        String::new(),
-        String::new(),
-        "removed",
-        serde_json::json!({
-            "containerId": id,
-            "removed": true,
-        }),
+        ContainerOperationRender {
+            kind: "ContainerRemove",
+            container_id: id.clone(),
+            pod_id: String::new(),
+            image: String::new(),
+            action: "removed",
+            summary: serde_json::json!({
+                "containerId": id,
+                "removed": true,
+            }),
+        },
     )
 }
 
@@ -385,15 +393,17 @@ pub(crate) async fn handle_update(
     render_container_operation(
         ctx,
         client,
-        "ContainerUpdate",
-        id.clone(),
-        String::new(),
-        String::new(),
-        "updated",
-        serde_json::json!({
-            "containerId": id,
-            "updated": true,
-        }),
+        ContainerOperationRender {
+            kind: "ContainerUpdate",
+            container_id: id.clone(),
+            pod_id: String::new(),
+            image: String::new(),
+            action: "updated",
+            summary: serde_json::json!({
+                "containerId": id,
+                "updated": true,
+            }),
+        },
     )
 }
 
@@ -432,17 +442,19 @@ pub(crate) async fn handle_checkpoint(
     render_container_operation(
         ctx,
         client,
-        "ContainerCheckpoint",
-        id.clone(),
-        String::new(),
-        String::new(),
-        "checkpointed",
-        serde_json::json!({
-            "containerId": id,
-            "location": location,
-            "checkpointed": true,
-            "timeoutSeconds": timeout.unwrap_or_default(),
-        }),
+        ContainerOperationRender {
+            kind: "ContainerCheckpoint",
+            container_id: id.clone(),
+            pod_id: String::new(),
+            image: String::new(),
+            action: "checkpointed",
+            summary: serde_json::json!({
+                "containerId": id,
+                "location": location,
+                "checkpointed": true,
+                "timeoutSeconds": timeout.unwrap_or_default(),
+            }),
+        },
     )
 }
 
@@ -469,15 +481,17 @@ pub(crate) async fn handle_reopen_log(
     render_container_operation(
         ctx,
         client,
-        "ContainerReopenLog",
-        id.clone(),
-        String::new(),
-        String::new(),
-        "reopened",
-        serde_json::json!({
-            "containerId": id,
-            "reopened": true,
-        }),
+        ContainerOperationRender {
+            kind: "ContainerReopenLog",
+            container_id: id.clone(),
+            pod_id: String::new(),
+            image: String::new(),
+            action: "reopened",
+            summary: serde_json::json!({
+                "containerId": id,
+                "reopened": true,
+            }),
+        },
     )
 }
 
@@ -575,30 +589,34 @@ fn container_status_error(
         .with_object(format!("container {id}"))
 }
 
-fn render_container_operation(
-    ctx: &CliContext,
-    client: &CrsClient,
+struct ContainerOperationRender {
     kind: &'static str,
-    container_id: String,
     pod_id: String,
+    container_id: String,
     image: String,
     action: &'static str,
     summary: serde_json::Value,
+}
+
+fn render_container_operation(
+    ctx: &CliContext,
+    client: &CrsClient,
+    operation: ContainerOperationRender,
 ) -> Result<CommandResult, CliError> {
     render_and_print(
         ctx,
         CommandOutput::new(
-            kind,
+            operation.kind,
             client.endpoint(),
             vec![ContainerOperationView {
-                container_id,
-                pod_id,
-                image,
-                action: action.to_string(),
+                container_id: operation.container_id,
+                pod_id: operation.pod_id,
+                image: operation.image,
+                action: operation.action.to_string(),
                 success: true,
             }],
         )
-        .with_summary(summary),
+        .with_summary(operation.summary),
     )
 }
 

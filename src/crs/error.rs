@@ -108,42 +108,42 @@ pub(crate) enum CliError {
     #[error("{command} is not implemented yet")]
     NotImplemented {
         command: String,
-        context: ErrorContext,
+        context: Box<ErrorContext>,
     },
     #[error("{message} for endpoint {endpoint}")]
     Timeout {
         message: String,
         endpoint: String,
-        context: ErrorContext,
+        context: Box<ErrorContext>,
     },
     #[error("diagnostics service is not available from this crius daemon at {endpoint}")]
     DiagnosticsUnavailable {
         endpoint: String,
-        context: ErrorContext,
+        context: Box<ErrorContext>,
     },
     #[error("daemon is unavailable at {endpoint}: {message}")]
     DaemonUnavailable {
         endpoint: String,
         message: String,
-        context: ErrorContext,
+        context: Box<ErrorContext>,
     },
     #[error("daemon returned {code:?}: {message}")]
     Grpc {
         code: Code,
         message: String,
-        context: ErrorContext,
+        context: Box<ErrorContext>,
     },
     #[error("operation interrupted")]
-    Interrupted { context: ErrorContext },
+    Interrupted { context: Box<ErrorContext> },
     #[error("{message}")]
     InvalidInput {
         message: String,
-        context: ErrorContext,
+        context: Box<ErrorContext>,
     },
     #[error("{message}")]
     Internal {
         message: String,
-        context: ErrorContext,
+        context: Box<ErrorContext>,
     },
 }
 
@@ -151,7 +151,7 @@ impl CliError {
     pub(crate) fn not_implemented(command: impl Into<String>) -> Self {
         let command = command.into();
         Self::NotImplemented {
-            context: ErrorContext::default().with_command(command.clone()),
+            context: Box::new(ErrorContext::default().with_command(command.clone())),
             command,
         }
     }
@@ -160,7 +160,7 @@ impl CliError {
         let endpoint = endpoint.into();
         Self::Timeout {
             message: message.into(),
-            context: ErrorContext::default().with_endpoint(endpoint.clone()),
+            context: Box::new(ErrorContext::default().with_endpoint(endpoint.clone())),
             endpoint,
         }
     }
@@ -168,7 +168,7 @@ impl CliError {
     pub(crate) fn diagnostics_unavailable(endpoint: impl Into<String>) -> Self {
         let endpoint = endpoint.into();
         Self::DiagnosticsUnavailable {
-            context: ErrorContext::default().with_endpoint(endpoint.clone()),
+            context: Box::new(ErrorContext::default().with_endpoint(endpoint.clone())),
             endpoint,
         }
     }
@@ -179,7 +179,7 @@ impl CliError {
     ) -> Self {
         let endpoint = endpoint.into();
         Self::DaemonUnavailable {
-            context: ErrorContext::default().with_endpoint(endpoint.clone()),
+            context: Box::new(ErrorContext::default().with_endpoint(endpoint.clone())),
             endpoint,
             message: message.into(),
         }
@@ -188,14 +188,14 @@ impl CliError {
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::Internal {
             message: message.into(),
-            context: ErrorContext::default(),
+            context: Box::default(),
         }
     }
 
     pub(crate) fn invalid_input(message: impl Into<String>) -> Self {
         Self::InvalidInput {
             message: message.into(),
-            context: ErrorContext::default(),
+            context: Box::default(),
         }
     }
 
@@ -204,14 +204,14 @@ impl CliError {
         Self::Grpc {
             code: status.code(),
             message: status.message().to_string(),
-            context: ErrorContext::default(),
+            context: Box::default(),
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn interrupted() -> Self {
         Self::Interrupted {
-            context: ErrorContext::default(),
+            context: Box::default(),
         }
     }
 

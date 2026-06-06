@@ -2,14 +2,20 @@ use crate::crs::{
     args::{ImageArgs, ImageCommand, ImageListArgs},
     builders::build_auth_config,
     client::CrsClient,
+    commands::config::load_effective_config,
     commands::status::{parse_info_map, render_and_print},
     context::CliContext,
     error::{CliError, CommandResult},
-    format::{CommandOutput, FilesystemUsageView, ImageOperationView, ImageView, InspectView},
+    format::{
+        CommandOutput, FilesystemUsageView, ImageConfigView, ImageOperationView, ImageTransferView,
+        ImageView, InspectView,
+    },
 };
+use crate::proto::diagnostics::v1::ImageTransfersRequest;
 use crate::proto::runtime::v1::{
     FilesystemUsage, Image, ImageFilter, ImageFsInfoRequest, ImageSpec, ImageStatusRequest,
     ListImagesRequest, PodSandboxStatusRequest, PullImageRequest, RemoveImageRequest,
+    StatusRequest,
 };
 
 pub(crate) async fn handle(
@@ -23,8 +29,8 @@ pub(crate) async fn handle(
         ImageCommand::Inspect { image } => handle_inspect(ctx, client, image).await,
         ImageCommand::Remove { image } => handle_remove(ctx, client, image).await,
         ImageCommand::FsInfo => handle_fs_info(ctx, client).await,
-        ImageCommand::Transfers => Err(CliError::not_implemented("crs image transfers")),
-        ImageCommand::Config => Err(CliError::not_implemented("crs image config")),
+        ImageCommand::Transfers => handle_transfers(ctx, client).await,
+        ImageCommand::Config => handle_config(ctx, client).await,
     }
 }
 
@@ -270,6 +276,179 @@ async fn handle_fs_info(ctx: &CliContext, client: &CrsClient) -> Result<CommandR
             }),
         ),
     )
+}
+
+async fn handle_transfers(ctx: &CliContext, client: &CrsClient) -> Result<CommandResult, CliError> {
+    let mut warnings = Vec::new();
+    let views = if let Ok(mut diagnostics) = client.diagnostics() {
+        match client
+            .with_rpc_timeout(async {
+                diagnostics
+                    .image_transfers(ImageTransfersRequest {
+                        include_completed: false,
+                    })
+                    .await
+                    .map_err(|status| {
+                        CliError::from_tonic_status(status)
+                            .with_command("crs image transfers")
+                            .with_endpoint(client.endpoint())
+                    })
+            })
+            .await
+        {
+            Ok(response) => response
+                .into_inner()
+                .transfers
+                .into_iter()
+                .filter(|transfer| transfer.status != "succeeded")
+                .map(|transfer| ImageTransferView {
+                    image: transfer.image,
+                    status: transfer.status,
+                    updated: crate::crs::format::format_unix_nanos(
+                        transfer.updated_at_unix_nanos,
+                        std::time::SystemTime::now(),
+                    ),
+                    error: transfer.error,
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                warnings.push(format!(
+                    "failed to read diagnostics image transfers: {error}"
+                ));
+                load_transfers_from_status(client, &mut warnings).await?
+            }
+        }
+    } else {
+        warnings.push(client.diagnostics_unavailable().to_string());
+        load_transfers_from_status(client, &mut warnings).await?
+    };
+
+    render_and_print(
+        ctx,
+        CommandOutput::new("ImageTransfers", client.endpoint(), views.clone())
+            .with_summary(serde_json::json!({ "count": views.len() }))
+            .with_warnings(warnings),
+    )
+}
+
+async fn handle_config(ctx: &CliContext, client: &CrsClient) -> Result<CommandResult, CliError> {
+    let mut warnings = Vec::new();
+    let (config, _) = load_effective_config(client, "crs image config", &mut warnings)
+        .await
+        .ok_or_else(|| {
+            CliError::diagnostics_unavailable(client.endpoint()).with_command("crs image config")
+        })?;
+    let image_config = extract_image_config(&config);
+    let view = ImageConfigView {
+        snapshotter: string_field(&image_config, &["snapshotter", "defaultSnapshotter"])
+            .or_else(|| {
+                config
+                    .pointer("/imageSnapshotModel/snapshotter")
+                    .and_then(crate::crs::commands::config::value_to_display)
+            })
+            .unwrap_or_else(|| "unknown".to_string()),
+        policy: string_field(
+            &image_config,
+            &["signaturePolicy", "signaturePolicyDir", "policy"],
+        )
+        .unwrap_or_else(|| "unknown".to_string()),
+        auth_configured: auth_summary(&image_config),
+        pinned_images: string_array(&image_config, "pinnedImages").join(","),
+        config: image_config,
+    };
+
+    render_and_print(
+        ctx,
+        CommandOutput::new("ImageConfig", client.endpoint(), vec![view.clone()])
+            .with_summary(serde_json::json!({
+                "snapshotter": view.snapshotter,
+                "authConfigured": view.auth_configured,
+                "pinnedImages": view.pinned_images,
+            }))
+            .with_warnings(warnings),
+    )
+}
+
+async fn load_transfers_from_status(
+    client: &CrsClient,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<ImageTransferView>, CliError> {
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .status(StatusRequest { verbose: true })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs image transfers")
+                        .with_endpoint(client.endpoint())
+                })
+        })
+        .await?
+        .into_inner();
+    let (info_json, _) = parse_info_map(&response.info, warnings);
+    let Some(transfers) = info_json.get("imageTransfers") else {
+        warnings.push("verbose status info did not include imageTransfers".to_string());
+        return Ok(Vec::new());
+    };
+
+    let items = transfers
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| string_field(item, &["status"]).as_deref() != Some("succeeded"))
+        .map(|item| ImageTransferView {
+            image: string_field(item, &["image", "ref", "source"]).unwrap_or_default(),
+            status: string_field(item, &["status"]).unwrap_or_default(),
+            updated: string_field(item, &["updated", "updatedAt", "updatedAtUnixNanos"])
+                .unwrap_or_default(),
+            error: string_field(item, &["error"]).unwrap_or_default(),
+        })
+        .collect();
+    Ok(items)
+}
+
+fn extract_image_config(config: &serde_json::Value) -> serde_json::Value {
+    config
+        .get("image")
+        .or_else(|| config.get("imageConfig"))
+        .cloned()
+        .unwrap_or_else(|| config.clone())
+}
+
+fn string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(crate::crs::commands::config::value_to_display)
+}
+
+fn string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(crate::crs::commands::config::value_to_display)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn auth_summary(config: &serde_json::Value) -> String {
+    let auth_keys = [
+        "auth",
+        "registryAuth",
+        "registryConfigDir",
+        "globalAuthFile",
+        "namespacedAuthDir",
+    ];
+    if auth_keys.iter().any(|key| config.get(*key).is_some()) {
+        "configured".to_string()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 async fn fetch_sandbox_config(

@@ -8,10 +8,22 @@ use std::{
     },
 };
 
-use crius::proto::runtime::v1::{
-    image_service_server::{ImageService, ImageServiceServer},
-    runtime_service_server::{RuntimeService, RuntimeServiceServer},
-    *,
+use crius::proto::{
+    diagnostics::v1::{
+        diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer},
+        ContainerLogChunk, ContainerLogRequest, ContentGcRequest, ContentGcResponse,
+        EffectiveConfigRequest, EffectiveConfigResponse, ImageTransferInfo, ImageTransfersRequest,
+        ImageTransfersResponse, NriStatusRequest, NriStatusResponse, RecoveryCheckRequest,
+        RecoveryCheckResponse, RecoveryStatusRequest, RecoveryStatusResponse, RuntimeHandlerInfo,
+        RuntimeHandlersRequest, RuntimeHandlersResponse, SecurityStatusRequest,
+        SecurityStatusResponse, ServerInfoRequest, ServerInfoResponse, ShimStatusRequest,
+        ShimStatusResponse,
+    },
+    runtime::v1::{
+        image_service_server::{ImageService, ImageServiceServer},
+        runtime_service_server::{RuntimeService, RuntimeServiceServer},
+        *,
+    },
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
@@ -49,6 +61,11 @@ struct MockImageService {
 }
 
 #[derive(Clone, Default)]
+struct MockDiagnosticsService {
+    state: MockState,
+}
+
+#[derive(Clone, Default)]
 struct MockState {
     version_requests: Arc<AtomicUsize>,
     status_requests: Arc<AtomicUsize>,
@@ -78,6 +95,9 @@ struct MockState {
     image_fs_info_requests: Arc<AtomicUsize>,
     pull_image_requests: Arc<AtomicUsize>,
     remove_image_requests: Arc<AtomicUsize>,
+    effective_config_requests: Arc<AtomicUsize>,
+    runtime_handlers_requests: Arc<AtomicUsize>,
+    image_transfers_requests: Arc<AtomicUsize>,
     last_update_runtime_config: Arc<Mutex<Option<UpdateRuntimeConfigRequest>>>,
     last_run_pod: Arc<Mutex<Option<RunPodSandboxRequest>>>,
     last_stop_pod: Arc<Mutex<Option<StopPodSandboxRequest>>>,
@@ -101,6 +121,8 @@ struct MockState {
     rpc_sequence: Arc<Mutex<Vec<String>>>,
     last_pull_image: Arc<Mutex<Option<PullImageRequest>>>,
     last_remove_image: Arc<Mutex<Option<RemoveImageRequest>>>,
+    last_effective_config: Arc<Mutex<Option<EffectiveConfigRequest>>>,
+    last_image_transfers: Arc<Mutex<Option<ImageTransfersRequest>>>,
 }
 
 #[tonic::async_trait]
@@ -933,6 +955,160 @@ impl ImageService for MockImageService {
     }
 }
 
+#[tonic::async_trait]
+impl DiagnosticsService for MockDiagnosticsService {
+    async fn server_info(
+        &self,
+        _request: Request<ServerInfoRequest>,
+    ) -> Result<Response<ServerInfoResponse>, Status> {
+        Ok(Response::new(ServerInfoResponse {
+            version: "0.1.0".into(),
+            git_commit: "test".into(),
+            config_path: "/etc/crius/crius.conf".into(),
+            state_dir: "/run/crius".into(),
+            socket_path: "/run/crius/crius.sock".into(),
+        }))
+    }
+
+    async fn effective_config(
+        &self,
+        request: Request<EffectiveConfigRequest>,
+    ) -> Result<Response<EffectiveConfigResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .effective_config_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_effective_config
+            .lock()
+            .expect("last effective config lock") = Some(request);
+
+        Ok(Response::new(EffectiveConfigResponse {
+            config_json: serde_json::json!({
+                "reload": {
+                    "watcherStatus": "running",
+                    "lastReloadAtUnixMillis": 1234,
+                    "lastReloadError": null,
+                    "lastCniWatchError": "template pending"
+                },
+                "image": {
+                    "snapshotter": "internal-overlay-untar",
+                    "signaturePolicy": "/etc/containers/policy.json",
+                    "globalAuthFile": "/var/lib/crius/auth.json",
+                    "password": "<redacted>",
+                    "pinnedImages": ["registry.example/static:*"]
+                }
+            })
+            .to_string(),
+            redacted_fields: vec!["image.password".into()],
+            warnings: vec![],
+        }))
+    }
+
+    async fn runtime_handlers(
+        &self,
+        _request: Request<RuntimeHandlersRequest>,
+    ) -> Result<Response<RuntimeHandlersResponse>, Status> {
+        self.state
+            .runtime_handlers_requests
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(Response::new(RuntimeHandlersResponse {
+            handlers: vec![RuntimeHandlerInfo {
+                name: "runc".into(),
+                runtime_type: "io.containerd.runc.v2".into(),
+                runtime_path: "/usr/bin/runc".into(),
+                runtime_config_path: "/etc/crius/runc.toml".into(),
+                features: vec!["snapshotter=internal-overlay-untar".into()],
+                warnings: vec![],
+            }],
+        }))
+    }
+
+    async fn image_transfers(
+        &self,
+        request: Request<ImageTransfersRequest>,
+    ) -> Result<Response<ImageTransfersResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .image_transfers_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_image_transfers
+            .lock()
+            .expect("last image transfers lock") = Some(request);
+        Ok(Response::new(ImageTransfersResponse {
+            transfers: vec![
+                ImageTransferInfo {
+                    image: "busybox:latest".into(),
+                    status: "running".into(),
+                    updated_at_unix_nanos: 2_000_000_000,
+                    error: String::new(),
+                },
+                ImageTransferInfo {
+                    image: "done:latest".into(),
+                    status: "succeeded".into(),
+                    updated_at_unix_nanos: 1_000_000_000,
+                    error: String::new(),
+                },
+            ],
+        }))
+    }
+
+    async fn recovery_status(
+        &self,
+        _request: Request<RecoveryStatusRequest>,
+    ) -> Result<Response<RecoveryStatusResponse>, Status> {
+        Ok(Response::new(RecoveryStatusResponse::default()))
+    }
+
+    async fn recovery_check(
+        &self,
+        _request: Request<RecoveryCheckRequest>,
+    ) -> Result<Response<RecoveryCheckResponse>, Status> {
+        Ok(Response::new(RecoveryCheckResponse::default()))
+    }
+
+    async fn nri_status(
+        &self,
+        _request: Request<NriStatusRequest>,
+    ) -> Result<Response<NriStatusResponse>, Status> {
+        Ok(Response::new(NriStatusResponse::default()))
+    }
+
+    async fn security_status(
+        &self,
+        _request: Request<SecurityStatusRequest>,
+    ) -> Result<Response<SecurityStatusResponse>, Status> {
+        Ok(Response::new(SecurityStatusResponse::default()))
+    }
+
+    async fn shim_status(
+        &self,
+        _request: Request<ShimStatusRequest>,
+    ) -> Result<Response<ShimStatusResponse>, Status> {
+        Ok(Response::new(ShimStatusResponse::default()))
+    }
+
+    async fn content_gc(
+        &self,
+        _request: Request<ContentGcRequest>,
+    ) -> Result<Response<ContentGcResponse>, Status> {
+        Ok(Response::new(ContentGcResponse::default()))
+    }
+
+    type ContainerLogStream = ReceiverStream<Result<ContainerLogChunk, Status>>;
+
+    async fn container_log(
+        &self,
+        _request: Request<ContainerLogRequest>,
+    ) -> Result<Response<Self::ContainerLogStream>, Status> {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn version_command_reaches_mock_runtime_service() {
     let state = MockState::default();
@@ -1054,11 +1230,73 @@ async fn runtime_update_validates_cidr_and_calls_update_runtime_config() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_commands_use_diagnostics_effective_config_and_redact_sensitive_fields() {
+    let state = MockState::default();
+    let config_requests = Arc::clone(&state.effective_config_requests);
+    let last_config = Arc::clone(&state.last_effective_config);
+    let endpoint = spawn_mock_services(state).await;
+
+    let show = run_crs(endpoint, ["--output", "json", "config", "show"]);
+    assert_success(&show);
+    let stdout = String::from_utf8(show.stdout).expect("stdout should be utf8");
+    assert!(!stdout.contains("secret"));
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("stdout json");
+    assert_eq!(value["kind"], "EffectiveConfig");
+    assert_eq!(
+        value["items"][0]["config"]["image"]["password"],
+        "<redacted>"
+    );
+    assert_eq!(value["items"][0]["redactedFields"][0], "image.password");
+
+    let request = last_config
+        .lock()
+        .expect("last effective config lock")
+        .clone()
+        .expect("effective config request should be recorded");
+    assert!(!request.include_sensitive);
+
+    let reload = run_crs(endpoint, ["--output", "json", "config", "reload-status"]);
+    assert_success(&reload);
+    let value = stdout_json(&reload);
+    assert_eq!(value["kind"], "ConfigReloadStatus");
+    assert_eq!(value["items"][0]["watcher"], "running");
+    assert_eq!(value["items"][0]["cniWatcher"], "template pending");
+    assert_eq!(config_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_handlers_uses_diagnostics_and_reports_kind() {
+    let state = MockState::default();
+    let requests = Arc::clone(&state.runtime_handlers_requests);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(
+        endpoint,
+        ["--output", "json", "runtime", "handlers", "--verbose"],
+    );
+
+    assert_success(&output);
+    let value = stdout_json(&output);
+    assert_eq!(value["kind"], "RuntimeHandlers");
+    assert_eq!(value["items"][0]["name"], "runc");
+    assert_eq!(
+        value["items"][0]["features"][0],
+        "snapshotter=internal-overlay-untar"
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn image_read_only_commands_return_expected_kinds() {
     let state = MockState::default();
     let list_requests = Arc::clone(&state.list_image_requests);
     let inspect_requests = Arc::clone(&state.image_inspect_requests);
     let fs_requests = Arc::clone(&state.image_fs_info_requests);
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("busybox:latest".to_string());
     let endpoint = spawn_mock_services(state).await;
 
     let list = run_crs(
@@ -1102,6 +1340,38 @@ async fn image_read_only_commands_return_expected_kinds() {
     assert_eq!(list_requests.load(Ordering::SeqCst), 2);
     assert_eq!(inspect_requests.load(Ordering::SeqCst), 1);
     assert_eq!(fs_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_diagnostics_commands_report_transfers_and_config_without_secrets() {
+    let state = MockState::default();
+    let transfer_requests = Arc::clone(&state.image_transfers_requests);
+    let last_transfers = Arc::clone(&state.last_image_transfers);
+    let endpoint = spawn_mock_services(state).await;
+
+    let transfers = run_crs(endpoint, ["--output", "json", "image", "transfers"]);
+    assert_success(&transfers);
+    let value = stdout_json(&transfers);
+    assert_eq!(value["kind"], "ImageTransfers");
+    assert_eq!(value["summary"]["count"], 1);
+    assert_eq!(value["items"][0]["image"], "busybox:latest");
+    assert_eq!(transfer_requests.load(Ordering::SeqCst), 1);
+    let request = last_transfers
+        .lock()
+        .expect("last image transfers lock")
+        .clone()
+        .expect("image transfers request should be recorded");
+    assert!(!request.include_completed);
+
+    let config = run_crs(endpoint, ["--output", "json", "image", "config"]);
+    assert_success(&config);
+    let stdout = String::from_utf8(config.stdout).expect("stdout should be utf8");
+    assert!(!stdout.contains("secret"));
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("stdout json");
+    assert_eq!(value["kind"], "ImageConfig");
+    assert_eq!(value["items"][0]["snapshotter"], "internal-overlay-untar");
+    assert_eq!(value["items"][0]["authConfigured"], "configured");
+    assert_eq!(value["items"][0]["config"]["password"], "<redacted>");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2320,6 +2590,11 @@ async fn shortcut_rm_resolves_unique_container_pod_or_image_target() {
     let remove_container_requests = Arc::clone(&state.remove_container_requests);
     let remove_pod_requests = Arc::clone(&state.remove_pod_requests);
     let remove_image_requests = Arc::clone(&state.remove_image_requests);
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("image-only".to_string());
     let endpoint = spawn_mock_services(state).await;
 
     let container_rm = run_crs(endpoint, ["--output", "json", "rm", "ctr-only"]);
@@ -2564,7 +2839,12 @@ async fn spawn_mock_services(state: MockState) -> SocketAddr {
             .add_service(RuntimeServiceServer::new(MockRuntimeService {
                 state: state.clone(),
             }))
-            .add_service(ImageServiceServer::new(MockImageService { state }))
+            .add_service(ImageServiceServer::new(MockImageService {
+                state: state.clone(),
+            }))
+            .add_service(DiagnosticsServiceServer::new(MockDiagnosticsService {
+                state,
+            }))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .expect("mock server should serve");

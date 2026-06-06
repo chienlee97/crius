@@ -373,12 +373,144 @@ impl TableRow for RuntimeConfigUpdateView {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct EffectiveConfigView {
+    pub config: Value,
+    pub redacted_fields: Vec<String>,
+}
+
+impl TableRow for EffectiveConfigView {
+    fn headers() -> &'static [&'static str] {
+        &["REDACTED FIELDS", "CONFIG KEYS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.redacted_fields.join(","),
+            value_object_keys(&self.config).join(","),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfigReloadStatusView {
+    pub watcher: String,
+    pub last_reload: String,
+    pub last_error: String,
+    pub cni_watcher: String,
+}
+
+impl TableRow for ConfigReloadStatusView {
+    fn headers() -> &'static [&'static str] {
+        &["WATCHER", "LAST RELOAD", "LAST ERROR", "CNI WATCHER"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.watcher.clone(),
+            self.last_reload.clone(),
+            self.last_error.clone(),
+            self.cni_watcher.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeHandlerView {
+    pub name: String,
+    pub runtime_type: String,
+    pub runtime_path: String,
+    pub runtime_config_path: String,
+    pub features: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl TableRow for RuntimeHandlerView {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "TYPE", "PATH", "CONFIG", "FEATURES", "WARNINGS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.name.clone(),
+            self.runtime_type.clone(),
+            self.runtime_path.clone(),
+            self.runtime_config_path.clone(),
+            self.features.join(","),
+            self.warnings.join(","),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.name.clone()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImageTransferView {
+    pub image: String,
+    pub status: String,
+    pub updated: String,
+    pub error: String,
+}
+
+impl TableRow for ImageTransferView {
+    fn headers() -> &'static [&'static str] {
+        &["IMAGE", "STATUS", "UPDATED", "ERROR"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.image.clone(),
+            self.status.clone(),
+            self.updated.clone(),
+            self.error.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImageConfigView {
+    pub snapshotter: String,
+    pub policy: String,
+    pub auth_configured: String,
+    pub pinned_images: String,
+    pub config: Value,
+}
+
+impl TableRow for ImageConfigView {
+    fn headers() -> &'static [&'static str] {
+        &["SNAPSHOTTER", "POLICY", "AUTH", "PINNED IMAGES"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.snapshotter.clone(),
+            self.policy.clone(),
+            self.auth_configured.clone(),
+            self.pinned_images.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ImageView {
     pub image: String,
     pub image_id: String,
     pub size_bytes: u64,
     pub user_spec: String,
     pub pinned: bool,
+}
+
+fn value_object_keys(value: &Value) -> Vec<String> {
+    value
+        .as_object()
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 impl TableRow for ImageView {
