@@ -1543,6 +1543,27 @@ async fn version_json_envelope_has_expected_kind() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn golden_version_outputs_are_stable() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+
+    let table = run_crs(endpoint, ["version"]);
+    assert_success(&table);
+    assert_stdout(
+        &table,
+        "RUNTIME     VERSION  API VERSION\ncrius-test  9.8.7    v1\n",
+    );
+
+    let json = run_crs(endpoint, ["--output", "json", "version"]);
+    assert_success(&json);
+    let value = stdout_json(&json);
+    assert_eq!(value["kind"], "RuntimeVersion");
+    assert_eq!(value["summary"]["count"], 1);
+    assert_eq!(value["items"][0]["runtimeName"], "crius-test");
+    assert_eq!(value["items"][0]["runtimeVersion"], "9.8.7");
+    assert_eq!(value["items"][0]["runtimeApiVersion"], "v1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_table_and_verbose_json_report_conditions_and_warnings() {
     let state = MockState::default();
     let status_requests = Arc::clone(&state.status_requests);
@@ -1570,6 +1591,32 @@ async fn status_table_and_verbose_json_report_conditions_and_warnings() {
         .expect("warning")
         .contains("bad"));
     assert_eq!(status_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn golden_status_outputs_are_stable() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+
+    let table = run_crs(endpoint, ["status"]);
+    assert_success(&table);
+    assert_stdout(
+        &table,
+        "RUNTIME READY  NETWORK READY  CONDITIONS\ntrue           false          2\n",
+    );
+
+    let json = run_crs(endpoint, ["--output", "json", "status", "--verbose"]);
+    assert_success(&json);
+    let value = stdout_json(&json);
+    assert_eq!(value["kind"], "RuntimeStatus");
+    assert_eq!(value["summary"]["count"], 1);
+    assert_eq!(value["items"][0]["runtimeReady"], true);
+    assert_eq!(value["items"][0]["networkReady"], false);
+    assert_eq!(value["items"][0]["conditions"][0]["kind"], "RuntimeReady");
+    assert_eq!(value["items"][0]["conditions"][1]["kind"], "NetworkReady");
+    assert_eq!(
+        value["warnings"][0],
+        "failed to parse verbose info field \"bad\" as JSON: expected ident at line 1 column 2"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1740,6 +1787,29 @@ async fn image_read_only_commands_return_expected_kinds() {
     assert_eq!(list_requests.load(Ordering::SeqCst), 2);
     assert_eq!(inspect_requests.load(Ordering::SeqCst), 1);
     assert_eq!(fs_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn golden_image_list_outputs_are_stable() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+
+    let table = run_crs(endpoint, ["image", "list"]);
+    assert_success(&table);
+    assert_stdout(
+        &table,
+        "IMAGE           IMAGE ID          SIZE    USER SPEC       PINNED\nbusybox:latest  sha256:testimage  1.0KiB  busybox:latest  false\n",
+    );
+
+    let json = run_crs(endpoint, ["--output", "json", "image", "list"]);
+    assert_success(&json);
+    let value = stdout_json(&json);
+    assert_eq!(value["kind"], "ImageList");
+    assert_eq!(value["summary"]["count"], 1);
+    assert_eq!(value["items"][0]["image"], "busybox:latest");
+    assert_eq!(value["items"][0]["imageId"], "sha256:testimage");
+    assert_eq!(value["items"][0]["sizeBytes"], 1024);
+    assert_eq!(value["items"][0]["userSpec"], "busybox:latest");
+    assert_eq!(value["items"][0]["pinned"], false);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2188,6 +2258,53 @@ async fn pod_and_container_lists_and_shortcuts_use_running_filters() {
 
     assert_eq!(pod_requests.load(Ordering::SeqCst), 2);
     assert_eq!(container_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn golden_pod_list_outputs_are_stable() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+
+    let table = run_crs(endpoint, ["pod", "list"]);
+    assert_success(&table);
+    assert_stdout(
+        &table,
+        "POD ID        NAME   NAMESPACE  STATE  IP  CREATED  ATTEMPT\npod123456789  pod-a  default    ready  -   42       1\n",
+    );
+
+    let json = run_crs(endpoint, ["--output", "json", "pod", "list"]);
+    assert_success(&json);
+    let value = stdout_json(&json);
+    assert_eq!(value["kind"], "PodList");
+    assert_eq!(value["summary"]["count"], 1);
+    assert_eq!(value["items"][0]["podId"], "pod123456789");
+    assert_eq!(value["items"][0]["name"], "pod-a");
+    assert_eq!(value["items"][0]["namespace"], "default");
+    assert_eq!(value["items"][0]["state"], "ready");
+    assert_eq!(value["items"][0]["attempt"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn golden_container_list_outputs_are_stable() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+
+    let table = run_crs(endpoint, ["container", "list"]);
+    assert_success(&table);
+    assert_stdout(
+        &table,
+        "CONTAINER ID  POD           IMAGE           STATE    CREATED  NAME   ATTEMPT\nctr123456789  pod123456789  busybox:latest  running  42       ctr-a  2\n",
+    );
+
+    let json = run_crs(endpoint, ["--output", "json", "container", "list"]);
+    assert_success(&json);
+    let value = stdout_json(&json);
+    assert_eq!(value["kind"], "ContainerList");
+    assert_eq!(value["summary"]["count"], 1);
+    assert_eq!(value["items"][0]["containerId"], "ctr123456789");
+    assert_eq!(value["items"][0]["pod"], "pod123456789");
+    assert_eq!(value["items"][0]["image"], "busybox:latest");
+    assert_eq!(value["items"][0]["state"], "running");
+    assert_eq!(value["items"][0]["name"], "ctr-a");
+    assert_eq!(value["items"][0]["attempt"], 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3959,6 +4076,11 @@ fn assert_success(output: &std::process::Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn assert_stdout(output: &std::process::Output, expected: &str) {
+    let stdout = String::from_utf8(output.stdout.clone()).expect("stdout should be utf8");
+    assert_eq!(stdout, expected);
 }
 
 fn stdout_json(output: &std::process::Output) -> serde_json::Value {
