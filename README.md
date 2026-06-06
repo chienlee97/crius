@@ -272,6 +272,25 @@ cargo test
 make release-gate
 ```
 
+Release gate commands:
+
+```bash
+cargo fmt --check
+cargo build --features shim --bins
+cargo test --features shim
+cargo run --bin crs -- completion bash >/tmp/crs.bash
+test -s /tmp/crs.bash
+```
+
+Optional manual validation on a prepared node:
+
+```bash
+sudo systemctl restart crius
+crs status
+crs version
+crs image list
+```
+
 Additional gated tests are available when the environment has the required
 external dependencies:
 
