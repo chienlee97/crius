@@ -123,7 +123,24 @@ make build
 ```
 
 `make build` currently builds the default `crius` binary. Use
-`cargo build --features shim --bins` when you also need `crius-shim`.
+`cargo build --features shim --bins` when you also need `crius-shim` and the
+local `crs` client.
+
+Build only the local `crs` client:
+
+```bash
+cargo build --bin crs
+```
+
+`crs` connects to `unix:///run/crius/crius.sock` by default. Override the daemon
+endpoint with `--address` or `CRIUS_ADDRESS`, and tune request behavior with the
+global `--connect-timeout`, `--timeout`, `--debug`, `--output table|json|text`,
+`--quiet`, and `--no-trunc` options.
+
+`crs` is the project-native local client for development validation, node
+diagnostics, and daemon maintenance workflows. `crictl` remains the standard
+Kubernetes CRI conformance and interoperability tool; use it when comparing
+behavior with other runtimes or following kubelet-oriented operational guides.
 
 ## Quick Start
 
