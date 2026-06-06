@@ -97,6 +97,9 @@ struct MockState {
     container_events_requests: Arc<AtomicUsize>,
     container_stats_requests: Arc<AtomicUsize>,
     list_container_stats_requests: Arc<AtomicUsize>,
+    pod_stats_requests: Arc<AtomicUsize>,
+    list_pod_stats_requests: Arc<AtomicUsize>,
+    list_pod_metrics_requests: Arc<AtomicUsize>,
     list_pod_requests: Arc<AtomicUsize>,
     pod_inspect_requests: Arc<AtomicUsize>,
     list_container_requests: Arc<AtomicUsize>,
@@ -132,6 +135,8 @@ struct MockState {
     last_port_forward: Arc<Mutex<Option<PortForwardRequest>>>,
     last_container_stats: Arc<Mutex<Option<ContainerStatsRequest>>>,
     last_list_container_stats: Arc<Mutex<Option<ListContainerStatsRequest>>>,
+    last_pod_stats: Arc<Mutex<Option<PodSandboxStatsRequest>>>,
+    last_list_pod_stats: Arc<Mutex<Option<ListPodSandboxStatsRequest>>>,
     exec_url: Arc<Mutex<Option<String>>>,
     attach_url: Arc<Mutex<Option<String>>>,
     port_forward_url: Arc<Mutex<Option<String>>>,
@@ -724,16 +729,46 @@ impl RuntimeService for MockRuntimeService {
             )],
         }))
     }
-    unimplemented_runtime_rpc!(
-        pod_sandbox_stats,
-        PodSandboxStatsRequest,
-        PodSandboxStatsResponse
-    );
-    unimplemented_runtime_rpc!(
-        list_pod_sandbox_stats,
-        ListPodSandboxStatsRequest,
-        ListPodSandboxStatsResponse
-    );
+    async fn pod_sandbox_stats(
+        &self,
+        request: Request<PodSandboxStatsRequest>,
+    ) -> Result<Response<PodSandboxStatsResponse>, Status> {
+        let request = request.into_inner();
+        let pod = request.pod_sandbox_id.clone();
+        self.state.pod_stats_requests.fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_pod_stats
+            .lock()
+            .expect("last pod stats lock") = Some(request);
+
+        if pod == "missing" {
+            return Err(Status::not_found("pod not found"));
+        }
+
+        Ok(Response::new(PodSandboxStatsResponse {
+            stats: Some(test_pod_stats(&pod, "pod-single")),
+        }))
+    }
+
+    async fn list_pod_sandbox_stats(
+        &self,
+        request: Request<ListPodSandboxStatsRequest>,
+    ) -> Result<Response<ListPodSandboxStatsResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .list_pod_stats_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_list_pod_stats
+            .lock()
+            .expect("last list pod stats lock") = Some(request);
+
+        Ok(Response::new(ListPodSandboxStatsResponse {
+            stats: vec![test_pod_stats("pod-stats-a", "pod-a")],
+        }))
+    }
     async fn update_runtime_config(
         &self,
         request: Request<UpdateRuntimeConfigRequest>,
@@ -877,11 +912,18 @@ impl RuntimeService for MockRuntimeService {
         ListMetricDescriptorsRequest,
         ListMetricDescriptorsResponse
     );
-    unimplemented_runtime_rpc!(
-        list_pod_sandbox_metrics,
-        ListPodSandboxMetricsRequest,
-        ListPodSandboxMetricsResponse
-    );
+    async fn list_pod_sandbox_metrics(
+        &self,
+        _request: Request<ListPodSandboxMetricsRequest>,
+    ) -> Result<Response<ListPodSandboxMetricsResponse>, Status> {
+        self.state
+            .list_pod_metrics_requests
+            .fetch_add(1, Ordering::SeqCst);
+
+        Ok(Response::new(ListPodSandboxMetricsResponse {
+            pod_metrics: vec![test_pod_metrics()],
+        }))
+    }
     async fn runtime_config(
         &self,
         _request: Request<RuntimeConfigRequest>,
@@ -3413,6 +3455,80 @@ async fn container_stats_single_and_list_paths_share_view_shape() {
     assert_eq!(list_requests.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pod_stats_single_and_list_paths_report_resource_columns() {
+    let state = MockState::default();
+    let single_requests = Arc::clone(&state.pod_stats_requests);
+    let list_requests = Arc::clone(&state.list_pod_stats_requests);
+    let last_single = Arc::clone(&state.last_pod_stats);
+    let last_list = Arc::clone(&state.last_list_pod_stats);
+    let endpoint = spawn_mock_services(state).await;
+
+    let single = run_crs(endpoint, ["--output", "json", "pod", "stats", "pod123"]);
+    assert_success(&single);
+    let value = stdout_json(&single);
+    assert_eq!(value["kind"], "PodStats");
+    assert_eq!(value["items"][0]["id"], "pod123");
+    assert_eq!(value["items"][0]["cpuNanoCores"], 750_000_000);
+    assert_eq!(value["items"][0]["memoryBytes"], 16_384);
+    assert_eq!(value["items"][0]["networkBytes"], 1536);
+    assert_eq!(value["items"][0]["pids"], 12);
+    assert_eq!(
+        last_single
+            .lock()
+            .expect("last pod stats lock")
+            .clone()
+            .expect("pod stats request")
+            .pod_sandbox_id,
+        "pod123"
+    );
+
+    let listed = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "pod",
+            "stats",
+            "--label",
+            "tier=frontend",
+        ],
+    );
+    assert_success(&listed);
+    let value = stdout_json(&listed);
+    assert_eq!(value["kind"], "PodStats");
+    assert_eq!(value["items"][0]["id"], "pod-stats-a");
+    let request = last_list
+        .lock()
+        .expect("last list pod stats lock")
+        .clone()
+        .expect("list pod stats request");
+    let filter = request.filter.expect("pod stats filter");
+    assert_eq!(filter.label_selector["tier"], "frontend");
+
+    assert_eq!(single_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(list_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pod_metrics_reports_items_and_count_summary() {
+    let state = MockState::default();
+    let requests = Arc::clone(&state.list_pod_metrics_requests);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["--output", "json", "pod", "metrics"]);
+
+    assert_success(&output);
+    let value = stdout_json(&output);
+    assert_eq!(value["kind"], "PodMetrics");
+    assert_eq!(value["items"][0]["podId"], "pod-metrics-a");
+    assert_eq!(value["items"][0]["podMetricCount"], 1);
+    assert_eq!(value["items"][0]["containerMetricCount"], 2);
+    assert_eq!(value["summary"]["count"], 3);
+    assert_eq!(value["summary"]["totalMetrics"], 3);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn json_error_is_written_to_stderr_with_empty_stdout() {
     let socket_dir = tempfile::tempdir().expect("tempdir should be created");
@@ -3560,6 +3676,87 @@ fn test_container_stats(
         }),
         writable_layer: None,
         swap: None,
+    }
+}
+
+fn test_pod_stats(id: &str, name: &str) -> PodSandboxStats {
+    PodSandboxStats {
+        attributes: Some(PodSandboxAttributes {
+            id: id.to_string(),
+            metadata: Some(PodSandboxMetadata {
+                name: name.to_string(),
+                uid: format!("uid-{name}"),
+                namespace: "default".into(),
+                attempt: 1,
+            }),
+            labels: Default::default(),
+            annotations: Default::default(),
+        }),
+        linux: Some(LinuxPodSandboxStats {
+            cpu: Some(CpuUsage {
+                timestamp: 1_000_000_000,
+                usage_core_nano_seconds: Some(UInt64Value { value: 3 }),
+                usage_nano_cores: Some(UInt64Value { value: 750_000_000 }),
+            }),
+            memory: Some(MemoryUsage {
+                timestamp: 1_000_000_000,
+                working_set_bytes: Some(UInt64Value { value: 16_384 }),
+                available_bytes: None,
+                usage_bytes: None,
+                rss_bytes: None,
+                page_faults: None,
+                major_page_faults: None,
+            }),
+            network: Some(NetworkUsage {
+                timestamp: 1_000_000_000,
+                default_interface: Some(NetworkInterfaceUsage {
+                    name: "eth0".into(),
+                    rx_bytes: Some(UInt64Value { value: 1024 }),
+                    rx_errors: None,
+                    tx_bytes: Some(UInt64Value { value: 512 }),
+                    tx_errors: None,
+                }),
+                interfaces: Vec::new(),
+            }),
+            process: Some(ProcessUsage {
+                timestamp: 1_000_000_000,
+                process_count: Some(UInt64Value { value: 12 }),
+            }),
+            containers: Vec::new(),
+        }),
+        windows: None,
+    }
+}
+
+fn test_pod_metrics() -> PodSandboxMetrics {
+    PodSandboxMetrics {
+        pod_sandbox_id: "pod-metrics-a".into(),
+        metrics: vec![Metric {
+            name: "pod_cpu_usage_seconds_total".into(),
+            timestamp: 1_000_000_000,
+            metric_type: MetricType::Counter as i32,
+            label_values: vec!["default".into()],
+            value: Some(UInt64Value { value: 7 }),
+        }],
+        container_metrics: vec![ContainerMetrics {
+            container_id: "ctr-metrics-a".into(),
+            metrics: vec![
+                Metric {
+                    name: "container_memory_working_set_bytes".into(),
+                    timestamp: 1_000_000_000,
+                    metric_type: MetricType::Gauge as i32,
+                    label_values: vec!["ctr-a".into()],
+                    value: Some(UInt64Value { value: 8192 }),
+                },
+                Metric {
+                    name: "container_cpu_usage_seconds_total".into(),
+                    timestamp: 1_000_000_000,
+                    metric_type: MetricType::Counter as i32,
+                    label_values: vec!["ctr-a".into()],
+                    value: Some(UInt64Value { value: 3 }),
+                },
+            ],
+        }],
     }
 }
 

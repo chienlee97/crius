@@ -910,6 +910,76 @@ impl TableRow for ResourceUsageView {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct PodStatsView {
+    pub id: String,
+    pub name: String,
+    pub namespace: String,
+    pub cpu_nano_cores: u64,
+    pub memory_bytes: u64,
+    pub network_bytes: u64,
+    pub pids: u64,
+}
+
+impl TableRow for PodStatsView {
+    fn headers() -> &'static [&'static str] {
+        &[
+            "POD ID",
+            "NAME",
+            "NAMESPACE",
+            "CPU",
+            "MEMORY",
+            "NETWORK",
+            "PIDS",
+        ]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.id.clone(),
+            self.name.clone(),
+            self.namespace.clone(),
+            format_cpu_millis(self.cpu_nano_cores),
+            format_bytes(self.memory_bytes),
+            format_bytes(self.network_bytes),
+            self.pids.to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.id.clone()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PodMetricsView {
+    pub pod_id: String,
+    pub pod_metric_count: usize,
+    pub container_metric_count: usize,
+    pub total_metric_count: usize,
+}
+
+impl TableRow for PodMetricsView {
+    fn headers() -> &'static [&'static str] {
+        &["POD ID", "POD METRICS", "CONTAINER METRICS", "TOTAL"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.pod_id.clone(),
+            self.pod_metric_count.to_string(),
+            self.container_metric_count.to_string(),
+            self.total_metric_count.to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.pod_id.clone()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct OperationView {
     pub target: String,
     pub status: String,

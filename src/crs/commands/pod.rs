@@ -1,17 +1,19 @@
 use crate::crs::{
-    args::{PodCommand, PodCreateArgs, PodListArgs, PodStateArg},
+    args::{PodCommand, PodCreateArgs, PodListArgs, PodStateArg, PodStatsArgs},
     builders::{build_pod_sandbox_config, build_resources_from_specs},
     client::CrsClient,
     commands::status::{parse_info_map, render_and_print},
     context::CliContext,
     error::{CliError, CommandResult},
-    format::{CommandOutput, InspectView, PodOperationView, PodView},
+    format::{CommandOutput, InspectView, PodMetricsView, PodOperationView, PodStatsView, PodView},
     parsers::parse_key_value,
 };
 use crate::proto::runtime::v1::{
-    ListPodSandboxRequest, PodSandbox, PodSandboxFilter, PodSandboxState, PodSandboxStateValue,
-    PodSandboxStatus, PodSandboxStatusRequest, RemovePodSandboxRequest, RunPodSandboxRequest,
-    StopPodSandboxRequest, UpdatePodSandboxResourcesRequest,
+    ListPodSandboxMetricsRequest, ListPodSandboxRequest, ListPodSandboxStatsRequest, PodSandbox,
+    PodSandboxFilter, PodSandboxMetrics, PodSandboxState, PodSandboxStateValue, PodSandboxStats,
+    PodSandboxStatsFilter, PodSandboxStatsRequest, PodSandboxStatus, PodSandboxStatusRequest,
+    RemovePodSandboxRequest, RunPodSandboxRequest, StopPodSandboxRequest,
+    UpdatePodSandboxResourcesRequest,
 };
 
 pub(crate) async fn handle(
@@ -25,8 +27,8 @@ pub(crate) async fn handle(
         PodCommand::Run(args) => handle_run(ctx, client, *args).await,
         PodCommand::Stop { pod, timeout } => handle_stop(ctx, client, pod, timeout).await,
         PodCommand::Remove { pod } => handle_remove(ctx, client, pod).await,
-        PodCommand::Stats(_) => Err(CliError::not_implemented("crs pod stats")),
-        PodCommand::Metrics => Err(CliError::not_implemented("crs pod metrics")),
+        PodCommand::Stats(args) => handle_stats(ctx, client, args).await,
+        PodCommand::Metrics => handle_metrics(ctx, client).await,
         PodCommand::UpdateResources {
             pod,
             overhead,
@@ -251,6 +253,103 @@ pub(crate) async fn handle_remove(
     )
 }
 
+pub(crate) async fn handle_stats(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: PodStatsArgs,
+) -> Result<CommandResult, CliError> {
+    if let Some(pod) = args.pod {
+        if pod.is_empty() {
+            return Err(
+                CliError::invalid_input("pod must not be empty").with_command("crs pod stats")
+            );
+        }
+        let mut runtime = client.runtime()?;
+        let response = client
+            .with_rpc_timeout(async {
+                runtime
+                    .pod_sandbox_stats(PodSandboxStatsRequest {
+                        pod_sandbox_id: pod.clone(),
+                    })
+                    .await
+                    .map_err(|status| {
+                        CliError::from_tonic_status(status)
+                            .with_command("crs pod stats")
+                            .with_endpoint(client.endpoint())
+                            .with_object(format!("pod {pod}"))
+                    })
+            })
+            .await?
+            .into_inner();
+        let items = response.stats.into_iter().map(pod_stats_view).collect();
+        return render_and_print(
+            ctx,
+            CommandOutput::new("PodStats", client.endpoint(), items),
+        );
+    }
+
+    let filter = pod_stats_filter(None, args.labels)?;
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .list_pod_sandbox_stats(ListPodSandboxStatsRequest { filter })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs pod stats")
+                        .with_endpoint(client.endpoint())
+                })
+        })
+        .await?
+        .into_inner();
+    let items = response.stats.into_iter().map(pod_stats_view).collect();
+
+    render_and_print(
+        ctx,
+        CommandOutput::new("PodStats", client.endpoint(), items),
+    )
+}
+
+pub(crate) async fn handle_metrics(
+    ctx: &CliContext,
+    client: &CrsClient,
+) -> Result<CommandResult, CliError> {
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .list_pod_sandbox_metrics(ListPodSandboxMetricsRequest {})
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs pod metrics")
+                        .with_endpoint(client.endpoint())
+                })
+        })
+        .await?
+        .into_inner();
+    let items = response
+        .pod_metrics
+        .into_iter()
+        .map(pod_metrics_view)
+        .collect::<Vec<_>>();
+    let total_metrics = items
+        .iter()
+        .map(|item| item.total_metric_count)
+        .sum::<usize>();
+
+    render_and_print(
+        ctx,
+        CommandOutput::new("PodMetrics", client.endpoint(), items).with_summary(
+            serde_json::json!({
+                "count": total_metrics,
+                "totalMetrics": total_metrics,
+            }),
+        ),
+    )
+}
+
 pub(crate) async fn handle_update_resources(
     ctx: &CliContext,
     client: &CrsClient,
@@ -338,6 +437,26 @@ pub(crate) fn pod_filter_from_args(
     }))
 }
 
+pub(crate) fn pod_stats_filter(
+    id: Option<String>,
+    labels: Vec<String>,
+) -> Result<Option<PodSandboxStatsFilter>, CliError> {
+    let labels = labels
+        .iter()
+        .map(|label| parse_key_value("--label", label).map(|pair| (pair.key, pair.value)))
+        .collect::<Result<std::collections::HashMap<_, _>, _>>()
+        .map_err(CliError::invalid_input)?;
+
+    if id.is_none() && labels.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(PodSandboxStatsFilter {
+        id: id.unwrap_or_default(),
+        label_selector: labels,
+    }))
+}
+
 pub(crate) fn pod_view(pod: PodSandbox) -> PodView {
     let metadata = pod.metadata.unwrap_or_default();
     PodView {
@@ -349,6 +468,83 @@ pub(crate) fn pod_view(pod: PodSandbox) -> PodView {
         created: pod.created_at.to_string(),
         attempt: metadata.attempt,
     }
+}
+
+pub(crate) fn pod_stats_view(stats: PodSandboxStats) -> PodStatsView {
+    let attributes = stats.attributes.unwrap_or_default();
+    let metadata = attributes.metadata.unwrap_or_default();
+    let linux = stats.linux;
+    let cpu_nano_cores = linux
+        .as_ref()
+        .and_then(|linux| linux.cpu.as_ref())
+        .and_then(|cpu| cpu.usage_nano_cores.as_ref())
+        .map(|value| value.value)
+        .unwrap_or_default();
+    let memory_bytes = linux
+        .as_ref()
+        .and_then(|linux| linux.memory.as_ref())
+        .and_then(|memory| memory.working_set_bytes.as_ref())
+        .map(|value| value.value)
+        .unwrap_or_default();
+    let network_bytes = linux
+        .as_ref()
+        .and_then(|linux| linux.network.as_ref())
+        .map(network_bytes)
+        .unwrap_or_default();
+    let pids = linux
+        .as_ref()
+        .and_then(|linux| linux.process.as_ref())
+        .and_then(|process| process.process_count.as_ref())
+        .map(|value| value.value)
+        .unwrap_or_default();
+
+    PodStatsView {
+        id: attributes.id,
+        name: metadata.name,
+        namespace: metadata.namespace,
+        cpu_nano_cores,
+        memory_bytes,
+        network_bytes,
+        pids,
+    }
+}
+
+pub(crate) fn pod_metrics_view(metrics: PodSandboxMetrics) -> PodMetricsView {
+    let pod_metric_count = metrics.metrics.len();
+    let container_metric_count = metrics
+        .container_metrics
+        .iter()
+        .map(|container| container.metrics.len())
+        .sum::<usize>();
+
+    PodMetricsView {
+        pod_id: metrics.pod_sandbox_id,
+        pod_metric_count,
+        container_metric_count,
+        total_metric_count: pod_metric_count + container_metric_count,
+    }
+}
+
+fn network_bytes(network: &crate::proto::runtime::v1::NetworkUsage) -> u64 {
+    let default_bytes = network
+        .default_interface
+        .as_ref()
+        .map(interface_bytes)
+        .unwrap_or_default();
+    default_bytes + network.interfaces.iter().map(interface_bytes).sum::<u64>()
+}
+
+fn interface_bytes(interface: &crate::proto::runtime::v1::NetworkInterfaceUsage) -> u64 {
+    interface
+        .rx_bytes
+        .as_ref()
+        .map(|value| value.value)
+        .unwrap_or_default()
+        + interface
+            .tx_bytes
+            .as_ref()
+            .map(|value| value.value)
+            .unwrap_or_default()
 }
 
 pub(crate) fn pod_state(state: PodStateArg) -> PodSandboxState {
