@@ -551,6 +551,36 @@ impl TableRow for RecoveryActionView {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct GcCandidateView {
+    pub object_type: String,
+    pub object_id: String,
+    pub path: String,
+    pub reason: String,
+    pub size_bytes: u64,
+    pub deleted: bool,
+    pub error: String,
+}
+
+impl TableRow for GcCandidateView {
+    fn headers() -> &'static [&'static str] {
+        &["TYPE", "ID", "SIZE", "DELETED", "ERROR", "REASON", "PATH"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.object_type.clone(),
+            self.object_id.clone(),
+            format_bytes(self.size_bytes),
+            format_bool(self.deleted).to_string(),
+            self.error.clone(),
+            self.reason.clone(),
+            self.path.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ImageView {
     pub image: String,
     pub image_id: String,

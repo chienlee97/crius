@@ -11,13 +11,13 @@ use std::{
 use crius::proto::{
     diagnostics::v1::{
         diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer},
-        ContainerLogChunk, ContainerLogRequest, ContentGcRequest, ContentGcResponse,
-        EffectiveConfigRequest, EffectiveConfigResponse, ImageTransferInfo, ImageTransfersRequest,
-        ImageTransfersResponse, NriStatusRequest, NriStatusResponse, RecoveryAction,
-        RecoveryCheckRequest, RecoveryCheckResponse, RecoveryStatusRequest, RecoveryStatusResponse,
-        RuntimeHandlerInfo, RuntimeHandlersRequest, RuntimeHandlersResponse, SecurityStatusRequest,
-        SecurityStatusResponse, ServerInfoRequest, ServerInfoResponse, ShimStatusRequest,
-        ShimStatusResponse,
+        ContainerLogChunk, ContainerLogRequest, ContentGcCandidate, ContentGcRequest,
+        ContentGcResponse, EffectiveConfigRequest, EffectiveConfigResponse, ImageTransferInfo,
+        ImageTransfersRequest, ImageTransfersResponse, NriStatusRequest, NriStatusResponse,
+        RecoveryAction, RecoveryCheckRequest, RecoveryCheckResponse, RecoveryStatusRequest,
+        RecoveryStatusResponse, RuntimeHandlerInfo, RuntimeHandlersRequest,
+        RuntimeHandlersResponse, SecurityStatusRequest, SecurityStatusResponse, ServerInfoRequest,
+        ServerInfoResponse, ShimStatusRequest, ShimStatusResponse,
     },
     runtime::v1::{
         image_service_server::{ImageService, ImageServiceServer},
@@ -101,6 +101,7 @@ struct MockState {
     container_log_requests: Arc<AtomicUsize>,
     recovery_status_requests: Arc<AtomicUsize>,
     recovery_check_requests: Arc<AtomicUsize>,
+    content_gc_requests: Arc<AtomicUsize>,
     last_update_runtime_config: Arc<Mutex<Option<UpdateRuntimeConfigRequest>>>,
     last_run_pod: Arc<Mutex<Option<RunPodSandboxRequest>>>,
     last_stop_pod: Arc<Mutex<Option<StopPodSandboxRequest>>>,
@@ -128,6 +129,7 @@ struct MockState {
     last_image_transfers: Arc<Mutex<Option<ImageTransfersRequest>>>,
     last_container_log: Arc<Mutex<Option<ContainerLogRequest>>>,
     last_recovery_check: Arc<Mutex<Option<RecoveryCheckRequest>>>,
+    last_content_gc: Arc<Mutex<Option<ContentGcRequest>>>,
 }
 
 #[tonic::async_trait]
@@ -1145,9 +1147,46 @@ impl DiagnosticsService for MockDiagnosticsService {
 
     async fn content_gc(
         &self,
-        _request: Request<ContentGcRequest>,
+        request: Request<ContentGcRequest>,
     ) -> Result<Response<ContentGcResponse>, Status> {
-        Ok(Response::new(ContentGcResponse::default()))
+        let request = request.into_inner();
+        self.state
+            .content_gc_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_content_gc
+            .lock()
+            .expect("last content gc lock") = Some(request.clone());
+        Ok(Response::new(ContentGcResponse {
+            dry_run: !request.execute,
+            candidates: vec![
+                ContentGcCandidate {
+                    object_type: "blob".into(),
+                    object_id: "sha256:unused".into(),
+                    path: "/var/lib/crius/content/unused".into(),
+                    size_bytes: 4096,
+                    reason: "unreferenced".into(),
+                    deleted: request.execute,
+                    error: String::new(),
+                },
+                ContentGcCandidate {
+                    object_type: "snapshot".into(),
+                    object_id: "snap-failed".into(),
+                    path: "/var/lib/crius/snapshots/snap-failed".into(),
+                    size_bytes: 8192,
+                    reason: "orphaned".into(),
+                    deleted: false,
+                    error: if request.execute {
+                        "permission denied".into()
+                    } else {
+                        String::new()
+                    },
+                },
+            ],
+            reclaimed_bytes: if request.execute { 4096 } else { 0 },
+            warnings: vec![],
+        }))
     }
 
     type ContainerLogStream = ReceiverStream<Result<ContainerLogChunk, Status>>;
@@ -1532,6 +1571,64 @@ async fn recovery_repair_execute_returns_failure_for_item_errors() {
         .expect("last recovery check lock")
         .clone()
         .expect("recovery repair request");
+    assert!(request.execute);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gc_candidates_and_dry_run_do_not_execute_deletions() {
+    let state = MockState::default();
+    let requests = Arc::clone(&state.content_gc_requests);
+    let last_gc = Arc::clone(&state.last_content_gc);
+    let endpoint = spawn_mock_services(state).await;
+
+    let candidates = run_crs(endpoint, ["--output", "json", "gc", "candidates"]);
+    assert_success(&candidates);
+    let value = stdout_json(&candidates);
+    assert_eq!(value["kind"], "GcCandidates");
+    assert_eq!(value["summary"]["dryRun"], true);
+    assert_eq!(value["summary"]["totalBytes"], 12_288);
+    let request = last_gc
+        .lock()
+        .expect("last content gc lock")
+        .clone()
+        .expect("content gc request");
+    assert!(!request.execute);
+
+    let dry_run = run_crs(endpoint, ["--output", "json", "gc", "run", "--dry-run"]);
+    assert_success(&dry_run);
+    let value = stdout_json(&dry_run);
+    assert_eq!(value["kind"], "GcPlan");
+    assert_eq!(value["summary"]["dryRun"], true);
+    assert_eq!(value["summary"]["deleted"], 0);
+    let request = last_gc
+        .lock()
+        .expect("last content gc lock")
+        .clone()
+        .expect("content gc request");
+    assert!(!request.execute);
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gc_run_execute_returns_failure_for_item_errors() {
+    let state = MockState::default();
+    let last_gc = Arc::clone(&state.last_content_gc);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["--output", "json", "gc", "run", "--execute"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let value = stdout_json(&output);
+    assert_eq!(value["kind"], "GcPlan");
+    assert_eq!(value["summary"]["dryRun"], false);
+    assert_eq!(value["summary"]["reclaimedBytes"], 4096);
+    assert_eq!(value["summary"]["deleted"], 1);
+    assert_eq!(value["summary"]["failed"], 1);
+    let request = last_gc
+        .lock()
+        .expect("last content gc lock")
+        .clone()
+        .expect("content gc request");
     assert!(request.execute);
 }
 
