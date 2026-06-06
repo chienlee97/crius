@@ -189,6 +189,38 @@ sudo crictl --runtime-endpoint unix:///run/crius/crius.sock info
 sudo crictl --runtime-endpoint unix:///run/crius/crius.sock images
 ```
 
+Inspect and diagnose the same daemon with `crs`:
+
+```bash
+crs version
+# RUNTIME     VERSION  API
+# crius       0.1.0    v1
+
+crs status
+# RUNTIME READY  NETWORK READY
+# true           true
+
+crs image list
+# IMAGE                TAG     SIZE
+# registry.local/app   stable  42.0MiB
+
+crs pod list
+# POD ID        NAME       NAMESPACE  STATE
+# pod-example   web-pod    default    ready
+
+crs container list
+# CONTAINER ID  POD ID       IMAGE                STATE
+# ctr-example   pod-example  registry.local/app   running
+
+crs run --rm registry.local/app:stable /bin/true
+# POD ID        CONTAINER ID  IMAGE
+# pod-example   ctr-example   registry.local/app:stable
+
+crs debug runtime
+# AREA     STATUS  MESSAGE
+# runtime  ok      runtime service is ready
+```
+
 ## Configuration
 
 Configuration precedence:
