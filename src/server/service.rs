@@ -1298,12 +1298,21 @@ impl RuntimeServiceImpl {
                 deadline.timeout_secs
             )));
         }
-        tokio::time::timeout(remaining, future).await.map_err(|_| {
+        let output = tokio::time::timeout(remaining, future).await.map_err(|_| {
             Status::deadline_exceeded(format!(
                 "container create phase {phase} exceeded runtime handler create timeout of {}s",
                 deadline.timeout_secs
             ))
-        })?
+        })?;
+
+        if Instant::now() >= deadline.deadline {
+            return Err(Status::deadline_exceeded(format!(
+                "container create phase {phase} exceeded runtime handler create timeout of {}s",
+                deadline.timeout_secs
+            )));
+        }
+
+        output
     }
 
     pub fn metrics_provider(&self) -> RuntimeMetricsProvider {
