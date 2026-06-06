@@ -581,6 +581,29 @@ impl TableRow for GcCandidateView {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct DebugView {
+    pub check: String,
+    pub status: String,
+    pub message: String,
+    pub details: Value,
+}
+
+impl TableRow for DebugView {
+    fn headers() -> &'static [&'static str] {
+        &["CHECK", "STATUS", "MESSAGE"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.check.clone(),
+            self.status.clone(),
+            self.message.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ImageView {
     pub image: String,
     pub image_id: String,

@@ -1005,6 +1005,26 @@ impl DiagnosticsService for MockDiagnosticsService {
                     "globalAuthFile": "/var/lib/crius/auth.json",
                     "password": "<redacted>",
                     "pinnedImages": ["registry.example/static:*"]
+                },
+                "streaming": {
+                    "enabled": true,
+                    "address": "127.0.0.1:10250",
+                    "tls": {"enabled": false},
+                    "tokenTTL": "10m",
+                    "portForwardTimeout": "4h"
+                },
+                "metrics": {
+                    "enabled": true,
+                    "endpoint": "127.0.0.1:9090",
+                    "collector": "default",
+                    "podMetrics": true
+                },
+                "tracing": {
+                    "enabled": true,
+                    "exporter": "otlp",
+                    "endpoint": "http://collector:4317",
+                    "samplingRate": "0.50",
+                    "headers": {"authorization": "<redacted>"}
                 }
             })
             .to_string(),
@@ -1128,21 +1148,48 @@ impl DiagnosticsService for MockDiagnosticsService {
         &self,
         _request: Request<NriStatusRequest>,
     ) -> Result<Response<NriStatusResponse>, Status> {
-        Ok(Response::new(NriStatusResponse::default()))
+        Ok(Response::new(NriStatusResponse {
+            enabled: false,
+            cdi_enabled: true,
+            cdi_spec_dirs: vec!["/etc/cdi".into()],
+            plugin_path: "/opt/nri/plugins".into(),
+            plugin_config_path: "/etc/nri/conf.d".into(),
+            blockio_config_path: "/etc/crius/blockio.yaml".into(),
+            blockio_supported: true,
+            rdt_supported: false,
+            warnings: vec![],
+        }))
     }
 
     async fn security_status(
         &self,
         _request: Request<SecurityStatusRequest>,
     ) -> Result<Response<SecurityStatusResponse>, Status> {
-        Ok(Response::new(SecurityStatusResponse::default()))
+        Ok(Response::new(SecurityStatusResponse {
+            seccomp_available: true,
+            seccomp_notifier_supported: true,
+            apparmor_available: false,
+            selinux_enabled: false,
+            rootless_enabled: false,
+            devices_policy_json: r#"{"defaultAction":"deny"}"#.into(),
+            warnings: vec![],
+        }))
     }
 
     async fn shim_status(
         &self,
         _request: Request<ShimStatusRequest>,
     ) -> Result<Response<ShimStatusResponse>, Status> {
-        Ok(Response::new(ShimStatusResponse::default()))
+        Ok(Response::new(ShimStatusResponse {
+            shims: vec![crius::proto::diagnostics::v1::ShimInfo {
+                container_id: "ctr1".into(),
+                pid: 1234,
+                task_socket: "/run/crius/shim/ctr1.sock".into(),
+                attach_socket: "/run/crius/shim/ctr1.attach".into(),
+                state: "running".into(),
+                error: String::new(),
+            }],
+        }))
     }
 
     async fn content_gc(
@@ -1630,6 +1677,48 @@ async fn gc_run_execute_returns_failure_for_item_errors() {
         .clone()
         .expect("content gc request");
     assert!(request.execute);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_commands_emit_stable_json_kinds() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+    let cases = [
+        (["debug", "network"].as_slice(), "DebugNetwork"),
+        (["debug", "runtime"].as_slice(), "DebugRuntime"),
+        (["debug", "shims"].as_slice(), "DebugShims"),
+        (["debug", "nri"].as_slice(), "DebugNri"),
+        (["debug", "security"].as_slice(), "DebugSecurity"),
+        (["debug", "cgroups"].as_slice(), "DebugCgroups"),
+        (["debug", "streaming"].as_slice(), "DebugStreaming"),
+        (["debug", "metrics"].as_slice(), "DebugMetrics"),
+        (["debug", "tracing"].as_slice(), "DebugTracing"),
+        (["debug", "rootless"].as_slice(), "DebugRootless"),
+    ];
+
+    for (args, expected_kind) in cases {
+        let output = run_crs(
+            endpoint,
+            std::iter::once("--output")
+                .chain(std::iter::once("json"))
+                .chain(args.iter().copied()),
+        );
+        assert_success(&output);
+        let value = stdout_json(&output);
+        assert_eq!(value["kind"], expected_kind);
+        assert!(value["summary"].is_object());
+        assert!(value["items"][0]["details"].is_object());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_security_preserves_raw_devices_policy_on_parse_failure() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+    let output = run_crs(endpoint, ["--output", "json", "debug", "security"]);
+
+    assert_success(&output);
+    let value = stdout_json(&output);
+    assert_eq!(value["kind"], "DebugSecurity");
+    assert_eq!(value["summary"]["devicesPolicy"]["defaultAction"], "deny");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

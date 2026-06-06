@@ -195,6 +195,13 @@ async fn load_handlers_from_status(
     Ok(runtime_backend_views(runtime_backend))
 }
 
+pub(crate) async fn load_handlers_from_status_for_debug(
+    client: &CrsClient,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<RuntimeHandlerView>, CliError> {
+    load_handlers_from_status(client, warnings).await
+}
+
 fn runtime_backend_views(value: &serde_json::Value) -> Vec<RuntimeHandlerView> {
     if let Some(handlers) = value
         .get("handlers")
