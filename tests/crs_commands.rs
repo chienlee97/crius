@@ -13,9 +13,9 @@ use crius::proto::{
         diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer},
         ContainerLogChunk, ContainerLogRequest, ContentGcRequest, ContentGcResponse,
         EffectiveConfigRequest, EffectiveConfigResponse, ImageTransferInfo, ImageTransfersRequest,
-        ImageTransfersResponse, NriStatusRequest, NriStatusResponse, RecoveryCheckRequest,
-        RecoveryCheckResponse, RecoveryStatusRequest, RecoveryStatusResponse, RuntimeHandlerInfo,
-        RuntimeHandlersRequest, RuntimeHandlersResponse, SecurityStatusRequest,
+        ImageTransfersResponse, NriStatusRequest, NriStatusResponse, RecoveryAction,
+        RecoveryCheckRequest, RecoveryCheckResponse, RecoveryStatusRequest, RecoveryStatusResponse,
+        RuntimeHandlerInfo, RuntimeHandlersRequest, RuntimeHandlersResponse, SecurityStatusRequest,
         SecurityStatusResponse, ServerInfoRequest, ServerInfoResponse, ShimStatusRequest,
         ShimStatusResponse,
     },
@@ -99,6 +99,8 @@ struct MockState {
     runtime_handlers_requests: Arc<AtomicUsize>,
     image_transfers_requests: Arc<AtomicUsize>,
     container_log_requests: Arc<AtomicUsize>,
+    recovery_status_requests: Arc<AtomicUsize>,
+    recovery_check_requests: Arc<AtomicUsize>,
     last_update_runtime_config: Arc<Mutex<Option<UpdateRuntimeConfigRequest>>>,
     last_run_pod: Arc<Mutex<Option<RunPodSandboxRequest>>>,
     last_stop_pod: Arc<Mutex<Option<StopPodSandboxRequest>>>,
@@ -125,6 +127,7 @@ struct MockState {
     last_effective_config: Arc<Mutex<Option<EffectiveConfigRequest>>>,
     last_image_transfers: Arc<Mutex<Option<ImageTransfersRequest>>>,
     last_container_log: Arc<Mutex<Option<ContainerLogRequest>>>,
+    last_recovery_check: Arc<Mutex<Option<RecoveryCheckRequest>>>,
 }
 
 #[tonic::async_trait]
@@ -1062,14 +1065,61 @@ impl DiagnosticsService for MockDiagnosticsService {
         &self,
         _request: Request<RecoveryStatusRequest>,
     ) -> Result<Response<RecoveryStatusResponse>, Status> {
-        Ok(Response::new(RecoveryStatusResponse::default()))
+        self.state
+            .recovery_status_requests
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(Response::new(RecoveryStatusResponse {
+            status: "degraded".into(),
+            last_startup: "2026-06-06T01:02:03Z".into(),
+            unhealthy_object_count: 2,
+            ledger_summary_json: serde_json::json!({
+                "pods": 1,
+                "containers": 1
+            })
+            .to_string(),
+            warnings: vec!["ledger contains stale objects".into()],
+        }))
     }
 
     async fn recovery_check(
         &self,
-        _request: Request<RecoveryCheckRequest>,
+        request: Request<RecoveryCheckRequest>,
     ) -> Result<Response<RecoveryCheckResponse>, Status> {
-        Ok(Response::new(RecoveryCheckResponse::default()))
+        let request = request.into_inner();
+        self.state
+            .recovery_check_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_recovery_check
+            .lock()
+            .expect("last recovery check lock") = Some(request.clone());
+        Ok(Response::new(RecoveryCheckResponse {
+            dry_run: !request.execute,
+            actions: vec![
+                RecoveryAction {
+                    object_type: "container".into(),
+                    object_id: "ctr-stale".into(),
+                    action: "remove-stale-record".into(),
+                    reason: "missing runtime task".into(),
+                    executed: request.execute,
+                    error: String::new(),
+                },
+                RecoveryAction {
+                    object_type: "pod".into(),
+                    object_id: "pod-broken".into(),
+                    action: "repair-network-state".into(),
+                    reason: "network checkpoint is incomplete".into(),
+                    executed: request.execute,
+                    error: if request.execute {
+                        "network namespace is unavailable".into()
+                    } else {
+                        String::new()
+                    },
+                },
+            ],
+            warnings: vec![],
+        }))
     }
 
     async fn nri_status(
@@ -1403,6 +1453,86 @@ async fn image_diagnostics_commands_report_transfers_and_config_without_secrets(
     assert_eq!(value["items"][0]["snapshotter"], "internal-overlay-untar");
     assert_eq!(value["items"][0]["authConfigured"], "configured");
     assert_eq!(value["items"][0]["config"]["password"], "<redacted>");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_status_reports_unhealthy_summary_without_failing() {
+    let state = MockState::default();
+    let requests = Arc::clone(&state.recovery_status_requests);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["--output", "json", "recovery", "status"]);
+
+    assert_success(&output);
+    let value = stdout_json(&output);
+    assert_eq!(value["kind"], "RecoveryStatus");
+    assert_eq!(value["summary"]["unhealthyObjectCount"], 2);
+    assert_eq!(value["summary"]["ledgerSummary"]["pods"], 1);
+    assert_eq!(value["warnings"][0], "ledger contains stale objects");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_check_and_repair_dry_run_do_not_execute_actions() {
+    let state = MockState::default();
+    let requests = Arc::clone(&state.recovery_check_requests);
+    let last_check = Arc::clone(&state.last_recovery_check);
+    let endpoint = spawn_mock_services(state).await;
+
+    let check = run_crs(endpoint, ["--output", "json", "recovery", "check"]);
+    assert_success(&check);
+    let value = stdout_json(&check);
+    assert_eq!(value["kind"], "RecoveryCheck");
+    assert_eq!(value["summary"]["dryRun"], true);
+    assert_eq!(value["summary"]["executed"], 0);
+    let request = last_check
+        .lock()
+        .expect("last recovery check lock")
+        .clone()
+        .expect("recovery check request");
+    assert!(!request.execute);
+
+    let repair = run_crs(
+        endpoint,
+        ["--output", "json", "recovery", "repair", "--dry-run"],
+    );
+    assert_success(&repair);
+    let value = stdout_json(&repair);
+    assert_eq!(value["kind"], "RecoveryRepairPlan");
+    assert_eq!(value["summary"]["dryRun"], true);
+    assert_eq!(value["summary"]["executed"], 0);
+    let request = last_check
+        .lock()
+        .expect("last recovery check lock")
+        .clone()
+        .expect("recovery repair request");
+    assert!(!request.execute);
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_repair_execute_returns_failure_for_item_errors() {
+    let state = MockState::default();
+    let last_check = Arc::clone(&state.last_recovery_check);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(
+        endpoint,
+        ["--output", "json", "recovery", "repair", "--execute"],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let value = stdout_json(&output);
+    assert_eq!(value["kind"], "RecoveryRepairPlan");
+    assert_eq!(value["summary"]["dryRun"], false);
+    assert_eq!(value["summary"]["executed"], 2);
+    assert_eq!(value["summary"]["failed"], 1);
+    let request = last_check
+        .lock()
+        .expect("last recovery check lock")
+        .clone()
+        .expect("recovery repair request");
+    assert!(request.execute);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

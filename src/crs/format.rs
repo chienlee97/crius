@@ -498,6 +498,59 @@ impl TableRow for ImageConfigView {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct RecoveryStatusView {
+    pub status: String,
+    pub last_startup: String,
+    pub unhealthy_object_count: u64,
+    pub ledger_summary: Value,
+    pub warnings: Vec<String>,
+}
+
+impl TableRow for RecoveryStatusView {
+    fn headers() -> &'static [&'static str] {
+        &["STATUS", "LAST STARTUP", "UNHEALTHY", "WARNINGS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.status.clone(),
+            self.last_startup.clone(),
+            self.unhealthy_object_count.to_string(),
+            self.warnings.join(","),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecoveryActionView {
+    pub object_type: String,
+    pub object_id: String,
+    pub action: String,
+    pub reason: String,
+    pub executed: bool,
+    pub error: String,
+}
+
+impl TableRow for RecoveryActionView {
+    fn headers() -> &'static [&'static str] {
+        &["TYPE", "ID", "ACTION", "EXECUTED", "ERROR", "REASON"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.object_type.clone(),
+            self.object_id.clone(),
+            self.action.clone(),
+            format_bool(self.executed).to_string(),
+            self.error.clone(),
+            self.reason.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ImageView {
     pub image: String,
     pub image_id: String,
