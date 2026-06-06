@@ -980,6 +980,56 @@ impl TableRow for PodMetricsView {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct MetricDescriptorView {
+    pub name: String,
+    pub help: String,
+    pub metric_type: String,
+    pub labels: Vec<String>,
+}
+
+impl TableRow for MetricDescriptorView {
+    fn headers() -> &'static [&'static str] {
+        &["NAME", "HELP", "TYPE", "LABELS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.name.clone(),
+            self.help.clone(),
+            self.metric_type.clone(),
+            self.labels.join(","),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.name.clone()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MetricsScrapeView {
+    pub content_type: String,
+    pub bytes: usize,
+    pub scraped_at: String,
+}
+
+impl TableRow for MetricsScrapeView {
+    fn headers() -> &'static [&'static str] {
+        &["CONTENT TYPE", "BYTES", "SCRAPED AT"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.content_type.clone(),
+            self.bytes.to_string(),
+            self.scraped_at.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct OperationView {
     pub target: String,
     pub status: String,

@@ -30,27 +30,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{transport::Server, Request, Response, Status};
 
-macro_rules! unimplemented_runtime_rpc {
-    ($name:ident, $request:ty, $response:ty) => {
-        fn $name<'life0, 'async_trait>(
-            &'life0 self,
-            _request: Request<$request>,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<Response<$response>, Status>>
-                    + Send
-                    + 'async_trait,
-            >,
-        >
-        where
-            Self: 'async_trait,
-            'life0: 'async_trait,
-        {
-            Box::pin(async { Err(Status::unimplemented("mock only implements Version")) })
-        }
-    };
-}
-
 #[derive(Clone, Default)]
 struct MockRuntimeService {
     state: MockState,
@@ -73,7 +52,7 @@ enum MockEventMode {
     Pending,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct MockState {
     version_requests: Arc<AtomicUsize>,
     status_requests: Arc<AtomicUsize>,
@@ -100,6 +79,7 @@ struct MockState {
     pod_stats_requests: Arc<AtomicUsize>,
     list_pod_stats_requests: Arc<AtomicUsize>,
     list_pod_metrics_requests: Arc<AtomicUsize>,
+    metric_descriptors_requests: Arc<AtomicUsize>,
     list_pod_requests: Arc<AtomicUsize>,
     pod_inspect_requests: Arc<AtomicUsize>,
     list_container_requests: Arc<AtomicUsize>,
@@ -117,6 +97,8 @@ struct MockState {
     recovery_check_requests: Arc<AtomicUsize>,
     content_gc_requests: Arc<AtomicUsize>,
     event_mode: Arc<Mutex<MockEventMode>>,
+    metrics_endpoint: Arc<Mutex<Option<String>>>,
+    metrics_enabled: Arc<Mutex<bool>>,
     last_update_runtime_config: Arc<Mutex<Option<UpdateRuntimeConfigRequest>>>,
     last_run_pod: Arc<Mutex<Option<RunPodSandboxRequest>>>,
     last_stop_pod: Arc<Mutex<Option<StopPodSandboxRequest>>>,
@@ -149,6 +131,90 @@ struct MockState {
     last_container_log: Arc<Mutex<Option<ContainerLogRequest>>>,
     last_recovery_check: Arc<Mutex<Option<RecoveryCheckRequest>>>,
     last_content_gc: Arc<Mutex<Option<ContentGcRequest>>>,
+}
+
+impl Default for MockState {
+    fn default() -> Self {
+        Self {
+            version_requests: Arc::default(),
+            status_requests: Arc::default(),
+            runtime_config_requests: Arc::default(),
+            update_runtime_config_requests: Arc::default(),
+            run_pod_requests: Arc::default(),
+            stop_pod_requests: Arc::default(),
+            remove_pod_requests: Arc::default(),
+            update_pod_resources_requests: Arc::default(),
+            create_container_requests: Arc::default(),
+            start_container_requests: Arc::default(),
+            stop_container_requests: Arc::default(),
+            remove_container_requests: Arc::default(),
+            update_container_resources_requests: Arc::default(),
+            checkpoint_container_requests: Arc::default(),
+            reopen_container_log_requests: Arc::default(),
+            exec_requests: Arc::default(),
+            exec_sync_requests: Arc::default(),
+            attach_requests: Arc::default(),
+            port_forward_requests: Arc::default(),
+            container_events_requests: Arc::default(),
+            container_stats_requests: Arc::default(),
+            list_container_stats_requests: Arc::default(),
+            pod_stats_requests: Arc::default(),
+            list_pod_stats_requests: Arc::default(),
+            list_pod_metrics_requests: Arc::default(),
+            metric_descriptors_requests: Arc::default(),
+            list_pod_requests: Arc::default(),
+            pod_inspect_requests: Arc::default(),
+            list_container_requests: Arc::default(),
+            container_inspect_requests: Arc::default(),
+            list_image_requests: Arc::default(),
+            image_inspect_requests: Arc::default(),
+            image_fs_info_requests: Arc::default(),
+            pull_image_requests: Arc::default(),
+            remove_image_requests: Arc::default(),
+            effective_config_requests: Arc::default(),
+            runtime_handlers_requests: Arc::default(),
+            image_transfers_requests: Arc::default(),
+            container_log_requests: Arc::default(),
+            recovery_status_requests: Arc::default(),
+            recovery_check_requests: Arc::default(),
+            content_gc_requests: Arc::default(),
+            event_mode: Arc::default(),
+            metrics_endpoint: Arc::default(),
+            metrics_enabled: Arc::new(Mutex::new(true)),
+            last_update_runtime_config: Arc::default(),
+            last_run_pod: Arc::default(),
+            last_stop_pod: Arc::default(),
+            last_remove_pod: Arc::default(),
+            last_update_pod_resources: Arc::default(),
+            last_create_container: Arc::default(),
+            last_start_container: Arc::default(),
+            last_stop_container: Arc::default(),
+            last_remove_container: Arc::default(),
+            last_update_container_resources: Arc::default(),
+            last_checkpoint_container: Arc::default(),
+            last_reopen_container_log: Arc::default(),
+            last_exec: Arc::default(),
+            last_exec_sync: Arc::default(),
+            last_attach: Arc::default(),
+            last_port_forward: Arc::default(),
+            last_container_stats: Arc::default(),
+            last_list_container_stats: Arc::default(),
+            last_pod_stats: Arc::default(),
+            last_list_pod_stats: Arc::default(),
+            exec_url: Arc::default(),
+            attach_url: Arc::default(),
+            port_forward_url: Arc::default(),
+            existing_images: Arc::default(),
+            rpc_sequence: Arc::default(),
+            last_pull_image: Arc::default(),
+            last_remove_image: Arc::default(),
+            last_effective_config: Arc::default(),
+            last_image_transfers: Arc::default(),
+            last_container_log: Arc::default(),
+            last_recovery_check: Arc::default(),
+            last_content_gc: Arc::default(),
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -907,11 +973,22 @@ impl RuntimeService for MockRuntimeService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    unimplemented_runtime_rpc!(
-        list_metric_descriptors,
-        ListMetricDescriptorsRequest,
-        ListMetricDescriptorsResponse
-    );
+    async fn list_metric_descriptors(
+        &self,
+        _request: Request<ListMetricDescriptorsRequest>,
+    ) -> Result<Response<ListMetricDescriptorsResponse>, Status> {
+        self.state
+            .metric_descriptors_requests
+            .fetch_add(1, Ordering::SeqCst);
+
+        Ok(Response::new(ListMetricDescriptorsResponse {
+            descriptors: vec![MetricDescriptor {
+                name: "container_cpu_usage_seconds_total".into(),
+                help: "Cumulative container CPU usage".into(),
+                label_keys: vec!["pod".into(), "container".into()],
+            }],
+        }))
+    }
     async fn list_pod_sandbox_metrics(
         &self,
         _request: Request<ListPodSandboxMetricsRequest>,
@@ -1134,6 +1211,18 @@ impl DiagnosticsService for MockDiagnosticsService {
             .last_effective_config
             .lock()
             .expect("last effective config lock") = Some(request);
+        let metrics_enabled = *self
+            .state
+            .metrics_enabled
+            .lock()
+            .expect("metrics enabled lock");
+        let metrics_endpoint = self
+            .state
+            .metrics_endpoint
+            .lock()
+            .expect("metrics endpoint lock")
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1:9090".to_string());
 
         Ok(Response::new(EffectiveConfigResponse {
             config_json: serde_json::json!({
@@ -1158,8 +1247,8 @@ impl DiagnosticsService for MockDiagnosticsService {
                     "portForwardTimeout": "4h"
                 },
                 "metrics": {
-                    "enabled": true,
-                    "endpoint": "127.0.0.1:9090",
+                    "enabled": metrics_enabled,
+                    "endpoint": metrics_endpoint,
                     "collector": "default",
                     "podMetrics": true
                 },
@@ -3529,6 +3618,88 @@ async fn pod_metrics_reports_items_and_count_summary() {
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_descriptors_reports_cri_descriptor_fields() {
+    let state = MockState::default();
+    let requests = Arc::clone(&state.metric_descriptors_requests);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["--output", "json", "metrics", "descriptors"]);
+
+    assert_success(&output);
+    let value = stdout_json(&output);
+    assert_eq!(value["kind"], "MetricDescriptors");
+    assert_eq!(
+        value["items"][0]["name"],
+        "container_cpu_usage_seconds_total"
+    );
+    assert_eq!(value["items"][0]["labels"][0], "pod");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_scrape_text_outputs_only_metrics_body() {
+    let metrics_endpoint = spawn_mock_metrics_server().await;
+    let state = MockState::default();
+    *state
+        .metrics_endpoint
+        .lock()
+        .expect("metrics endpoint lock") = Some(format!("127.0.0.1:{}", metrics_endpoint.port()));
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["--output", "text", "metrics", "scrape"]);
+
+    assert_success(&output);
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert_eq!(stdout, "crius_test_metric 42\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_scrape_json_reports_summary_without_embedding_body() {
+    let metrics_endpoint = spawn_mock_metrics_server().await;
+    let state = MockState::default();
+    *state
+        .metrics_endpoint
+        .lock()
+        .expect("metrics endpoint lock") = Some(format!(
+        "http://127.0.0.1:{}/metrics",
+        metrics_endpoint.port()
+    ));
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["--output", "json", "metrics", "scrape"]);
+
+    assert_success(&output);
+    let value = stdout_json(&output);
+    assert_eq!(value["kind"], "MetricsScrape");
+    assert_eq!(value["summary"]["contentType"], "text/plain; version=0.0.4");
+    assert_eq!(value["summary"]["bytes"], "crius_test_metric 42\n".len());
+    assert!(value["summary"]["scrapedAt"]
+        .as_str()
+        .expect("scrapedAt")
+        .contains('T'));
+    assert!(value.get("body").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_scrape_disabled_endpoint_returns_failed_precondition() {
+    let state = MockState::default();
+    *state.metrics_enabled.lock().expect("metrics enabled lock") = false;
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["--output", "json", "metrics", "scrape"]);
+
+    assert_eq!(output.status.code(), Some(6));
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    let value: serde_json::Value = serde_json::from_str(stderr.trim()).expect("json error");
+    assert_eq!(value["error"]["exitCode"], 6);
+    assert!(value["error"]["message"]
+        .as_str()
+        .expect("message")
+        .contains("enable the daemon metrics endpoint"));
+}
+
 #[test]
 fn json_error_is_written_to_stderr_with_empty_stdout() {
     let socket_dir = tempfile::tempdir().expect("tempdir should be created");
@@ -3838,6 +4009,45 @@ async fn spawn_mock_cri_services(state: MockState) -> SocketAddr {
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .expect("mock server should serve");
+    });
+
+    endpoint
+}
+
+async fn spawn_mock_metrics_server() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock metrics server should bind");
+    let endpoint = listener
+        .local_addr()
+        .expect("mock metrics server should expose addr");
+
+    tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("metrics client should connect");
+        let mut stream = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .await
+                .expect("metrics request should read");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        let mut stream = stream.into_inner();
+        let body = "crius_test_metric 42\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("metrics response should write");
     });
 
     endpoint
