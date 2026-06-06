@@ -1722,6 +1722,40 @@ async fn debug_security_preserves_raw_devices_policy_on_parse_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_unavailable_errors_and_fallbacks_are_stable() {
+    let endpoint = spawn_mock_cri_services(MockState::default()).await;
+
+    let recovery = run_crs(endpoint, ["--output", "json", "recovery", "status"]);
+    assert_eq!(recovery.status.code(), Some(1));
+    let stderr = String::from_utf8(recovery.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("diagnostics service is not available from this crius daemon"));
+
+    let shims = run_crs(endpoint, ["--output", "json", "debug", "shims"]);
+    assert_eq!(shims.status.code(), Some(1));
+    let stderr = String::from_utf8(shims.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("diagnostics service is not available from this crius daemon"));
+
+    let config = run_crs(endpoint, ["--output", "json", "config", "show"]);
+    assert_success(&config);
+    let value = stdout_json(&config);
+    assert_eq!(value["kind"], "EffectiveConfig");
+    assert_eq!(value["summary"]["source"], "status");
+    assert!(value["warnings"][0]
+        .as_str()
+        .expect("warning")
+        .contains("diagnostics service is not available from this crius daemon"));
+
+    let handlers = run_crs(endpoint, ["--output", "json", "runtime", "handlers"]);
+    assert_success(&handlers);
+    let value = stdout_json(&handlers);
+    assert_eq!(value["kind"], "RuntimeHandlers");
+    assert!(value["warnings"][0]
+        .as_str()
+        .expect("warning")
+        .contains("diagnostics service is not available from this crius daemon"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn image_pull_sends_auth_only_in_request_and_reports_ref() {
     let state = MockState::default();
     let pull_requests = Arc::clone(&state.pull_image_requests);
@@ -3271,6 +3305,28 @@ async fn spawn_mock_services(state: MockState) -> SocketAddr {
             .add_service(DiagnosticsServiceServer::new(MockDiagnosticsService {
                 state,
             }))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("mock server should serve");
+    });
+
+    endpoint
+}
+
+async fn spawn_mock_cri_services(state: MockState) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock server should bind");
+    let endpoint = listener
+        .local_addr()
+        .expect("mock server should expose addr");
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(RuntimeServiceServer::new(MockRuntimeService {
+                state: state.clone(),
+            }))
+            .add_service(ImageServiceServer::new(MockImageService { state }))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .expect("mock server should serve");

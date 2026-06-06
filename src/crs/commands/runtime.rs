@@ -117,9 +117,8 @@ async fn handle_handlers(
                     .runtime_handlers(RuntimeHandlersRequest {})
                     .await
                     .map_err(|status| {
-                        CliError::from_tonic_status(status)
+                        CliError::from_diagnostics_status(status, client.endpoint())
                             .with_command("crs runtime handlers")
-                            .with_endpoint(client.endpoint())
                     })
             })
             .await

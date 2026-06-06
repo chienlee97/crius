@@ -208,6 +208,18 @@ impl CliError {
         }
     }
 
+    pub(crate) fn from_diagnostics_status(
+        status: tonic::Status,
+        endpoint: impl Into<String>,
+    ) -> Self {
+        let endpoint = endpoint.into();
+        if status.code() == Code::Unimplemented {
+            Self::diagnostics_unavailable(endpoint)
+        } else {
+            Self::from_tonic_status(status).with_endpoint(endpoint)
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn interrupted() -> Self {
         Self::Interrupted {

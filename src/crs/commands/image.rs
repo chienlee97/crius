@@ -289,9 +289,8 @@ async fn handle_transfers(ctx: &CliContext, client: &CrsClient) -> Result<Comman
                     })
                     .await
                     .map_err(|status| {
-                        CliError::from_tonic_status(status)
+                        CliError::from_diagnostics_status(status, client.endpoint())
                             .with_command("crs image transfers")
-                            .with_endpoint(client.endpoint())
                     })
             })
             .await

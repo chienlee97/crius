@@ -48,9 +48,8 @@ async fn content_gc(
                 .content_gc(ContentGcRequest { execute })
                 .await
                 .map_err(|status| {
-                    CliError::from_tonic_status(status)
+                    CliError::from_diagnostics_status(status, client.endpoint())
                         .with_command(command_name)
-                        .with_endpoint(client.endpoint())
                 })
         })
         .await?

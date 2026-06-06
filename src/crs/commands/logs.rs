@@ -40,9 +40,8 @@ pub(crate) async fn handle(
     let mut stream = client
         .with_rpc_timeout(async {
             diagnostics.container_log(request).await.map_err(|status| {
-                CliError::from_tonic_status(status)
+                CliError::from_diagnostics_status(status, client.endpoint())
                     .with_command("crs logs")
-                    .with_endpoint(client.endpoint())
                     .with_object(format!("container {}", args.container))
             })
         })

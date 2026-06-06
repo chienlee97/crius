@@ -30,9 +30,8 @@ async fn handle_status(ctx: &CliContext, client: &CrsClient) -> Result<CommandRe
                 .recovery_status(RecoveryStatusRequest {})
                 .await
                 .map_err(|status| {
-                    CliError::from_tonic_status(status)
+                    CliError::from_diagnostics_status(status, client.endpoint())
                         .with_command("crs recovery status")
-                        .with_endpoint(client.endpoint())
                 })
         })
         .await?
@@ -87,9 +86,8 @@ async fn recovery_check(
                 .recovery_check(RecoveryCheckRequest { execute })
                 .await
                 .map_err(|status| {
-                    CliError::from_tonic_status(status)
+                    CliError::from_diagnostics_status(status, client.endpoint())
                         .with_command(command_name)
-                        .with_endpoint(client.endpoint())
                 })
         })
         .await?

@@ -105,9 +105,8 @@ async fn debug_shims(ctx: &CliContext, client: &CrsClient) -> Result<CommandResu
                 })
                 .await
                 .map_err(|status| {
-                    CliError::from_tonic_status(status)
+                    CliError::from_diagnostics_status(status, client.endpoint())
                         .with_command("crs debug shims")
-                        .with_endpoint(client.endpoint())
                 })
         })
         .await?
@@ -149,9 +148,8 @@ async fn debug_nri(ctx: &CliContext, client: &CrsClient) -> Result<CommandResult
                 .nri_status(NriStatusRequest {})
                 .await
                 .map_err(|status| {
-                    CliError::from_tonic_status(status)
+                    CliError::from_diagnostics_status(status, client.endpoint())
                         .with_command("crs debug nri")
-                        .with_endpoint(client.endpoint())
                 })
         })
         .await?
@@ -379,9 +377,8 @@ async fn verbose_status(
                 .status(StatusRequest { verbose: true })
                 .await
                 .map_err(|status| {
-                    CliError::from_tonic_status(status)
+                    CliError::from_diagnostics_status(status, client.endpoint())
                         .with_command(command_name)
-                        .with_endpoint(client.endpoint())
                 })
         })
         .await?
@@ -415,9 +412,8 @@ async fn version_json(
                 })
                 .await
                 .map_err(|status| {
-                    CliError::from_tonic_status(status)
+                    CliError::from_diagnostics_status(status, client.endpoint())
                         .with_command(command_name)
-                        .with_endpoint(client.endpoint())
                 })
         })
         .await?
@@ -440,9 +436,8 @@ async fn runtime_config_json(
                 .runtime_config(RuntimeConfigRequest {})
                 .await
                 .map_err(|status| {
-                    CliError::from_tonic_status(status)
+                    CliError::from_diagnostics_status(status, client.endpoint())
                         .with_command(command_name)
-                        .with_endpoint(client.endpoint())
                 })
         })
         .await?
@@ -485,9 +480,8 @@ async fn server_info(
                 .server_info(ServerInfoRequest {})
                 .await
                 .map_err(|status| {
-                    CliError::from_tonic_status(status)
+                    CliError::from_diagnostics_status(status, client.endpoint())
                         .with_command(command_name)
-                        .with_endpoint(client.endpoint())
                 })
         })
         .await?
@@ -512,9 +506,8 @@ async fn security_status(
                 .security_status(SecurityStatusRequest {})
                 .await
                 .map_err(|status| {
-                    CliError::from_tonic_status(status)
+                    CliError::from_diagnostics_status(status, client.endpoint())
                         .with_command(command_name)
-                        .with_endpoint(client.endpoint())
                 })
         })
         .await?
