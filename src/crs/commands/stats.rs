@@ -1,11 +1,15 @@
 use crate::crs::{
-    args::StatsArgs, client::CrsClient, context::CliContext, error::CliError, error::CommandResult,
+    args::StatsArgs,
+    client::CrsClient,
+    commands::container,
+    context::CliContext,
+    error::{CliError, CommandResult},
 };
 
 pub(crate) async fn handle(
-    _ctx: &CliContext,
-    _client: &CrsClient,
+    ctx: &CliContext,
+    client: &CrsClient,
     _args: StatsArgs,
 ) -> Result<CommandResult, CliError> {
-    Err(CliError::not_implemented("crs stats"))
+    container::handle_stats_list(ctx, client, None, Vec::new(), "ContainerStats").await
 }

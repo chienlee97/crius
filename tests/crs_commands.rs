@@ -95,6 +95,8 @@ struct MockState {
     attach_requests: Arc<AtomicUsize>,
     port_forward_requests: Arc<AtomicUsize>,
     container_events_requests: Arc<AtomicUsize>,
+    container_stats_requests: Arc<AtomicUsize>,
+    list_container_stats_requests: Arc<AtomicUsize>,
     list_pod_requests: Arc<AtomicUsize>,
     pod_inspect_requests: Arc<AtomicUsize>,
     list_container_requests: Arc<AtomicUsize>,
@@ -128,6 +130,8 @@ struct MockState {
     last_exec_sync: Arc<Mutex<Option<ExecSyncRequest>>>,
     last_attach: Arc<Mutex<Option<AttachRequest>>>,
     last_port_forward: Arc<Mutex<Option<PortForwardRequest>>>,
+    last_container_stats: Arc<Mutex<Option<ContainerStatsRequest>>>,
+    last_list_container_stats: Arc<Mutex<Option<ListContainerStatsRequest>>>,
     exec_url: Arc<Mutex<Option<String>>>,
     attach_url: Arc<Mutex<Option<String>>>,
     port_forward_url: Arc<Mutex<Option<String>>>,
@@ -662,16 +666,64 @@ impl RuntimeService for MockRuntimeService {
             .unwrap_or_else(|| "ws://127.0.0.1:9/portforward/mock".to_string());
         Ok(Response::new(PortForwardResponse { url }))
     }
-    unimplemented_runtime_rpc!(
-        container_stats,
-        ContainerStatsRequest,
-        ContainerStatsResponse
-    );
-    unimplemented_runtime_rpc!(
-        list_container_stats,
-        ListContainerStatsRequest,
-        ListContainerStatsResponse
-    );
+    async fn container_stats(
+        &self,
+        request: Request<ContainerStatsRequest>,
+    ) -> Result<Response<ContainerStatsResponse>, Status> {
+        let request = request.into_inner();
+        let id = request.container_id.clone();
+        self.state
+            .container_stats_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_container_stats
+            .lock()
+            .expect("last container stats lock") = Some(request);
+
+        if id == "missing" {
+            return Err(Status::not_found("container not found"));
+        }
+
+        Ok(Response::new(ContainerStatsResponse {
+            stats: Some(test_container_stats(
+                &id,
+                "single-container",
+                250_000_000,
+                4096,
+            )),
+        }))
+    }
+
+    async fn list_container_stats(
+        &self,
+        request: Request<ListContainerStatsRequest>,
+    ) -> Result<Response<ListContainerStatsResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .list_container_stats_requests
+            .fetch_add(1, Ordering::SeqCst);
+        *self
+            .state
+            .last_list_container_stats
+            .lock()
+            .expect("last list container stats lock") = Some(request.clone());
+
+        if request.filter.is_none() {
+            return Ok(Response::new(ListContainerStatsResponse {
+                stats: Vec::new(),
+            }));
+        }
+
+        Ok(Response::new(ListContainerStatsResponse {
+            stats: vec![test_container_stats(
+                "ctr-stats-a",
+                "container-a",
+                500_000_000,
+                8192,
+            )],
+        }))
+    }
     unimplemented_runtime_rpc!(
         pod_sandbox_stats,
         PodSandboxStatsRequest,
@@ -3285,6 +3337,82 @@ async fn events_sigint_returns_interrupted_exit_code() {
     assert_eq!(status.code(), Some(130));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn top_level_stats_empty_list_returns_successful_summary() {
+    let state = MockState::default();
+    let requests = Arc::clone(&state.list_container_stats_requests);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["--output", "json", "stats"]);
+
+    assert_success(&output);
+    let value = stdout_json(&output);
+    assert_eq!(value["kind"], "ContainerStats");
+    assert_eq!(value["items"].as_array().expect("items").len(), 0);
+    assert_eq!(value["summary"]["count"], 0);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn container_stats_single_and_list_paths_share_view_shape() {
+    let state = MockState::default();
+    let single_requests = Arc::clone(&state.container_stats_requests);
+    let list_requests = Arc::clone(&state.list_container_stats_requests);
+    let last_single = Arc::clone(&state.last_container_stats);
+    let last_list = Arc::clone(&state.last_list_container_stats);
+    let endpoint = spawn_mock_services(state).await;
+
+    let single = run_crs(
+        endpoint,
+        ["--output", "json", "container", "stats", "ctr123"],
+    );
+    assert_success(&single);
+    let value = stdout_json(&single);
+    assert_eq!(value["kind"], "ContainerStats");
+    assert_eq!(value["items"][0]["id"], "ctr123");
+    assert_eq!(value["items"][0]["name"], "single-container");
+    assert_eq!(value["items"][0]["cpuNanoCores"], 250_000_000);
+    assert_eq!(
+        last_single
+            .lock()
+            .expect("last container stats lock")
+            .clone()
+            .expect("container stats request")
+            .container_id,
+        "ctr123"
+    );
+
+    let listed = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "container",
+            "stats",
+            "--pod",
+            "pod123",
+            "--label",
+            "app=demo",
+        ],
+    );
+    assert_success(&listed);
+    let value = stdout_json(&listed);
+    assert_eq!(value["kind"], "ContainerStats");
+    assert_eq!(value["items"][0]["id"], "ctr-stats-a");
+    assert_eq!(value["items"][0]["memoryBytes"], 8192);
+    let request = last_list
+        .lock()
+        .expect("last list container stats lock")
+        .clone()
+        .expect("list container stats request");
+    let filter = request.filter.expect("filter");
+    assert_eq!(filter.pod_sandbox_id, "pod123");
+    assert_eq!(filter.label_selector["app"], "demo");
+
+    assert_eq!(single_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(list_requests.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn json_error_is_written_to_stderr_with_empty_stdout() {
     let socket_dir = tempfile::tempdir().expect("tempdir should be created");
@@ -3393,6 +3521,45 @@ fn test_container_event(
             runtime_handler: "runc".into(),
         }),
         containers_statuses: Vec::new(),
+    }
+}
+
+fn test_container_stats(
+    id: &str,
+    name: &str,
+    cpu_nano_cores: u64,
+    memory_bytes: u64,
+) -> ContainerStats {
+    ContainerStats {
+        attributes: Some(ContainerAttributes {
+            id: id.to_string(),
+            metadata: Some(ContainerMetadata {
+                name: name.to_string(),
+                attempt: 1,
+            }),
+            labels: Default::default(),
+            annotations: Default::default(),
+        }),
+        cpu: Some(CpuUsage {
+            timestamp: 1_000_000_000,
+            usage_core_nano_seconds: Some(UInt64Value { value: 2 }),
+            usage_nano_cores: Some(UInt64Value {
+                value: cpu_nano_cores,
+            }),
+        }),
+        memory: Some(MemoryUsage {
+            timestamp: 1_000_000_000,
+            working_set_bytes: Some(UInt64Value {
+                value: memory_bytes,
+            }),
+            available_bytes: None,
+            usage_bytes: None,
+            rss_bytes: None,
+            page_faults: None,
+            major_page_faults: None,
+        }),
+        writable_layer: None,
+        swap: None,
     }
 }
 

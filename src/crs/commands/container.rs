@@ -1,18 +1,24 @@
 use std::io::Write;
 
 use crate::crs::{
-    args::{ContainerCommand, ContainerCreateArgs, ContainerListArgs, ContainerStateArg},
+    args::{
+        ContainerCommand, ContainerCreateArgs, ContainerListArgs, ContainerStateArg,
+        ContainerStatsArgs,
+    },
     builders::{build_container_config, build_resources_from_specs},
     client::CrsClient,
     commands::status::{parse_info_map, render_and_print},
     context::CliContext,
     error::{CliError, CommandResult},
-    format::{CommandOutput, ContainerOperationView, ContainerView, InspectView},
+    format::{
+        CommandOutput, ContainerOperationView, ContainerView, InspectView, ResourceUsageView,
+    },
     parsers::parse_key_value,
 };
 use crate::proto::runtime::v1::{
     CheckpointContainerRequest, Container, ContainerFilter, ContainerState, ContainerStateValue,
-    ContainerStatus, ContainerStatusRequest, CreateContainerRequest, ExecSyncRequest,
+    ContainerStats, ContainerStatsFilter, ContainerStatsRequest, ContainerStatus,
+    ContainerStatusRequest, CreateContainerRequest, ExecSyncRequest, ListContainerStatsRequest,
     ListContainersRequest, PodSandboxConfig, PodSandboxMetadata, PodSandboxStatusRequest,
     RemoveContainerRequest, ReopenContainerLogRequest, StartContainerRequest, StopContainerRequest,
     UpdateContainerResourcesRequest,
@@ -33,7 +39,7 @@ pub(crate) async fn handle(
         ContainerCommand::Exec(_) => Err(CliError::not_implemented("crs container exec")),
         ContainerCommand::ExecSync(args) => handle_exec_sync(ctx, client, args).await,
         ContainerCommand::Attach { .. } => Err(CliError::not_implemented("crs container attach")),
-        ContainerCommand::Stats(_) => Err(CliError::not_implemented("crs container stats")),
+        ContainerCommand::Stats(args) => handle_stats(ctx, client, args).await,
         ContainerCommand::Checkpoint {
             id,
             location,
@@ -47,6 +53,72 @@ pub(crate) async fn handle(
         ContainerCommand::ReopenLog { id } => handle_reopen_log(ctx, client, id).await,
         ContainerCommand::Logs(_) => Err(CliError::not_implemented("crs container logs")),
     }
+}
+
+pub(crate) async fn handle_stats(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: ContainerStatsArgs,
+) -> Result<CommandResult, CliError> {
+    if let Some(id) = args.id {
+        ensure_container_id(&id, "crs container stats")?;
+        let mut runtime = client.runtime()?;
+        let response = client
+            .with_rpc_timeout(async {
+                runtime
+                    .container_stats(ContainerStatsRequest {
+                        container_id: id.clone(),
+                    })
+                    .await
+                    .map_err(|status| {
+                        container_status_error(status, client, "crs container stats", &id)
+                    })
+            })
+            .await?
+            .into_inner();
+        let items = response
+            .stats
+            .into_iter()
+            .map(container_stats_view)
+            .collect();
+        return render_and_print(
+            ctx,
+            CommandOutput::new("ContainerStats", client.endpoint(), items),
+        );
+    }
+
+    handle_stats_list(ctx, client, args.pod, args.labels, "ContainerStats").await
+}
+
+pub(crate) async fn handle_stats_list(
+    ctx: &CliContext,
+    client: &CrsClient,
+    pod: Option<String>,
+    labels: Vec<String>,
+    kind: &'static str,
+) -> Result<CommandResult, CliError> {
+    let filter = container_stats_filter(None, pod, labels)?;
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .list_container_stats(ListContainerStatsRequest { filter })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs container stats")
+                        .with_endpoint(client.endpoint())
+                })
+        })
+        .await?
+        .into_inner();
+    let items = response
+        .stats
+        .into_iter()
+        .map(container_stats_view)
+        .collect();
+
+    render_and_print(ctx, CommandOutput::new(kind, client.endpoint(), items))
 }
 
 pub(crate) async fn handle_exec_sync(
@@ -524,6 +596,28 @@ pub(crate) fn container_filter_from_args(
     }))
 }
 
+pub(crate) fn container_stats_filter(
+    id: Option<String>,
+    pod: Option<String>,
+    labels: Vec<String>,
+) -> Result<Option<ContainerStatsFilter>, CliError> {
+    let labels = labels
+        .iter()
+        .map(|label| parse_key_value("--label", label).map(|pair| (pair.key, pair.value)))
+        .collect::<Result<std::collections::HashMap<_, _>, _>>()
+        .map_err(CliError::invalid_input)?;
+
+    if id.is_none() && pod.is_none() && labels.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(ContainerStatsFilter {
+        id: id.unwrap_or_default(),
+        pod_sandbox_id: pod.unwrap_or_default(),
+        label_selector: labels,
+    }))
+}
+
 async fn fetch_sandbox_config(
     client: &CrsClient,
     pod: &str,
@@ -660,6 +754,29 @@ fn container_state_name(state: i32) -> &'static str {
         Some(ContainerState::ContainerExited) => "exited",
         Some(ContainerState::ContainerUnknown) => "unknown",
         None => "unknown",
+    }
+}
+
+pub(crate) fn container_stats_view(stats: ContainerStats) -> ResourceUsageView {
+    let attributes = stats.attributes.unwrap_or_default();
+    let metadata = attributes.metadata.unwrap_or_default();
+    let cpu_nano_cores = stats
+        .cpu
+        .and_then(|cpu| cpu.usage_nano_cores)
+        .map(|value| value.value)
+        .unwrap_or_default();
+    let memory_bytes = stats
+        .memory
+        .and_then(|memory| memory.working_set_bytes)
+        .map(|value| value.value)
+        .unwrap_or_default();
+
+    ResourceUsageView {
+        id: attributes.id,
+        name: metadata.name,
+        cpu_nano_cores,
+        memory_bytes,
+        pids: 0,
     }
 }
 
