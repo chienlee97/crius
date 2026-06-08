@@ -52,6 +52,10 @@ pub enum Command {
     Image(ImageArgs),
     Pod(PodArgs),
     Container(ContainerArgs),
+    #[command(
+        about = "Create and start a local ordinary container",
+        long_about = "Create and start a local ordinary container. By default, crs run does not create a user-visible Pod and does not use the default CNI path. Pass --pod to join an existing local Pod sandbox."
+    )]
     Run(Box<RunArgs>),
     Events(EventsArgs),
     Stats(StatsArgs),
@@ -480,7 +484,7 @@ pub enum ContainerCommand {
 pub struct ContainerListArgs {
     #[arg(long)]
     pub id: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Join an existing local Pod sandbox")]
     pub pod: Option<String>,
     #[arg(long, value_enum)]
     pub state: Option<ContainerStateArg>,

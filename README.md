@@ -138,9 +138,11 @@ global `--connect-timeout`, `--timeout`, `--debug`, `--output table|json|text`,
 `--quiet`, and `--no-trunc` options.
 
 `crs` is the project-native local client for development validation, node
-diagnostics, and daemon maintenance workflows. `crictl` remains the standard
-Kubernetes CRI conformance and interoperability tool; use it when comparing
-behavior with other runtimes or following kubelet-oriented operational guides.
+diagnostics, and daemon maintenance workflows. `crs run IMAGE ...` starts an
+ordinary container by default; Pod grouping is explicit through `crs pod run`
+or `crs run --pod POD IMAGE ...`. `crictl` remains the standard Kubernetes CRI
+conformance and interoperability tool; use it when comparing behavior with
+other runtimes or following kubelet-oriented operational guides.
 
 ## Quick Start
 
@@ -213,8 +215,8 @@ crs container list
 # ctr-example   pod-example  registry.local/app   running
 
 crs run --rm registry.local/app:stable /bin/true
-# POD ID        CONTAINER ID  IMAGE
-# pod-example   ctr-example   registry.local/app:stable
+# CONTAINER ID  IMAGE
+# ctr-example   registry.local/app:stable
 
 crs debug runtime
 # AREA     STATUS  MESSAGE

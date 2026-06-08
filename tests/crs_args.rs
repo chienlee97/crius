@@ -24,6 +24,17 @@ fn parses_version_help() {
 }
 
 #[test]
+fn run_help_describes_default_ordinary_container() {
+    let error =
+        Args::try_parse_from(["crs", "run", "--help"]).expect_err("help should short-circuit");
+    let help = error.render().to_string();
+
+    assert!(help.contains("ordinary container"));
+    assert!(help.contains("--pod"));
+    assert!(!help.contains("temporary Pod"));
+}
+
+#[test]
 fn parses_minimal_version_command() {
     let args = Args::try_parse_from(["crs", "version"]).expect("version should parse");
 
