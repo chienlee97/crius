@@ -170,6 +170,18 @@ sudo /usr/bin/crius --write-default-config /etc/crius/crius.conf
 Review `/etc/crius/crius.conf` before connecting kubelet. Pay special attention
 to runtime paths, shim path, CNI paths, pause image, and cgroup driver.
 
+For local `crs pod run` validation on a node that is not using Kubernetes CNI,
+install the sample local bridge network before starting the daemon:
+
+```bash
+sudo install -Dm644 examples/cni/crius-bridge.conflist \
+  /etc/crius/cni/net.d/10-crius-bridge.conflist
+```
+
+This sample uses the standard `bridge`, `host-local`, and `portmap` CNI plugins
+and does not require Kubernetes API access. Kubernetes / CRI networking remains
+configured separately under `[network.cri]`.
+
 Start the service:
 
 ```bash

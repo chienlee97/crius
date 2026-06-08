@@ -143,9 +143,12 @@ events.
 
 ## Networking
 
-The default network implementation is CNI. `crius` loads configuration from
-`network.config_dirs`, plugin binaries from `network.plugin_dirs`, and cache
-state from `network.cache_dir`.
+The default network implementation is CNI. Local `crs` Pod workflows load CNI
+configuration from `[network.local]`, which defaults to `/etc/crius/cni/net.d`.
+Kubelet and generic CRI workflows load CNI configuration from `[network.cri]`,
+which defaults to `/etc/cni/net.d` and `/etc/kubernetes/cni/net.d`. The legacy
+top-level `[network]` CNI fields remain accepted and map to the CRI network
+domain.
 
 Supported behavior includes CNI ADD/DEL, hostPort mappings, PodCIDR template
 rendering through `UpdateRuntimeConfig`, handler-specific CNI directories, and
