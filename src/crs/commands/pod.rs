@@ -1,4 +1,5 @@
 use crate::crs::{
+    annotations::{LOCAL_NETWORK_DOMAIN, NETWORK_DOMAIN_ANNOTATION},
     args::{PodCommand, PodCreateArgs, PodListArgs, PodStateArg, PodStatsArgs},
     builders::{build_pod_sandbox_config, build_resources_from_specs},
     client::CrsClient,
@@ -118,7 +119,11 @@ pub(crate) async fn handle_run(
     client: &CrsClient,
     args: PodCreateArgs,
 ) -> Result<CommandResult, CliError> {
-    let config = build_pod_sandbox_config(&args).map_err(CliError::invalid_input)?;
+    let mut config = build_pod_sandbox_config(&args).map_err(CliError::invalid_input)?;
+    config.annotations.insert(
+        NETWORK_DOMAIN_ANNOTATION.to_string(),
+        LOCAL_NETWORK_DOMAIN.to_string(),
+    );
     let metadata = config.metadata.clone().unwrap_or_default();
     let runtime_handler = args.runtime_handler.clone().unwrap_or_default();
     let mut runtime = client.runtime()?;

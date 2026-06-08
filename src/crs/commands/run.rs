@@ -1,6 +1,7 @@
 use uuid::Uuid;
 
 use crate::crs::{
+    annotations::{INTERNAL_SANDBOX_ANNOTATION, LOCAL_NETWORK_DOMAIN, NETWORK_DOMAIN_ANNOTATION},
     args::{
         ContainerCreateArgs, ContainerCreateOptions, ExecModeArg, PullPolicyArg, RunArgs,
         StreamOptions,
@@ -19,10 +20,6 @@ use crate::proto::runtime::v1::{
     RemoveContainerRequest, RemovePodSandboxRequest, RunPodSandboxRequest, StartContainerRequest,
     StopContainerRequest, StopPodSandboxRequest,
 };
-
-pub(crate) const INTERNAL_SANDBOX_ANNOTATION: &str = "crius.crs/internal-sandbox";
-const LOCAL_NETWORK_ANNOTATION: &str = "crius.crs/network-domain";
-const LOCAL_NETWORK_VALUE: &str = "local";
 
 #[derive(Debug)]
 struct RunPlan {
@@ -152,7 +149,9 @@ fn run_pod_args(args: &RunArgs) -> crate::crs::args::PodCreateArgs {
     let options = &args.pod_options;
     let mut annotations = options.annotations.clone();
     annotations.push(format!("{INTERNAL_SANDBOX_ANNOTATION}=true"));
-    annotations.push(format!("{LOCAL_NETWORK_ANNOTATION}={LOCAL_NETWORK_VALUE}"));
+    annotations.push(format!(
+        "{NETWORK_DOMAIN_ANNOTATION}={LOCAL_NETWORK_DOMAIN}"
+    ));
 
     crate::crs::args::PodCreateArgs {
         name: Some(
@@ -331,8 +330,8 @@ fn internal_sandbox_config(mut config: PodSandboxConfig) -> PodSandboxConfig {
         .annotations
         .insert(INTERNAL_SANDBOX_ANNOTATION.to_string(), "true".to_string());
     config.annotations.insert(
-        LOCAL_NETWORK_ANNOTATION.to_string(),
-        LOCAL_NETWORK_VALUE.to_string(),
+        NETWORK_DOMAIN_ANNOTATION.to_string(),
+        LOCAL_NETWORK_DOMAIN.to_string(),
     );
 
     if let Some(linux) = config.linux.as_mut() {

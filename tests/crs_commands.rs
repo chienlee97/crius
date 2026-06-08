@@ -2350,6 +2350,10 @@ async fn pod_run_stop_remove_and_update_resources_call_runtime_rpcs() {
     let config = request.config.expect("pod config");
     assert_eq!(config.metadata.expect("metadata").namespace, "ns-a");
     assert_eq!(config.labels["app"], "demo");
+    assert_eq!(
+        config.annotations.get("crius.crs/network-domain"),
+        Some(&"local".to_string())
+    );
 
     let stop = run_crs(endpoint, ["--output", "json", "pod", "stop", "pod-demo"]);
     assert_success(&stop);
