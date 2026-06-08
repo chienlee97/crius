@@ -171,6 +171,62 @@ fn network_config_accepts_legacy_single_config_dir() {
     .expect("legacy config_dir should deserialize");
 
     assert_eq!(config.network.config_dirs, vec!["/etc/cni/net.d"]);
+    assert_eq!(
+        config
+            .network
+            .cni_config()
+            .config_dirs()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        vec!["/etc/cni/net.d"]
+    );
+}
+
+#[test]
+fn network_config_has_separate_local_and_cri_defaults() {
+    let config = Config::default();
+
+    assert_eq!(
+        config.network.local.config_dirs,
+        vec!["/etc/crius/cni/net.d"]
+    );
+    assert_eq!(
+        config.network.cri.config_dirs,
+        vec!["/etc/cni/net.d", "/etc/kubernetes/cni/net.d"]
+    );
+    assert_eq!(
+        config
+            .network
+            .local_cni_config()
+            .config_dirs()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        vec!["/etc/crius/cni/net.d"]
+    );
+}
+
+#[test]
+fn network_config_accepts_cri_domain_table() {
+    let config: Config = toml::from_str(
+        r#"
+            root = "/var/lib/crius"
+
+            [network.cri]
+            config_dirs = ["/etc/cri/net.d"]
+            plugin_dirs = ["/opt/cri/bin"]
+            cache_dir = "/var/lib/cri-cni/cache"
+            max_conf_num = 2
+            "#,
+    )
+    .expect("network.cri should deserialize");
+
+    let cri = config.network.cri_domain();
+    assert_eq!(cri.config_dirs, vec!["/etc/cri/net.d"]);
+    assert_eq!(cri.plugin_dirs, vec!["/opt/cri/bin"]);
+    assert_eq!(cri.cache_dir, "/var/lib/cri-cni/cache");
+    assert_eq!(cri.max_conf_num, 2);
 }
 
 #[test]
