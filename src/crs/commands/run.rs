@@ -15,10 +15,14 @@ use crate::crs::{
 };
 use crate::proto::runtime::v1::{
     AttachRequest, CreateContainerRequest, ExecSyncRequest, ImageSpec, ImageStatusRequest,
-    PodSandboxConfig, PodSandboxStatusRequest, PullImageRequest, RemoveContainerRequest,
-    RemovePodSandboxRequest, RunPodSandboxRequest, StartContainerRequest, StopContainerRequest,
-    StopPodSandboxRequest,
+    NamespaceMode, PodSandboxConfig, PodSandboxStatusRequest, PullImageRequest,
+    RemoveContainerRequest, RemovePodSandboxRequest, RunPodSandboxRequest, StartContainerRequest,
+    StopContainerRequest, StopPodSandboxRequest,
 };
+
+pub(crate) const INTERNAL_SANDBOX_ANNOTATION: &str = "crius.crs/internal-sandbox";
+const LOCAL_NETWORK_ANNOTATION: &str = "crius.crs/network-domain";
+const LOCAL_NETWORK_VALUE: &str = "local";
 
 #[derive(Debug)]
 struct RunPlan {
@@ -146,6 +150,10 @@ impl RunPlan {
 
 fn run_pod_args(args: &RunArgs) -> crate::crs::args::PodCreateArgs {
     let options = &args.pod_options;
+    let mut annotations = options.annotations.clone();
+    annotations.push(format!("{INTERNAL_SANDBOX_ANNOTATION}=true"));
+    annotations.push(format!("{LOCAL_NETWORK_ANNOTATION}={LOCAL_NETWORK_VALUE}"));
+
     crate::crs::args::PodCreateArgs {
         name: Some(
             options
@@ -172,13 +180,13 @@ fn run_pod_args(args: &RunArgs) -> crate::crs::args::PodCreateArgs {
         dns_options: options.dns_options.clone(),
         publish: options.publish.clone(),
         labels: options.labels.clone(),
-        annotations: options.annotations.clone(),
+        annotations,
         runtime_handler: options.runtime_handler.clone(),
         cgroup_parent: options.cgroup_parent.clone(),
         sysctls: options.sysctls.clone(),
-        host_network: options.host_network,
-        host_pid: options.host_pid,
-        host_ipc: options.host_ipc,
+        host_network: true,
+        host_pid: true,
+        host_ipc: true,
         userns: options.userns.clone(),
         uid_maps: options.uid_maps.clone(),
         gid_maps: options.gid_maps.clone(),
@@ -293,7 +301,9 @@ async fn prepare_pod(
             Ok((pod_id.clone(), config, false))
         }
         PodPlan::Create(args) => {
-            let sandbox_config = build_pod_sandbox_config(args).map_err(CliError::invalid_input)?;
+            let sandbox_config = internal_sandbox_config(
+                build_pod_sandbox_config(args).map_err(CliError::invalid_input)?,
+            );
             let mut runtime = client.runtime()?;
             let response = client
                 .with_rpc_timeout(async {
@@ -314,6 +324,29 @@ async fn prepare_pod(
             Ok((response.pod_sandbox_id, sandbox_config, true))
         }
     }
+}
+
+fn internal_sandbox_config(mut config: PodSandboxConfig) -> PodSandboxConfig {
+    config
+        .annotations
+        .insert(INTERNAL_SANDBOX_ANNOTATION.to_string(), "true".to_string());
+    config.annotations.insert(
+        LOCAL_NETWORK_ANNOTATION.to_string(),
+        LOCAL_NETWORK_VALUE.to_string(),
+    );
+
+    if let Some(linux) = config.linux.as_mut() {
+        if let Some(security) = linux.security_context.as_mut() {
+            let namespace_options = security
+                .namespace_options
+                .get_or_insert_with(Default::default);
+            namespace_options.network = NamespaceMode::Node as i32;
+            namespace_options.pid = NamespaceMode::Node as i32;
+            namespace_options.ipc = NamespaceMode::Node as i32;
+        }
+    }
+
+    config
 }
 
 async fn fetch_sandbox_config(

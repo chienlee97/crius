@@ -2568,6 +2568,19 @@ async fn run_detach_creates_or_reuses_pod_and_starts_container() {
     let pod_metadata = pod_config.metadata.expect("pod metadata");
     assert_eq!(pod_metadata.name, "pod-demo");
     assert_eq!(pod_metadata.namespace, "ns-a");
+    assert_eq!(
+        pod_config.annotations.get("crius.crs/internal-sandbox"),
+        Some(&"true".to_string())
+    );
+    let namespace_options = pod_config
+        .linux
+        .as_ref()
+        .and_then(|linux| linux.security_context.as_ref())
+        .and_then(|security| security.namespace_options.as_ref())
+        .expect("sandbox namespace options");
+    assert_eq!(namespace_options.network, NamespaceMode::Node as i32);
+    assert_eq!(namespace_options.pid, NamespaceMode::Node as i32);
+    assert_eq!(namespace_options.ipc, NamespaceMode::Node as i32);
 
     let create_request = last_create_container
         .lock()
