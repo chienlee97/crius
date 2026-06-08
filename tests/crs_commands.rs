@@ -131,6 +131,7 @@ struct MockState {
     last_container_log: Arc<Mutex<Option<ContainerLogRequest>>>,
     last_recovery_check: Arc<Mutex<Option<RecoveryCheckRequest>>>,
     last_content_gc: Arc<Mutex<Option<ContentGcRequest>>>,
+    fail_non_host_pod_network: Arc<Mutex<bool>>,
 }
 
 impl Default for MockState {
@@ -213,6 +214,7 @@ impl Default for MockState {
             last_container_log: Arc::default(),
             last_recovery_check: Arc::default(),
             last_content_gc: Arc::default(),
+            fail_non_host_pod_network: Arc::default(),
         }
     }
 }
@@ -247,7 +249,27 @@ impl RuntimeService for MockRuntimeService {
             .unwrap_or_default()
             .to_string();
         self.state.run_pod_requests.fetch_add(1, Ordering::SeqCst);
+        let uses_host_network = request
+            .config
+            .as_ref()
+            .and_then(|config| config.linux.as_ref())
+            .and_then(|linux| linux.security_context.as_ref())
+            .and_then(|security| security.namespace_options.as_ref())
+            .map(|namespaces| namespaces.network == NamespaceMode::Node as i32)
+            .unwrap_or(false);
         *self.state.last_run_pod.lock().expect("last run pod lock") = Some(request);
+
+        if *self
+            .state
+            .fail_non_host_pod_network
+            .lock()
+            .expect("fail non-host pod network lock")
+            && !uses_host_network
+        {
+            return Err(Status::failed_precondition(
+                "Calico Kubernetes API is unavailable while loading cluster information",
+            ));
+        }
 
         if name == "bad-runtime" {
             return Err(Status::failed_precondition(
@@ -2662,6 +2684,55 @@ async fn run_detach_creates_or_reuses_pod_and_starts_container() {
     assert_eq!(pod_status_requests.load(Ordering::SeqCst), 1);
     assert_eq!(create_container_requests.load(Ordering::SeqCst), 2);
     assert_eq!(start_container_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_run_uses_host_internal_sandbox_when_cri_cni_fails() {
+    let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("busybox:latest".to_string());
+    *state
+        .fail_non_host_pod_network
+        .lock()
+        .expect("fail non-host pod network lock") = true;
+    let endpoint = spawn_mock_services(state).await;
+
+    let default_run = run_crs(
+        endpoint,
+        [
+            "--output",
+            "json",
+            "run",
+            "--detach",
+            "--pull",
+            "never",
+            "busybox:latest",
+            "true",
+        ],
+    );
+    assert_success(&default_run);
+    assert_eq!(stdout_json(&default_run)["kind"], "Run");
+
+    let explicit_pod_run = run_crs(
+        endpoint,
+        [
+            "pod",
+            "run",
+            "--name",
+            "local-pod",
+            "--namespace",
+            "default",
+        ],
+    );
+    assert_eq!(explicit_pod_run.status.code(), Some(6));
+    let stderr = String::from_utf8(explicit_pod_run.stderr).expect("stderr should be utf8");
+    assert!(
+        stderr.contains("Calico Kubernetes API is unavailable"),
+        "unexpected stderr: {stderr}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
