@@ -2691,10 +2691,26 @@ impl RuntimeServiceImpl {
         config
     }
 
-    pub(super) async fn activate_pod_network_domain(&self, local: bool) {
+    pub(super) async fn activate_pod_network_domain(
+        &self,
+        local: bool,
+        managed_netns: bool,
+    ) -> Result<(), Status> {
         let config = self.pod_network_domain_cni_config(local);
+        if local && managed_netns && !Self::cni_config_has_config_file(&config) {
+            return Err(Status::failed_precondition(format!(
+                "local network is not configured: no CNI config file found in {}; install a local CNI conflist such as examples/cni/crius-bridge.conflist under /etc/crius/cni/net.d",
+                config
+                    .config_dirs()
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
         let mut pod_manager = self.pod_manager.lock().await;
         pod_manager.reload_runtime_network_settings(self.config.pause_image.clone(), config);
+        Ok(())
     }
 
     pub(super) fn pod_network_domain_cni_config(&self, local: bool) -> crate::network::CniConfig {
@@ -2711,6 +2727,21 @@ impl RuntimeServiceImpl {
             config.set_netns_mount_dir(self.config.rootless.netns_dir.clone());
         }
         config
+    }
+
+    fn cni_config_has_config_file(config: &crate::network::CniConfig) -> bool {
+        config.config_dirs().iter().any(|dir| {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return false;
+            };
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| matches!(extension, "conf" | "json" | "conflist"))
+                    .unwrap_or(false)
+            })
+        })
     }
 
     fn update_reload_state(&self, update: impl FnOnce(&mut RuntimeReloadState)) {

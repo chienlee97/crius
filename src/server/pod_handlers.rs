@@ -471,7 +471,6 @@ impl RuntimeServiceImpl {
             run_as_group,
             &supplemental_groups,
         )?;
-        self.activate_pod_network_domain(use_local_network).await;
         let mut pod_overhead = linux_config
             .as_ref()
             .and_then(|linux| linux.overhead.clone());
@@ -513,6 +512,8 @@ impl RuntimeServiceImpl {
             .and(effective_namespace_options.as_ref())
             .map(|options| options.network != NamespaceMode::Node as i32)
             .unwrap_or(true);
+        self.activate_pod_network_domain(use_local_network, managed_netns)
+            .await?;
         let pod_metadata = pod_config.metadata.as_ref();
         let pod_selinux_seed = format!(
             "{}:{}:{}",
