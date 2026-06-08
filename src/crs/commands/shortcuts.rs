@@ -212,7 +212,12 @@ async fn pod_exists(
                 })
                 .await
             {
-                Ok(response) => Ok(response.into_inner().status.is_some()),
+                Ok(response) => Ok(response
+                    .into_inner()
+                    .status
+                    .as_ref()
+                    .map(|status| !pod::is_internal_sandbox_status(status))
+                    .unwrap_or(false)),
                 Err(status) if status.code() == tonic::Code::NotFound => Ok(false),
                 Err(status) => Err(candidate_error(status, client, command_name, "pod", target)),
             }

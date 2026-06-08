@@ -326,6 +326,12 @@ impl RuntimeService for MockRuntimeService {
             return Err(Status::not_found("pod not found"));
         }
 
+        let annotations = if request.pod_sandbox_id == "internal-pod" {
+            [("crius.crs/internal-sandbox".to_string(), "true".to_string())].into()
+        } else {
+            Default::default()
+        };
+
         Ok(Response::new(PodSandboxStatusResponse {
             status: Some(PodSandboxStatus {
                 id: request.pod_sandbox_id,
@@ -342,7 +348,7 @@ impl RuntimeService for MockRuntimeService {
                     additional_ips: vec![],
                 }),
                 labels: Default::default(),
-                annotations: Default::default(),
+                annotations,
                 runtime_handler: "runc".into(),
                 linux: None,
             }),
@@ -366,20 +372,37 @@ impl RuntimeService for MockRuntimeService {
         );
 
         Ok(Response::new(ListPodSandboxResponse {
-            items: vec![PodSandbox {
-                id: "pod123456789".into(),
-                metadata: Some(PodSandboxMetadata {
-                    name: "pod-a".into(),
-                    uid: "uid-a".into(),
-                    namespace: "default".into(),
-                    attempt: 1,
-                }),
-                state: PodSandboxState::SandboxReady as i32,
-                created_at: 42,
-                labels: Default::default(),
-                annotations: Default::default(),
-                runtime_handler: "runc".into(),
-            }],
+            items: vec![
+                PodSandbox {
+                    id: "pod123456789".into(),
+                    metadata: Some(PodSandboxMetadata {
+                        name: "pod-a".into(),
+                        uid: "uid-a".into(),
+                        namespace: "default".into(),
+                        attempt: 1,
+                    }),
+                    state: PodSandboxState::SandboxReady as i32,
+                    created_at: 42,
+                    labels: Default::default(),
+                    annotations: Default::default(),
+                    runtime_handler: "runc".into(),
+                },
+                PodSandbox {
+                    id: "internal-pod".into(),
+                    metadata: Some(PodSandboxMetadata {
+                        name: "crius-internal".into(),
+                        uid: "uid-internal".into(),
+                        namespace: "default".into(),
+                        attempt: 1,
+                    }),
+                    state: PodSandboxState::SandboxReady as i32,
+                    created_at: 42,
+                    labels: Default::default(),
+                    annotations: [("crius.crs/internal-sandbox".to_string(), "true".to_string())]
+                        .into(),
+                    runtime_handler: "runc".into(),
+                },
+            ],
         }))
     }
     async fn create_container(
@@ -3407,7 +3430,15 @@ async fn shortcut_stop_resolves_unique_container_or_pod_target() {
     assert_success(&pod_stop);
     assert_eq!(stdout_json(&pod_stop)["kind"], "PodStop");
 
-    assert_eq!(stop_container_requests.load(Ordering::SeqCst), 1);
+    let internal_pod_stop = run_crs(endpoint, ["--output", "json", "stop", "internal-pod"]);
+    assert_success(&internal_pod_stop);
+    assert_eq!(
+        stdout_json(&internal_pod_stop)["kind"],
+        "ContainerStop",
+        "internal run sandbox must not be treated as a user pod candidate"
+    );
+
+    assert_eq!(stop_container_requests.load(Ordering::SeqCst), 2);
     assert_eq!(stop_pod_requests.load(Ordering::SeqCst), 1);
 }
 
@@ -3436,7 +3467,15 @@ async fn shortcut_rm_resolves_unique_container_pod_or_image_target() {
     assert_success(&image_rm);
     assert_eq!(stdout_json(&image_rm)["kind"], "ImageRemove");
 
-    assert_eq!(remove_container_requests.load(Ordering::SeqCst), 1);
+    let internal_pod_rm = run_crs(endpoint, ["--output", "json", "rm", "internal-pod"]);
+    assert_success(&internal_pod_rm);
+    assert_eq!(
+        stdout_json(&internal_pod_rm)["kind"],
+        "ContainerRemove",
+        "internal run sandbox must not be treated as a user pod candidate"
+    );
+
+    assert_eq!(remove_container_requests.load(Ordering::SeqCst), 2);
     assert_eq!(remove_pod_requests.load(Ordering::SeqCst), 1);
     assert_eq!(remove_image_requests.load(Ordering::SeqCst), 1);
 }

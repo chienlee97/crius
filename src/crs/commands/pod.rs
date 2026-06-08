@@ -1,5 +1,5 @@
 use crate::crs::{
-    annotations::{LOCAL_NETWORK_DOMAIN, NETWORK_DOMAIN_ANNOTATION},
+    annotations::{INTERNAL_SANDBOX_ANNOTATION, LOCAL_NETWORK_DOMAIN, NETWORK_DOMAIN_ANNOTATION},
     args::{PodCommand, PodCreateArgs, PodListArgs, PodStateArg, PodStatsArgs},
     builders::{build_pod_sandbox_config, build_resources_from_specs},
     client::CrsClient,
@@ -60,7 +60,12 @@ pub(crate) async fn handle_list(
         .await?
         .into_inner();
 
-    let views = response.items.into_iter().map(pod_view).collect();
+    let views = response
+        .items
+        .into_iter()
+        .filter(|pod| !is_internal_sandbox_annotations(&pod.annotations))
+        .map(pod_view)
+        .collect();
     render_and_print(ctx, CommandOutput::new("PodList", client.endpoint(), views))
 }
 
@@ -473,6 +478,19 @@ pub(crate) fn pod_view(pod: PodSandbox) -> PodView {
         created: pod.created_at.to_string(),
         attempt: metadata.attempt,
     }
+}
+
+pub(crate) fn is_internal_sandbox_status(status: &PodSandboxStatus) -> bool {
+    is_internal_sandbox_annotations(&status.annotations)
+}
+
+fn is_internal_sandbox_annotations(
+    annotations: &std::collections::HashMap<String, String>,
+) -> bool {
+    annotations
+        .get(INTERNAL_SANDBOX_ANNOTATION)
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 pub(crate) fn pod_stats_view(stats: PodSandboxStats) -> PodStatsView {
