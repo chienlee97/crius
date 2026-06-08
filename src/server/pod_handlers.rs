@@ -1,5 +1,8 @@
 use super::*;
 
+const CRS_NETWORK_DOMAIN_ANNOTATION: &str = "crius.crs/network-domain";
+const CRS_LOCAL_NETWORK_DOMAIN: &str = "local";
+
 impl RuntimeServiceImpl {
     fn untrusted_workload_requested(config: &crate::proto::runtime::v1::PodSandboxConfig) -> bool {
         config
@@ -17,6 +20,14 @@ impl RuntimeServiceImpl {
         namespace_options.network == NamespaceMode::Node as i32
             || namespace_options.pid == NamespaceMode::Node as i32
             || namespace_options.ipc == NamespaceMode::Node as i32
+    }
+
+    fn pod_uses_local_network(config: &crate::proto::runtime::v1::PodSandboxConfig) -> bool {
+        config
+            .annotations
+            .get(CRS_NETWORK_DOMAIN_ANNOTATION)
+            .map(|value| value.trim().eq_ignore_ascii_case(CRS_LOCAL_NETWORK_DOMAIN))
+            .unwrap_or(false)
     }
 
     pub(super) fn resolve_pod_runtime_handler(
@@ -407,6 +418,7 @@ impl RuntimeServiceImpl {
         let pod_config = req
             .config
             .ok_or_else(|| Status::invalid_argument("Pod config not specified"))?;
+        let use_local_network = Self::pod_uses_local_network(&pod_config);
         let pod_metadata = pod_config
             .metadata
             .as_ref()
@@ -459,6 +471,7 @@ impl RuntimeServiceImpl {
             run_as_group,
             &supplemental_groups,
         )?;
+        self.activate_pod_network_domain(use_local_network).await;
         let mut pod_overhead = linux_config
             .as_ref()
             .and_then(|linux| linux.overhead.clone());

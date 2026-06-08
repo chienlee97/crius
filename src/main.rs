@@ -193,14 +193,19 @@ async fn main() -> Result<(), Error> {
         )
     };
     let mut cni_config = config.network.cni_config();
+    let mut local_cni_config = config.network.local_cni_config();
     cni_config.set_rootless_config(Some(effective_rootless.clone()));
+    local_cni_config.set_rootless_config(Some(effective_rootless.clone()));
     if effective_rootless.enabled {
         cni_config.set_netns_mount_dir(effective_rootless.netns_dir.clone());
+        local_cni_config.set_netns_mount_dir(effective_rootless.netns_dir.clone());
     } else if config.network.netns_mounts_under_state_dir {
         cni_config.set_netns_mount_dir(PathBuf::from(&config.runtime.root).join("netns"));
+        local_cni_config.set_netns_mount_dir(PathBuf::from(&config.runtime.root).join("netns"));
     }
     if !config.runtime.pinns_path.trim().is_empty() {
         cni_config.set_namespace_helper_path(Some(PathBuf::from(&config.runtime.pinns_path)));
+        local_cni_config.set_namespace_helper_path(Some(PathBuf::from(&config.runtime.pinns_path)));
     }
     for (handler, handler_config) in &config.runtime.runtimes {
         let cni_conf_dir = handler_config.cni_conf_dir.trim();
@@ -361,6 +366,7 @@ async fn main() -> Result<(), Error> {
         pause_command: config.runtime.pause_command.clone(),
         drop_infra_ctr: config.runtime.drop_infra_ctr,
         cni_config,
+        local_cni_config,
         cgroup_driver: config.runtime.cgroup_driver.map(|driver| driver.as_proto()),
         exec_sync_io_drain_timeout: config.api.exec_sync_io_drain_timeout,
         max_container_log_line_size: config.logging.max_container_log_line_size,
@@ -1270,6 +1276,7 @@ mod tests {
             pause_command: "/pause".to_string(),
             drop_infra_ctr: false,
             cni_config: CniConfig::default(),
+            local_cni_config: CniConfig::default(),
             cgroup_driver: None,
             exec_sync_io_drain_timeout: std::time::Duration::ZERO,
             max_container_log_line_size: 4096,

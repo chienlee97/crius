@@ -70,6 +70,30 @@ async fn container_status_verbose_returns_json_info() {
 }
 
 #[tokio::test]
+async fn pod_network_domain_selection_uses_local_or_cri_cni_config() {
+    let mut service = test_service();
+    let mut reloadable = service.current_reloadable_config();
+    reloadable.cni_config_dirs = vec![std::path::PathBuf::from("/cri-cni")];
+    service
+        .apply_reloadable_config(reloadable, "test")
+        .await
+        .expect("reloadable network config should apply");
+    service
+        .config
+        .local_cni_config
+        .set_config_dirs(vec![std::path::PathBuf::from("/local-cni")]);
+
+    assert_eq!(
+        service.pod_network_domain_cni_config(false).config_dirs(),
+        &[std::path::PathBuf::from("/cri-cni")]
+    );
+    assert_eq!(
+        service.pod_network_domain_cni_config(true).config_dirs(),
+        &[std::path::PathBuf::from("/local-cni")]
+    );
+}
+
+#[tokio::test]
 async fn pod_sandbox_status_verbose_returns_json_info() {
     let (dir, service) = test_service_with_fake_runtime();
     let mut annotations = HashMap::new();

@@ -411,6 +411,7 @@ pub struct RuntimeConfig {
     pub pause_command: String,
     pub drop_infra_ctr: bool,
     pub cni_config: CniConfig,
+    pub local_cni_config: CniConfig,
     pub cgroup_driver: Option<CgroupDriver>,
     pub exec_sync_io_drain_timeout: std::time::Duration,
     pub max_container_log_line_size: usize,
@@ -453,11 +454,15 @@ impl Default for RuntimeConfig {
             )])
         });
         let mut cni_config = loaded.network.cni_config();
+        let mut local_cni_config = loaded.network.local_cni_config();
         if loaded.network.netns_mounts_under_state_dir {
             cni_config.set_netns_mount_dir(PathBuf::from(&loaded.runtime.root).join("netns"));
+            local_cni_config.set_netns_mount_dir(PathBuf::from(&loaded.runtime.root).join("netns"));
         }
         if !loaded.runtime.pinns_path.trim().is_empty() {
             cni_config.set_namespace_helper_path(Some(PathBuf::from(&loaded.runtime.pinns_path)));
+            local_cni_config
+                .set_namespace_helper_path(Some(PathBuf::from(&loaded.runtime.pinns_path)));
         }
         for (handler, handler_config) in &loaded.runtime.runtimes {
             let cni_conf_dir = handler_config.cni_conf_dir.trim();
@@ -641,6 +646,7 @@ impl Default for RuntimeConfig {
             pause_command: loaded.runtime.pause_command.clone(),
             drop_infra_ctr: loaded.runtime.drop_infra_ctr,
             cni_config,
+            local_cni_config,
             cgroup_driver,
             exec_sync_io_drain_timeout: loaded.api.exec_sync_io_drain_timeout,
             max_container_log_line_size: loaded.logging.max_container_log_line_size,
@@ -2675,6 +2681,28 @@ impl RuntimeServiceImpl {
         let mut config = self
             .current_reloadable_config()
             .with_cni_config(&self.config.cni_config);
+        config.set_rootless_config(Some(self.config.rootless.clone()));
+        config.set_event_sink(Some(crate::services::LedgerInternalEventSink::new(
+            self.config.root_dir.join("crius.db"),
+        )));
+        if self.config.rootless.enabled {
+            config.set_netns_mount_dir(self.config.rootless.netns_dir.clone());
+        }
+        config
+    }
+
+    pub(super) async fn activate_pod_network_domain(&self, local: bool) {
+        let config = self.pod_network_domain_cni_config(local);
+        let mut pod_manager = self.pod_manager.lock().await;
+        pod_manager.reload_runtime_network_settings(self.config.pause_image.clone(), config);
+    }
+
+    pub(super) fn pod_network_domain_cni_config(&self, local: bool) -> crate::network::CniConfig {
+        let mut config = if local {
+            self.config.local_cni_config.clone()
+        } else {
+            self.current_cni_config()
+        };
         config.set_rootless_config(Some(self.config.rootless.clone()));
         config.set_event_sink(Some(crate::services::LedgerInternalEventSink::new(
             self.config.root_dir.join("crius.db"),
