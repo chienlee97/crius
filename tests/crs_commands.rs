@@ -939,6 +939,42 @@ impl RuntimeService for MockRuntimeService {
                         "config".to_string(),
                         r#"{"cgroupDriver":"systemd"}"#.to_string(),
                     ),
+                    (
+                        "networkDiagnostics".to_string(),
+                        serde_json::json!({
+                            "ready": false,
+                            "reason": "CniNotReady",
+                            "message": "network is not ready",
+                            "domains": {
+                                "local": {
+                                    "configDirs": ["/etc/crius/cni/net.d"],
+                                    "pluginDirs": ["/opt/cni/bin"],
+                                    "cacheDir": "/var/lib/cni/cache",
+                                    "maxConfNum": 0,
+                                    "defaultNetworkName": "crius-bridge"
+                                },
+                                "cri": {
+                                    "configDirs": ["/etc/cni/net.d", "/etc/kubernetes/cni/net.d"],
+                                    "pluginDirs": ["/opt/cni/bin", "/usr/lib/cni"],
+                                    "cacheDir": "/var/lib/cni/cache",
+                                    "maxConfNum": 0,
+                                    "defaultNetworkName": "k8s-pod-network"
+                                }
+                            },
+                            "lastCniLoadStatus": {
+                                "ready": true,
+                                "reason": "CNINetworkConfigReady",
+                                "message": "loaded 1 CNI network config(s) and 1 plugin type(s)",
+                                "discoveredFiles": ["/etc/cni/net.d/10-calico.conflist"],
+                                "invalidFiles": [],
+                                "loadedNetworks": ["k8s-pod-network"],
+                                "declaredPlugins": ["calico"],
+                                "missingPluginBinaries": [],
+                                "defaultNetworkName": "k8s-pod-network"
+                            }
+                        })
+                        .to_string(),
+                    ),
                     ("bad".to_string(), "not-json".to_string()),
                 ]
                 .into()
@@ -2056,6 +2092,33 @@ async fn debug_commands_emit_stable_json_kinds() {
         assert!(value["summary"].is_object());
         assert!(value["items"][0]["details"].is_object());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_network_exposes_cni_domain_and_selection_details() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+
+    let output = run_crs(endpoint, ["--output", "json", "debug", "network"]);
+
+    assert_success(&output);
+    let value = stdout_json(&output);
+    let details = &value["summary"];
+    assert_eq!(details["localNetwork"]["configDirs"][0], "/etc/crius/cni/net.d");
+    assert_eq!(details["criNetwork"]["configDirs"][0], "/etc/cni/net.d");
+    assert_eq!(
+        details["cniSelection"]["discoveredFiles"][0],
+        "/etc/cni/net.d/10-calico.conflist"
+    );
+    assert_eq!(details["cniSelection"]["loadedNetworks"][0], "k8s-pod-network");
+    assert_eq!(details["cniSelection"]["declaredPlugins"][0], "calico");
+    assert!(value["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .unwrap_or_default()
+            .contains("Calico may depend on the Kubernetes API")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -3,6 +3,24 @@ use super::*;
 const STATUS_RECENT_NETWORK_EVENT_LIMIT: usize = 16;
 
 impl RuntimeServiceImpl {
+    fn cni_config_summary(config: &crate::network::CniConfig) -> serde_json::Value {
+        json!({
+            "configDirs": config
+                .config_dirs()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            "pluginDirs": config
+                .plugin_dirs()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            "cacheDir": config.cache_dir().display().to_string(),
+            "maxConfNum": config.max_conf_num(),
+            "defaultNetworkName": config.default_network_name(),
+        })
+    }
+
     async fn recent_internal_events_for_status(
         &self,
         subject_kind: &str,
@@ -880,6 +898,8 @@ impl RuntimeServiceImpl {
                     Ok(report) => (Some(report), None),
                     Err(err) => (None, Some(err)),
                 };
+            let local_network_config = self.pod_network_domain_cni_config(true);
+            let cri_network_config = self.pod_network_domain_cni_config(false);
             let (recent_network_runtime_events, recent_network_runtime_events_error) = self
                 .recent_internal_events_for_status(
                     "network",
@@ -1323,6 +1343,10 @@ impl RuntimeServiceImpl {
                     "ready": network_condition.ready,
                     "reason": network_condition.reason.clone(),
                     "message": network_condition.message.clone(),
+                    "domains": {
+                        "local": Self::cni_config_summary(&local_network_config),
+                        "cri": Self::cni_config_summary(&cri_network_config),
+                    },
                     "lastCniLoadStatus": cni_load_status.clone(),
                     "reload": self.internal_services.introspection.reload(
                         self.config.config_path.as_deref(),

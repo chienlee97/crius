@@ -44,12 +44,32 @@ async fn debug_network(ctx: &CliContext, client: &CrsClient) -> Result<CommandRe
         .await
         .map(|(config, _)| config)
         .unwrap_or_default();
+    let network_diagnostics = status_info
+        .get("networkDiagnostics")
+        .cloned()
+        .unwrap_or_default();
+    let local_network = network_diagnostics
+        .pointer("/domains/local")
+        .cloned()
+        .unwrap_or_default();
+    let cri_network = network_diagnostics
+        .pointer("/domains/cri")
+        .cloned()
+        .unwrap_or_default();
+    let cni_selection = network_diagnostics
+        .get("lastCniLoadStatus")
+        .cloned()
+        .unwrap_or_default();
+    add_cni_selection_warnings(&cni_selection, &mut warnings);
     let details = serde_json::json!({
         "networkReady": network_ready,
         "podCIDR": lookup_display(&config, &["/runtimeNetworkConfig/podCIDR", "/network/podCIDR", "/podCIDR"]),
         "cniTemplate": lookup_display(&config, &["/reload/current/cniConfTemplate", "/network/cniConfTemplate", "/cniConfTemplate"]),
         "cniWatcher": lookup_display(&config, &["/reload/lastCniWatchError", "/reload/cniWatchDirs"]),
-        "statusInfo": status_info.get("networkDiagnostics").cloned().unwrap_or_default(),
+        "localNetwork": local_network,
+        "criNetwork": cri_network,
+        "cniSelection": cni_selection,
+        "statusInfo": network_diagnostics,
     });
     render_debug(
         ctx,
@@ -63,6 +83,22 @@ async fn debug_network(ctx: &CliContext, client: &CrsClient) -> Result<CommandRe
             warnings,
         },
     )
+}
+
+fn add_cni_selection_warnings(cni_selection: &serde_json::Value, warnings: &mut Vec<String>) {
+    let mut declared_plugins = cni_selection
+        .get("declaredPlugins")
+        .and_then(|plugins| plugins.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|plugin| plugin.as_str());
+
+    if declared_plugins.any(|plugin| plugin.eq_ignore_ascii_case("calico")) {
+        warnings.push(
+            "selected CNI configuration uses Calico; Calico may depend on the Kubernetes API"
+                .to_string(),
+        );
+    }
 }
 
 async fn debug_runtime(ctx: &CliContext, client: &CrsClient) -> Result<CommandResult, CliError> {
