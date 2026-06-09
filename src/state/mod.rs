@@ -320,19 +320,21 @@ impl RecoveryLedgerSnapshot {
 
         for entry in &self.containers {
             let container = &entry.record;
-            if !pod_ids.contains(container.pod_id.as_str()) {
-                push_issue(
-                    &mut issues,
-                    "ownerGraphBroken",
-                    "container",
-                    &container.id,
-                    false,
-                    format!(
-                        "container {} references missing pod {}",
-                        container.id, container.pod_id
-                    ),
-                    json!({ "missingOwnerKind": "pod", "missingOwnerId": container.pod_id }),
-                );
+            if let Some(pod_id) = container.pod_id.as_deref() {
+                if !pod_ids.contains(pod_id) {
+                    push_issue(
+                        &mut issues,
+                        "ownerGraphBroken",
+                        "container",
+                        &container.id,
+                        false,
+                        format!(
+                            "container {} references missing pod {}",
+                            container.id, pod_id
+                        ),
+                        json!({ "missingOwnerKind": "pod", "missingOwnerId": pod_id }),
+                    );
+                }
             }
 
             if let Some(snapshot_key) = &container.snapshot_key {
@@ -881,7 +883,7 @@ impl<'a> StateLedgerWriter<'a> {
     pub fn save_container_state(
         &mut self,
         id: &str,
-        pod_id: &str,
+        pod_id: Option<&str>,
         state: ContainerStatus,
         image: &str,
         command: &[String],
@@ -1355,7 +1357,7 @@ mod tests {
         };
         let container = ContainerRecord {
             id: "container-a".to_string(),
-            pod_id: pod.id.clone(),
+            pod_id: Some(pod.id.clone()),
             state: "running".to_string(),
             image: "docker.io/library/busybox:latest".to_string(),
             command: "sleep 60".to_string(),
@@ -1444,20 +1446,23 @@ mod tests {
         let ledger = StateLedger::new(&persistence);
         let snapshot = ledger.recovery_snapshot().unwrap();
 
-        assert_eq!(ledger.schema_version().unwrap(), 1);
+        assert_eq!(ledger.schema_version().unwrap(), 2);
         assert_eq!(
             ledger
                 .latest_schema_migration()
                 .unwrap()
                 .unwrap()
                 .migration_name,
-            "baseline-current-ledger-schema"
+            "local-containers-null-pod-owner"
         );
         assert_eq!(snapshot.pods.len(), 1);
         assert_eq!(snapshot.pods[0].id, pod.id);
         assert_eq!(snapshot.containers.len(), 1);
         assert_eq!(snapshot.containers[0].status, ContainerStatus::Running);
-        assert_eq!(snapshot.containers[0].record.pod_id, "pod-a");
+        assert_eq!(
+            snapshot.containers[0].record.pod_id.as_deref(),
+            Some("pod-a")
+        );
         assert_eq!(
             snapshot.containers[0].record.snapshot_key.as_deref(),
             Some("snapshot-a")
@@ -1699,7 +1704,7 @@ mod tests {
             ledger
                 .save_container(&ContainerRecord {
                     id: "container-check".to_string(),
-                    pod_id: "missing-pod".to_string(),
+                    pod_id: Some("missing-pod".to_string()),
                     state: "running".to_string(),
                     image: "busybox:latest".to_string(),
                     command: "sleep 60".to_string(),

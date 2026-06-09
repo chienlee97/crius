@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package local.v1;
+
+import "k8s.io/cri-api/pkg/apis/runtime/v1/api.proto";
+
+service LocalService {
+  rpc CreateLocalContainer(CreateLocalContainerRequest) returns (CreateLocalContainerResponse);
+}
+
+message CreateLocalContainerRequest {
+  runtime.v1.ContainerConfig config = 1;
+  string runtime_handler = 2;
+  string cgroup_parent = 3;
+  repeated string sysctls = 4;
+}
+
+message CreateLocalContainerResponse {
+  string container_id = 1;
+}

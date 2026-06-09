@@ -19,6 +19,10 @@ use crius::proto::{
         RuntimeHandlersResponse, SecurityStatusRequest, SecurityStatusResponse, ServerInfoRequest,
         ServerInfoResponse, ShimStatusRequest, ShimStatusResponse,
     },
+    local::v1::{
+        local_service_server::{LocalService, LocalServiceServer},
+        CreateLocalContainerRequest, CreateLocalContainerResponse,
+    },
     runtime::v1::{
         image_service_server::{ImageService, ImageServiceServer},
         runtime_service_server::{RuntimeService, RuntimeServiceServer},
@@ -45,6 +49,11 @@ struct MockDiagnosticsService {
     state: MockState,
 }
 
+#[derive(Clone, Default)]
+struct MockLocalService {
+    state: MockState,
+}
+
 #[derive(Copy, Clone, Debug, Default)]
 enum MockEventMode {
     #[default]
@@ -63,6 +72,7 @@ struct MockState {
     remove_pod_requests: Arc<AtomicUsize>,
     update_pod_resources_requests: Arc<AtomicUsize>,
     create_container_requests: Arc<AtomicUsize>,
+    create_local_container_requests: Arc<AtomicUsize>,
     start_container_requests: Arc<AtomicUsize>,
     stop_container_requests: Arc<AtomicUsize>,
     remove_container_requests: Arc<AtomicUsize>,
@@ -105,6 +115,7 @@ struct MockState {
     last_remove_pod: Arc<Mutex<Option<RemovePodSandboxRequest>>>,
     last_update_pod_resources: Arc<Mutex<Option<UpdatePodSandboxResourcesRequest>>>,
     last_create_container: Arc<Mutex<Option<CreateContainerRequest>>>,
+    last_create_local_container: Arc<Mutex<Option<CreateLocalContainerRequest>>>,
     last_start_container: Arc<Mutex<Option<StartContainerRequest>>>,
     last_stop_container: Arc<Mutex<Option<StopContainerRequest>>>,
     last_remove_container: Arc<Mutex<Option<RemoveContainerRequest>>>,
@@ -148,6 +159,7 @@ impl Default for MockState {
             remove_pod_requests: Arc::default(),
             update_pod_resources_requests: Arc::default(),
             create_container_requests: Arc::default(),
+            create_local_container_requests: Arc::default(),
             start_container_requests: Arc::default(),
             stop_container_requests: Arc::default(),
             remove_container_requests: Arc::default(),
@@ -190,6 +202,7 @@ impl Default for MockState {
             last_remove_pod: Arc::default(),
             last_update_pod_resources: Arc::default(),
             last_create_container: Arc::default(),
+            last_create_local_container: Arc::default(),
             last_start_container: Arc::default(),
             last_stop_container: Arc::default(),
             last_remove_container: Arc::default(),
@@ -352,12 +365,6 @@ impl RuntimeService for MockRuntimeService {
             return Err(Status::not_found("pod not found"));
         }
 
-        let annotations = if request.pod_sandbox_id == "internal-pod" {
-            [("crius.crs/internal-sandbox".to_string(), "true".to_string())].into()
-        } else {
-            Default::default()
-        };
-
         Ok(Response::new(PodSandboxStatusResponse {
             status: Some(PodSandboxStatus {
                 id: request.pod_sandbox_id,
@@ -374,7 +381,7 @@ impl RuntimeService for MockRuntimeService {
                     additional_ips: vec![],
                 }),
                 labels: Default::default(),
-                annotations,
+                annotations: Default::default(),
                 runtime_handler: "runc".into(),
                 linux: None,
             }),
@@ -398,37 +405,20 @@ impl RuntimeService for MockRuntimeService {
         );
 
         Ok(Response::new(ListPodSandboxResponse {
-            items: vec![
-                PodSandbox {
-                    id: "pod123456789".into(),
-                    metadata: Some(PodSandboxMetadata {
-                        name: "pod-a".into(),
-                        uid: "uid-a".into(),
-                        namespace: "default".into(),
-                        attempt: 1,
-                    }),
-                    state: PodSandboxState::SandboxReady as i32,
-                    created_at: 42,
-                    labels: Default::default(),
-                    annotations: Default::default(),
-                    runtime_handler: "runc".into(),
-                },
-                PodSandbox {
-                    id: "internal-pod".into(),
-                    metadata: Some(PodSandboxMetadata {
-                        name: "crius-internal".into(),
-                        uid: "uid-internal".into(),
-                        namespace: "default".into(),
-                        attempt: 1,
-                    }),
-                    state: PodSandboxState::SandboxReady as i32,
-                    created_at: 42,
-                    labels: Default::default(),
-                    annotations: [("crius.crs/internal-sandbox".to_string(), "true".to_string())]
-                        .into(),
-                    runtime_handler: "runc".into(),
-                },
-            ],
+            items: vec![PodSandbox {
+                id: "pod123456789".into(),
+                metadata: Some(PodSandboxMetadata {
+                    name: "pod-a".into(),
+                    uid: "uid-a".into(),
+                    namespace: "default".into(),
+                    attempt: 1,
+                }),
+                state: PodSandboxState::SandboxReady as i32,
+                created_at: 42,
+                labels: Default::default(),
+                annotations: Default::default(),
+                runtime_handler: "runc".into(),
+            }],
         }))
     }
     async fn create_container(
@@ -1165,6 +1155,44 @@ impl RuntimeService for MockRuntimeService {
         }
 
         Ok(Response::new(UpdatePodSandboxResourcesResponse {}))
+    }
+}
+
+#[tonic::async_trait]
+impl LocalService for MockLocalService {
+    async fn create_local_container(
+        &self,
+        request: Request<CreateLocalContainerRequest>,
+    ) -> Result<Response<CreateLocalContainerResponse>, Status> {
+        let request = request.into_inner();
+        let image = request
+            .config
+            .as_ref()
+            .and_then(|config| config.image.as_ref())
+            .map(|image| image.image.as_str())
+            .unwrap_or_default()
+            .to_string();
+        self.state
+            .create_local_container_requests
+            .fetch_add(1, Ordering::SeqCst);
+        self.state
+            .rpc_sequence
+            .lock()
+            .expect("rpc sequence lock")
+            .push(format!("create-local-container:{image}"));
+        *self
+            .state
+            .last_create_local_container
+            .lock()
+            .expect("last create local container lock") = Some(request);
+
+        if image == "bad-config" {
+            return Err(Status::failed_precondition("container config rejected"));
+        }
+
+        Ok(Response::new(CreateLocalContainerResponse {
+            container_id: format!("ctr-local-{image}"),
+        }))
     }
 }
 
@@ -2677,7 +2705,36 @@ async fn run_pull_policy_controls_image_status_and_pull_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_detach_creates_or_reuses_pod_and_starts_container() {
+async fn run_detach_table_for_native_local_container_omits_pod_columns() {
+    let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("busybox:latest".to_string());
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(
+        endpoint,
+        [
+            "run",
+            "--detach",
+            "--pull",
+            "never",
+            "busybox:latest",
+            "true",
+        ],
+    );
+
+    assert_success(&output);
+    assert_stdout(
+        &output,
+        "CONTAINER ID              IMAGE           ACTION   DETACHED\nctr-local-busybox:latest  busybox:latest  started  true\n",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_detach_creates_native_local_container_or_reuses_explicit_pod() {
     let state = MockState::default();
     state
         .existing_images
@@ -2687,9 +2744,9 @@ async fn run_detach_creates_or_reuses_pod_and_starts_container() {
     let run_pod_requests = Arc::clone(&state.run_pod_requests);
     let pod_status_requests = Arc::clone(&state.pod_inspect_requests);
     let create_container_requests = Arc::clone(&state.create_container_requests);
+    let create_local_container_requests = Arc::clone(&state.create_local_container_requests);
     let start_container_requests = Arc::clone(&state.start_container_requests);
-    let last_run_pod = Arc::clone(&state.last_run_pod);
-    let last_create_container = Arc::clone(&state.last_create_container);
+    let last_create_local_container = Arc::clone(&state.last_create_local_container);
     let last_start_container = Arc::clone(&state.last_start_container);
     let endpoint = spawn_mock_services(state).await;
 
@@ -2702,10 +2759,12 @@ async fn run_detach_creates_or_reuses_pod_and_starts_container() {
             "--detach",
             "--name",
             "ctr-demo",
-            "--namespace",
-            "ns-a",
-            "--pod-name",
-            "pod-demo",
+            "--runtime-handler",
+            "runc",
+            "--cgroup-parent",
+            "/local.slice",
+            "--sysctl",
+            "kernel.shm_rmid_forced=1",
             "busybox:latest",
             "echo",
             "ok",
@@ -2714,57 +2773,32 @@ async fn run_detach_creates_or_reuses_pod_and_starts_container() {
     assert_success(&created);
     let value = stdout_json(&created);
     assert_eq!(value["kind"], "Run");
-    assert_eq!(value["summary"]["podSandboxId"], "pod-pod-demo");
-    assert_eq!(
-        value["summary"]["containerId"],
-        "ctr-pod-pod-demo-busybox:latest"
-    );
+    assert_eq!(value["summary"]["containerId"], "ctr-local-busybox:latest");
     assert_eq!(value["summary"]["detached"], true);
-    assert_eq!(value["summary"]["podCreated"], true);
+    assert!(value["summary"].get("podSandboxId").is_none());
+    assert!(value["items"][0].get("podId").is_none());
 
-    let pod_request = last_run_pod
+    let local_request = last_create_local_container
         .lock()
-        .expect("last run pod lock")
+        .expect("last create local container lock")
         .clone()
-        .expect("run pod request");
-    let pod_config = pod_request.config.expect("pod config");
-    let pod_metadata = pod_config.metadata.expect("pod metadata");
-    assert_eq!(pod_metadata.name, "pod-demo");
-    assert_eq!(pod_metadata.namespace, "ns-a");
+        .expect("create local container request");
+    assert_eq!(local_request.runtime_handler, "runc");
+    assert_eq!(local_request.cgroup_parent, "/local.slice");
+    assert_eq!(local_request.sysctls, vec!["kernel.shm_rmid_forced=1"]);
+    let local_config = local_request.config.expect("local container config");
     assert_eq!(
-        pod_config.annotations.get("crius.crs/internal-sandbox"),
-        Some(&"true".to_string())
+        local_config.metadata.expect("container metadata").name,
+        "ctr-demo"
     );
-    let namespace_options = pod_config
+    assert_eq!(local_config.command, vec!["echo", "ok"]);
+    let namespace_options = local_config
         .linux
         .as_ref()
         .and_then(|linux| linux.security_context.as_ref())
         .and_then(|security| security.namespace_options.as_ref())
-        .expect("sandbox namespace options");
+        .expect("container namespace options");
     assert_eq!(namespace_options.network, NamespaceMode::Node as i32);
-    assert_eq!(namespace_options.pid, NamespaceMode::Node as i32);
-    assert_eq!(namespace_options.ipc, NamespaceMode::Node as i32);
-
-    let create_request = last_create_container
-        .lock()
-        .expect("last create container lock")
-        .clone()
-        .expect("create container request");
-    assert_eq!(create_request.pod_sandbox_id, "pod-pod-demo");
-    assert_eq!(
-        create_request
-            .sandbox_config
-            .as_ref()
-            .and_then(|config| config.metadata.as_ref())
-            .map(|metadata| metadata.name.as_str()),
-        Some("pod-demo")
-    );
-    let container_config = create_request.config.expect("container config");
-    assert_eq!(
-        container_config.metadata.expect("container metadata").name,
-        "ctr-demo"
-    );
-    assert_eq!(container_config.command, vec!["echo", "ok"]);
 
     assert_eq!(
         last_start_container
@@ -2773,7 +2807,7 @@ async fn run_detach_creates_or_reuses_pod_and_starts_container() {
             .clone()
             .expect("start container request")
             .container_id,
-        "ctr-pod-pod-demo-busybox:latest"
+        "ctr-local-busybox:latest"
     );
 
     let reused = run_crs(
@@ -2792,16 +2826,16 @@ async fn run_detach_creates_or_reuses_pod_and_starts_container() {
     assert_success(&reused);
     let value = stdout_json(&reused);
     assert_eq!(value["summary"]["podSandboxId"], "pod-existing");
-    assert_eq!(value["summary"]["podCreated"], false);
 
-    assert_eq!(run_pod_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(run_pod_requests.load(Ordering::SeqCst), 0);
     assert_eq!(pod_status_requests.load(Ordering::SeqCst), 1);
-    assert_eq!(create_container_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(create_local_container_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(create_container_requests.load(Ordering::SeqCst), 1);
     assert_eq!(start_container_requests.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn default_run_uses_host_internal_sandbox_when_cri_cni_fails() {
+async fn default_run_uses_native_local_container_when_cri_cni_fails() {
     let state = MockState::default();
     state
         .existing_images
@@ -2812,6 +2846,8 @@ async fn default_run_uses_host_internal_sandbox_when_cri_cni_fails() {
         .fail_non_host_pod_network
         .lock()
         .expect("fail non-host pod network lock") = true;
+    let run_pod_requests = Arc::clone(&state.run_pod_requests);
+    let create_local_container_requests = Arc::clone(&state.create_local_container_requests);
     let endpoint = spawn_mock_services(state).await;
 
     let default_run = run_crs(
@@ -2829,6 +2865,8 @@ async fn default_run_uses_host_internal_sandbox_when_cri_cni_fails() {
     );
     assert_success(&default_run);
     assert_eq!(stdout_json(&default_run)["kind"], "Run");
+    assert_eq!(create_local_container_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(run_pod_requests.load(Ordering::SeqCst), 0);
 
     let explicit_pod_run = run_crs(
         endpoint,
@@ -2847,6 +2885,7 @@ async fn default_run_uses_host_internal_sandbox_when_cri_cni_fails() {
         stderr.contains("Calico Kubernetes API is unavailable"),
         "unexpected stderr: {stderr}"
     );
+    assert_eq!(run_pod_requests.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2875,7 +2914,7 @@ async fn run_exec_mode_sync_executes_command_after_start_and_returns_exit_code()
         .expect("last exec-sync lock")
         .clone()
         .expect("exec-sync request");
-    assert!(request.container_id.starts_with("ctr-pod-crius-"));
+    assert_eq!(request.container_id, "ctr-local-busybox:latest");
     assert_eq!(request.cmd, vec!["exit-7"]);
 }
 
@@ -2974,7 +3013,7 @@ async fn run_exec_mode_attach_streams_started_container() {
         .expect("last attach lock")
         .clone()
         .expect("attach request");
-    assert!(request.container_id.starts_with("ctr-pod-crius-"));
+    assert_eq!(request.container_id, "ctr-local-busybox:latest");
     assert!(!request.stdin);
     assert!(request.stdout);
     assert!(request.stderr);
@@ -2982,7 +3021,7 @@ async fn run_exec_mode_attach_streams_started_container() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_rm_cleans_created_resources_in_order() {
+async fn run_rm_cleans_native_local_container_only() {
     let state = MockState::default();
     state
         .existing_images
@@ -3000,8 +3039,6 @@ async fn run_rm_cleans_created_resources_in_order() {
             "run",
             "--detach",
             "--rm",
-            "--pod-name",
-            "cleanup",
             "busybox:latest",
             "true",
         ],
@@ -3010,16 +3047,18 @@ async fn run_rm_cleans_created_resources_in_order() {
 
     let sequence = sequence.lock().expect("rpc sequence lock").clone();
     assert!(
-        sequence.windows(4).any(|window| {
+        sequence.windows(2).any(|window| {
             window
                 == [
-                    "stop-container:ctr-pod-cleanup-busybox:latest",
-                    "remove-container:ctr-pod-cleanup-busybox:latest",
-                    "stop-pod:pod-cleanup",
-                    "remove-pod:pod-cleanup",
+                    "stop-container:ctr-local-busybox:latest",
+                    "remove-container:ctr-local-busybox:latest",
                 ]
         }),
-        "temporary pod cleanup should stop/remove container and pod in order, got {sequence:?}"
+        "local cleanup should stop/remove only the created container, got {sequence:?}"
+    );
+    assert!(
+        !sequence.iter().any(|entry| entry.starts_with("stop-pod:")),
+        "local cleanup must not stop a pod, got {sequence:?}"
     );
 }
 
@@ -3072,7 +3111,7 @@ async fn run_rm_reused_pod_only_cleans_container() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_failure_warns_about_created_pod_leftover() {
+async fn run_create_failure_does_not_warn_about_pod_leftover() {
     let state = MockState::default();
     state
         .existing_images
@@ -3081,23 +3120,13 @@ async fn run_failure_warns_about_created_pod_leftover() {
         .insert("bad-config".to_string());
     let endpoint = spawn_mock_services(state).await;
 
-    let output = run_crs(
-        endpoint,
-        [
-            "run",
-            "--detach",
-            "--pod-name",
-            "leftover",
-            "bad-config",
-            "true",
-        ],
-    );
+    let output = run_crs(endpoint, ["run", "--detach", "bad-config", "true"]);
 
     assert_eq!(output.status.code(), Some(6));
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
     assert!(stderr.contains("container config rejected"));
-    assert!(stderr.contains("run created pod pod-leftover before failing"));
-    assert!(stderr.contains("crs pod remove pod-leftover"));
+    assert!(!stderr.contains("run created pod"));
+    assert!(!stderr.contains("crs pod remove"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3683,15 +3712,7 @@ async fn shortcut_stop_resolves_unique_container_or_pod_target() {
     assert_success(&pod_stop);
     assert_eq!(stdout_json(&pod_stop)["kind"], "PodStop");
 
-    let internal_pod_stop = run_crs(endpoint, ["--output", "json", "stop", "internal-pod"]);
-    assert_success(&internal_pod_stop);
-    assert_eq!(
-        stdout_json(&internal_pod_stop)["kind"],
-        "ContainerStop",
-        "internal run sandbox must not be treated as a user pod candidate"
-    );
-
-    assert_eq!(stop_container_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(stop_container_requests.load(Ordering::SeqCst), 1);
     assert_eq!(stop_pod_requests.load(Ordering::SeqCst), 1);
 }
 
@@ -3720,15 +3741,7 @@ async fn shortcut_rm_resolves_unique_container_pod_or_image_target() {
     assert_success(&image_rm);
     assert_eq!(stdout_json(&image_rm)["kind"], "ImageRemove");
 
-    let internal_pod_rm = run_crs(endpoint, ["--output", "json", "rm", "internal-pod"]);
-    assert_success(&internal_pod_rm);
-    assert_eq!(
-        stdout_json(&internal_pod_rm)["kind"],
-        "ContainerRemove",
-        "internal run sandbox must not be treated as a user pod candidate"
-    );
-
-    assert_eq!(remove_container_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(remove_container_requests.load(Ordering::SeqCst), 1);
     assert_eq!(remove_pod_requests.load(Ordering::SeqCst), 1);
     assert_eq!(remove_image_requests.load(Ordering::SeqCst), 1);
 }
@@ -4413,8 +4426,9 @@ async fn spawn_mock_services(state: MockState) -> SocketAddr {
                 state: state.clone(),
             }))
             .add_service(DiagnosticsServiceServer::new(MockDiagnosticsService {
-                state,
+                state: state.clone(),
             }))
+            .add_service(LocalServiceServer::new(MockLocalService { state }))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .expect("mock server should serve");

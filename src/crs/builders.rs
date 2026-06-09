@@ -116,6 +116,15 @@ pub(crate) fn build_auth_config(args: &ImageAuthArgs) -> Result<Option<AuthConfi
     }))
 }
 
+pub(crate) fn parse_local_sysctls(sysctls: &[String]) -> Result<Vec<String>, String> {
+    key_value_map("--sysctl", sysctls).map(|values| {
+        values
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect()
+    })
+}
+
 fn build_container_config_from_parts(
     image: &str,
     positional_command: &[String],

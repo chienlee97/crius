@@ -145,7 +145,7 @@ async fn create_container_reclaims_exited_reserved_name_without_live_runtime() {
         .await
         .save_container(
             "exited-container",
-            "pod-exited-name",
+            Some("pod-exited-name"),
             crate::runtime::ContainerStatus::Stopped(-1),
             "busybox:latest",
             &["sleep".to_string()],
@@ -1243,7 +1243,7 @@ async fn recover_state_rebuilds_reserved_pod_and_container_names() {
         .await
         .save_container(
             "container-recover-name",
-            "pod-recover-name",
+            Some("pod-recover-name"),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &["sleep".to_string(), "1".to_string()],

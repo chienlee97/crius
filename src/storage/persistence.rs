@@ -14,7 +14,7 @@ use std::collections::HashMap;
 /// 将容器配置转换为存储记录
 pub fn container_to_record(
     id: &str,
-    pod_id: &str,
+    pod_id: Option<&str>,
     state: ContainerStatus,
     image: &str,
     command: &[String],
@@ -27,7 +27,7 @@ pub fn container_to_record(
         ContainerStatus::Stopped(code) => {
             return ContainerRecord {
                 id: id.to_string(),
-                pod_id: pod_id.to_string(),
+                pod_id: pod_id.map(ToString::to_string),
                 state: "stopped".to_string(),
                 image: image.to_string(),
                 command: command.join(" "),
@@ -46,7 +46,7 @@ pub fn container_to_record(
 
     ContainerRecord {
         id: id.to_string(),
-        pod_id: pod_id.to_string(),
+        pod_id: pod_id.map(ToString::to_string),
         state: state_str.to_string(),
         image: image.to_string(),
         command: command.join(" "),
@@ -170,7 +170,7 @@ impl PersistenceManager {
     pub fn save_container(
         &mut self,
         id: &str,
-        pod_id: &str,
+        pod_id: Option<&str>,
         state: ContainerStatus,
         image: &str,
         command: &[String],
@@ -417,7 +417,7 @@ mod tests {
         manager
             .save_container(
                 "container-1",
-                "pod-1",
+                Some("pod-1"),
                 ContainerStatus::Running,
                 "test:latest",
                 &["echo".to_string(), "hello".to_string()],

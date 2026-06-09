@@ -20,7 +20,7 @@ async fn recover_state_reconciles_running_container_to_exited() {
         .await
         .save_container(
             "recover-container",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -130,7 +130,7 @@ async fn recover_state_does_not_replay_historical_events() {
         .storage_mut()
         .save_container(&ContainerRecord {
             id: "recover-container".to_string(),
-            pod_id: "pod-1".to_string(),
+            pod_id: Some("pod-1".to_string()),
             state: "running".to_string(),
             image: "busybox:latest".to_string(),
             command: String::new(),
@@ -184,7 +184,7 @@ async fn recover_state_re_registers_exit_monitor_for_running_container() {
         .storage_mut()
         .save_container(&ContainerRecord {
             id: "recover-running".to_string(),
-            pod_id: "pod-1".to_string(),
+            pod_id: Some("pod-1".to_string()),
             state: "running".to_string(),
             image: "busybox:latest".to_string(),
             command: String::new(),
@@ -309,7 +309,7 @@ async fn recover_state_supports_inspect_and_list_after_restart() {
         .await
         .save_container(
             "recover-container",
-            "pod-recover",
+            Some("pod-recover"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -643,7 +643,7 @@ async fn recover_state_supports_stop_and_remove_after_restart() {
         .await
         .save_container(
             "recover-container",
-            "pod-recover",
+            Some("pod-recover"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -999,7 +999,7 @@ async fn remove_pod_sandbox_cascades_recovered_containers_after_restart() {
         .await
         .save_container(
             "recover-container",
-            "pod-recover",
+            Some("pod-recover"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -1384,7 +1384,7 @@ async fn recover_state_ignores_stale_shim_metadata_artifacts() {
         .await
         .save_container(
             "recover-container",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -1512,7 +1512,7 @@ async fn recover_state_cleans_orphaned_attach_socket_artifacts_from_separate_dir
         .await
         .save_container(
             "recover-container",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -1541,7 +1541,7 @@ async fn recover_state_recovers_running_container_without_shim_metadata_file_fro
         .await
         .save_container(
             "recover-ledger-only",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -1640,7 +1640,7 @@ async fn recover_state_marks_missing_shim_socket_dead_in_ledger() {
         .await
         .save_container(
             "missing-shim-socket",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -1768,7 +1768,7 @@ async fn recover_state_marks_container_broken_when_runtime_bundle_is_missing() {
         .await
         .save_container(
             "broken-bundle",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -1907,7 +1907,7 @@ async fn recover_state_reconciles_direct_task_backend_without_oci_bundle() {
         .await
         .save_container(
             "direct-recover",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "wasm:latest",
             &Vec::new(),
@@ -1967,7 +1967,7 @@ async fn recover_state_marks_rootfs_artifact_and_snapshot_broken_when_rootfs_is_
         .await
         .save_container(
             "broken-rootfs",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -2087,7 +2087,7 @@ async fn recover_state_marks_external_snapshot_stale_when_mountpoint_is_missing(
         .await
         .save_container(
             "external-rootfs",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -2255,7 +2255,7 @@ async fn recover_state_cleans_orphaned_runtime_bundles_but_keeps_recovered_ones(
         .await
         .save_container(
             "recover-container",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),

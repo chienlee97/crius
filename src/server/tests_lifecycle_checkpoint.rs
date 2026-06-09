@@ -376,7 +376,7 @@ async fn start_container_restores_from_checkpoint_artifact_and_clears_pending_ma
         .await
         .save_container(
             "restore-container",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &Vec::new(),
@@ -521,7 +521,7 @@ async fn start_container_rejects_checkpoint_restore_when_criu_support_is_disable
         .await
         .save_container(
             "restore-container",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &Vec::new(),

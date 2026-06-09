@@ -1,26 +1,23 @@
 use std::time::{Duration, Instant};
 
-use uuid::Uuid;
-
 use crate::crs::{
-    annotations::{INTERNAL_SANDBOX_ANNOTATION, LOCAL_NETWORK_DOMAIN, NETWORK_DOMAIN_ANNOTATION},
     args::{
         ContainerCreateArgs, ContainerCreateOptions, ExecModeArg, PullPolicyArg, RunArgs,
         StreamOptions,
     },
-    builders::{build_container_config, build_pod_sandbox_config},
+    builders::{build_container_config, parse_local_sysctls},
     client::CrsClient,
     commands::status::render_and_print,
     context::CliContext,
     error::{CliError, CommandResult},
-    format::{CommandOutput, ContainerOperationView},
+    format::CommandOutput,
     streaming,
 };
+use crate::proto::local::v1::CreateLocalContainerRequest;
 use crate::proto::runtime::v1::{
     AttachRequest, ContainerState, ContainerStatusRequest, CreateContainerRequest, ExecSyncRequest,
     ImageSpec, ImageStatusRequest, NamespaceMode, PodSandboxConfig, PodSandboxStatusRequest,
-    PullImageRequest, RemoveContainerRequest, RemovePodSandboxRequest, RunPodSandboxRequest,
-    StartContainerRequest, StopContainerRequest, StopPodSandboxRequest,
+    PullImageRequest, RemoveContainerRequest, StartContainerRequest, StopContainerRequest,
 };
 
 const STOPPED_STREAMING_STATUS_WAIT: Duration = Duration::from_secs(2);
@@ -35,28 +32,52 @@ struct RunPlan {
     rm: bool,
     exec_mode: ExecModeArg,
     stream: StreamOptions,
-    pod: PodPlan,
+    pod: Option<String>,
+    runtime_handler: Option<String>,
+    cgroup_parent: Option<String>,
+    sysctls: Vec<String>,
     container_options: ContainerCreateOptions,
-}
-
-#[derive(Debug)]
-enum PodPlan {
-    Existing(String),
-    Create(Box<crate::crs::args::PodCreateArgs>),
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RunView {
+struct LocalRunView {
+    container_id: String,
+    image: String,
+    action: String,
+    detached: bool,
+}
+
+impl crate::crs::format::TableRow for LocalRunView {
+    fn headers() -> &'static [&'static str] {
+        &["CONTAINER ID", "IMAGE", "ACTION", "DETACHED"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.container_id.clone(),
+            self.image.clone(),
+            self.action.clone(),
+            crate::crs::format::format_bool(self.detached).to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.container_id.clone()
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PodRunView {
     container_id: String,
     pod_id: String,
     image: String,
     action: String,
     detached: bool,
-    pod_created: bool,
 }
 
-impl crate::crs::format::TableRow for RunView {
+impl crate::crs::format::TableRow for PodRunView {
     fn headers() -> &'static [&'static str] {
         &["CONTAINER ID", "POD ID", "IMAGE", "ACTION", "DETACHED"]
     }
@@ -83,24 +104,14 @@ pub(crate) async fn handle(
 ) -> Result<CommandResult, CliError> {
     let plan = RunPlan::from_args(args)?;
     ensure_image(client, &plan).await?;
-    let (pod_id, sandbox_config, pod_created) = prepare_pod(client, &plan).await?;
-    let container_id = match create_container(client, &plan, &pod_id, sandbox_config).await {
-        Ok(container_id) => container_id,
-        Err(error) => {
-            emit_leftover_warnings(&leftover_warnings(None, Some((&pod_id, pod_created))));
-            return Err(error);
-        }
-    };
+    let (container_id, pod_id) = create_run_container(client, &plan).await?;
     if let Err(error) = start_container(client, &container_id).await {
-        emit_leftover_warnings(&leftover_warnings(
-            Some(&container_id),
-            Some((&pod_id, pod_created)),
-        ));
+        emit_leftover_warnings(&leftover_warnings(Some(&container_id)));
         return Err(error);
     }
 
     let outcome = if plan.detach {
-        render_detached(ctx, client, &plan, &pod_id, &container_id, pod_created)
+        render_detached(ctx, client, &plan, pod_id.as_deref(), &container_id)
     } else {
         match run_foreground(ctx, client, &plan, &container_id).await {
             Ok(result) => Ok(result),
@@ -111,7 +122,7 @@ pub(crate) async fn handle(
     };
 
     if plan.rm {
-        let warnings = cleanup_run_resources(client, &container_id, &pod_id, pod_created).await;
+        let warnings = cleanup_run_resources(client, &container_id).await;
         emit_cleanup_warnings(ctx, &warnings);
     }
 
@@ -130,8 +141,8 @@ impl RunPlan {
                     CliError::invalid_input("pod id must not be empty").with_command("crs run")
                 );
             }
-            Some(pod) => PodPlan::Existing(pod),
-            None => PodPlan::Create(Box::new(run_pod_args(&args))),
+            Some(pod) => Some(pod),
+            None => None,
         };
 
         Ok(Self {
@@ -150,58 +161,11 @@ impl RunPlan {
                 protocol: args.protocol,
             },
             pod,
+            runtime_handler: args.pod_options.runtime_handler,
+            cgroup_parent: args.pod_options.cgroup_parent,
+            sysctls: args.pod_options.sysctls,
             container_options: run_container_options(args.container_options, args.name),
         })
-    }
-}
-
-fn run_pod_args(args: &RunArgs) -> crate::crs::args::PodCreateArgs {
-    let options = &args.pod_options;
-    let mut annotations = options.annotations.clone();
-    annotations.push(format!("{INTERNAL_SANDBOX_ANNOTATION}=true"));
-    annotations.push(format!(
-        "{NETWORK_DOMAIN_ANNOTATION}={LOCAL_NETWORK_DOMAIN}"
-    ));
-
-    crate::crs::args::PodCreateArgs {
-        name: Some(
-            options
-                .pod_name
-                .clone()
-                .unwrap_or_else(|| format!("crius-{}", Uuid::new_v4().to_simple())),
-        ),
-        uid: Some(
-            options
-                .uid
-                .clone()
-                .unwrap_or_else(|| Uuid::new_v4().to_simple().to_string()),
-        ),
-        namespace: Some(
-            args.namespace
-                .clone()
-                .unwrap_or_else(|| "default".to_string()),
-        ),
-        attempt: options.pod_attempt,
-        hostname: options.hostname.clone(),
-        log_dir: options.log_dir.clone(),
-        dns_servers: options.dns_servers.clone(),
-        dns_searches: options.dns_searches.clone(),
-        dns_options: options.dns_options.clone(),
-        publish: options.publish.clone(),
-        labels: options.labels.clone(),
-        annotations,
-        runtime_handler: options.runtime_handler.clone(),
-        cgroup_parent: options.cgroup_parent.clone(),
-        sysctls: options.sysctls.clone(),
-        host_network: true,
-        host_pid: true,
-        host_ipc: true,
-        userns: options.userns.clone(),
-        uid_maps: options.uid_maps.clone(),
-        gid_maps: options.gid_maps.clone(),
-        security: options.security.clone(),
-        overhead: options.overhead.clone(),
-        pod_resources: options.pod_resources.clone(),
     }
 }
 
@@ -300,64 +264,6 @@ async fn pull_image(client: &CrsClient, image: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn prepare_pod(
-    client: &CrsClient,
-    plan: &RunPlan,
-) -> Result<(String, PodSandboxConfig, bool), CliError> {
-    match &plan.pod {
-        PodPlan::Existing(pod_id) => {
-            let config = fetch_sandbox_config(client, pod_id).await?;
-            Ok((pod_id.clone(), config, false))
-        }
-        PodPlan::Create(args) => {
-            let sandbox_config = internal_sandbox_config(
-                build_pod_sandbox_config(args).map_err(CliError::invalid_input)?,
-            );
-            let mut runtime = client.runtime()?;
-            let response = client
-                .with_rpc_timeout(async {
-                    runtime
-                        .run_pod_sandbox(RunPodSandboxRequest {
-                            config: Some(sandbox_config.clone()),
-                            runtime_handler: args.runtime_handler.clone().unwrap_or_default(),
-                        })
-                        .await
-                        .map_err(|status| {
-                            CliError::from_tonic_status(status)
-                                .with_command("crs run")
-                                .with_endpoint(client.endpoint())
-                        })
-                })
-                .await?
-                .into_inner();
-            Ok((response.pod_sandbox_id, sandbox_config, true))
-        }
-    }
-}
-
-fn internal_sandbox_config(mut config: PodSandboxConfig) -> PodSandboxConfig {
-    config
-        .annotations
-        .insert(INTERNAL_SANDBOX_ANNOTATION.to_string(), "true".to_string());
-    config.annotations.insert(
-        NETWORK_DOMAIN_ANNOTATION.to_string(),
-        LOCAL_NETWORK_DOMAIN.to_string(),
-    );
-
-    if let Some(linux) = config.linux.as_mut() {
-        if let Some(security) = linux.security_context.as_mut() {
-            let namespace_options = security
-                .namespace_options
-                .get_or_insert_with(Default::default);
-            namespace_options.network = NamespaceMode::Node as i32;
-            namespace_options.pid = NamespaceMode::Node as i32;
-            namespace_options.ipc = NamespaceMode::Node as i32;
-        }
-    }
-
-    config
-}
-
 async fn fetch_sandbox_config(
     client: &CrsClient,
     pod_id: &str,
@@ -395,6 +301,63 @@ async fn fetch_sandbox_config(
             .with_command("crs run")
             .with_object(format!("pod {pod_id}"))
         })
+}
+
+async fn create_run_container(
+    client: &CrsClient,
+    plan: &RunPlan,
+) -> Result<(String, Option<String>), CliError> {
+    match plan.pod.as_deref() {
+        Some(pod_id) => {
+            let sandbox_config = fetch_sandbox_config(client, pod_id).await?;
+            create_container(client, plan, pod_id, sandbox_config)
+                .await
+                .map(|container_id| (container_id, Some(pod_id.to_string())))
+        }
+        None => create_local_container(client, plan)
+            .await
+            .map(|container_id| (container_id, None)),
+    }
+}
+
+async fn create_local_container(client: &CrsClient, plan: &RunPlan) -> Result<String, CliError> {
+    let args = ContainerCreateArgs {
+        options: plan.container_options.clone(),
+        pod: String::new(),
+        image: plan.image.clone(),
+        command: plan.command.clone(),
+    };
+    let mut config = build_container_config(&args).map_err(CliError::invalid_input)?;
+    if let Some(linux) = config.linux.as_mut() {
+        if let Some(security) = linux.security_context.as_mut() {
+            let namespace_options = security
+                .namespace_options
+                .get_or_insert_with(Default::default);
+            namespace_options.network = NamespaceMode::Node as i32;
+        }
+    }
+    let sysctls = parse_local_sysctls(&plan.sysctls).map_err(CliError::invalid_input)?;
+    let mut local = client.local()?;
+    let response = client
+        .with_rpc_timeout(async {
+            local
+                .create_local_container(CreateLocalContainerRequest {
+                    config: Some(config),
+                    runtime_handler: plan.runtime_handler.clone().unwrap_or_default(),
+                    cgroup_parent: plan.cgroup_parent.clone().unwrap_or_default(),
+                    sysctls,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run")
+                        .with_endpoint(client.endpoint())
+                })
+        })
+        .await?
+        .into_inner();
+
+    Ok(response.container_id)
 }
 
 async fn create_container(
@@ -677,48 +640,56 @@ fn render_detached(
     ctx: &CliContext,
     client: &CrsClient,
     plan: &RunPlan,
-    pod_id: &str,
+    pod_id: Option<&str>,
     container_id: &str,
-    pod_created: bool,
 ) -> Result<CommandResult, CliError> {
+    if let Some(pod_id) = pod_id {
+        return render_and_print(
+            ctx,
+            CommandOutput::new(
+                "Run",
+                client.endpoint(),
+                vec![PodRunView {
+                    container_id: container_id.to_string(),
+                    pod_id: pod_id.to_string(),
+                    image: plan.image.clone(),
+                    action: "started".to_string(),
+                    detached: true,
+                }],
+            )
+            .with_summary(serde_json::json!({
+                "containerId": container_id,
+                "podSandboxId": pod_id,
+                "image": plan.image,
+                "detached": true,
+            })),
+        );
+    }
+
     render_and_print(
         ctx,
         CommandOutput::new(
             "Run",
             client.endpoint(),
-            vec![RunView {
+            vec![LocalRunView {
                 container_id: container_id.to_string(),
-                pod_id: pod_id.to_string(),
                 image: plan.image.clone(),
                 action: "started".to_string(),
                 detached: true,
-                pod_created,
             }],
         )
         .with_summary(serde_json::json!({
             "containerId": container_id,
-            "podSandboxId": pod_id,
             "image": plan.image,
             "detached": true,
-            "podCreated": pod_created,
         })),
     )
 }
 
-async fn cleanup_run_resources(
-    client: &CrsClient,
-    container_id: &str,
-    pod_id: &str,
-    pod_created: bool,
-) -> Vec<String> {
+async fn cleanup_run_resources(client: &CrsClient, container_id: &str) -> Vec<String> {
     let mut warnings = Vec::new();
     cleanup_stop_container(client, container_id, &mut warnings).await;
     cleanup_remove_container(client, container_id, &mut warnings).await;
-
-    if pod_created {
-        cleanup_stop_pod(client, pod_id, &mut warnings).await;
-        cleanup_remove_pod(client, pod_id, &mut warnings).await;
-    }
 
     warnings
 }
@@ -789,60 +760,6 @@ async fn cleanup_remove_container(
     }
 }
 
-async fn cleanup_stop_pod(client: &CrsClient, pod_id: &str, warnings: &mut Vec<String>) {
-    let Ok(mut runtime) = client.runtime() else {
-        warnings.push("failed to stop run pod during cleanup: runtime client unavailable".into());
-        return;
-    };
-    if let Err(error) = client
-        .with_rpc_timeout(async {
-            runtime
-                .stop_pod_sandbox(StopPodSandboxRequest {
-                    pod_sandbox_id: pod_id.to_string(),
-                })
-                .await
-                .map_err(|status| {
-                    CliError::from_tonic_status(status)
-                        .with_command("crs run --rm")
-                        .with_endpoint(client.endpoint())
-                        .with_object(format!("pod {pod_id}"))
-                })
-        })
-        .await
-    {
-        warnings.push(format!(
-            "failed to stop run pod {pod_id}: {error}; run `crs pod stop {pod_id}`"
-        ));
-    }
-}
-
-async fn cleanup_remove_pod(client: &CrsClient, pod_id: &str, warnings: &mut Vec<String>) {
-    let Ok(mut runtime) = client.runtime() else {
-        warnings.push("failed to remove run pod during cleanup: runtime client unavailable".into());
-        return;
-    };
-    if let Err(error) = client
-        .with_rpc_timeout(async {
-            runtime
-                .remove_pod_sandbox(RemovePodSandboxRequest {
-                    pod_sandbox_id: pod_id.to_string(),
-                })
-                .await
-                .map_err(|status| {
-                    CliError::from_tonic_status(status)
-                        .with_command("crs run --rm")
-                        .with_endpoint(client.endpoint())
-                        .with_object(format!("pod {pod_id}"))
-                })
-        })
-        .await
-    {
-        warnings.push(format!(
-            "failed to remove run pod {pod_id}: {error}; run `crs pod remove {pod_id}`"
-        ));
-    }
-}
-
 fn emit_cleanup_warnings(ctx: &CliContext, warnings: &[String]) {
     if warnings.is_empty() || matches!(ctx.output(), crate::crs::args::OutputArg::Json) {
         return;
@@ -853,16 +770,11 @@ fn emit_cleanup_warnings(ctx: &CliContext, warnings: &[String]) {
     }
 }
 
-fn leftover_warnings(container_id: Option<&str>, pod: Option<(&str, bool)>) -> Vec<String> {
+fn leftover_warnings(container_id: Option<&str>) -> Vec<String> {
     let mut warnings = Vec::new();
     if let Some(container_id) = container_id {
         warnings.push(format!(
             "run created container {container_id} before failing; remove it with `crs container remove {container_id}`"
-        ));
-    }
-    if let Some((pod_id, true)) = pod {
-        warnings.push(format!(
-            "run created pod {pod_id} before failing; remove it with `crs pod remove {pod_id}`"
         ));
     }
     warnings
@@ -871,16 +783,5 @@ fn leftover_warnings(container_id: Option<&str>, pod: Option<(&str, bool)>) -> V
 fn emit_leftover_warnings(warnings: &[String]) {
     for warning in warnings {
         eprintln!("warning: {warning}");
-    }
-}
-
-#[allow(dead_code)]
-fn _container_operation_view_from_run(view: &RunView) -> ContainerOperationView {
-    ContainerOperationView {
-        container_id: view.container_id.clone(),
-        pod_id: view.pod_id.clone(),
-        image: view.image.clone(),
-        action: view.action.clone(),
-        success: true,
     }
 }

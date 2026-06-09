@@ -887,7 +887,7 @@ async fn attach_uses_log_stream_fallback_when_recovered_socket_is_missing() {
         .await
         .save_container(
             "recover-container",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -2069,7 +2069,7 @@ sleep 1
         .await
         .save_container(
             "tty-recover-after-restart",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),

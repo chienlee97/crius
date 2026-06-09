@@ -13,12 +13,13 @@ use clap::Parser;
 use crius::config::{CgroupDriverConfig, Config};
 use crius::oci::spec::Spec;
 use crius::proto::diagnostics::v1::diagnostics_service_server::DiagnosticsServiceServer;
+use crius::proto::local::v1::local_service_server::LocalServiceServer;
 use crius::proto::runtime::v1::{
     image_service_server::ImageServiceServer, runtime_service_server::RuntimeServiceServer,
 };
 use crius::runtime::ShimConfig;
 use crius::server::{IrqBalanceRestoreStatus, RuntimeConfig, RuntimeServiceImpl};
-use crius::services::{DiagnosticsServiceImpl, DiagnosticsState};
+use crius::services::{DiagnosticsServiceImpl, DiagnosticsState, LocalServiceImpl};
 use crius::streaming::StreamingServer;
 use tokio::net::UnixListener as TokioUnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -465,7 +466,7 @@ async fn main() -> Result<(), Error> {
             .unwrap_or(&listen)
             .to_string(),
     );
-    let runtime_service_server = RuntimeServiceServer::new(runtime_service)
+    let runtime_service_server = RuntimeServiceServer::new(runtime_service.clone())
         .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
         .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
     let image_service_server = ImageServiceServer::new(image_service)
@@ -475,11 +476,16 @@ async fn main() -> Result<(), Error> {
         DiagnosticsServiceServer::new(DiagnosticsServiceImpl::new(diagnostics_state))
             .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
             .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
+    let local_service_server =
+        LocalServiceServer::new(LocalServiceImpl::new(runtime_service.clone()))
+            .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
+            .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
 
     let server = Server::builder()
         .add_service(runtime_service_server)
         .add_service(image_service_server)
         .add_service(diagnostics_service_server)
+        .add_service(local_service_server)
         .add_service(reflection_service);
 
     let shutdown_watchdog = spawn_shutdown_watchdog();

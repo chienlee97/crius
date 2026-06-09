@@ -10,7 +10,7 @@ use std::path::Path;
 pub mod volume;
 pub use volume::{MountedVolume, VolumeConfig, VolumeManager, VolumeType};
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 /// 存储管理器
 #[derive(Debug)]
@@ -41,7 +41,7 @@ fn transfer_source_matches_blob(
 #[derive(Debug, Clone)]
 pub struct ContainerRecord {
     pub id: String,
-    pub pod_id: String,
+    pub pod_id: Option<String>,
     pub state: String,
     pub image: String,
     pub command: String,
@@ -245,7 +245,7 @@ impl StorageManager {
             .execute(
                 "CREATE TABLE IF NOT EXISTS containers (
                 id TEXT PRIMARY KEY,
-                pod_id TEXT NOT NULL,
+                pod_id TEXT,
                 state TEXT NOT NULL,
                 image TEXT NOT NULL,
                 command TEXT NOT NULL,
@@ -559,6 +559,9 @@ impl StorageManager {
         self.apply_schema_migration(1, "baseline-current-ledger-schema", |manager| {
             manager.verify_current_schema()
         })?;
+        self.apply_schema_migration(2, "local-containers-null-pod-owner", |manager| {
+            manager.migrate_containers_pod_id_nullable()
+        })?;
         Ok(())
     }
 
@@ -613,6 +616,53 @@ impl StorageManager {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn migrate_containers_pod_id_nullable(&mut self) -> Result<()> {
+        let pod_id_notnull: i64 = self
+            .conn
+            .prepare("PRAGMA table_info(containers)")?
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                let notnull: i64 = row.get(3)?;
+                Ok((name, notnull))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .find_map(|(name, notnull)| (name == "pod_id").then_some(notnull))
+            .unwrap_or_default();
+        if pod_id_notnull == 0 {
+            return Ok(());
+        }
+
+        self.conn
+            .execute_batch(
+                "ALTER TABLE containers RENAME TO containers_old;
+                 CREATE TABLE containers (
+                   id TEXT PRIMARY KEY,
+                   pod_id TEXT,
+                   state TEXT NOT NULL,
+                   image TEXT NOT NULL,
+                   command TEXT NOT NULL,
+                   created_at INTEGER NOT NULL,
+                   labels TEXT NOT NULL DEFAULT '{}',
+                   annotations TEXT NOT NULL DEFAULT '{}',
+                   exit_code INTEGER,
+                   exit_time INTEGER,
+                   runtime_handler TEXT,
+                   runtime_backend TEXT,
+                   snapshot_key TEXT
+                 );
+                 INSERT INTO containers
+                   (id, pod_id, state, image, command, created_at, labels, annotations, exit_code, exit_time, runtime_handler, runtime_backend, snapshot_key)
+                 SELECT id, NULLIF(pod_id, ''), state, image, command, created_at, labels, annotations, exit_code, exit_time, runtime_handler, runtime_backend, snapshot_key
+                 FROM containers_old;
+                 DROP TABLE containers_old;
+                 CREATE INDEX IF NOT EXISTS idx_containers_pod ON containers(pod_id);
+                 CREATE INDEX IF NOT EXISTS idx_containers_state ON containers(state);",
+            )
+            .context("Failed to migrate containers.pod_id to nullable")?;
         Ok(())
     }
 
@@ -2004,7 +2054,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .migration_name,
-            "baseline-current-ledger-schema"
+            "local-containers-null-pod-owner"
         );
     }
 
@@ -2020,7 +2070,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -2066,7 +2116,7 @@ mod tests {
         // 创建容器记录
         let container = ContainerRecord {
             id: "container-1".to_string(),
-            pod_id: "pod-1".to_string(),
+            pod_id: Some("pod-1".to_string()),
             state: "running".to_string(),
             image: "test:latest".to_string(),
             command: "echo hello".to_string(),
@@ -2113,7 +2163,7 @@ mod tests {
         manager
             .save_container(&ContainerRecord {
                 id: "container-events".to_string(),
-                pod_id: "pod-1".to_string(),
+                pod_id: Some("pod-1".to_string()),
                 state: "created".to_string(),
                 image: "test:latest".to_string(),
                 command: "sleep 60".to_string(),

@@ -156,7 +156,7 @@ async fn nri_domain_apply_updates_accepts_short_container_ids() {
         .await
         .save_container(
             "container-running-long",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -255,7 +255,7 @@ async fn nri_domain_apply_updates_accepts_extended_resources() {
         .await
         .save_container(
             "container-running",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -356,7 +356,7 @@ async fn nri_domain_evict_stops_container_and_persists_state() {
         .await
         .save_container(
             "container-running",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),

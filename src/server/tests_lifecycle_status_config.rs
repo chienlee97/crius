@@ -1302,7 +1302,7 @@ async fn status_verbose_reports_recovery_ledger_degraded_objects() {
         persistence
             .save_container(
                 "recovery-broken",
-                "pod-1",
+                Some("pod-1"),
                 crate::runtime::ContainerStatus::Running,
                 "busybox:latest",
                 &Vec::new(),

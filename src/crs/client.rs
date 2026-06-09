@@ -7,6 +7,7 @@ use tower::service_fn;
 
 use crate::crs::{context::CliContext, error::CliError, parsers::Endpoint};
 use crate::proto::diagnostics::v1::diagnostics_service_client::DiagnosticsServiceClient;
+use crate::proto::local::v1::local_service_client::LocalServiceClient;
 use crate::proto::runtime::v1::{
     image_service_client::ImageServiceClient, runtime_service_client::RuntimeServiceClient,
 };
@@ -20,6 +21,7 @@ pub(crate) struct CrsClient {
     runtime: Option<RuntimeServiceClient<Channel>>,
     image: Option<ImageServiceClient<Channel>>,
     diagnostics: Option<DiagnosticsServiceClient<Channel>>,
+    local: Option<LocalServiceClient<Channel>>,
 }
 
 impl CrsClient {
@@ -35,6 +37,7 @@ impl CrsClient {
             runtime: None,
             image: None,
             diagnostics: None,
+            local: None,
         }
     }
 
@@ -44,7 +47,8 @@ impl CrsClient {
         let channel = client.connect_channel().await?;
         client.runtime = Some(RuntimeServiceClient::new(channel.clone()));
         client.image = Some(ImageServiceClient::new(channel.clone()));
-        client.diagnostics = Some(DiagnosticsServiceClient::new(channel));
+        client.diagnostics = Some(DiagnosticsServiceClient::new(channel.clone()));
+        client.local = Some(LocalServiceClient::new(channel));
         Ok(client)
     }
 
@@ -106,6 +110,16 @@ impl CrsClient {
         self.diagnostics
             .clone()
             .ok_or_else(|| self.diagnostics_unavailable())
+    }
+
+    #[allow(dead_code, clippy::result_large_err)]
+    pub(crate) fn local(&self) -> Result<LocalServiceClient<Channel>, CliError> {
+        self.local.clone().ok_or_else(|| {
+            CliError::daemon_unavailable(
+                self.endpoint(),
+                "local service client is not connected; this crius daemon may not support native local containers",
+            )
+        })
     }
 
     #[allow(dead_code)]
