@@ -132,6 +132,8 @@ struct MockState {
     last_recovery_check: Arc<Mutex<Option<RecoveryCheckRequest>>>,
     last_content_gc: Arc<Mutex<Option<ContentGcRequest>>>,
     fail_non_host_pod_network: Arc<Mutex<bool>>,
+    fail_run_streaming_when_stopped: Arc<Mutex<bool>>,
+    short_run_status_polls: Arc<AtomicUsize>,
 }
 
 impl Default for MockState {
@@ -215,6 +217,8 @@ impl Default for MockState {
             last_recovery_check: Arc::default(),
             last_content_gc: Arc::default(),
             fail_non_host_pod_network: Arc::default(),
+            fail_run_streaming_when_stopped: Arc::default(),
+            short_run_status_polls: Arc::default(),
         }
     }
 }
@@ -605,6 +609,21 @@ impl RuntimeService for MockRuntimeService {
             return Err(Status::not_found("container not found"));
         }
 
+        let short_run = request.container_id.contains("short-run");
+        let state = if short_run
+            && self
+                .state
+                .short_run_status_polls
+                .fetch_add(1, Ordering::SeqCst)
+                > 0
+        {
+            ContainerState::ContainerExited as i32
+        } else if short_run {
+            ContainerState::ContainerRunning as i32
+        } else {
+            ContainerState::ContainerRunning as i32
+        };
+        let exit_code = if short_run { 7 } else { 0 };
         Ok(Response::new(ContainerStatusResponse {
             status: Some(ContainerStatus {
                 id: request.container_id,
@@ -612,11 +631,15 @@ impl RuntimeService for MockRuntimeService {
                     name: "ctr-a".into(),
                     attempt: 2,
                 }),
-                state: ContainerState::ContainerRunning as i32,
+                state,
                 created_at: 42,
                 started_at: 43,
-                finished_at: 0,
-                exit_code: 0,
+                finished_at: if state == ContainerState::ContainerExited as i32 {
+                    44
+                } else {
+                    0
+                },
+                exit_code,
                 image: Some(ImageSpec {
                     image: "busybox:latest".into(),
                     user_specified_image: "busybox:latest".into(),
@@ -720,6 +743,17 @@ impl RuntimeService for MockRuntimeService {
         if id == "missing" {
             return Err(Status::not_found("container not found"));
         }
+        if *self
+            .state
+            .fail_run_streaming_when_stopped
+            .lock()
+            .expect("fail run streaming lock")
+            && id.contains("short-run")
+        {
+            return Err(Status::failed_precondition(format!(
+                "container {id} is not in a streamable state for exec_sync: current runtime state is running"
+            )));
+        }
 
         let exit_code = cmd
             .iter()
@@ -743,6 +777,17 @@ impl RuntimeService for MockRuntimeService {
 
         if id == "missing" {
             return Err(Status::not_found("container not found"));
+        }
+        if *self
+            .state
+            .fail_run_streaming_when_stopped
+            .lock()
+            .expect("fail run streaming lock")
+            && id.contains("short-run")
+        {
+            return Err(Status::failed_precondition(format!(
+                "container {id} is not in a streamable state for attach: current runtime state is unknown"
+            )));
         }
 
         let url = self
@@ -2103,13 +2148,19 @@ async fn debug_network_exposes_cni_domain_and_selection_details() {
     assert_success(&output);
     let value = stdout_json(&output);
     let details = &value["summary"];
-    assert_eq!(details["localNetwork"]["configDirs"][0], "/etc/crius/cni/net.d");
+    assert_eq!(
+        details["localNetwork"]["configDirs"][0],
+        "/etc/crius/cni/net.d"
+    );
     assert_eq!(details["criNetwork"]["configDirs"][0], "/etc/cni/net.d");
     assert_eq!(
         details["cniSelection"]["discoveredFiles"][0],
         "/etc/cni/net.d/10-calico.conflist"
     );
-    assert_eq!(details["cniSelection"]["loadedNetworks"][0], "k8s-pod-network");
+    assert_eq!(
+        details["cniSelection"]["loadedNetworks"][0],
+        "k8s-pod-network"
+    );
     assert_eq!(details["cniSelection"]["declaredPlugins"][0], "calico");
     assert!(value["warnings"]
         .as_array()
@@ -2826,6 +2877,74 @@ async fn run_exec_mode_sync_executes_command_after_start_and_returns_exit_code()
         .expect("exec-sync request");
     assert!(request.container_id.starts_with("ctr-pod-crius-"));
     assert_eq!(request.cmd, vec!["exit-7"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_attach_returns_exited_container_code_when_main_process_stops_before_streaming() {
+    let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("short-run:latest".to_string());
+    *state
+        .fail_run_streaming_when_stopped
+        .lock()
+        .expect("fail run streaming lock") = true;
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["run", "--rm", "short-run:latest", "echo", "ok"]);
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("container exited before attach could stream output"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not in a streamable state"),
+        "streamable-state daemon error should be translated: {stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_exec_sync_returns_exited_container_code_when_main_process_stops_before_exec() {
+    let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("short-run:latest".to_string());
+    *state
+        .fail_run_streaming_when_stopped
+        .lock()
+        .expect("fail run streaming lock") = true;
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(
+        endpoint,
+        [
+            "run",
+            "--rm",
+            "--exec-mode",
+            "sync",
+            "short-run:latest",
+            "echo",
+            "ok",
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(7));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("container exited before exec-sync could run"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("--exec-mode sync runs a command after container start"),
+        "sync-mode warning should explain the semantics: {stderr}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

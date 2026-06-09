@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use uuid::Uuid;
 
 use crate::crs::{
@@ -15,11 +17,14 @@ use crate::crs::{
     streaming,
 };
 use crate::proto::runtime::v1::{
-    AttachRequest, CreateContainerRequest, ExecSyncRequest, ImageSpec, ImageStatusRequest,
-    NamespaceMode, PodSandboxConfig, PodSandboxStatusRequest, PullImageRequest,
-    RemoveContainerRequest, RemovePodSandboxRequest, RunPodSandboxRequest, StartContainerRequest,
-    StopContainerRequest, StopPodSandboxRequest,
+    AttachRequest, ContainerState, ContainerStatusRequest, CreateContainerRequest, ExecSyncRequest,
+    ImageSpec, ImageStatusRequest, NamespaceMode, PodSandboxConfig, PodSandboxStatusRequest,
+    PullImageRequest, RemoveContainerRequest, RemovePodSandboxRequest, RunPodSandboxRequest,
+    StartContainerRequest, StopContainerRequest, StopPodSandboxRequest,
 };
+
+const STOPPED_STREAMING_STATUS_WAIT: Duration = Duration::from_secs(2);
+const STOPPED_STREAMING_STATUS_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 struct RunPlan {
@@ -97,7 +102,12 @@ pub(crate) async fn handle(
     let outcome = if plan.detach {
         render_detached(ctx, client, &plan, &pod_id, &container_id, pod_created)
     } else {
-        run_foreground(ctx, client, &plan, &container_id).await
+        match run_foreground(ctx, client, &plan, &container_id).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                render_stopped_before_streaming(ctx, client, &plan, &container_id, error).await
+            }
+        }
     };
 
     if plan.rm {
@@ -514,6 +524,107 @@ async fn run_exec_sync(
     }
 
     Ok(CommandResult::from_code(response.exit_code))
+}
+
+async fn render_stopped_before_streaming(
+    ctx: &CliContext,
+    client: &CrsClient,
+    plan: &RunPlan,
+    container_id: &str,
+    original_error: CliError,
+) -> Result<CommandResult, CliError> {
+    let Some(status) = wait_for_exited_status(client, container_id).await? else {
+        return Err(original_error);
+    };
+
+    let warning = stopped_before_streaming_warning(plan.exec_mode);
+    if matches!(ctx.output(), crate::crs::args::OutputArg::Json) {
+        let envelope = serde_json::json!({
+            "kind": "RunResult",
+            "apiVersion": crate::crs::format::API_VERSION,
+            "endpoint": client.endpoint(),
+            "items": [],
+            "summary": {
+                "containerId": container_id,
+                "image": plan.image,
+                "exitCode": status.exit_code,
+                "state": "exited",
+                "streamingStarted": false,
+            },
+            "warnings": [warning],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope).map_err(|source| CliError::internal(
+                format!("failed to render run JSON: {source}")
+            ))?
+        );
+    } else {
+        eprintln!("warning: {warning}");
+    }
+
+    Ok(CommandResult::container_exit(status.exit_code))
+}
+
+async fn wait_for_exited_status(
+    client: &CrsClient,
+    container_id: &str,
+) -> Result<Option<crate::proto::runtime::v1::ContainerStatus>, CliError> {
+    let deadline = Instant::now() + STOPPED_STREAMING_STATUS_WAIT;
+    loop {
+        let status = fetch_container_status(client, container_id).await?;
+        if status.state == ContainerState::ContainerExited as i32 {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(STOPPED_STREAMING_STATUS_POLL).await;
+    }
+}
+
+async fn fetch_container_status(
+    client: &CrsClient,
+    container_id: &str,
+) -> Result<crate::proto::runtime::v1::ContainerStatus, CliError> {
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .container_status(ContainerStatusRequest {
+                    container_id: container_id.to_string(),
+                    verbose: false,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("container {container_id}"))
+                })
+        })
+        .await?
+        .into_inner()
+        .status
+        .ok_or_else(|| {
+            CliError::internal(format!(
+                "daemon did not return container status for {container_id}"
+            ))
+            .with_command("crs run")
+            .with_endpoint(client.endpoint())
+            .with_object(format!("container {container_id}"))
+        })
+}
+
+fn stopped_before_streaming_warning(exec_mode: ExecModeArg) -> &'static str {
+    match exec_mode {
+        ExecModeArg::Attach => {
+            "container exited before attach could stream output; use --detach for lifecycle-only checks or run a longer-lived command when interactive output is required"
+        }
+        ExecModeArg::Sync => {
+            "container exited before exec-sync could run; --exec-mode sync runs a command after container start, so use a longer-lived container command or run the desired command as the container process"
+        }
+    }
 }
 
 fn foreground_command(plan: &RunPlan) -> Result<Vec<String>, CliError> {
