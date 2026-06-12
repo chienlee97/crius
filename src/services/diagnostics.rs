@@ -945,7 +945,7 @@ mod tests {
             .actions
             .iter()
             .any(|action| action.object_id == "snapshot-repair"
-                && action.action == "markSnapshotBroken"
+                && action.action == "deleteOrphanSnapshot"
                 && !action.executed));
 
         let storage = crate::storage::StorageManager::new(&db_path).expect("storage should open");
