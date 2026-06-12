@@ -1356,7 +1356,7 @@ impl RuntimeServiceImpl {
                     "message": network_condition.message.clone(),
                     "domains": {
                         "local": {
-                            "purpose": "crs pod and local Podman-style networking; uses crius local CNI config and containernetworking-plugins such as bridge, host-local, loopback, and portmap",
+                            "purpose": "crs pod and CRS local explicit Pod networking; uses crius local CNI config and containernetworking-plugins such as bridge, host-local, loopback, and portmap",
                             "config": Self::cni_config_summary(&local_network_config),
                             "loadStatus": local_cni_load_status,
                         },

@@ -33,8 +33,8 @@
 - 与 kubelet 配置兼容的 cgroup 设置
 - 可选：用于 checkpoint / restore 验证的 `criu`
 
-常规 kubelet 节点集成建议以 root 权限运行 `crius`。rootless 是独立验证路径，见
-[rootless.md](rootless.md)。
+kubelet/kubeadm 节点接入建议使用 root 权限运行的 `crius` daemon。rootless 是
+独立的开发和受限环境验证路径，见 [rootless.md](rootless.md)。
 
 ## 构建与安装
 

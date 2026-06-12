@@ -96,10 +96,30 @@ OCI artifact mount support, and `image.external_snapshotters.*`.
 
 ### Network
 
-`network.plugin` currently supports `cni`. Important fields include
-`config_dirs`, `plugin_dirs`, `cache_dir`, `conf_template`, `max_conf_num`,
-`ip_pref`, `teardown_timeout`, `default_network_name`,
-`disable_hostport_mapping`, and `netns_mounts_under_state_dir`.
+`network.plugin` currently supports `cni`.
+
+| Field | Purpose |
+| --- | --- |
+| `network.config_dirs` | legacy CRI CNI config directories; mapped to the CRI network domain |
+| `network.plugin_dirs` | legacy CRI CNI plugin binary directories; mapped to the CRI network domain |
+| `network.cache_dir` | legacy CRI CNI cache directory; mapped to the CRI network domain |
+| `network.conf_template` | template rendered from PodCIDR updates |
+| `network.max_conf_num` | maximum number of CNI config files to load; `0` means unlimited |
+| `network.ip_pref` | `cni`, `ipv4`, or `ipv6` |
+| `network.teardown_timeout` | CNI DEL timeout |
+| `network.default_network_name` | optional CNI network name |
+| `network.disable_hostport_mapping` | disables built-in hostPort handling |
+| `network.netns_mounts_under_state_dir` | places netns mounts under the runtime state directory |
+| `network.local.config_dirs` | local `crs pod` CNI config directories, default `/etc/crius/cni/net.d` |
+| `network.local.plugin_dirs` | local `crs pod` CNI plugin binary directories |
+| `network.local.cache_dir` | local `crs pod` CNI cache directory |
+| `network.cri.config_dirs` | kubelet / `crictl` / CRI PodSandbox CNI config directories |
+| `network.cri.plugin_dirs` | kubelet / `crictl` / CRI PodSandbox CNI plugin binary directories |
+| `network.cri.cache_dir` | kubelet / `crictl` / CRI PodSandbox CNI cache directory |
+
+Local `crs` Pod workflows use `[network.local]`. kubelet, `crictl`, and generic
+CRI PodSandbox workflows use `[network.cri]`. See
+[networking.md](networking.md) for details.
 
 ### Security
 

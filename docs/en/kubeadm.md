@@ -30,7 +30,8 @@ Install or provide:
 - cgroup settings compatible with kubelet
 - optional: `criu` for checkpoint/restore validation
 
-For normal kubelet integration, run `crius` as root. Rootless mode is a separate
+For kubelet/kubeadm node integration, run the `crius` daemon with root
+privileges. Rootless mode is a separate development and restricted-environment
 validation path documented in [rootless.md](rootless.md).
 
 ## Build And Install

@@ -1026,7 +1026,7 @@ impl RuntimeService for MockRuntimeService {
                                 "message": "network is not ready",
                                 "domains": {
                                     "local": {
-                                        "purpose": "crs pod and local Podman-style networking; uses crius local CNI config and containernetworking-plugins such as bridge, host-local, loopback, and portmap",
+                                        "purpose": "crs pod and CRS local explicit Pod networking; uses crius local CNI config and containernetworking-plugins such as bridge, host-local, loopback, and portmap",
                                         "config": {
                                             "configDirs": ["/etc/crius/cni/net.d"],
                                             "pluginDirs": ["/opt/cni/bin"],

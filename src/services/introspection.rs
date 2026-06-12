@@ -772,7 +772,7 @@ mod tests {
             cni_config_dirs: Vec::new(),
             cni_conf_template: None,
             cni_max_conf_num: 1,
-            cni_default_network_name: Some("podman".to_string()),
+            cni_default_network_name: Some("crius-bridge".to_string()),
         };
         let state = RuntimeReloadState {
             watcher_active: true,

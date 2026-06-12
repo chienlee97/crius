@@ -2,8 +2,9 @@
 
 This document describes current rootless support in `crius`.
 
-Rootless mode is intended for development and validation. Normal kubeadm /
-kubelet node integration should use the rootful daemon path.
+Rootless mode is primarily for development and restricted-environment
+validation. kubelet/kubeadm node integration should use a `crius` daemon
+running with root privileges.
 
 ## Configuration
 

@@ -132,64 +132,20 @@ Build only the local `crs` client:
 cargo build --bin crs
 ```
 
-`crs` connects to `unix:///run/crius/crius.sock` by default. Override the daemon
-endpoint with `--address` or `CRIUS_ADDRESS`, and tune request behavior with the
-global `--connect-timeout`, `--timeout`, `--debug`, `--output table|json|text`,
-`--quiet`, and `--no-trunc` options.
-
-`crs` is the project-native local client for development validation, node
-diagnostics, and daemon maintenance workflows. `crs run IMAGE ...` starts an
-ordinary container by default; Pod grouping is explicit through `crs pod run`
-or `crs run --pod POD IMAGE ...`. `crictl` remains the standard Kubernetes CRI
-conformance and interoperability tool; use it when comparing behavior with
-other runtimes or following kubelet-oriented operational guides.
+See [docs/en/operations.md](docs/en/operations.md) for node installation and
+validation, and [docs/en/crs.md](docs/en/crs.md) for the local `crs` client.
 
 ## Quick Start
 
-Build daemon and shim:
+Build the project:
 
 ```bash
 cargo build --features shim --bins
 ```
 
-Install on a validation node:
-
-```bash
-sudo install -Dm755 target/debug/crius /usr/bin/crius
-sudo install -Dm755 target/debug/crius-shim /usr/bin/crius-shim
-sudo install -Dm644 crius.service /etc/systemd/system/crius.service
-```
-
-Export configuration from the current binary:
-
-```bash
-sudo mkdir -p /etc/crius
-sudo /usr/bin/crius --write-default-config /etc/crius/crius.conf
-```
-
-Review `/etc/crius/crius.conf` before connecting kubelet. Pay special attention
-to runtime paths, shim path, CNI paths, pause image, and cgroup driver.
-
-For local `crs pod run` validation on a node that is not using Kubernetes CNI,
-install the sample local bridge network before starting the daemon:
-
-```bash
-sudo install -Dm644 examples/cni/crius-bridge.conflist \
-  /etc/crius/cni/net.d/10-crius-bridge.conflist
-```
-
-This sample uses the standard `bridge`, `host-local`, and `portmap` CNI plugins
-and does not require Kubernetes API access. Kubernetes / CRI networking remains
-configured separately under `[network.cri]`.
-
-Start the service:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now crius
-```
-
-Default CRI endpoint:
+Install on a validation node, export configuration, and start the service as
+described in [docs/en/operations.md](docs/en/operations.md). The default CRI
+endpoint is:
 
 ```text
 unix:///run/crius/crius.sock
@@ -203,37 +159,8 @@ sudo crictl --runtime-endpoint unix:///run/crius/crius.sock info
 sudo crictl --runtime-endpoint unix:///run/crius/crius.sock images
 ```
 
-Inspect and diagnose the same daemon with `crs`:
-
-```bash
-crs version
-# RUNTIME     VERSION  API
-# crius       0.1.0    v1
-
-crs status
-# RUNTIME READY  NETWORK READY
-# true           true
-
-crs image list
-# IMAGE                TAG     SIZE
-# registry.local/app   stable  42.0MiB
-
-crs pod list
-# POD ID        NAME       NAMESPACE  STATE
-# pod-example   web-pod    default    ready
-
-crs container list
-# CONTAINER ID  POD ID       IMAGE                STATE
-# ctr-example   pod-example  registry.local/app   running
-
-crs run --rm registry.local/app:stable /bin/true
-# CONTAINER ID  IMAGE
-# ctr-example   registry.local/app:stable
-
-crs debug runtime
-# AREA     STATUS  MESSAGE
-# runtime  ok      runtime service is ready
-```
+Use [docs/en/crs.md](docs/en/crs.md) for local `crs` workflows and
+[docs/en/networking.md](docs/en/networking.md) for local `crs` CNI setup.
 
 ## Configuration
 
@@ -323,6 +250,9 @@ make release-soak
 | Document | Description |
 | --- | --- |
 | [docs/en/architecture.md](docs/en/architecture.md) | Architecture, module boundaries, and core request flows |
+| [docs/en/crs.md](docs/en/crs.md) | Local `crs` client usage, containers, Pods, images, diagnostics, recovery, and GC |
+| [docs/en/networking.md](docs/en/networking.md) | Local `crs` CNI, CRI CNI, and network domain boundaries |
+| [docs/en/operations.md](docs/en/operations.md) | Node installation, validation, diagnostics, recovery, and issue report materials |
 | [docs/en/config-matrix.md](docs/en/config-matrix.md) | Configuration precedence, reload policy, and important fields |
 | [docs/en/kubeadm.md](docs/en/kubeadm.md) | kubelet and kubeadm node integration |
 | [docs/en/nri.md](docs/en/nri.md) | NRI configuration, lifecycle, adjustments, validators, and operations |
@@ -337,8 +267,9 @@ Chinese documentation is available under [docs/zh](docs/zh/architecture.md).
 - Deployment is still source-build oriented.
 - The sample systemd unit is suitable for validation nodes and should be
   reviewed against production security baselines before production use.
-- Rootless mode has explicit limitations and is not a direct replacement for
-  rootful kubelet integration.
+- Rootless mode is primarily for development and restricted-environment
+  validation; kubelet/kubeadm node integration should use a `crius` daemon
+  running with root privileges.
 - Checkpoint/restore depends on host, CRIU, and runtime support.
 
 ## License

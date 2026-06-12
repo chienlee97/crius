@@ -171,9 +171,9 @@ handler-specific 表为 `runtime.runtimes.<handler>`。
 | 字段 | 作用 |
 | --- | --- |
 | `network.plugin` | 网络实现，当前为 `cni` |
-| `network.config_dirs` | CNI 配置目录 |
-| `network.plugin_dirs` | CNI plugin binary 目录 |
-| `network.cache_dir` | CNI cache 目录 |
+| `network.config_dirs` | 旧版 CRI CNI 配置目录；映射到 CRI 网络域 |
+| `network.plugin_dirs` | 旧版 CRI CNI plugin binary 目录；映射到 CRI 网络域 |
+| `network.cache_dir` | 旧版 CRI CNI cache 目录；映射到 CRI 网络域 |
 | `network.conf_template` | 根据 PodCIDR 更新渲染的模板 |
 | `network.max_conf_num` | 最大加载 CNI 配置文件数量；`0` 表示不限制 |
 | `network.ip_pref` | `cni`、`ipv4` 或 `ipv6` |
@@ -181,6 +181,16 @@ handler-specific 表为 `runtime.runtimes.<handler>`。
 | `network.default_network_name` | 可选 CNI network name |
 | `network.disable_hostport_mapping` | 禁用内建 hostPort 处理 |
 | `network.netns_mounts_under_state_dir` | 将 netns mount 放到 runtime state dir 下 |
+| `network.local.config_dirs` | 本地 `crs pod` CNI 配置目录，默认 `/etc/crius/cni/net.d` |
+| `network.local.plugin_dirs` | 本地 `crs pod` CNI plugin binary 目录 |
+| `network.local.cache_dir` | 本地 `crs pod` CNI cache 目录 |
+| `network.cri.config_dirs` | kubelet / `crictl` / CRI PodSandbox CNI 配置目录 |
+| `network.cri.plugin_dirs` | kubelet / `crictl` / CRI PodSandbox CNI plugin binary 目录 |
+| `network.cri.cache_dir` | kubelet / `crictl` / CRI PodSandbox CNI cache 目录 |
+
+本地 `crs` Pod 工作流使用 `[network.local]`。kubelet、`crictl` 和通用 CRI
+PodSandbox 工作流使用 `[network.cri]`。详细说明见
+[networking.md](networking.md)。
 
 ### 安全
 
