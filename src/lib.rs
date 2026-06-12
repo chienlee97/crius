@@ -32,6 +32,9 @@ pub mod trace_export;
 pub mod utils;
 pub use crate::proto::nri as nri_proto;
 
+pub(crate) const CRS_RUN_ANNOTATION: &str = "io.crius.internal/crs-run";
+pub(crate) const CRS_RUN_ANNOTATION_VALUE: &str = "true";
+
 #[cfg(feature = "shim")]
 pub mod shim;
 

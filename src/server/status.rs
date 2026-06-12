@@ -278,7 +278,7 @@ impl RuntimeServiceImpl {
         let pod_has_required_netns = Self::pod_has_required_netns(pod);
 
         match pause_status {
-            ContainerStatus::Running if pod_has_required_netns => {
+            ContainerStatus::Running | ContainerStatus::Created if pod_has_required_netns => {
                 PodSandboxState::SandboxReady as i32
             }
             ContainerStatus::Unknown
@@ -560,7 +560,14 @@ impl RuntimeServiceImpl {
     }
 
     pub(super) async fn probe_cni_load_status(&self) -> crate::network::CniLoadStatus {
-        let cni_config = self.current_cni_config();
+        self.probe_cni_load_status_for_config(self.current_cni_config())
+            .await
+    }
+
+    pub(super) async fn probe_cni_load_status_for_config(
+        &self,
+        cni_config: crate::network::CniConfig,
+    ) -> crate::network::CniLoadStatus {
         if let Some(status) = cni_config.rootless_load_status() {
             return status;
         }
@@ -900,6 +907,10 @@ impl RuntimeServiceImpl {
                 };
             let local_network_config = self.pod_network_domain_cni_config(true);
             let cri_network_config = self.pod_network_domain_cni_config(false);
+            let local_cni_load_status = self
+                .probe_cni_load_status_for_config(local_network_config.clone())
+                .await;
+            let cri_cni_load_status = cni_load_status.clone();
             let (recent_network_runtime_events, recent_network_runtime_events_error) = self
                 .recent_internal_events_for_status(
                     "network",
@@ -1344,8 +1355,16 @@ impl RuntimeServiceImpl {
                     "reason": network_condition.reason.clone(),
                     "message": network_condition.message.clone(),
                     "domains": {
-                        "local": Self::cni_config_summary(&local_network_config),
-                        "cri": Self::cni_config_summary(&cri_network_config),
+                        "local": {
+                            "purpose": "crs pod and local Podman-style networking; uses crius local CNI config and containernetworking-plugins such as bridge, host-local, loopback, and portmap",
+                            "config": Self::cni_config_summary(&local_network_config),
+                            "loadStatus": local_cni_load_status,
+                        },
+                        "cri": {
+                            "purpose": "CRI consumers such as crictl/kubelet; uses standard CRI CNI config dirs and may select Kubernetes/Calico configs if configured there",
+                            "config": Self::cni_config_summary(&cri_network_config),
+                            "loadStatus": cri_cni_load_status,
+                        },
                     },
                     "lastCniLoadStatus": cni_load_status.clone(),
                     "reload": self.internal_services.introspection.reload(

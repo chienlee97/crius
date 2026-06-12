@@ -20,7 +20,7 @@ const DEFAULT_PERSISTENT_ROOT_DIR: &str = "/var/lib/crius";
 const DEFAULT_RUNTIME_STATE_DIR: &str = "/run/crius";
 const DEFAULT_CRI_SOCKET_URI: &str = "unix:///run/crius/crius.sock";
 const DEFAULT_RUNTIME_SHIM_DIR: &str = "/run/crius/shims";
-const DEFAULT_RUNTIME_ATTACH_SOCKET_DIR: &str = "/run/crius/shims";
+const DEFAULT_RUNTIME_ATTACH_SOCKET_DIR: &str = "/run/crius/attach";
 const DEFAULT_RUNTIME_CONTAINER_EXITS_DIR: &str = "/run/crius/exits";
 const DEFAULT_RUNTIME_CLEAN_SHUTDOWN_FILE: &str = "/var/lib/crius/clean.shutdown";
 const DEFAULT_RUNTIME_VERSION_FILE: &str = "/run/crius/version";
@@ -469,7 +469,7 @@ impl Default for ResolvedRuntimeHandlerConfig {
             monitor_path: String::new(),
             monitor_cgroup: String::new(),
             monitor_env: Vec::new(),
-            stream_websockets: false,
+            stream_websockets: true,
             allowed_annotations: Vec::new(),
             default_annotations: HashMap::new(),
             privileged_without_host_devices: false,
@@ -1079,7 +1079,7 @@ impl RuntimeConfig {
                 self.effective_cgroup_driver(),
             )?,
             monitor_env: self.monitor_env.clone(),
-            stream_websockets: false,
+            stream_websockets: true,
             allowed_annotations: Vec::new(),
             default_annotations: HashMap::new(),
             privileged_without_host_devices: false,
@@ -1863,8 +1863,9 @@ impl Config {
             &[
                 DEFAULT_RUNTIME_ATTACH_SOCKET_DIR,
                 LEGACY_RUNTIME_ATTACH_SOCKET_DIR,
+                DEFAULT_RUNTIME_SHIM_DIR,
             ],
-            runtime_state_dir.join("shims").display().to_string(),
+            runtime_state_dir.join("attach").display().to_string(),
         );
         rewrite_default_string(
             &mut self.runtime.container_exits_dir,

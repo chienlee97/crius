@@ -1,5 +1,6 @@
 use super::service::NameReservationGuard;
 use super::*;
+use crate::{CRS_RUN_ANNOTATION, CRS_RUN_ANNOTATION_VALUE};
 
 enum ContainerOwner {
     Local { runtime_handler: Option<String> },
@@ -36,6 +37,26 @@ struct ContainerCreateInput {
 }
 
 impl RuntimeServiceImpl {
+    fn should_assign_default_log_path(
+        owner: &ContainerOwner,
+        config: &crate::proto::runtime::v1::ContainerConfig,
+    ) -> bool {
+        matches!(owner, ContainerOwner::Local { .. })
+            || config
+                .annotations
+                .get(CRS_RUN_ANNOTATION)
+                .is_some_and(|value| value == CRS_RUN_ANNOTATION_VALUE)
+    }
+
+    fn default_container_log_path(&self, container_id: &str) -> String {
+        self.config
+            .log_dir
+            .join("containers")
+            .join(format!("{container_id}.log"))
+            .display()
+            .to_string()
+    }
+
     fn merge_default_env(&self, requested: &[(String, String)]) -> Vec<(String, String)> {
         let mut merged = self.config.default_env.clone();
         for (key, value) in requested {
@@ -1611,7 +1632,7 @@ impl RuntimeServiceImpl {
         input: ContainerCreateInput,
     ) -> Result<Response<CreateContainerResponse>, Status> {
         let ContainerCreateInput {
-            config,
+            mut config,
             sandbox_config,
             owner,
         } = input;
@@ -1646,6 +1667,11 @@ impl RuntimeServiceImpl {
         };
 
         let container_id = uuid::Uuid::new_v4().to_simple().to_string();
+        if config.log_path.trim().is_empty()
+            && Self::should_assign_default_log_path(&owner, &config)
+        {
+            config.log_path = self.default_container_log_path(&container_id);
+        }
         let container_name_key = Self::container_name_key(container_metadata, &pod_metadata);
         let mut container_name_guard = self
             .reserve_container_name_for_create(&container_id, &container_name_key)

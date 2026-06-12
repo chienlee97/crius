@@ -60,8 +60,34 @@ pub(crate) async fn handle_list(
         .await?
         .into_inner();
 
-    let views = response.items.into_iter().map(pod_view).collect();
+    let mut views = Vec::with_capacity(response.items.len());
+    for pod in response.items {
+        let status = pod_status_for_list(client, &pod.id).await;
+        views.push(pod_view_with_status(pod, status.as_ref()));
+    }
     render_and_print(ctx, CommandOutput::new("PodList", client.endpoint(), views))
+}
+
+async fn pod_status_for_list(client: &CrsClient, pod_id: &str) -> Option<PodSandboxStatus> {
+    let mut runtime = client.runtime().ok()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .pod_sandbox_status(PodSandboxStatusRequest {
+                    pod_sandbox_id: pod_id.to_string(),
+                    verbose: false,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs pod list")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("pod {pod_id}"))
+                })
+        })
+        .await
+        .ok()
+        .and_then(|response| response.into_inner().status)
 }
 
 pub(crate) async fn handle_inspect(
@@ -462,17 +488,39 @@ pub(crate) fn pod_stats_filter(
     }))
 }
 
-pub(crate) fn pod_view(pod: PodSandbox) -> PodView {
+fn pod_view_with_status(pod: PodSandbox, status: Option<&PodSandboxStatus>) -> PodView {
     let metadata = pod.metadata.unwrap_or_default();
+    let ip = status
+        .and_then(|status| status.network.as_ref())
+        .map(|network| network.ip.clone())
+        .filter(|ip| !ip.is_empty())
+        .or_else(|| pod_ip_from_annotations(&pod.annotations))
+        .unwrap_or_default();
+    let state = status.map(|status| status.state).unwrap_or(pod.state);
     PodView {
         pod_id: pod.id,
         name: metadata.name,
         namespace: metadata.namespace,
-        state: pod_state_name(pod.state).to_string(),
-        ip: String::new(),
+        state: pod_state_name(state).to_string(),
+        ip,
         created: pod.created_at.to_string(),
         attempt: metadata.attempt,
     }
+}
+
+fn pod_ip_from_annotations(
+    annotations: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    annotations
+        .get("io.crius.internal/pod-state")
+        .and_then(|state| serde_json::from_str::<serde_json::Value>(state).ok())
+        .and_then(|state| {
+            state
+                .get("ip")
+                .and_then(serde_json::Value::as_str)
+                .filter(|ip| !ip.is_empty())
+                .map(ToString::to_string)
+        })
 }
 
 pub(crate) fn pod_stats_view(stats: PodSandboxStats) -> PodStatsView {

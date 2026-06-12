@@ -5,10 +5,14 @@ use crate::crs::{
 use crate::proto::runtime::v1::ExecRequest;
 
 pub(crate) async fn handle(
-    _ctx: &CliContext,
+    ctx: &CliContext,
     client: &CrsClient,
     args: ExecArgs,
 ) -> Result<CommandResult, CliError> {
+    if !args.stream.stdin && !args.stream.tty {
+        return super::container::exec_sync_with_command(ctx, client, args, "crs exec").await;
+    }
+
     let mut options =
         streaming::ExecStreamOptions::from_args(args.container, args.command, args.stream)?;
     let mut runtime = client.runtime()?;

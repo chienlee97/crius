@@ -45,7 +45,8 @@ async fn debug_network(ctx: &CliContext, client: &CrsClient) -> Result<CommandRe
         .map(|(config, _)| config)
         .unwrap_or_default();
     let network_diagnostics = status_info
-        .get("networkDiagnostics")
+        .pointer("/networkDiagnostics")
+        .or_else(|| status_info.pointer("/config/networkDiagnostics"))
         .cloned()
         .unwrap_or_default();
     let local_network = network_diagnostics
@@ -61,6 +62,12 @@ async fn debug_network(ctx: &CliContext, client: &CrsClient) -> Result<CommandRe
         .cloned()
         .unwrap_or_default();
     add_cni_selection_warnings(&cni_selection, &mut warnings);
+    add_cni_selection_warnings(
+        cri_network
+            .get("loadStatus")
+            .unwrap_or(&serde_json::Value::Null),
+        &mut warnings,
+    );
     let details = serde_json::json!({
         "networkReady": network_ready,
         "podCIDR": lookup_display(&config, &["/runtimeNetworkConfig/podCIDR", "/network/podCIDR", "/podCIDR"]),
@@ -94,10 +101,11 @@ fn add_cni_selection_warnings(cni_selection: &serde_json::Value, warnings: &mut 
         .filter_map(|plugin| plugin.as_str());
 
     if declared_plugins.any(|plugin| plugin.eq_ignore_ascii_case("calico")) {
-        warnings.push(
-            "selected CNI configuration uses Calico; Calico may depend on the Kubernetes API"
-                .to_string(),
-        );
+        let warning =
+            "selected CNI configuration uses Calico; Calico may depend on the Kubernetes API";
+        if !warnings.iter().any(|existing| existing == warning) {
+            warnings.push(warning.to_string());
+        }
     }
 }
 

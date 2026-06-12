@@ -3816,6 +3816,7 @@ async fn serve_exec_websocket_via_shim(
     let stdout_enabled = req.stdout;
     let stderr_enabled = req.stderr;
     let tty = req.tty;
+    let (output_done_tx, mut output_done_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         let mut decoder = AttachOutputDecoder::default();
         let mut buffer = [0u8; 8192];
@@ -3824,6 +3825,7 @@ async fn serve_exec_websocket_via_shim(
                 Ok(0) => {
                     let _ =
                         write_websocket_frame(&mut *writer_for_output.lock().await, 0x8, &[]).await;
+                    let _ = output_done_tx.send(());
                     if let Err(e) = decoder.finish() {
                         log::debug!("Exec websocket decoder finished with trailing data: {}", e);
                     }
@@ -3873,9 +3875,11 @@ async fn serve_exec_websocket_via_shim(
     });
 
     loop {
-        let Some(frame) = read_websocket_frame(&mut reader).await? else {
-            break;
+        let frame = tokio::select! {
+            result = read_websocket_frame(&mut reader) => result?,
+            _ = &mut output_done_rx => break,
         };
+        let Some(frame) = frame else { break };
         match frame.opcode {
             0x8 => break,
             0x9 => {
@@ -4128,6 +4132,7 @@ async fn serve_attach_websocket(
     let stdout_enabled = req.stdout;
     let stderr_enabled = req.stderr;
     let tty = req.tty;
+    let (output_done_tx, mut output_done_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         let mut decoder = AttachOutputDecoder::default();
         let mut buffer = [0u8; 8192];
@@ -4136,6 +4141,7 @@ async fn serve_attach_websocket(
                 Ok(0) => {
                     let _ =
                         write_websocket_frame(&mut *writer_for_output.lock().await, 0x8, &[]).await;
+                    let _ = output_done_tx.send(());
                     if let Err(e) = decoder.finish() {
                         log::debug!(
                             "Attach websocket decoder finished with trailing data: {}",
@@ -4193,9 +4199,11 @@ async fn serve_attach_websocket(
     });
 
     loop {
-        let Some(frame) = read_websocket_frame(&mut reader).await? else {
-            break;
+        let frame = tokio::select! {
+            result = read_websocket_frame(&mut reader) => result?,
+            _ = &mut output_done_rx => break,
         };
+        let Some(frame) = frame else { break };
         match frame.opcode {
             0x8 => break,
             0x9 => {

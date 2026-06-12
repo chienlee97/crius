@@ -58,11 +58,20 @@ pub(crate) async fn handle_pull(
 }
 
 pub(crate) async fn handle_inspect(
-    _ctx: &CliContext,
-    _client: &CrsClient,
-    _args: InspectArgs,
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: InspectArgs,
 ) -> Result<CommandResult, CliError> {
-    Err(CliError::not_implemented("crs inspect"))
+    match args.object_type {
+        Some(ObjectType::Container) => container::handle_inspect(ctx, client, args.target).await,
+        Some(ObjectType::Pod) => pod::handle_inspect(ctx, client, args.target).await,
+        Some(ObjectType::Image) => image::handle_inspect(ctx, client, args.target).await,
+        None => match resolve_remove_target(client, &args.target).await? {
+            RemoveCandidate::Container => container::handle_inspect(ctx, client, args.target).await,
+            RemoveCandidate::Pod => pod::handle_inspect(ctx, client, args.target).await,
+            RemoveCandidate::Image => image::handle_inspect(ctx, client, args.target).await,
+        },
+    }
 }
 
 pub(crate) async fn handle_stop(

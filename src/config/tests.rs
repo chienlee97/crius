@@ -75,7 +75,7 @@ fn resolved_runtimes_merge_default_and_handler_specific_entries() {
             monitor_path: "/usr/bin/crius-shim".to_string(),
             monitor_cgroup: expected_monitor_cgroup.clone(),
             monitor_env: vec!["PATH=/usr/bin".to_string()],
-            stream_websockets: false,
+            stream_websockets: true,
             allowed_annotations: Vec::new(),
             default_annotations: HashMap::new(),
             privileged_without_host_devices: false,
@@ -96,7 +96,7 @@ fn resolved_runtimes_merge_default_and_handler_specific_entries() {
             monitor_path: "/usr/bin/kata-shim".to_string(),
             monitor_cgroup: expected_monitor_cgroup.clone(),
             monitor_env: vec!["RUST_LOG=debug".to_string()],
-            stream_websockets: false,
+            stream_websockets: true,
             allowed_annotations: vec!["io.example.runtime/".to_string()],
             default_annotations: HashMap::from([(
                 "io.example.runtime/default".to_string(),
@@ -120,7 +120,7 @@ fn resolved_runtimes_merge_default_and_handler_specific_entries() {
             monitor_path: "/usr/bin/crius-shim".to_string(),
             monitor_cgroup: expected_monitor_cgroup,
             monitor_env: vec!["PATH=/usr/bin".to_string()],
-            stream_websockets: false,
+            stream_websockets: true,
             allowed_annotations: Vec::new(),
             default_annotations: HashMap::new(),
             privileged_without_host_devices: false,
@@ -2397,7 +2397,7 @@ fn default_stateful_paths_follow_runtime_and_persistent_roots() {
 
     assert_eq!(config.api.listen, "unix:///run/custom-crius/crius.sock");
     assert_eq!(config.runtime.shim_dir, "/run/custom-crius/shims");
-    assert_eq!(config.runtime.attach_socket_dir, "/run/custom-crius/shims");
+    assert_eq!(config.runtime.attach_socket_dir, "/run/custom-crius/attach");
     assert_eq!(
         config.runtime.container_exits_dir,
         "/run/custom-crius/exits"

@@ -31,7 +31,7 @@ pub(crate) async fn handle(
     let request = ContainerLogRequest {
         container_id: args.container.clone(),
         follow: args.follow,
-        tail_lines: args.tail.unwrap_or_default(),
+        tail_lines: args.tail.unwrap_or(-1),
         since_unix_nanos: since_unix_nanos.unwrap_or_default(),
         timestamps: args.timestamps,
     };

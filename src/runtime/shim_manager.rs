@@ -36,6 +36,12 @@ pub fn default_shim_work_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_SHIM_WORK_DIR))
 }
 
+pub fn default_attach_socket_dir() -> PathBuf {
+    std::env::var("CRIUS_ATTACH_SOCKET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/var/run/crius/attach"))
+}
+
 /// Shim配置
 #[derive(Debug, Clone)]
 pub struct ShimConfig {
@@ -84,7 +90,7 @@ impl Default for ShimConfig {
             runtime_config_path: PathBuf::new(),
             monitor_cgroup: String::new(),
             work_dir: default_shim_work_dir(),
-            attach_socket_dir: default_shim_work_dir(),
+            attach_socket_dir: default_attach_socket_dir(),
             container_exits_dir: PathBuf::from("/var/run/crius/exits"),
             io_uid: 0,
             io_gid: 0,

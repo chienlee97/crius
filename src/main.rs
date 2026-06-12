@@ -1148,7 +1148,7 @@ mod tests {
                     monitor_path: "/definitely/missing/crius-shim".to_string(),
                     monitor_cgroup: String::new(),
                     monitor_env: Vec::new(),
-                    stream_websockets: false,
+                    stream_websockets: true,
                     allowed_annotations: Vec::new(),
                     default_annotations: std::collections::HashMap::new(),
                     privileged_without_host_devices: false,
@@ -1379,7 +1379,7 @@ mod tests {
         assert_eq!(config.runtime.root, "/run/custom-crius");
         assert_eq!(config.runtime.pause_image, "registry.example.com/pause:4.0");
         assert_eq!(config.runtime.shim_dir, "/run/custom-crius/shims");
-        assert_eq!(config.runtime.attach_socket_dir, "/run/custom-crius/shims");
+        assert_eq!(config.runtime.attach_socket_dir, "/run/custom-crius/attach");
         assert_eq!(
             config.runtime.container_exits_dir,
             "/run/custom-crius/exits"

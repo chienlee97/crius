@@ -443,7 +443,7 @@ impl Default for RuntimeConfig {
                     monitor_path: loaded.runtime.shim_path.clone(),
                     monitor_cgroup: loaded.runtime.monitor_cgroup.clone(),
                     monitor_env: loaded.runtime.monitor_env.clone(),
-                    stream_websockets: false,
+                    stream_websockets: true,
                     allowed_annotations: Vec::new(),
                     default_annotations: HashMap::new(),
                     privileged_without_host_devices: false,
@@ -1430,19 +1430,23 @@ impl RuntimeServiceImpl {
             ));
         }
 
-        let allowed_root = self.config.root_dir.clone();
+        let allowed_roots = [self.config.root_dir.clone(), self.config.log_dir.clone()];
         let parent = path.parent().ok_or_else(|| {
             tonic::Status::failed_precondition("container log path does not have a parent")
         })?;
         let canonical_parent = parent
             .canonicalize()
             .map_err(|err| tonic::Status::not_found(format!("container log parent: {err}")))?;
-        let canonical_root = allowed_root
-            .canonicalize()
-            .unwrap_or_else(|_| allowed_root.clone());
-        if !canonical_parent.starts_with(&canonical_root) {
+        let allowed = allowed_roots.iter().any(|root| {
+            if root.as_os_str().is_empty() {
+                return false;
+            }
+            let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            canonical_parent.starts_with(canonical_root)
+        });
+        if !allowed {
             return Err(tonic::Status::permission_denied(
-                "container log path is outside daemon state directory",
+                "container log path is outside daemon state or log directory",
             ));
         }
 
@@ -2234,7 +2238,7 @@ impl RuntimeServiceImpl {
                 monitor_path: config.shim.shim_path.display().to_string(),
                 monitor_cgroup: config.monitor_cgroup.clone(),
                 monitor_env: config.monitor_env.clone(),
-                stream_websockets: false,
+                stream_websockets: true,
                 allowed_annotations: Vec::new(),
                 default_annotations: HashMap::new(),
                 privileged_without_host_devices: false,

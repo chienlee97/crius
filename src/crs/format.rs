@@ -789,6 +789,7 @@ impl TableRow for PodOperationView {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ContainerView {
     pub container_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub pod: String,
     pub image: String,
     pub state: String,
@@ -827,7 +828,9 @@ impl TableRow for ContainerView {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ContainerOperationView {
     pub container_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub pod_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub image: String,
     pub action: String,
     pub success: bool,

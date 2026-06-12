@@ -82,6 +82,53 @@ async fn load_network_configs_includes_conflist_files() {
     assert_eq!(status.loaded_networks, vec!["test-net"]);
 }
 
+#[tokio::test]
+async fn load_network_configs_treats_ipam_as_required_plugin() {
+    let dir = tempdir().unwrap();
+    let config_dir = dir.path().join("net.d");
+    let plugin_dir = dir.path().join("bin");
+    tokio::fs::create_dir_all(&config_dir).await.unwrap();
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    for plugin in ["bridge", "loopback", "portmap"] {
+        let path = plugin_dir.join(plugin);
+        tokio::fs::write(&path, "#!/bin/sh\ncat >/dev/null\n")
+            .await
+            .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+    tokio::fs::write(
+        config_dir.join("10-crius-bridge.conflist"),
+        r#"{
+                "cniVersion":"1.0.0",
+                "name":"crius-bridge",
+                "plugins":[
+                    {"type":"loopback"},
+                    {"type":"bridge","ipam":{"type":"host-local"}},
+                    {"type":"portmap"}
+                ]
+            }"#,
+    )
+    .await
+    .unwrap();
+
+    let mut manager = CniManager::new(
+        vec![plugin_dir.display().to_string()],
+        vec![config_dir.display().to_string()],
+        dir.path().join("cache").display().to_string(),
+    )
+    .unwrap();
+    let status = manager.load_network_configs().await.unwrap();
+
+    assert_eq!(status.reason, "CNIPluginMissing");
+    assert_eq!(
+        status.declared_plugins,
+        vec!["bridge", "host-local", "loopback", "portmap"]
+    );
+    assert_eq!(status.missing_plugin_binaries, vec!["host-local"]);
+}
+
 #[test]
 fn primary_plugin_type_prefers_type_then_first_plugin() {
     let direct = serde_json::json!({
@@ -375,6 +422,17 @@ async fn setup_pod_network_executes_conflist_as_plugin_chain() {
     let mut bridge_perms = std::fs::metadata(&bridge_path).unwrap().permissions();
     bridge_perms.set_mode(0o755);
     std::fs::set_permissions(&bridge_path, bridge_perms).unwrap();
+
+    let host_local_path = plugin_dir.join("host-local");
+    tokio::fs::write(
+        &host_local_path,
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{}'\n",
+    )
+    .await
+    .unwrap();
+    let mut host_local_perms = std::fs::metadata(&host_local_path).unwrap().permissions();
+    host_local_perms.set_mode(0o755);
+    std::fs::set_permissions(&host_local_path, host_local_perms).unwrap();
 
     let portmap_script = format!(
             "#!/bin/sh\ncat > \"{}/portmap.input\"\nprintf '%s\\n' '{{\"cniVersion\":\"1.0.0\",\"ips\":[{{\"address\":\"10.88.0.2/16\"}}]}}'\n",

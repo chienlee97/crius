@@ -748,6 +748,15 @@ impl CniManager {
                 plugin_types.push(plugin_type.to_string());
             }
         }
+        if let Some(ipam_type) = config_value
+            .get("ipam")
+            .and_then(|ipam| ipam.get("type"))
+            .and_then(|value| value.as_str())
+        {
+            if !ipam_type.trim().is_empty() {
+                plugin_types.push(ipam_type.to_string());
+            }
+        }
 
         if let Some(plugins) = config_value
             .get("plugins")
@@ -757,6 +766,15 @@ impl CniManager {
                 if let Some(plugin_type) = plugin.get("type").and_then(|value| value.as_str()) {
                     if !plugin_type.trim().is_empty() {
                         plugin_types.push(plugin_type.to_string());
+                    }
+                }
+                if let Some(ipam_type) = plugin
+                    .get("ipam")
+                    .and_then(|ipam| ipam.get("type"))
+                    .and_then(|value| value.as_str())
+                {
+                    if !ipam_type.trim().is_empty() {
+                        plugin_types.push(ipam_type.to_string());
                     }
                 }
             }

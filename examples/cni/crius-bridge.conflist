@@ -3,6 +3,9 @@
   "name": "crius-bridge",
   "plugins": [
     {
+      "type": "loopback"
+    },
+    {
       "type": "bridge",
       "bridge": "crius0",
       "isGateway": true,

@@ -23,8 +23,11 @@ impl RuntimeServiceImpl {
     }
 
     fn pod_uses_local_network(config: &crate::proto::runtime::v1::PodSandboxConfig) -> bool {
-        config
-            .annotations
+        Self::annotations_use_local_network(&config.annotations)
+    }
+
+    fn annotations_use_local_network(annotations: &HashMap<String, String>) -> bool {
+        annotations
             .get(CRS_NETWORK_DOMAIN_ANNOTATION)
             .map(|value| value.trim().eq_ignore_ascii_case(CRS_LOCAL_NETWORK_DOMAIN))
             .unwrap_or(false)
@@ -271,7 +274,9 @@ impl RuntimeServiceImpl {
 
         if let Some(netns_name) = Self::pod_fallback_netns_name(pod, pod_state) {
             let network_manager =
-                DefaultNetworkManager::from_cni_config(self.config.cni_config.clone());
+                DefaultNetworkManager::from_cni_config(self.pod_network_domain_cni_config(
+                    Self::annotations_use_local_network(&pod.annotations),
+                ));
             if let Some(netns_path) = pod_state
                 .and_then(|state| state.netns_path.as_deref())
                 .filter(|path| !path.is_empty())
@@ -706,12 +711,9 @@ impl RuntimeServiceImpl {
                     ),
                     pod_cidr: cfg.pod_cidr.clone(),
                 }),
-            cgroup_parent: linux_config
-                .as_ref()
-                .and_then(|linux| {
-                    (!linux.cgroup_parent.is_empty()).then(|| linux.cgroup_parent.clone())
-                })
-                .or_else(|| Some("crius".to_string())),
+            cgroup_parent: linux_config.as_ref().and_then(|linux| {
+                (!linux.cgroup_parent.is_empty()).then(|| linux.cgroup_parent.clone())
+            }),
             sysctls: effective_sysctls.clone(),
             namespace_options: effective_namespace_options.clone(),
             privileged: pod_privileged,

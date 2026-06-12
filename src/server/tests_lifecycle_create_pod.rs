@@ -436,6 +436,112 @@ async fn create_container_oci_backend_creates_task_after_adjusted_bundle() {
 }
 
 #[tokio::test]
+async fn create_container_from_crs_run_pod_gets_default_log_path() {
+    let dir = tempdir().unwrap();
+    let runtime_root = dir.path().join("fake-runtime-root");
+    let fake_backend = Arc::new(common::FakeRuntimeBackend::new(&runtime_root));
+    let mut config = test_runtime_config(dir.path().join("root"));
+    config.runtime = "fake".to_string();
+    config.runtime_handlers = vec!["fake".to_string()];
+    config.runtime_root = runtime_root.clone();
+    config.log_dir = dir.path().join("logs");
+    config.runtime_configs = HashMap::from([(
+        "fake".to_string(),
+        crate::config::ResolvedRuntimeHandlerConfig {
+            backend: "fake".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: "/fake/runtime".to_string(),
+            runtime_config_path: String::new(),
+            runtime_root: runtime_root.display().to_string(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: "/fake/shim".to_string(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: false,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: 30,
+            snapshotter: "internal-overlay-untar".to_string(),
+        },
+    )]);
+    let service = RuntimeServiceImpl::new_with_runtime_backends(
+        config,
+        HashMap::from([(
+            "fake".to_string(),
+            fake_backend as Arc<dyn crate::runtime::RuntimeBackend>,
+        )]),
+    );
+    let mut pod = test_pod("pod-crs-run", HashMap::new());
+    pod.runtime_handler = "fake".to_string();
+    service
+        .pod_sandboxes
+        .lock()
+        .await
+        .insert("pod-crs-run".to_string(), pod);
+
+    let response = RuntimeService::create_container(
+        &service,
+        Request::new(CreateContainerRequest {
+            pod_sandbox_id: "pod-crs-run".to_string(),
+            config: Some(crate::proto::runtime::v1::ContainerConfig {
+                metadata: Some(ContainerMetadata {
+                    name: "crs-workload".to_string(),
+                    attempt: 1,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:latest".to_string(),
+                    user_specified_image: "busybox:latest".to_string(),
+                    ..Default::default()
+                }),
+                annotations: HashMap::from([(
+                    crate::CRS_RUN_ANNOTATION.to_string(),
+                    crate::CRS_RUN_ANNOTATION_VALUE.to_string(),
+                )]),
+                ..Default::default()
+            }),
+            sandbox_config: Some(crate::proto::runtime::v1::PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: "pod-crs-run-pod".to_string(),
+                    uid: "pod-crs-run-uid".to_string(),
+                    namespace: "default".to_string(),
+                    attempt: 1,
+                }),
+                ..Default::default()
+            }),
+        }),
+    )
+    .await
+    .expect("CRS run pod container should be created")
+    .into_inner();
+
+    let container = service
+        .containers
+        .lock()
+        .await
+        .get(&response.container_id)
+        .cloned()
+        .expect("container should be stored");
+    let state = RuntimeServiceImpl::read_internal_state::<StoredContainerState>(
+        &container.annotations,
+        INTERNAL_CONTAINER_STATE_KEY,
+    )
+    .expect("stored container state");
+    let expected_log_path = service
+        .config
+        .log_dir
+        .join("containers")
+        .join(format!("{}.log", response.container_id))
+        .display()
+        .to_string();
+    assert_eq!(
+        state.log_path.as_deref(),
+        Some(expected_log_path.as_str())
+    );
+}
+
+#[tokio::test]
 async fn create_container_applies_cdi_devices_without_nri_adjustment() {
     let cdi_dir = tempdir().unwrap();
     fs::write(

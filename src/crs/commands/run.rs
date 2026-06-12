@@ -1,3 +1,5 @@
+use futures::StreamExt;
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use crate::crs::{
@@ -13,12 +15,14 @@ use crate::crs::{
     format::CommandOutput,
     streaming,
 };
+use crate::proto::diagnostics::v1::ContainerLogRequest;
 use crate::proto::local::v1::CreateLocalContainerRequest;
 use crate::proto::runtime::v1::{
-    AttachRequest, ContainerState, ContainerStatusRequest, CreateContainerRequest, ExecSyncRequest,
-    ImageSpec, ImageStatusRequest, NamespaceMode, PodSandboxConfig, PodSandboxStatusRequest,
-    PullImageRequest, RemoveContainerRequest, StartContainerRequest, StopContainerRequest,
+    AttachRequest, ContainerState, ContainerStatusRequest, CreateContainerRequest, ImageSpec,
+    ImageStatusRequest, NamespaceMode, PodSandboxConfig, PodSandboxStatusRequest, PullImageRequest,
+    RemoveContainerRequest, StartContainerRequest, StopContainerRequest,
 };
+use crate::{CRS_RUN_ANNOTATION, CRS_RUN_ANNOTATION_VALUE};
 
 const STOPPED_STREAMING_STATUS_WAIT: Duration = Duration::from_secs(2);
 const STOPPED_STREAMING_STATUS_POLL: Duration = Duration::from_millis(100);
@@ -372,7 +376,11 @@ async fn create_container(
         image: plan.image.clone(),
         command: plan.command.clone(),
     };
-    let config = build_container_config(&args).map_err(CliError::invalid_input)?;
+    let mut config = build_container_config(&args).map_err(CliError::invalid_input)?;
+    config.annotations.insert(
+        CRS_RUN_ANNOTATION.to_string(),
+        CRS_RUN_ANNOTATION_VALUE.to_string(),
+    );
     let mut runtime = client.runtime()?;
     let response = client
         .with_rpc_timeout(async {
@@ -434,39 +442,22 @@ async fn run_exec_sync(
     plan: &RunPlan,
     container_id: &str,
 ) -> Result<CommandResult, CliError> {
-    let command = foreground_command(plan)?;
-    let mut runtime = client.runtime()?;
-    let response = client
-        .with_rpc_timeout(async {
-            runtime
-                .exec_sync(ExecSyncRequest {
-                    container_id: container_id.to_string(),
-                    cmd: command,
-                    timeout: 0,
-                })
-                .await
-                .map_err(|status| {
-                    CliError::from_tonic_status(status)
-                        .with_command("crs run")
-                        .with_endpoint(client.endpoint())
-                        .with_object(format!("container {container_id}"))
-                })
-        })
-        .await?
-        .into_inner();
+    let status = wait_for_run_exit(client, container_id).await?;
+    let log = read_run_log(client, container_id).await.unwrap_or_default();
 
     if matches!(ctx.output(), crate::crs::args::OutputArg::Json) {
         let envelope = serde_json::json!({
-            "kind": "RunExecSync",
+            "kind": "Run",
             "apiVersion": crate::crs::format::API_VERSION,
             "endpoint": client.endpoint(),
             "summary": {
                 "containerId": container_id,
                 "image": plan.image,
-                "exitCode": response.exit_code,
+                "exitCode": status.exit_code,
+                "state": "exited",
             },
-            "stdout": String::from_utf8_lossy(&response.stdout),
-            "stderr": String::from_utf8_lossy(&response.stderr),
+            "stdout": String::from_utf8_lossy(&log),
+            "stderr": "",
             "warnings": [],
         });
         println!(
@@ -476,17 +467,12 @@ async fn run_exec_sync(
             ))?
         );
     } else {
-        use std::io::Write;
-
         std::io::stdout()
-            .write_all(&response.stdout)
+            .write_all(&log)
             .map_err(|source| CliError::internal(format!("failed to write stdout: {source}")))?;
-        std::io::stderr()
-            .write_all(&response.stderr)
-            .map_err(|source| CliError::internal(format!("failed to write stderr: {source}")))?;
     }
 
-    Ok(CommandResult::from_code(response.exit_code))
+    Ok(CommandResult::container_exit(status.exit_code))
 }
 
 async fn render_stopped_before_streaming(
@@ -584,23 +570,52 @@ fn stopped_before_streaming_warning(exec_mode: ExecModeArg) -> &'static str {
         ExecModeArg::Attach => {
             "container exited before attach could stream output; use --detach for lifecycle-only checks or run a longer-lived command when interactive output is required"
         }
-        ExecModeArg::Sync => {
-            "container exited before exec-sync could run; --exec-mode sync runs a command after container start, so use a longer-lived container command or run the desired command as the container process"
-        }
+        ExecModeArg::Sync => "container exited before foreground output could be collected",
     }
 }
 
-fn foreground_command(plan: &RunPlan) -> Result<Vec<String>, CliError> {
-    if !plan.command.is_empty() {
-        return Ok(plan.command.clone());
+async fn wait_for_run_exit(
+    client: &CrsClient,
+    container_id: &str,
+) -> Result<crate::proto::runtime::v1::ContainerStatus, CliError> {
+    loop {
+        let status = fetch_container_status(client, container_id).await?;
+        if status.state == ContainerState::ContainerExited as i32 {
+            return Ok(status);
+        }
+        tokio::time::sleep(STOPPED_STREAMING_STATUS_POLL).await;
     }
-    if !plan.container_options.commands.is_empty() {
-        let mut command = plan.container_options.commands.clone();
-        command.extend(plan.container_options.args.clone());
-        return Ok(command);
-    }
+}
 
-    Err(CliError::invalid_input("run --exec-mode sync requires a command").with_command("crs run"))
+async fn read_run_log(client: &CrsClient, container_id: &str) -> Result<Vec<u8>, CliError> {
+    let mut diagnostics = client.diagnostics()?;
+    let mut stream = client
+        .with_rpc_timeout(async {
+            diagnostics
+                .container_log(ContainerLogRequest {
+                    container_id: container_id.to_string(),
+                    follow: false,
+                    tail_lines: -1,
+                    since_unix_nanos: 0,
+                    timestamps: false,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_diagnostics_status(status, client.endpoint())
+                        .with_command("crs run")
+                        .with_object(format!("container {container_id}"))
+                })
+        })
+        .await?
+        .into_inner();
+
+    let mut output = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|status| CliError::from_tonic_status(status).with_command("crs run"))?;
+        output.extend_from_slice(&chunk.data);
+    }
+    Ok(output)
 }
 
 async fn run_attach(

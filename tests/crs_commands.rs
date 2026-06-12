@@ -142,7 +142,7 @@ struct MockState {
     last_container_log: Arc<Mutex<Option<ContainerLogRequest>>>,
     last_recovery_check: Arc<Mutex<Option<RecoveryCheckRequest>>>,
     last_content_gc: Arc<Mutex<Option<ContentGcRequest>>>,
-    fail_non_host_pod_network: Arc<Mutex<bool>>,
+    fail_cri_cni_network: Arc<Mutex<bool>>,
     fail_run_streaming_when_stopped: Arc<Mutex<bool>>,
     short_run_status_polls: Arc<AtomicUsize>,
 }
@@ -229,7 +229,7 @@ impl Default for MockState {
             last_container_log: Arc::default(),
             last_recovery_check: Arc::default(),
             last_content_gc: Arc::default(),
-            fail_non_host_pod_network: Arc::default(),
+            fail_cri_cni_network: Arc::default(),
             fail_run_streaming_when_stopped: Arc::default(),
             short_run_status_polls: Arc::default(),
         }
@@ -266,25 +266,27 @@ impl RuntimeService for MockRuntimeService {
             .unwrap_or_default()
             .to_string();
         self.state.run_pod_requests.fetch_add(1, Ordering::SeqCst);
-        let uses_host_network = request
+        let uses_local_crs_network = request
             .config
             .as_ref()
-            .and_then(|config| config.linux.as_ref())
-            .and_then(|linux| linux.security_context.as_ref())
-            .and_then(|security| security.namespace_options.as_ref())
-            .map(|namespaces| namespaces.network == NamespaceMode::Node as i32)
+            .map(|config| {
+                config
+                    .annotations
+                    .get("crius.crs/network-domain")
+                    .is_some_and(|domain| domain == "local")
+            })
             .unwrap_or(false);
         *self.state.last_run_pod.lock().expect("last run pod lock") = Some(request);
 
         if *self
             .state
-            .fail_non_host_pod_network
+            .fail_cri_cni_network
             .lock()
-            .expect("fail non-host pod network lock")
-            && !uses_host_network
+            .expect("fail CRI CNI network lock")
+            && !uses_local_crs_network
         {
             return Err(Status::failed_precondition(
-                "Calico Kubernetes API is unavailable while loading cluster information",
+                "CRI CNI network is unavailable while loading cluster configuration",
             ));
         }
 
@@ -416,7 +418,14 @@ impl RuntimeService for MockRuntimeService {
                 state: PodSandboxState::SandboxReady as i32,
                 created_at: 42,
                 labels: Default::default(),
-                annotations: Default::default(),
+                annotations: [(
+                    "io.crius.internal/pod-state".to_string(),
+                    serde_json::json!({
+                        "ip": "10.88.0.42"
+                    })
+                    .to_string(),
+                )]
+                .into(),
                 runtime_handler: "runc".into(),
             }],
         }))
@@ -614,6 +623,43 @@ impl RuntimeService for MockRuntimeService {
             ContainerState::ContainerRunning as i32
         };
         let exit_code = if short_run { 7 } else { 0 };
+        let local_container = request.container_id == "local-ctr";
+        let annotations = if local_container {
+            [
+                ("io.kubernetes.cri.sandbox-id".to_string(), String::new()),
+                ("io.kubernetes.cri-o.SandboxID".to_string(), String::new()),
+                (
+                    "io.kubernetes.container.name".to_string(),
+                    "local-ctr".to_string(),
+                ),
+            ]
+            .into()
+        } else {
+            Default::default()
+        };
+        let info = if local_container {
+            [(
+                "info".to_string(),
+                serde_json::json!({
+                    "id": "local-ctr",
+                    "sandboxID": "",
+                    "podSandboxId": "",
+                    "runtimeState": "running",
+                    "runtimeSpec": {
+                        "annotations": {
+                            "io.kubernetes.cri.sandbox-id": "",
+                            "io.kubernetes.cri-o.SandboxID": "",
+                            "io.kubernetes.container.name": "local-ctr"
+                        }
+                    }
+                })
+                .to_string(),
+            )]
+            .into()
+        } else {
+            [("pid".to_string(), "1234".to_string())].into()
+        };
+
         Ok(Response::new(ContainerStatusResponse {
             status: Some(ContainerStatus {
                 id: request.container_id,
@@ -639,12 +685,12 @@ impl RuntimeService for MockRuntimeService {
                 reason: String::new(),
                 message: String::new(),
                 labels: Default::default(),
-                annotations: Default::default(),
+                annotations,
                 mounts: vec![],
                 log_path: "ctr-a.log".into(),
                 resources: None,
             }),
-            info: [("pid".to_string(), "1234".to_string())].into(),
+            info,
         }))
     }
     async fn update_container_resources(
@@ -972,40 +1018,67 @@ impl RuntimeService for MockRuntimeService {
                 [
                     (
                         "config".to_string(),
-                        r#"{"cgroupDriver":"systemd"}"#.to_string(),
-                    ),
-                    (
-                        "networkDiagnostics".to_string(),
                         serde_json::json!({
-                            "ready": false,
-                            "reason": "CniNotReady",
-                            "message": "network is not ready",
-                            "domains": {
-                                "local": {
-                                    "configDirs": ["/etc/crius/cni/net.d"],
-                                    "pluginDirs": ["/opt/cni/bin"],
-                                    "cacheDir": "/var/lib/cni/cache",
-                                    "maxConfNum": 0,
-                                    "defaultNetworkName": "crius-bridge"
+                            "cgroupDriver": "systemd",
+                            "networkDiagnostics": {
+                                "ready": false,
+                                "reason": "CniNotReady",
+                                "message": "network is not ready",
+                                "domains": {
+                                    "local": {
+                                        "purpose": "crs pod and local Podman-style networking; uses crius local CNI config and containernetworking-plugins such as bridge, host-local, loopback, and portmap",
+                                        "config": {
+                                            "configDirs": ["/etc/crius/cni/net.d"],
+                                            "pluginDirs": ["/opt/cni/bin"],
+                                            "cacheDir": "/var/lib/cni/crius-local-cache",
+                                            "maxConfNum": 0,
+                                            "defaultNetworkName": "crius-bridge"
+                                        },
+                                        "loadStatus": {
+                                            "ready": true,
+                                            "reason": "CNINetworkConfigReady",
+                                            "message": "loaded 1 CNI network config(s) and 4 plugin type(s)",
+                                            "discoveredFiles": ["/etc/crius/cni/net.d/10-crius-bridge.conflist"],
+                                            "invalidFiles": [],
+                                            "loadedNetworks": ["crius-bridge"],
+                                            "declaredPlugins": ["bridge", "host-local", "loopback", "portmap"],
+                                            "missingPluginBinaries": [],
+                                            "defaultNetworkName": "crius-bridge"
+                                        }
+                                    },
+                                    "cri": {
+                                        "purpose": "CRI consumers such as crictl/kubelet; uses standard CRI CNI config dirs and may select Kubernetes/Calico configs if configured there",
+                                        "config": {
+                                            "configDirs": ["/etc/cni/net.d", "/etc/kubernetes/cni/net.d"],
+                                            "pluginDirs": ["/opt/cni/bin", "/usr/lib/cni"],
+                                            "cacheDir": "/var/lib/cni/cache",
+                                            "maxConfNum": 0,
+                                            "defaultNetworkName": "k8s-pod-network"
+                                        },
+                                        "loadStatus": {
+                                            "ready": true,
+                                            "reason": "CNINetworkConfigReady",
+                                            "message": "loaded 1 CNI network config(s) and 1 plugin type(s)",
+                                            "discoveredFiles": ["/etc/cni/net.d/10-calico.conflist"],
+                                            "invalidFiles": [],
+                                            "loadedNetworks": ["k8s-pod-network"],
+                                            "declaredPlugins": ["calico"],
+                                            "missingPluginBinaries": [],
+                                            "defaultNetworkName": "k8s-pod-network"
+                                        }
+                                    }
                                 },
-                                "cri": {
-                                    "configDirs": ["/etc/cni/net.d", "/etc/kubernetes/cni/net.d"],
-                                    "pluginDirs": ["/opt/cni/bin", "/usr/lib/cni"],
-                                    "cacheDir": "/var/lib/cni/cache",
-                                    "maxConfNum": 0,
+                                "lastCniLoadStatus": {
+                                    "ready": true,
+                                    "reason": "CNINetworkConfigReady",
+                                    "message": "loaded 1 CNI network config(s) and 1 plugin type(s)",
+                                    "discoveredFiles": ["/etc/cni/net.d/10-calico.conflist"],
+                                    "invalidFiles": [],
+                                    "loadedNetworks": ["k8s-pod-network"],
+                                    "declaredPlugins": ["calico"],
+                                    "missingPluginBinaries": [],
                                     "defaultNetworkName": "k8s-pod-network"
                                 }
-                            },
-                            "lastCniLoadStatus": {
-                                "ready": true,
-                                "reason": "CNINetworkConfigReady",
-                                "message": "loaded 1 CNI network config(s) and 1 plugin type(s)",
-                                "discoveredFiles": ["/etc/cni/net.d/10-calico.conflist"],
-                                "invalidFiles": [],
-                                "loadedNetworks": ["k8s-pod-network"],
-                                "declaredPlugins": ["calico"],
-                                "missingPluginBinaries": [],
-                                "defaultNetworkName": "k8s-pod-network"
                             }
                         })
                         .to_string(),
@@ -2177,10 +2250,29 @@ async fn debug_network_exposes_cni_domain_and_selection_details() {
     let value = stdout_json(&output);
     let details = &value["summary"];
     assert_eq!(
-        details["localNetwork"]["configDirs"][0],
+        details["localNetwork"]["config"]["configDirs"][0],
         "/etc/crius/cni/net.d"
     );
-    assert_eq!(details["criNetwork"]["configDirs"][0], "/etc/cni/net.d");
+    assert_eq!(
+        details["localNetwork"]["loadStatus"]["discoveredFiles"][0],
+        "/etc/crius/cni/net.d/10-crius-bridge.conflist"
+    );
+    assert_eq!(
+        details["localNetwork"]["loadStatus"]["loadedNetworks"][0],
+        "crius-bridge"
+    );
+    assert_eq!(
+        details["localNetwork"]["loadStatus"]["declaredPlugins"],
+        serde_json::json!(["bridge", "host-local", "loopback", "portmap"])
+    );
+    assert_eq!(
+        details["criNetwork"]["config"]["configDirs"][0],
+        "/etc/cni/net.d"
+    );
+    assert_eq!(
+        details["criNetwork"]["loadStatus"]["declaredPlugins"][0],
+        "calico"
+    );
     assert_eq!(
         details["cniSelection"]["discoveredFiles"][0],
         "/etc/cni/net.d/10-calico.conflist"
@@ -2455,7 +2547,7 @@ async fn golden_pod_list_outputs_are_stable() {
     assert_success(&table);
     assert_stdout(
         &table,
-        "POD ID        NAME   NAMESPACE  STATE  IP  CREATED  ATTEMPT\npod123456789  pod-a  default    ready  -   42       1\n",
+        "POD ID        NAME   NAMESPACE  STATE  IP        CREATED  ATTEMPT\npod123456789  pod-a  default    ready  10.0.0.2  42       1\n",
     );
 
     let json = run_crs(endpoint, ["--output", "json", "pod", "list"]);
@@ -2467,6 +2559,7 @@ async fn golden_pod_list_outputs_are_stable() {
     assert_eq!(value["items"][0]["name"], "pod-a");
     assert_eq!(value["items"][0]["namespace"], "default");
     assert_eq!(value["items"][0]["state"], "ready");
+    assert_eq!(value["items"][0]["ip"], "10.0.0.2");
     assert_eq!(value["items"][0]["attempt"], 1);
 }
 
@@ -2747,6 +2840,7 @@ async fn run_detach_creates_native_local_container_or_reuses_explicit_pod() {
     let create_local_container_requests = Arc::clone(&state.create_local_container_requests);
     let start_container_requests = Arc::clone(&state.start_container_requests);
     let last_create_local_container = Arc::clone(&state.last_create_local_container);
+    let last_create_container = Arc::clone(&state.last_create_container);
     let last_start_container = Arc::clone(&state.last_start_container);
     let endpoint = spawn_mock_services(state).await;
 
@@ -2826,6 +2920,16 @@ async fn run_detach_creates_native_local_container_or_reuses_explicit_pod() {
     assert_success(&reused);
     let value = stdout_json(&reused);
     assert_eq!(value["summary"]["podSandboxId"], "pod-existing");
+    let pod_request = last_create_container
+        .lock()
+        .expect("last create container lock")
+        .clone()
+        .expect("create container request");
+    let pod_config = pod_request.config.expect("pod container config");
+    assert_eq!(
+        pod_config.annotations.get("io.crius.internal/crs-run"),
+        Some(&"true".to_string())
+    );
 
     assert_eq!(run_pod_requests.load(Ordering::SeqCst), 0);
     assert_eq!(pod_status_requests.load(Ordering::SeqCst), 1);
@@ -2843,9 +2947,9 @@ async fn default_run_uses_native_local_container_when_cri_cni_fails() {
         .expect("existing images lock")
         .insert("busybox:latest".to_string());
     *state
-        .fail_non_host_pod_network
+        .fail_cri_cni_network
         .lock()
-        .expect("fail non-host pod network lock") = true;
+        .expect("fail CRI CNI network lock") = true;
     let run_pod_requests = Arc::clone(&state.run_pod_requests);
     let create_local_container_requests = Arc::clone(&state.create_local_container_requests);
     let endpoint = spawn_mock_services(state).await;
@@ -2879,43 +2983,30 @@ async fn default_run_uses_native_local_container_when_cri_cni_fails() {
             "default",
         ],
     );
-    assert_eq!(explicit_pod_run.status.code(), Some(6));
-    let stderr = String::from_utf8(explicit_pod_run.stderr).expect("stderr should be utf8");
-    assert!(
-        stderr.contains("Calico Kubernetes API is unavailable"),
-        "unexpected stderr: {stderr}"
-    );
+    assert_success(&explicit_pod_run);
     assert_eq!(run_pod_requests.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_exec_mode_sync_executes_command_after_start_and_returns_exit_code() {
+async fn run_exec_mode_sync_waits_for_main_process_and_returns_exit_code() {
     let state = MockState::default();
     state
         .existing_images
         .lock()
         .expect("existing images lock")
-        .insert("busybox:latest".to_string());
+        .insert("short-run:latest".to_string());
     let exec_sync_requests = Arc::clone(&state.exec_sync_requests);
-    let last_exec_sync = Arc::clone(&state.last_exec_sync);
     let endpoint = spawn_mock_services(state).await;
 
     let output = run_crs(
         endpoint,
-        ["run", "--exec-mode", "sync", "busybox:latest", "exit-7"],
+        ["run", "--exec-mode", "sync", "short-run:latest", "exit-7"],
     );
 
     assert_eq!(output.status.code(), Some(7));
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "sync-stdout");
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "sync-stderr");
-    assert_eq!(exec_sync_requests.load(Ordering::SeqCst), 1);
-    let request = last_exec_sync
-        .lock()
-        .expect("last exec-sync lock")
-        .clone()
-        .expect("exec-sync request");
-    assert_eq!(request.container_id, "ctr-local-busybox:latest");
-    assert_eq!(request.cmd, vec!["exit-7"]);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello\nwarn\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(exec_sync_requests.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2950,6 +3041,7 @@ async fn run_attach_returns_exited_container_code_when_main_process_stops_before
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_exec_sync_returns_exited_container_code_when_main_process_stops_before_exec() {
     let state = MockState::default();
+    let exec_sync_requests = Arc::clone(&state.exec_sync_requests);
     state
         .existing_images
         .lock()
@@ -2975,15 +3067,10 @@ async fn run_exec_sync_returns_exited_container_code_when_main_process_stops_bef
     );
 
     assert_eq!(output.status.code(), Some(7));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello\nwarn\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("container exited before exec-sync could run"),
-        "unexpected stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains("--exec-mode sync runs a command after container start"),
-        "sync-mode warning should explain the semantics: {stderr}"
-    );
+    assert!(!stderr.contains("exec-sync"), "unexpected stderr: {stderr}");
+    assert_eq!(exec_sync_requests.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3372,7 +3459,29 @@ async fn container_write_commands_call_runtime_rpcs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn container_exec_calls_runtime_exec_and_streams_websocket() {
+async fn container_exec_uses_exec_sync_for_non_interactive_commands() {
+    let state = MockState::default();
+    let exec_sync_requests = Arc::clone(&state.exec_sync_requests);
+    let last_exec_sync = Arc::clone(&state.last_exec_sync);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["container", "exec", "ctr1", "--", "echo", "ok"]);
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "sync-stdout");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "sync-stderr");
+    assert_eq!(exec_sync_requests.load(Ordering::SeqCst), 1);
+    let request = last_exec_sync
+        .lock()
+        .expect("last exec sync lock")
+        .clone()
+        .expect("exec sync request");
+    assert_eq!(request.container_id, "ctr1");
+    assert_eq!(request.cmd, vec!["echo".to_string(), "ok".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn container_exec_with_tty_calls_runtime_exec_and_streams_websocket() {
     let state = MockState::default();
     let exec_requests = Arc::clone(&state.exec_requests);
     let last_exec = Arc::clone(&state.last_exec);
@@ -3380,7 +3489,10 @@ async fn container_exec_calls_runtime_exec_and_streams_websocket() {
     *state.exec_url.lock().expect("exec url lock") = Some(format!("ws://{websocket}/exec/token"));
     let endpoint = spawn_mock_services(state).await;
 
-    let output = run_crs(endpoint, ["container", "exec", "ctr1", "--", "echo", "ok"]);
+    let output = run_crs(
+        endpoint,
+        ["container", "exec", "--tty", "ctr1", "--", "echo", "ok"],
+    );
 
     assert_success(&output);
     assert_eq!(exec_requests.load(Ordering::SeqCst), 1);
@@ -3392,21 +3504,20 @@ async fn container_exec_calls_runtime_exec_and_streams_websocket() {
     assert_eq!(request.container_id, "ctr1");
     assert_eq!(request.cmd, vec!["echo".to_string(), "ok".to_string()]);
     assert!(request.stdout);
-    assert!(request.stderr);
+    assert!(!request.stderr);
+    assert!(request.tty);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn top_level_exec_reuses_container_exec() {
     let state = MockState::default();
-    let exec_requests = Arc::clone(&state.exec_requests);
-    let websocket = spawn_mock_websocket().await;
-    *state.exec_url.lock().expect("exec url lock") = Some(format!("ws://{websocket}/exec/token"));
+    let exec_sync_requests = Arc::clone(&state.exec_sync_requests);
     let endpoint = spawn_mock_services(state).await;
 
     let output = run_crs(endpoint, ["exec", "ctr1", "--", "true"]);
 
     assert_success(&output);
-    assert_eq!(exec_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(exec_sync_requests.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3731,7 +3842,10 @@ async fn shortcut_rm_resolves_unique_container_pod_or_image_target() {
 
     let container_rm = run_crs(endpoint, ["--output", "json", "rm", "ctr-only"]);
     assert_success(&container_rm);
-    assert_eq!(stdout_json(&container_rm)["kind"], "ContainerRemove");
+    let container_rm_value = stdout_json(&container_rm);
+    assert_eq!(container_rm_value["kind"], "ContainerRemove");
+    assert!(container_rm_value["items"][0].get("podId").is_none());
+    assert!(container_rm_value["items"][0].get("image").is_none());
 
     let pod_rm = run_crs(endpoint, ["--output", "json", "rm", "pod-only"]);
     assert_success(&pod_rm);
@@ -3815,6 +3929,35 @@ async fn pod_and_container_inspect_parse_verbose_info() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn container_inspect_hides_empty_sandbox_fields_for_local_containers() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+
+    let output = run_crs(
+        endpoint,
+        ["--output", "json", "container", "inspect", "local-ctr"],
+    );
+    assert_success(&output);
+    let value = stdout_json(&output);
+    let item = &value["items"][0];
+
+    assert!(item["response"]["status"]["annotations"]
+        .get("io.kubernetes.cri.sandbox-id")
+        .is_none());
+    assert!(item["response"]["status"]["annotations"]
+        .get("io.kubernetes.cri-o.SandboxID")
+        .is_none());
+    assert!(item["infoJson"]["info"].get("sandboxID").is_none());
+    assert!(item["infoJson"]["info"].get("podSandboxId").is_none());
+    let raw_info = item["infoRaw"]["info"]
+        .as_str()
+        .expect("raw info should remain a JSON string");
+    assert!(!raw_info.contains("\"sandboxID\":\"\""));
+    assert!(!raw_info.contains("\"podSandboxId\":\"\""));
+    assert!(!raw_info.contains("\"io.kubernetes.cri.sandbox-id\":\"\""));
+    assert!(!raw_info.contains("\"io.kubernetes.cri-o.SandboxID\":\"\""));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inspect_not_found_maps_to_exit_code_four() {
     let endpoint = spawn_mock_services(MockState::default()).await;
 
@@ -3831,16 +3974,29 @@ async fn inspect_not_found_maps_to_exit_code_four() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn doctor_uses_cri_and_warns_when_diagnostics_is_unavailable() {
+async fn doctor_uses_cri_and_reports_diagnostics_status() {
     let endpoint = spawn_mock_services(MockState::default()).await;
-    let output = run_crs(endpoint, ["doctor"]);
+    let output = run_crs(endpoint, ["--output", "json", "doctor"]);
 
     assert_success(&output);
-    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let value = stdout_json(&output);
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
-    assert!(stdout.contains("runtime"));
-    assert!(stdout.contains("diagnostics"));
-    assert!(stderr.contains("diagnostics service is not available"));
+    let checks = value["items"].as_array().expect("doctor items");
+    let check = |name: &str| {
+        checks
+            .iter()
+            .find(|item| item["check"] == name)
+            .unwrap_or_else(|| panic!("missing doctor check {name}"))
+    };
+    assert_eq!(check("runtime")["status"], "ok");
+    assert_eq!(check("local-network")["status"], "ok");
+    assert!(check("local-network")["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("bridge, host-local, loopback, portmap"));
+    assert_eq!(check("cri-network")["status"], "not-ready");
+    assert_eq!(check("diagnostics")["status"], "ok");
+    assert!(!stderr.contains("diagnostics service is not available"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

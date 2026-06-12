@@ -85,6 +85,24 @@ impl RuntimeServiceImpl {
         )))
     }
 
+    pub(super) async fn ensure_container_is_running_for_exec(
+        &self,
+        container_id: &str,
+        operation: &str,
+    ) -> Result<(), Status> {
+        let runtime_status = self.runtime_container_status_checked(container_id).await;
+        if matches!(runtime_status, ContainerStatus::Running) {
+            return Ok(());
+        }
+
+        Err(Status::failed_precondition(format!(
+            "container {} is not running for {}: current runtime state is {}",
+            container_id,
+            operation,
+            Self::runtime_container_status_name(&runtime_status)
+        )))
+    }
+
     pub(super) fn attach_socket_path(&self, container_id: &str) -> PathBuf {
         self.attach_socket_dir
             .join(container_id)
@@ -175,7 +193,7 @@ impl RuntimeServiceImpl {
             )
             .await?;
         }
-        self.ensure_container_is_streamable(&req.container_id, "exec")
+        self.ensure_container_is_running_for_exec(&req.container_id, "exec")
             .await?;
         let runtime = self
             .runtime_for_container_request(&req.container_id)
@@ -285,7 +303,7 @@ impl RuntimeServiceImpl {
             .await?;
         }
 
-        self.ensure_container_is_streamable(&container_id, "exec_sync")
+        self.ensure_container_is_running_for_exec(&container_id, "exec_sync")
             .await?;
 
         let runtime = self.runtime_for_container_request(&container_id).await?;

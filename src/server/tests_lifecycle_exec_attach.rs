@@ -47,10 +47,31 @@ async fn exec_validates_container_is_streamable() {
         test_container("container-created", "pod-1", HashMap::new()),
     );
     set_fake_runtime_state(&dir, "container-created", "created");
-    let response = RuntimeService::exec(
+    let created = RuntimeService::exec(
         &service,
         Request::new(ExecRequest {
             container_id: "container-created".to_string(),
+            cmd: vec!["sh".to_string()],
+            stdin: false,
+            stdout: true,
+            stderr: true,
+            tty: false,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(created.code(), tonic::Code::FailedPrecondition);
+    assert!(created.message().contains("is not running for exec"));
+
+    service.containers.lock().await.insert(
+        "container-running".to_string(),
+        test_container("container-running", "pod-1", HashMap::new()),
+    );
+    set_fake_runtime_state(&dir, "container-running", "running");
+    let response = RuntimeService::exec(
+        &service,
+        Request::new(ExecRequest {
+            container_id: "container-running".to_string(),
             cmd: vec!["sh".to_string()],
             stdin: false,
             stdout: true,

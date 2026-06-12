@@ -788,7 +788,11 @@ impl Daemon {
         io_manager: &IoManager,
     ) -> Result<()> {
         let mut command = self.runtime_command();
-        command.arg("exec").arg(&request.container_id);
+        command.arg("exec");
+        if request.stdin {
+            command.arg("-i");
+        }
+        command.arg(&request.container_id);
         for arg in &request.command {
             command.arg(arg);
         }
@@ -796,7 +800,11 @@ impl Daemon {
             &mut command,
             request.exec_cpu_affinity,
         );
-        command.stdin(std::process::Stdio::piped());
+        command.stdin(if request.stdin {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        });
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         let mut child = command
@@ -858,9 +866,14 @@ impl Daemon {
             })
         });
 
+        let stop_stdin = Arc::new(AtomicBool::new(false));
         let stdin_handle = child.stdin.take().map(|mut stdin| {
             let io_manager = io_manager.clone();
+            let stop_stdin = Arc::clone(&stop_stdin);
             std::thread::spawn(move || loop {
+                if stop_stdin.load(Ordering::Relaxed) {
+                    break;
+                }
                 match io_manager.read_stdin() {
                     Ok(data) if !data.is_empty() => {
                         if let Err(err) = std::io::Write::write_all(&mut stdin, &data) {
@@ -879,6 +892,7 @@ impl Daemon {
         });
 
         let status = child.wait().context("Failed to wait for exec session")?;
+        stop_stdin.store(true, Ordering::Relaxed);
         if let Some(handle) = stdout_handle {
             let _ = handle.join();
         }
@@ -998,9 +1012,12 @@ impl Daemon {
     }
 
     fn cleanup_attach_socket_directory(&self) {
-        let Some(_root) = self.attach_socket_dir.as_ref() else {
+        let Some(root) = self.attach_socket_dir.as_ref() else {
             return;
         };
+        if root == &self.work_dir {
+            return;
+        }
         let path = self.attach_socket_container_dir();
         if let Err(err) = fs::remove_dir_all(&path) {
             if err.kind() != std::io::ErrorKind::NotFound {

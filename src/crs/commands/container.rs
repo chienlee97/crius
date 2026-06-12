@@ -126,6 +126,15 @@ pub(crate) async fn handle_exec_sync(
     client: &CrsClient,
     args: crate::crs::args::ExecArgs,
 ) -> Result<CommandResult, CliError> {
+    exec_sync_with_command(ctx, client, args, "crs container exec-sync").await
+}
+
+pub(crate) async fn exec_sync_with_command(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: crate::crs::args::ExecArgs,
+    command_name: &'static str,
+) -> Result<CommandResult, CliError> {
     let options = crate::crs::streaming::ExecStreamOptions::from_args(
         args.container,
         args.command,
@@ -143,7 +152,7 @@ pub(crate) async fn handle_exec_sync(
                 .await
                 .map_err(|status| {
                     CliError::from_tonic_status(status)
-                        .with_command("crs container exec-sync")
+                        .with_command(command_name)
                         .with_endpoint(client.endpoint())
                         .with_object(format!("container {}", options.container_id))
                 })
@@ -239,13 +248,21 @@ pub(crate) async fn handle_inspect(
         .into_inner();
 
     let mut warnings = Vec::new();
-    let (info_json, info_raw) = parse_info_map(&response.info, &mut warnings);
+    let (mut info_json, mut info_raw) = parse_info_map(&response.info, &mut warnings);
     let id = response
         .status
         .as_ref()
         .map(|status| status.id.clone())
         .unwrap_or_else(|| id.clone());
-    let response_json = container_status_json(response.status.as_ref());
+    let is_local_container = response
+        .status
+        .as_ref()
+        .is_some_and(is_local_container_status);
+    if is_local_container {
+        hide_empty_sandbox_info(&mut info_json);
+        hide_empty_sandbox_info(&mut info_raw);
+    }
+    let response_json = container_status_json(response.status.as_ref(), is_local_container);
 
     render_and_print(
         ctx,
@@ -780,11 +797,24 @@ pub(crate) fn container_stats_view(stats: ContainerStats) -> ResourceUsageView {
     }
 }
 
-fn container_status_json(status: Option<&ContainerStatus>) -> serde_json::Value {
+fn container_status_json(
+    status: Option<&ContainerStatus>,
+    hide_empty_sandbox_fields: bool,
+) -> serde_json::Value {
     serde_json::json!({
         "status": status.map(|status| {
             let metadata = status.metadata.as_ref();
             let image = status.image.as_ref();
+            let mut annotations = status.annotations.clone();
+            if hide_empty_sandbox_fields {
+                annotations.retain(|key, value| {
+                    !value.is_empty()
+                        || !matches!(
+                            key.as_str(),
+                            "io.kubernetes.cri.sandbox-id" | "io.kubernetes.cri-o.SandboxID"
+                        )
+                });
+            }
             serde_json::json!({
                 "id": status.id,
                 "metadata": metadata.map(|metadata| serde_json::json!({
@@ -806,9 +836,76 @@ fn container_status_json(status: Option<&ContainerStatus>) -> serde_json::Value 
                 "reason": status.reason,
                 "message": status.message,
                 "labels": status.labels,
-                "annotations": status.annotations,
+                "annotations": annotations,
                 "logPath": status.log_path,
             })
         })
     })
+}
+
+fn is_local_container_status(status: &ContainerStatus) -> bool {
+    status
+        .annotations
+        .get("io.kubernetes.cri.sandbox-id")
+        .or_else(|| status.annotations.get("io.kubernetes.cri-o.SandboxID"))
+        .is_some_and(|pod_id| pod_id.is_empty())
+}
+
+fn hide_empty_sandbox_info(value: &mut serde_json::Value) {
+    let Some(info_value) = value.get_mut("info") else {
+        return;
+    };
+    if let Some(raw) = info_value.as_str() {
+        if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+            remove_empty_sandbox_fields_recursively(&mut parsed);
+            if let Ok(sanitized) = serde_json::to_string(&parsed) {
+                *info_value = serde_json::Value::String(sanitized);
+            }
+        }
+        return;
+    }
+    remove_empty_sandbox_fields_recursively(info_value);
+}
+
+fn remove_empty_sandbox_fields_recursively(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let keys: Vec<String> = map
+                .iter()
+                .filter_map(|(key, value)| {
+                    (is_empty_sandbox_field(key, value)).then(|| key.clone())
+                })
+                .collect();
+            for key in keys {
+                map.remove(&key);
+            }
+            for value in map.values_mut() {
+                remove_empty_sandbox_fields_recursively(value);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                remove_empty_sandbox_fields_recursively(item);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+fn is_empty_json_value(value: &serde_json::Value) -> bool {
+    value.as_str().is_some_and(str::is_empty)
+}
+
+fn is_empty_sandbox_field(key: &str, value: &serde_json::Value) -> bool {
+    is_empty_json_value(value)
+        && matches!(
+            key,
+            "sandboxID"
+                | "podSandboxId"
+                | "io.kubernetes.cri.sandbox-id"
+                | "io.kubernetes.cri-o.SandboxID"
+        )
 }
