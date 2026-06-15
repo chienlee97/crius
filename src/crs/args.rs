@@ -86,7 +86,7 @@ pub struct DoctorArgs {}
 
 #[derive(Debug, Default, ClapArgs)]
 pub struct ListArgs {
-    #[arg(long)]
+    #[arg(short = 'a', long)]
     pub all: bool,
 }
 
@@ -627,13 +627,13 @@ pub struct RunArgs {
     pub name: Option<String>,
     #[arg(long)]
     pub namespace: Option<String>,
-    #[arg(long)]
+    #[arg(short = 'd', long)]
     pub detach: bool,
     #[arg(long)]
     pub rm: bool,
-    #[arg(long)]
+    #[arg(short = 't', long)]
     pub tty: bool,
-    #[arg(long)]
+    #[arg(short = 'i', long)]
     pub stdin: bool,
     #[arg(long, value_enum, default_value_t = StreamProtocolArg::Websocket)]
     pub protocol: StreamProtocolArg,

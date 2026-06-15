@@ -388,6 +388,12 @@ fn parses_container_create_arguments() {
 
 #[test]
 fn parses_base_and_multitype_shortcut_args() {
+    let args = Args::try_parse_from(["crs", "ps", "-a"]).expect("ps -a should parse");
+    let Command::Ps(list) = args.command else {
+        panic!("expected ps command");
+    };
+    assert!(list.all);
+
     let args = Args::try_parse_from(["crs", "inspect", "--type", "image", "busybox:latest"])
         .expect("inspect object type should parse");
     let Command::Inspect(inspect) = args.command else {
@@ -686,6 +692,20 @@ fn parses_run_command_arguments() {
     );
     assert_eq!(run.image, "busybox");
     assert_eq!(run.command, vec!["echo", "ok"]);
+}
+
+#[test]
+fn parses_combined_run_short_flags() {
+    let args =
+        Args::try_parse_from(["crs", "run", "-itd", "busybox"]).expect("run -itd should parse");
+    let Command::Run(run) = args.command else {
+        panic!("expected run command");
+    };
+
+    assert!(run.stdin);
+    assert!(run.tty);
+    assert!(run.detach);
+    assert_eq!(run.image, "busybox");
 }
 
 #[test]
