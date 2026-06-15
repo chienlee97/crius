@@ -101,7 +101,8 @@ pub(crate) async fn handle_rm(
     args: RemoveArgs,
 ) -> Result<CommandResult, CliError> {
     let _force = args.force;
-    container::handle_remove_with_command(ctx, client, args.target, "crs rm").await
+    let target = resolve_container_remove_target(client, &args.target).await?;
+    container::handle_remove_with_command(ctx, client, target, "crs rm").await
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -115,6 +116,49 @@ enum InspectCandidate {
     Container,
     Pod,
     Image,
+}
+
+async fn resolve_container_remove_target(
+    client: &CrsClient,
+    target: &str,
+) -> Result<String, CliError> {
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .list_containers(crate::proto::runtime::v1::ListContainersRequest { filter: None })
+                .await
+                .map_err(|status| candidate_error(status, client, "crs rm", "container", target))
+        })
+        .await?
+        .into_inner();
+
+    let mut matches = response
+        .containers
+        .into_iter()
+        .filter(|container| {
+            container.id == target
+                || container.id.starts_with(target)
+                || container
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.name == target)
+                    .unwrap_or(false)
+        })
+        .map(|container| container.id)
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+
+    match matches.as_slice() {
+        [id] => Ok(id.clone()),
+        [] => Ok(target.to_string()),
+        [_, ..] => Err(CliError::invalid_input(format!(
+            "container target {target} is ambiguous; retry with the full container ID"
+        ))
+        .with_command("crs rm")
+        .with_object(target.to_string())),
+    }
 }
 
 async fn resolve_stop_target(client: &CrsClient, target: &str) -> Result<StopCandidate, CliError> {

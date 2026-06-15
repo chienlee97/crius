@@ -563,32 +563,53 @@ impl RuntimeService for MockRuntimeService {
         self.state
             .list_container_requests
             .fetch_add(1, Ordering::SeqCst);
-        assert_eq!(
-            request
-                .filter
-                .and_then(|filter| filter.state.map(|state| state.state)),
-            Some(ContainerState::ContainerRunning as i32)
-        );
+        if let Some(state) = request
+            .filter
+            .and_then(|filter| filter.state.map(|state| state.state))
+        {
+            assert_eq!(state, ContainerState::ContainerRunning as i32);
+        }
 
         Ok(Response::new(ListContainersResponse {
-            containers: vec![Container {
-                id: "ctr123456789".into(),
-                pod_sandbox_id: "pod123456789".into(),
-                metadata: Some(ContainerMetadata {
-                    name: "ctr-a".into(),
-                    attempt: 2,
-                }),
-                image: Some(ImageSpec {
-                    image: "busybox:latest".into(),
-                    user_specified_image: "busybox:latest".into(),
-                    ..Default::default()
-                }),
-                image_ref: "sha256:image".into(),
-                state: ContainerState::ContainerRunning as i32,
-                created_at: 42,
-                labels: Default::default(),
-                annotations: Default::default(),
-            }],
+            containers: vec![
+                Container {
+                    id: "ctr123456789".into(),
+                    pod_sandbox_id: "pod123456789".into(),
+                    metadata: Some(ContainerMetadata {
+                        name: "ctr-a".into(),
+                        attempt: 2,
+                    }),
+                    image: Some(ImageSpec {
+                        image: "busybox:latest".into(),
+                        user_specified_image: "busybox:latest".into(),
+                        ..Default::default()
+                    }),
+                    image_ref: "sha256:image".into(),
+                    state: ContainerState::ContainerRunning as i32,
+                    created_at: 42,
+                    labels: Default::default(),
+                    annotations: Default::default(),
+                },
+                Container {
+                    id: "e24e56207e5a4ed59d2003fe12e1073d".into(),
+                    pod_sandbox_id: String::new(),
+                    metadata: Some(ContainerMetadata {
+                        name: "v11-2503".into(),
+                        attempt: 0,
+                    }),
+                    image: Some(ImageSpec {
+                        image: "cr.kylinos.cn/kylin/kylin-server-platform:v11-2503".into(),
+                        user_specified_image: "cr.kylinos.cn/kylin/kylin-server-platform:v11-2503"
+                            .into(),
+                        ..Default::default()
+                    }),
+                    image_ref: "sha256:v11".into(),
+                    state: ContainerState::ContainerExited as i32,
+                    created_at: 1_781_516_201_793_380_301,
+                    labels: Default::default(),
+                    annotations: Default::default(),
+                },
+            ],
         }))
     }
 
@@ -3853,6 +3874,29 @@ async fn shortcut_rm_rmi_and_rmp_remove_fixed_object_types() {
     assert_eq!(remove_container_requests.load(Ordering::SeqCst), 1);
     assert_eq!(remove_pod_requests.load(Ordering::SeqCst), 1);
     assert_eq!(remove_image_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shortcut_rm_resolves_container_name_before_removing() {
+    let state = MockState::default();
+    let last_remove = Arc::clone(&state.last_remove_container);
+    let endpoint = spawn_mock_services(state).await;
+
+    let output = run_crs(endpoint, ["--output", "json", "rm", "v11-2503"]);
+    assert_success(&output);
+    let value = stdout_json(&output);
+    assert_eq!(value["kind"], "ContainerRemove");
+    assert_eq!(
+        value["summary"]["containerId"],
+        "e24e56207e5a4ed59d2003fe12e1073d"
+    );
+
+    let request = last_remove
+        .lock()
+        .expect("last remove container lock")
+        .clone()
+        .expect("remove request should be recorded");
+    assert_eq!(request.container_id, "e24e56207e5a4ed59d2003fe12e1073d");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
