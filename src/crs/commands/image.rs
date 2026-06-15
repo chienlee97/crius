@@ -131,10 +131,17 @@ pub(crate) async fn handle_remove(
     client: &CrsClient,
     image: String,
 ) -> Result<CommandResult, CliError> {
+    handle_remove_with_command(ctx, client, image, "crs image remove").await
+}
+
+pub(crate) async fn handle_remove_with_command(
+    ctx: &CliContext,
+    client: &CrsClient,
+    image: String,
+    command_name: &'static str,
+) -> Result<CommandResult, CliError> {
     if image.is_empty() {
-        return Err(
-            CliError::invalid_input("image must not be empty").with_command("crs image remove")
-        );
+        return Err(CliError::invalid_input("image must not be empty").with_command(command_name));
     }
 
     let mut image_client = client.image()?;
@@ -151,7 +158,7 @@ pub(crate) async fn handle_remove(
                 .await
                 .map_err(|status| {
                     CliError::from_tonic_status(status)
-                        .with_command("crs image remove")
+                        .with_command(command_name)
                         .with_endpoint(client.endpoint())
                         .with_object(format!("image {image}"))
                 })

@@ -47,6 +47,12 @@ pub enum Command {
     Exec(ExecArgs),
     Stop(StopArgs),
     Rm(RemoveArgs),
+    Rmi {
+        image: String,
+    },
+    Rmp {
+        pod: String,
+    },
     Config(ConfigArgs),
     Runtime(RuntimeArgs),
     Image(ImageArgs),
@@ -245,8 +251,6 @@ pub struct StopArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct RemoveArgs {
-    #[arg(long = "type", value_enum)]
-    pub object_type: Option<ObjectType>,
     #[arg(long)]
     pub force: bool,
     pub target: String,

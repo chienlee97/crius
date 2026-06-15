@@ -66,10 +66,12 @@ pub(crate) async fn handle_inspect(
         Some(ObjectType::Container) => container::handle_inspect(ctx, client, args.target).await,
         Some(ObjectType::Pod) => pod::handle_inspect(ctx, client, args.target).await,
         Some(ObjectType::Image) => image::handle_inspect(ctx, client, args.target).await,
-        None => match resolve_remove_target(client, &args.target).await? {
-            RemoveCandidate::Container => container::handle_inspect(ctx, client, args.target).await,
-            RemoveCandidate::Pod => pod::handle_inspect(ctx, client, args.target).await,
-            RemoveCandidate::Image => image::handle_inspect(ctx, client, args.target).await,
+        None => match resolve_inspect_target(client, &args.target).await? {
+            InspectCandidate::Container => {
+                container::handle_inspect(ctx, client, args.target).await
+            }
+            InspectCandidate::Pod => pod::handle_inspect(ctx, client, args.target).await,
+            InspectCandidate::Image => image::handle_inspect(ctx, client, args.target).await,
         },
     }
 }
@@ -98,16 +100,8 @@ pub(crate) async fn handle_rm(
     client: &CrsClient,
     args: RemoveArgs,
 ) -> Result<CommandResult, CliError> {
-    match args.object_type {
-        Some(ObjectType::Container) => container::handle_remove(ctx, client, args.target).await,
-        Some(ObjectType::Pod) => pod::handle_remove(ctx, client, args.target).await,
-        Some(ObjectType::Image) => image::handle_remove(ctx, client, args.target).await,
-        None => match resolve_remove_target(client, &args.target).await? {
-            RemoveCandidate::Container => container::handle_remove(ctx, client, args.target).await,
-            RemoveCandidate::Pod => pod::handle_remove(ctx, client, args.target).await,
-            RemoveCandidate::Image => image::handle_remove(ctx, client, args.target).await,
-        },
-    }
+    let _force = args.force;
+    container::handle_remove_with_command(ctx, client, args.target, "crs rm").await
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -117,7 +111,7 @@ enum StopCandidate {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum RemoveCandidate {
+enum InspectCandidate {
     Container,
     Pod,
     Image,
@@ -147,19 +141,19 @@ async fn resolve_stop_target(client: &CrsClient, target: &str) -> Result<StopCan
     }
 }
 
-async fn resolve_remove_target(
+async fn resolve_inspect_target(
     client: &CrsClient,
     target: &str,
-) -> Result<RemoveCandidate, CliError> {
+) -> Result<InspectCandidate, CliError> {
     let mut candidates = Vec::new();
-    if container_exists(client, target, "crs rm").await? {
-        candidates.push(RemoveCandidate::Container);
+    if container_exists(client, target, "crs inspect").await? {
+        candidates.push(InspectCandidate::Container);
     }
-    if pod_exists(client, target, "crs rm").await? {
-        candidates.push(RemoveCandidate::Pod);
+    if pod_exists(client, target, "crs inspect").await? {
+        candidates.push(InspectCandidate::Pod);
     }
-    if image_exists(client, target, "crs rm").await? {
-        candidates.push(RemoveCandidate::Image);
+    if image_exists(client, target, "crs inspect").await? {
+        candidates.push(InspectCandidate::Image);
     }
 
     match candidates.as_slice() {
@@ -167,12 +161,12 @@ async fn resolve_remove_target(
         [] => Err(CliError::invalid_input(format!(
             "target {target} did not match a container, pod, or image; use --type container|pod|image with a valid ID or image reference"
         ))
-        .with_command("crs rm")
+        .with_command("crs inspect")
         .with_object(target.to_string())),
         [_, ..] => Err(CliError::invalid_input(format!(
             "target {target} is ambiguous; specify --type container|pod|image"
         ))
-        .with_command("crs rm")
+        .with_command("crs inspect")
         .with_object(target.to_string())),
     }
 }

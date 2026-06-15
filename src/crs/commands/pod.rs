@@ -243,8 +243,17 @@ pub(crate) async fn handle_remove(
     client: &CrsClient,
     pod: String,
 ) -> Result<CommandResult, CliError> {
+    handle_remove_with_command(ctx, client, pod, "crs pod remove").await
+}
+
+pub(crate) async fn handle_remove_with_command(
+    ctx: &CliContext,
+    client: &CrsClient,
+    pod: String,
+    command_name: &'static str,
+) -> Result<CommandResult, CliError> {
     if pod.is_empty() {
-        return Err(CliError::invalid_input("pod must not be empty").with_command("crs pod remove"));
+        return Err(CliError::invalid_input("pod must not be empty").with_command(command_name));
     }
 
     let mut runtime = client.runtime()?;
@@ -257,7 +266,7 @@ pub(crate) async fn handle_remove(
                 .await
                 .map_err(|status| {
                     CliError::from_tonic_status(status)
-                        .with_command("crs pod remove")
+                        .with_command(command_name)
                         .with_endpoint(client.endpoint())
                         .with_object(format!("pod {pod}"))
                 })

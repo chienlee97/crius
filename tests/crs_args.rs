@@ -123,6 +123,12 @@ fn parses_top_level_shortcut_commands() {
         (&["crs", "rm", "abc123"], |command| {
             matches!(command, Command::Rm(_))
         }),
+        (&["crs", "rmi", "busybox"], |command| {
+            matches!(command, Command::Rmi { .. })
+        }),
+        (&["crs", "rmp", "pod123"], |command| {
+            matches!(command, Command::Rmp { .. })
+        }),
     ];
 
     for (argv, assert_command) in cases {
@@ -399,13 +405,12 @@ fn parses_base_and_multitype_shortcut_args() {
     assert_eq!(stop.timeout, Some(10));
     assert_eq!(stop.target, "pod1");
 
-    let args = Args::try_parse_from(["crs", "rm", "--force", "--type", "container", "container1"])
+    let args = Args::try_parse_from(["crs", "rm", "--force", "container1"])
         .expect("remove force should parse");
     let Command::Rm(remove) = args.command else {
         panic!("expected rm command");
     };
     assert!(remove.force);
-    assert_eq!(remove.object_type, Some(ObjectType::Container));
     assert_eq!(remove.target, "container1");
 }
 
@@ -771,6 +776,8 @@ fn parses_every_public_command_minimal_arguments() {
         &["crs", "exec", "ctr", "--", "sh"],
         &["crs", "stop", "target"],
         &["crs", "rm", "target"],
+        &["crs", "rmi", "busybox"],
+        &["crs", "rmp", "pod"],
         &["crs", "config", "show"],
         &["crs", "config", "reload-status"],
         &["crs", "runtime", "config"],

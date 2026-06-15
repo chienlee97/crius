@@ -45,6 +45,12 @@ pub(crate) async fn dispatch(
         Command::Exec(args) => exec::handle(ctx, client, args).await,
         Command::Stop(args) => shortcuts::handle_stop(ctx, client, args).await,
         Command::Rm(args) => shortcuts::handle_rm(ctx, client, args).await,
+        Command::Rmi { image: image_name } => {
+            image::handle_remove_with_command(ctx, client, image_name, "crs rmi").await
+        }
+        Command::Rmp { pod: pod_name } => {
+            pod::handle_remove_with_command(ctx, client, pod_name, "crs rmp").await
+        }
         Command::Config(args) => config::handle(ctx, client, args).await,
         Command::Runtime(args) => runtime::handle(ctx, client, args).await,
         Command::Image(args) => image::handle(ctx, client, args).await,

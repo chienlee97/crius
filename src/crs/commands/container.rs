@@ -407,7 +407,16 @@ pub(crate) async fn handle_remove(
     client: &CrsClient,
     id: String,
 ) -> Result<CommandResult, CliError> {
-    ensure_container_id(&id, "crs container remove")?;
+    handle_remove_with_command(ctx, client, id, "crs container remove").await
+}
+
+pub(crate) async fn handle_remove_with_command(
+    ctx: &CliContext,
+    client: &CrsClient,
+    id: String,
+    command_name: &'static str,
+) -> Result<CommandResult, CliError> {
+    ensure_container_id(&id, command_name)?;
     let mut runtime = client.runtime()?;
     client
         .with_rpc_timeout(async {
@@ -416,9 +425,7 @@ pub(crate) async fn handle_remove(
                     container_id: id.clone(),
                 })
                 .await
-                .map_err(|status| {
-                    container_status_error(status, client, "crs container remove", &id)
-                })
+                .map_err(|status| container_status_error(status, client, command_name, &id))
         })
         .await?;
 

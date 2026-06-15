@@ -91,7 +91,9 @@ crs run --rm --pull missing registry.k8s.io/pause:3.9
 | `crs logs` | 查看容器日志 |
 | `crs exec` | 在运行中容器内执行命令 |
 | `crs stop` | 停止容器或 Pod |
-| `crs rm` | 删除容器、Pod 或镜像 |
+| `crs rm` | 删除容器 |
+| `crs rmi` | 删除镜像 |
+| `crs rmp` | 删除 Pod |
 | `crs container ...` | 容器完整生命周期和高级操作 |
 | `crs pod ...` | 显式 Pod 生命周期、stats、metrics、port-forward |
 | `crs image ...` | 镜像管理、文件系统信息、拉取状态 |
@@ -231,6 +233,8 @@ crs image remove registry.k8s.io/pause:3.9
 ```bash
 crs pull registry.k8s.io/pause:3.9
 crs images
+crs rmi registry.k8s.io/pause:3.9
+crs rmp <pod>
 ```
 
 私有仓库鉴权可以使用：

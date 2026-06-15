@@ -95,7 +95,9 @@ hostPort mappings, or other Pod-level settings are required.
 | `crs logs` | Read container logs |
 | `crs exec` | Execute a command in a running container |
 | `crs stop` | Stop a container or Pod |
-| `crs rm` | Remove a container, Pod, or image |
+| `crs rm` | Remove a container |
+| `crs rmi` | Remove an image |
+| `crs rmp` | Remove a Pod |
 | `crs container ...` | Full container lifecycle and advanced operations |
 | `crs pod ...` | Explicit Pod lifecycle, stats, metrics, and port-forward |
 | `crs image ...` | Image management, filesystem information, and transfer state |
@@ -239,6 +241,8 @@ Top-level aliases:
 ```bash
 crs pull registry.k8s.io/pause:3.9
 crs images
+crs rmi registry.k8s.io/pause:3.9
+crs rmp <pod>
 ```
 
 Private registry authentication:
