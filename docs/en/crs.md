@@ -22,7 +22,7 @@ unix:///run/crius/crius.sock
 Use a global option or environment variable to select a different endpoint:
 
 ```bash
-crs --address unix:///run/crius/crius.sock version
+crs -H unix:///run/crius/crius.sock version
 CRIUS_ADDRESS=unix:///run/crius/crius.sock crs status
 ```
 
@@ -30,7 +30,7 @@ Common global options:
 
 | Option | Description |
 | --- | --- |
-| `--address` | daemon endpoint; accepts Unix socket paths, `unix://`, `http://`, and `https://` |
+| `-H, --host` | daemon endpoint; accepts Unix socket paths, `unix://`, `http://`, and `https://` |
 | `--connect-timeout` | connection timeout, such as `5s` or `500ms` |
 | `--timeout` | total command timeout; `0s` disables it and is the default |
 | `--output table\|json\|text` | output format |
@@ -139,21 +139,21 @@ Common create options:
 | `--detach` | Run in the background |
 | `--rm` | Remove the container after exit |
 | `--pull missing\|always\|never` | Image pull policy |
-| `--stdin` / `--tty` | Enable interactive input and TTY |
+| `--interactive` / `--tty` | Enable interactive input and TTY |
 | `--exec-mode attach\|sync` | Use streaming attach or ExecSync for foreground commands |
-| `--env KEY=VALUE` | Set an environment variable |
+| `-e, --env KEY=VALUE` | Set an environment variable |
 | `--env-file PATH` | Read environment variables from a file; blank lines and `#` comments are ignored |
-| `--workdir PATH` | Set the working directory |
-| `--label KEY=VALUE` | Set a container label |
+| `-w, --workdir PATH` | Set the working directory |
+| `-l, --label KEY=VALUE` | Set a container label |
 | `--annotation KEY=VALUE` | Set a container annotation |
 | `--mount SPEC` | Add a mount |
 | `--device SPEC` | Add a device |
 | `--cdi-device NAME` | Add a CDI device |
-| `--memory SIZE` | Set a memory limit |
+| `-m, --memory SIZE` | Set a memory limit |
 | `--cpu-quota VALUE` | Set CPU quota |
 | `--resource SPEC` | Set multiple resource fields with one resource specification |
 | `--privileged` | Run a privileged container |
-| `--user USER` | Set container user; accepts UID, UID:GID, or username |
+| `-u, --user USER` | Set container user; accepts UID, UID:GID, or username |
 | `--cap-add` / `--cap-drop` | Add or drop Linux capabilities |
 | `--seccomp` / `--apparmor` / `--selinux` | Set security profiles |
 
@@ -200,9 +200,9 @@ Common Pod options:
 | `--hostname` | Pod hostname |
 | `--publish HOST:CONTAINER[/PROTO]` | hostPort mapping; protocols are `tcp`, `udp`, and `sctp` |
 | `--dns-server` / `--dns-search` / `--dns-option` | DNS configuration |
-| `--label KEY=VALUE` | Pod label |
+| `-l, --label KEY=VALUE` | Pod label |
 | `--annotation KEY=VALUE` | Pod annotation |
-| `--runtime-handler` | Select runtime handler |
+| `--runtime` | Select runtime handler |
 | `--cgroup-parent` | Pod cgroup parent |
 | `--sysctl KEY=VALUE` | Pod sysctl |
 | `--host-network` / `--host-pid` / `--host-ipc` | Use host namespaces |
@@ -218,7 +218,7 @@ crs pod stats <pod>
 crs pod metrics
 crs pod update-resources <pod> --pod-resource memory=256MiB
 crs pod port-forward <pod> --forward 8080:80
-crs pod stop <pod> --timeout 10
+crs pod stop <pod> --time 10
 crs pod remove <pod>
 ```
 
@@ -260,7 +260,7 @@ Container commands provide the full lifecycle:
 ```bash
 crs container list --all
 crs container inspect <container>
-crs container stop <container> --timeout 10
+crs container stop <container> --time 10
 crs container remove <container>
 ```
 
@@ -270,14 +270,14 @@ Exec and attach:
 crs exec <container> -- /bin/echo ok
 crs container exec-sync <container> -- /bin/date
 crs container exec -it <container> -- /bin/sh
-crs container attach <container> --stdin --tty
+crs container attach <container> --interactive --tty
 ```
 
 Logs and statistics:
 
 ```bash
 crs logs <container>
-crs logs --follow --timestamps <container>
+crs logs -f -t <container>
 crs container stats <container>
 crs container stats --pod <pod>
 ```

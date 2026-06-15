@@ -19,7 +19,7 @@ unix:///run/crius/crius.sock
 可以通过全局参数或环境变量指定其他地址：
 
 ```bash
-crs --address unix:///run/crius/crius.sock version
+crs -H unix:///run/crius/crius.sock version
 CRIUS_ADDRESS=unix:///run/crius/crius.sock crs status
 ```
 
@@ -27,7 +27,7 @@ CRIUS_ADDRESS=unix:///run/crius/crius.sock crs status
 
 | 参数 | 说明 |
 | --- | --- |
-| `--address` | daemon endpoint，支持 Unix socket 路径、`unix://`、`http://` 和 `https://` |
+| `-H, --host` | daemon endpoint，支持 Unix socket 路径、`unix://`、`http://` 和 `https://` |
 | `--connect-timeout` | 建连超时，例如 `5s`、`500ms` |
 | `--timeout` | 命令总超时；`0s` 表示关闭，默认关闭 |
 | `--output table\|json\|text` | 输出格式 |
@@ -134,21 +134,21 @@ crs rm "$cid"
 | `--detach` | 后台运行 |
 | `--rm` | 容器退出后自动删除 |
 | `--pull missing\|always\|never` | 镜像拉取策略 |
-| `--stdin` / `--tty` | 启用交互式输入和 TTY |
+| `--interactive` / `--tty` | 启用交互式输入和 TTY |
 | `--exec-mode attach\|sync` | 前台命令使用 streaming attach 或 ExecSync 模式 |
-| `--env KEY=VALUE` | 设置环境变量 |
+| `-e, --env KEY=VALUE` | 设置环境变量 |
 | `--env-file PATH` | 从文件读取环境变量；空行和 `#` 注释会被忽略 |
-| `--workdir PATH` | 设置工作目录 |
-| `--label KEY=VALUE` | 设置容器 label |
+| `-w, --workdir PATH` | 设置工作目录 |
+| `-l, --label KEY=VALUE` | 设置容器 label |
 | `--annotation KEY=VALUE` | 设置容器 annotation |
 | `--mount SPEC` | 添加挂载 |
 | `--device SPEC` | 添加设备 |
 | `--cdi-device NAME` | 添加 CDI 设备 |
-| `--memory SIZE` | 设置内存限制 |
+| `-m, --memory SIZE` | 设置内存限制 |
 | `--cpu-quota VALUE` | 设置 CPU quota |
 | `--resource SPEC` | 使用统一资源规格设置多个资源字段 |
 | `--privileged` | 启用 privileged 容器 |
-| `--user USER` | 设置容器用户，支持 UID、UID:GID 或用户名 |
+| `-u, --user USER` | 设置容器用户，支持 UID、UID:GID 或用户名 |
 | `--cap-add` / `--cap-drop` | 增加或删除 Linux capability |
 | `--seccomp` / `--apparmor` / `--selinux` | 设置安全 profile |
 
@@ -193,9 +193,9 @@ Pod 常用参数：
 | `--hostname` | Pod hostname |
 | `--publish HOST:CONTAINER[/PROTO]` | hostPort 映射，协议支持 `tcp`、`udp`、`sctp` |
 | `--dns-server` / `--dns-search` / `--dns-option` | DNS 配置 |
-| `--label KEY=VALUE` | Pod label |
+| `-l, --label KEY=VALUE` | Pod label |
 | `--annotation KEY=VALUE` | Pod annotation |
-| `--runtime-handler` | 选择 runtime handler |
+| `--runtime` | 选择 runtime handler |
 | `--cgroup-parent` | Pod cgroup parent |
 | `--sysctl KEY=VALUE` | Pod sysctl |
 | `--host-network` / `--host-pid` / `--host-ipc` | 使用宿主机 namespace |
@@ -211,7 +211,7 @@ crs pod stats <pod>
 crs pod metrics
 crs pod update-resources <pod> --pod-resource memory=256MiB
 crs pod port-forward <pod> --forward 8080:80
-crs pod stop <pod> --timeout 10
+crs pod stop <pod> --time 10
 crs pod remove <pod>
 ```
 
@@ -252,7 +252,7 @@ crs image pull --auth-json '{"username":"USER","password":"PASS","serverAddress"
 ```bash
 crs container list --all
 crs container inspect <container>
-crs container stop <container> --timeout 10
+crs container stop <container> --time 10
 crs container remove <container>
 ```
 
@@ -262,14 +262,14 @@ crs container remove <container>
 crs exec <container> -- /bin/echo ok
 crs container exec-sync <container> -- /bin/date
 crs container exec -it <container> -- /bin/sh
-crs container attach <container> --stdin --tty
+crs container attach <container> --interactive --tty
 ```
 
 日志和统计：
 
 ```bash
 crs logs <container>
-crs logs --follow --timestamps <container>
+crs logs -f -t <container>
 crs container stats <container>
 crs container stats --pod <pod>
 ```

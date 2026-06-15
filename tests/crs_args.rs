@@ -76,6 +76,12 @@ fn parses_global_options_after_command() {
         .expect("global options should parse after the command");
 
     assert!(args.debug);
+
+    let args = Args::try_parse_from(["crs", "-H", "unix:///tmp/crius.sock", "-D", "version"])
+        .expect("common global options should parse before the command");
+
+    assert_eq!(args.address, "unix:///tmp/crius.sock");
+    assert!(args.debug);
 }
 
 #[test]
@@ -164,6 +170,20 @@ fn parses_logs_options() {
     assert!(logs.follow);
     assert_eq!(logs.tail, Some(10));
     assert_eq!(logs.since.as_deref(), Some("2026-06-03T12:00:00Z"));
+    assert!(logs.timestamps);
+}
+
+#[test]
+fn parses_logs_short_options() {
+    let args = Args::try_parse_from(["crs", "logs", "-f", "-n", "10", "-t", "ctr1"])
+        .expect("logs short options should parse");
+    let Command::Logs(logs) = args.command else {
+        panic!("expected logs command");
+    };
+
+    assert_eq!(logs.container, "ctr1");
+    assert!(logs.follow);
+    assert_eq!(logs.tail, Some(10));
     assert!(logs.timestamps);
 }
 
@@ -348,6 +368,26 @@ fn parses_container_command_arguments() {
     assert!(exec.stream.stdin);
     assert_eq!(exec.stream.protocol, StreamProtocolArg::Spdy);
     assert_eq!(exec.command, vec!["echo", "ok"]);
+
+    let args = Args::try_parse_from([
+        "crs",
+        "container",
+        "exec",
+        "--interactive",
+        "--tty",
+        "ctr1",
+        "--",
+        "sh",
+    ])
+    .expect("container exec common input option should parse");
+    let Command::Container(container) = args.command else {
+        panic!("expected container command");
+    };
+    let ContainerCommand::Exec(exec) = container.command else {
+        panic!("expected container exec command");
+    };
+    assert!(exec.stream.stdin);
+    assert!(exec.stream.tty);
 }
 
 #[test]
@@ -384,6 +424,34 @@ fn parses_container_create_arguments() {
     assert_eq!(create.options.resources.memory.as_deref(), Some("64MiB"));
     assert_eq!(create.options.security.cap_add, vec!["NET_ADMIN"]);
     assert_eq!(create.command, vec!["sleep", "1"]);
+
+    let args = Args::try_parse_from([
+        "crs",
+        "container",
+        "create",
+        "-i",
+        "-w",
+        "/work",
+        "-e",
+        "A=B",
+        "--read-only",
+        "--group-add",
+        "audio",
+        "pod1",
+        "busybox",
+    ])
+    .expect("container create common option names should parse");
+    let Command::Container(container) = args.command else {
+        panic!("expected container command");
+    };
+    let ContainerCommand::Create(create) = container.command else {
+        panic!("expected container create command");
+    };
+    assert!(create.options.stdin);
+    assert_eq!(create.options.workdir.as_deref(), Some("/work"));
+    assert_eq!(create.options.env, vec!["A=B"]);
+    assert!(create.options.security.readonly_rootfs);
+    assert_eq!(create.options.security.supplemental_groups, vec!["audio"]);
 }
 
 #[test]
@@ -402,7 +470,7 @@ fn parses_base_and_multitype_shortcut_args() {
     assert_eq!(inspect.object_type, Some(ObjectType::Image));
     assert_eq!(inspect.target, "busybox:latest");
 
-    let args = Args::try_parse_from(["crs", "stop", "--type", "pod", "--timeout", "10", "pod1"])
+    let args = Args::try_parse_from(["crs", "stop", "--type", "pod", "--time", "10", "pod1"])
         .expect("stop object type and timeout should parse");
     let Command::Stop(stop) = args.command else {
         panic!("expected stop command");
@@ -411,8 +479,15 @@ fn parses_base_and_multitype_shortcut_args() {
     assert_eq!(stop.timeout, Some(10));
     assert_eq!(stop.target, "pod1");
 
-    let args = Args::try_parse_from(["crs", "rm", "--force", "container1"])
-        .expect("remove force should parse");
+    let args = Args::try_parse_from(["crs", "stop", "--type", "pod", "--timeout", "10", "pod1"])
+        .expect("legacy stop timeout option should parse");
+    let Command::Stop(stop) = args.command else {
+        panic!("expected stop command");
+    };
+    assert_eq!(stop.timeout, Some(10));
+
+    let args =
+        Args::try_parse_from(["crs", "rm", "-f", "container1"]).expect("remove force should parse");
     let Command::Rm(remove) = args.command else {
         panic!("expected rm command");
     };
@@ -551,9 +626,9 @@ fn parses_run_command_arguments() {
         "svc.cluster.local",
         "--dns-option",
         "ndots:5",
-        "--publish",
+        "-p",
         "8080:80",
-        "--runtime-handler",
+        "--runtime",
         "runc",
         "--cgroup-parent",
         "/kubepods",
@@ -568,6 +643,8 @@ fn parses_run_command_arguments() {
         "0:100000:65536",
         "--gid-map",
         "0:100000:65536",
+        "--sandbox-read-only",
+        "--read-only",
         "--sandbox-seccomp",
         "runtime/default",
         "--sandbox-apparmor",
@@ -584,9 +661,9 @@ fn parses_run_command_arguments() {
         "/bin/sh",
         "--arg",
         "-c",
-        "--workdir",
+        "-w",
         "/work",
-        "--env",
+        "-e",
         "A=B",
         "--env-file",
         "/tmp/env",
@@ -598,14 +675,18 @@ fn parses_run_command_arguments() {
         "vendor.com/device=name",
         "--log-path",
         "container.log",
-        "--memory",
+        "-m",
         "64MiB",
         "--cpu-quota",
         "100000",
+        "-c",
+        "512",
         "--cap-add",
         "NET_ADMIN",
-        "--user",
+        "-u",
         "1000:1000",
+        "--group-add",
+        "audio",
         "--seccomp",
         "localhost/container.json",
         "busybox",
@@ -655,6 +736,7 @@ fn parses_run_command_arguments() {
         run.pod_options.security.sandbox_selinux.as_deref(),
         Some("system_u:system_r:container_t:s0")
     );
+    assert!(run.pod_options.security.sandbox_readonly_rootfs);
     assert_eq!(run.pod_options.overhead, vec!["memory=16MiB"]);
     assert_eq!(run.pod_options.pod_resources, vec!["cpu=100m"]);
     assert_eq!(run.container_options.container_attempt, Some(3));
@@ -681,11 +763,17 @@ fn parses_run_command_arguments() {
         Some("64MiB")
     );
     assert_eq!(run.container_options.resources.cpu_quota, Some(100000));
+    assert_eq!(run.container_options.resources.cpu_shares, Some(512));
     assert_eq!(run.container_options.security.cap_add, vec!["NET_ADMIN"]);
     assert_eq!(
         run.container_options.security.user.as_deref(),
         Some("1000:1000")
     );
+    assert_eq!(
+        run.container_options.security.supplemental_groups,
+        vec!["audio"]
+    );
+    assert!(run.container_options.security.readonly_rootfs);
     assert_eq!(
         run.container_options.security.seccomp.as_deref(),
         Some("localhost/container.json")

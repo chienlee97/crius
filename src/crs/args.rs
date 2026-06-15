@@ -8,13 +8,20 @@ use crate::crs::parsers::{parse_duration, DEFAULT_ENDPOINT};
 #[derive(Debug, Parser)]
 #[command(name = "crs", version, about = "Local command-line client for crius")]
 pub struct Args {
-    #[arg(long, env = "CRIUS_ADDRESS", default_value = DEFAULT_ENDPOINT, global = true)]
+    #[arg(
+        short = 'H',
+        long = "host",
+        alias = "address",
+        env = "CRIUS_ADDRESS",
+        default_value = DEFAULT_ENDPOINT,
+        global = true
+    )]
     pub address: String,
     #[arg(long, default_value = "5s", value_parser = parse_duration, global = true)]
     pub connect_timeout: Duration,
     #[arg(long, default_value = "0s", value_parser = parse_duration)]
     pub timeout: Duration,
-    #[arg(long, global = true)]
+    #[arg(short = 'D', long, global = true)]
     pub debug: bool,
     #[arg(long, value_enum, default_value_t = OutputArg::Table, global = true)]
     pub output: OutputArg,
@@ -159,13 +166,13 @@ pub struct InspectArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct ContainerLogsArgs {
-    #[arg(long)]
+    #[arg(short = 'f', long)]
     pub follow: bool,
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     pub tail: Option<i64>,
     #[arg(long)]
     pub since: Option<String>,
-    #[arg(long)]
+    #[arg(short = 't', long)]
     pub timestamps: bool,
     pub container: String,
 }
@@ -226,7 +233,7 @@ impl Default for StreamProtocolArg {
 
 #[derive(Clone, Debug, Default, ClapArgs)]
 pub struct StreamOptions {
-    #[arg(short = 'i', long)]
+    #[arg(short = 'i', long = "interactive", alias = "stdin")]
     pub stdin: bool,
     #[arg(short = 't', long)]
     pub tty: bool,
@@ -244,14 +251,20 @@ pub struct StreamOptions {
 pub struct StopArgs {
     #[arg(long = "type", value_enum)]
     pub object_type: Option<StopObjectType>,
-    #[arg(long, id = "stop-timeout", value_name = "SECONDS")]
+    #[arg(
+        short = 't',
+        long = "time",
+        alias = "timeout",
+        id = "stop-timeout",
+        value_name = "SECONDS"
+    )]
     pub timeout: Option<u32>,
     pub target: String,
 }
 
 #[derive(Debug, ClapArgs)]
 pub struct RemoveArgs {
-    #[arg(long)]
+    #[arg(short = 'f', long)]
     pub force: bool,
     pub target: String,
 }
@@ -319,7 +332,7 @@ pub enum PodCommand {
     Run(Box<PodCreateArgs>),
     Stop {
         pod: String,
-        #[arg(long, value_name = "SECONDS")]
+        #[arg(short = 't', long = "time", alias = "timeout", value_name = "SECONDS")]
         timeout: Option<u32>,
     },
     Remove {
@@ -347,7 +360,7 @@ pub struct PodListArgs {
     pub id: Option<String>,
     #[arg(long, value_enum)]
     pub state: Option<PodStateArg>,
-    #[arg(long = "label")]
+    #[arg(short = 'l', long = "label")]
     pub labels: Vec<String>,
     #[arg(long)]
     pub all: bool,
@@ -373,13 +386,13 @@ pub struct PodCreateArgs {
     pub dns_searches: Vec<String>,
     #[arg(long = "dns-option")]
     pub dns_options: Vec<String>,
-    #[arg(long = "publish")]
+    #[arg(short = 'p', long = "publish")]
     pub publish: Vec<String>,
-    #[arg(long = "label")]
+    #[arg(short = 'l', long = "label")]
     pub labels: Vec<String>,
     #[arg(long = "annotation")]
     pub annotations: Vec<String>,
-    #[arg(long)]
+    #[arg(long = "runtime", alias = "runtime-handler")]
     pub runtime_handler: Option<String>,
     #[arg(long)]
     pub cgroup_parent: Option<String>,
@@ -413,7 +426,7 @@ pub struct SandboxSecurityArgs {
     pub sandbox_group: Option<u32>,
     #[arg(long = "sandbox-supplemental-group")]
     pub sandbox_supplemental_groups: Vec<u32>,
-    #[arg(long)]
+    #[arg(long = "sandbox-read-only", alias = "sandbox-readonly-rootfs")]
     pub sandbox_readonly_rootfs: bool,
     #[arg(long)]
     pub sandbox_privileged: bool,
@@ -428,7 +441,7 @@ pub struct SandboxSecurityArgs {
 #[derive(Debug, Default, ClapArgs)]
 pub struct PodStatsArgs {
     pub pod: Option<String>,
-    #[arg(long = "label")]
+    #[arg(short = 'l', long = "label")]
     pub labels: Vec<String>,
 }
 
@@ -450,7 +463,7 @@ pub enum ContainerCommand {
     },
     Stop {
         id: String,
-        #[arg(long, value_name = "SECONDS")]
+        #[arg(short = 't', long = "time", alias = "timeout", value_name = "SECONDS")]
         timeout: Option<u32>,
     },
     Remove {
@@ -492,7 +505,7 @@ pub struct ContainerListArgs {
     pub pod: Option<String>,
     #[arg(long, value_enum)]
     pub state: Option<ContainerStateArg>,
-    #[arg(long = "label")]
+    #[arg(short = 'l', long = "label")]
     pub labels: Vec<String>,
     #[arg(long)]
     pub all: bool,
@@ -518,9 +531,9 @@ pub struct ContainerCreateOptions {
     pub commands: Vec<String>,
     #[arg(long = "arg", allow_hyphen_values = true)]
     pub args: Vec<String>,
-    #[arg(long)]
+    #[arg(short = 'w', long)]
     pub workdir: Option<String>,
-    #[arg(long = "env")]
+    #[arg(short = 'e', long = "env")]
     pub env: Vec<String>,
     #[arg(long = "env-file")]
     pub env_files: Vec<String>,
@@ -536,7 +549,7 @@ pub struct ContainerCreateOptions {
     pub cdi_devices: Vec<String>,
     #[arg(long)]
     pub log_path: Option<String>,
-    #[arg(long)]
+    #[arg(short = 'i', long = "interactive", alias = "stdin")]
     pub stdin: bool,
     #[arg(long)]
     pub tty: bool,
@@ -554,9 +567,9 @@ pub struct ContainerResourceArgs {
     pub cpu_period: Option<i64>,
     #[arg(long)]
     pub cpu_quota: Option<i64>,
-    #[arg(long)]
+    #[arg(short = 'c', long)]
     pub cpu_shares: Option<i64>,
-    #[arg(long)]
+    #[arg(short = 'm', long)]
     pub memory: Option<String>,
     #[arg(long)]
     pub memory_swap: Option<String>,
@@ -582,13 +595,13 @@ pub struct ContainerSecurityArgs {
     pub cap_drop: Vec<String>,
     #[arg(long = "ambient-cap-add")]
     pub ambient_cap_add: Vec<String>,
-    #[arg(long)]
+    #[arg(short = 'u', long)]
     pub user: Option<String>,
     #[arg(long)]
     pub group: Option<String>,
-    #[arg(long = "supplemental-group")]
+    #[arg(long = "group-add", alias = "supplemental-group")]
     pub supplemental_groups: Vec<String>,
-    #[arg(long)]
+    #[arg(long = "read-only", alias = "readonly-rootfs")]
     pub readonly_rootfs: bool,
     #[arg(long)]
     pub no_new_privs: bool,
@@ -633,7 +646,7 @@ pub struct RunArgs {
     pub rm: bool,
     #[arg(short = 't', long)]
     pub tty: bool,
-    #[arg(short = 'i', long)]
+    #[arg(short = 'i', long = "interactive", alias = "stdin")]
     pub stdin: bool,
     #[arg(long, value_enum, default_value_t = StreamProtocolArg::Websocket)]
     pub protocol: StreamProtocolArg,
@@ -669,13 +682,13 @@ pub struct RunPodCreateOptions {
     pub dns_searches: Vec<String>,
     #[arg(long = "dns-option")]
     pub dns_options: Vec<String>,
-    #[arg(long = "publish")]
+    #[arg(short = 'p', long = "publish")]
     pub publish: Vec<String>,
     #[arg(long = "pod-label", id = "run-pod-label")]
     pub labels: Vec<String>,
     #[arg(long = "pod-annotation", id = "run-pod-annotation")]
     pub annotations: Vec<String>,
-    #[arg(long)]
+    #[arg(long = "runtime", alias = "runtime-handler")]
     pub runtime_handler: Option<String>,
     #[arg(long)]
     pub cgroup_parent: Option<String>,
@@ -709,13 +722,13 @@ pub struct RunContainerCreateOptions {
     pub commands: Vec<String>,
     #[arg(long = "arg", allow_hyphen_values = true)]
     pub args: Vec<String>,
-    #[arg(long)]
+    #[arg(short = 'w', long)]
     pub workdir: Option<String>,
-    #[arg(long = "env")]
+    #[arg(short = 'e', long = "env")]
     pub env: Vec<String>,
     #[arg(long = "env-file")]
     pub env_files: Vec<String>,
-    #[arg(long = "label")]
+    #[arg(short = 'l', long = "label")]
     pub labels: Vec<String>,
     #[arg(long = "annotation")]
     pub annotations: Vec<String>,
