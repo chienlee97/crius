@@ -29,7 +29,7 @@ CRIUS_ADDRESS=unix:///run/crius/crius.sock crs status
 | --- | --- |
 | `--address` | daemon endpoint，支持 Unix socket 路径、`unix://`、`http://` 和 `https://` |
 | `--connect-timeout` | 建连超时，例如 `5s`、`500ms` |
-| `--timeout` | 普通请求超时，默认 `30s` |
+| `--timeout` | 命令总超时；`0s` 表示关闭，默认关闭 |
 | `--output table\|json\|text` | 输出格式 |
 | `--quiet` | 减少非必要输出 |
 | `--no-trunc` | 不截断 ID 或长字段 |

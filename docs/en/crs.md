@@ -32,7 +32,7 @@ Common global options:
 | --- | --- |
 | `--address` | daemon endpoint; accepts Unix socket paths, `unix://`, `http://`, and `https://` |
 | `--connect-timeout` | connection timeout, such as `5s` or `500ms` |
-| `--timeout` | normal request timeout, default `30s` |
+| `--timeout` | total command timeout; `0s` disables it and is the default |
 | `--output table\|json\|text` | output format |
 | `--quiet` | reduce non-essential output |
 | `--no-trunc` | do not truncate IDs or long fields |

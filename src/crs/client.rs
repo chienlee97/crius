@@ -127,6 +127,10 @@ impl CrsClient {
     where
         F: Future<Output = Result<T, CliError>>,
     {
+        if self.rpc_timeout.is_zero() {
+            return future.await;
+        }
+
         tokio::time::timeout(self.rpc_timeout, future)
             .await
             .map_err(|_| CliError::timeout("RPC timed out", self.endpoint()))?
@@ -216,6 +220,22 @@ mod tests {
             .expect_err("future should time out");
 
         assert_eq!(error.exit_status().code(), 124);
+    }
+
+    #[tokio::test]
+    async fn zero_rpc_timeout_waits_for_future() {
+        let args =
+            Args::try_parse_from(["crs", "--timeout", "0s", "version"]).expect("args should parse");
+        let ctx = CliContext::from_args(&args).expect("context should build");
+        let client = CrsClient::new(&ctx);
+
+        client
+            .with_rpc_timeout(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(())
+            })
+            .await
+            .expect("zero timeout should not cancel the future");
     }
 
     #[test]

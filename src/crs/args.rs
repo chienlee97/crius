@@ -12,7 +12,7 @@ pub struct Args {
     pub address: String,
     #[arg(long, default_value = "5s", value_parser = parse_duration, global = true)]
     pub connect_timeout: Duration,
-    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    #[arg(long, default_value = "0s", value_parser = parse_duration)]
     pub timeout: Duration,
     #[arg(long, global = true)]
     pub debug: bool,
