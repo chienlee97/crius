@@ -4,7 +4,11 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::crs::{args::OutputArg, context::CliContext, ids::truncate_field};
+use crate::crs::{
+    args::OutputArg,
+    context::CliContext,
+    ids::{short_image_id, truncate_field},
+};
 
 pub(crate) const API_VERSION: &str = "crius.io/crs/v1";
 
@@ -83,6 +87,9 @@ pub(crate) trait TableRow {
     where
         Self: Sized;
     fn cells(&self) -> Vec<String>;
+    fn table_cells(&self, _no_trunc: bool) -> Vec<String> {
+        self.cells()
+    }
     fn quiet_cell(&self) -> String {
         self.cells().into_iter().next().unwrap_or_default()
     }
@@ -129,7 +136,7 @@ where
     let rows: Vec<Vec<String>> = items
         .iter()
         .map(|item| {
-            item.cells()
+            item.table_cells(no_trunc)
                 .into_iter()
                 .map(|cell| truncate_field(&normalize_cell(&cell), no_trunc))
                 .collect()
@@ -621,17 +628,55 @@ fn value_object_keys(value: &Value) -> Vec<String> {
 
 impl TableRow for ImageView {
     fn headers() -> &'static [&'static str] {
-        &["IMAGE", "IMAGE ID", "SIZE", "USER SPEC", "PINNED"]
+        &["REPOSITORY", "TAG", "IMAGE ID", "SIZE"]
     }
 
     fn cells(&self) -> Vec<String> {
+        let (repository, tag) = split_image_reference(&self.image);
         vec![
-            self.image.clone(),
-            self.image_id.clone(),
+            repository,
+            tag,
+            short_image_id(&self.image_id),
             format_bytes(self.size_bytes),
-            self.user_spec.clone(),
-            format_bool(self.pinned).to_string(),
         ]
+    }
+
+    fn table_cells(&self, no_trunc: bool) -> Vec<String> {
+        if !no_trunc {
+            return self.cells();
+        }
+
+        let mut cells = self.cells();
+        cells[2] = self.image_id.clone();
+        cells
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.image.clone()
+    }
+}
+
+fn split_image_reference(image: &str) -> (String, String) {
+    let image = image.trim();
+    if image.is_empty() {
+        return ("<none>".to_string(), "<none>".to_string());
+    }
+
+    let repository = image
+        .split_once('@')
+        .map(|(repository, _digest)| repository)
+        .unwrap_or(image);
+    let last_slash = repository.rfind('/');
+    let tag_separator = repository
+        .rfind(':')
+        .filter(|index| last_slash.is_none_or(|slash| *index > slash));
+
+    match tag_separator {
+        Some(index) if index + 1 < repository.len() => (
+            repository[..index].to_string(),
+            repository[index + 1..].to_string(),
+        ),
+        _ => (repository.to_string(), "<none>".to_string()),
     }
 }
 
@@ -1231,7 +1276,7 @@ mod tests {
         );
         assert_eq!(
             ImageView::headers(),
-            &["IMAGE", "IMAGE ID", "SIZE", "USER SPEC", "PINNED"]
+            &["REPOSITORY", "TAG", "IMAGE ID", "SIZE"]
         );
         assert_eq!(
             PodView::headers(),
@@ -1260,6 +1305,37 @@ mod tests {
         assert_eq!(
             ResourceUsageView::headers(),
             &["ID", "NAME", "CPU", "MEMORY", "PIDS"]
+        );
+    }
+
+    #[test]
+    fn image_view_uses_docker_style_table_columns() {
+        let rows = vec![
+            ImageView {
+                image: "cr.kylinos.cn/kylin/kylin-server-platform:v11-2503".into(),
+                image_id: "sha256:35efb0be1f05ef7a58406c9391f6812270146c".into(),
+                size_bytes: 64 * 1024 * 1024,
+                user_spec: "cr.kylinos.cn/kylin/kylin-server-platform:v11-2503".into(),
+                pinned: false,
+            },
+            ImageView {
+                image: "busybox@sha256:abcdef".into(),
+                image_id: "sha256:68c2fc315e0d4e0e0b284e81e663a428417c86".into(),
+                size_bytes: 1024,
+                user_spec: "busybox@sha256:abcdef".into(),
+                pinned: true,
+            },
+        ];
+
+        assert_eq!(
+            print_table(&rows, false),
+            "REPOSITORY                                 TAG       IMAGE ID      SIZE\n\
+cr.kylinos.cn/kylin/kylin-server-platform  v11-2503  35efb0be1f05  64.0MiB\n\
+busybox                                    <none>    68c2fc315e0d  1.0KiB"
+        );
+        assert_eq!(
+            print_quiet(&rows, false),
+            "cr.kylinos.cn/kylin/kylin-server-platform:v11...\nbusybox@sha256:abcdef"
         );
     }
 

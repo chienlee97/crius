@@ -2045,7 +2045,7 @@ async fn golden_image_list_outputs_are_stable() {
     assert_success(&table);
     assert_stdout(
         &table,
-        "IMAGE           IMAGE ID          SIZE    USER SPEC       PINNED\nbusybox:latest  sha256:testimage  1.0KiB  busybox:latest  false\n",
+        "REPOSITORY  TAG     IMAGE ID   SIZE\nbusybox     latest  testimage  1.0KiB\n",
     );
 
     let json = run_crs(endpoint, ["--output", "json", "image", "list"]);
