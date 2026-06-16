@@ -617,18 +617,31 @@ impl Daemon {
         }
 
         let daemon = self.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let handle = std::thread::spawn(move || {
             daemon.set_task_state(DaemonTaskState::Running);
+            let mut started_tx = Some(started_tx);
             let result = if daemon.is_terminal().unwrap_or(false) {
                 match daemon.create_terminal_container() {
                     Ok(pid) => {
                         *daemon.container_pid.lock().unwrap() = Some(pid.as_raw());
                         info!("Container created with PID: {}", pid);
+                        if let Some(tx) = started_tx.take() {
+                            let _ = tx.send(Ok(()));
+                        }
                         daemon.monitor_container(pid)
                     }
-                    Err(err) => Err(err),
+                    Err(err) => {
+                        if let Some(tx) = started_tx.take() {
+                            let _ = tx.send(Err(err.to_string()));
+                        }
+                        Err(err)
+                    }
                 }
             } else {
+                if let Some(tx) = started_tx.take() {
+                    let _ = tx.send(Ok(()));
+                }
                 daemon.run_non_terminal_container()
             };
 
@@ -658,6 +671,10 @@ impl Daemon {
 
         let mut guard = self.task_thread.lock().unwrap();
         *guard = Some(handle);
+        started_rx
+            .recv()
+            .map_err(|err| anyhow::anyhow!("task runner exited before start confirmation: {err}"))?
+            .map_err(|err| anyhow::anyhow!("task start failed: {err}"))?;
         Ok(())
     }
 

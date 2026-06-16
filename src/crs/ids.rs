@@ -10,7 +10,7 @@ pub(crate) fn short_image_id(id: &str) -> String {
 }
 
 pub(crate) fn truncate_field(value: &str, no_trunc: bool) -> String {
-    const MAX_FIELD_WIDTH: usize = 48;
+    const MAX_FIELD_WIDTH: usize = 96;
 
     if no_trunc || value.chars().count() <= MAX_FIELD_WIDTH {
         return value.to_string();
@@ -46,9 +46,9 @@ mod tests {
 
     #[test]
     fn truncates_fields() {
-        let value = "a".repeat(60);
+        let value = "a".repeat(120);
 
-        assert_eq!(truncate_field(&value, false).chars().count(), 48);
+        assert_eq!(truncate_field(&value, false).chars().count(), 96);
         assert!(truncate_field(&value, false).ends_with("..."));
         assert_eq!(truncate_field(&value, true), value);
     }

@@ -2733,7 +2733,7 @@ impl RuntimeServiceImpl {
         config
     }
 
-    fn cni_config_has_config_file(config: &crate::network::CniConfig) -> bool {
+    pub(super) fn cni_config_has_config_file(config: &crate::network::CniConfig) -> bool {
         config.config_dirs().iter().any(|dir| {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return false;

@@ -1,6 +1,7 @@
 use futures::StreamExt;
 use std::io::Write;
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 use crate::crs::{
     args::{
@@ -19,7 +20,7 @@ use crate::proto::diagnostics::v1::ContainerLogRequest;
 use crate::proto::local::v1::CreateLocalContainerRequest;
 use crate::proto::runtime::v1::{
     AttachRequest, ContainerState, ContainerStatusRequest, CreateContainerRequest, ImageSpec,
-    ImageStatusRequest, NamespaceMode, PodSandboxConfig, PodSandboxStatusRequest, PullImageRequest,
+    ImageStatusRequest, PodSandboxConfig, PodSandboxStatusRequest, PullImageRequest,
     RemoveContainerRequest, StartContainerRequest, StopContainerRequest,
 };
 use crate::{CRS_RUN_ANNOTATION, CRS_RUN_ANNOTATION_VALUE};
@@ -109,15 +110,25 @@ pub(crate) async fn handle(
     let plan = RunPlan::from_args(args)?;
     ensure_image(client, &plan).await?;
     let (container_id, pod_id) = create_run_container(client, &plan).await?;
-    if let Err(error) = start_container(client, &container_id).await {
-        emit_leftover_warnings(&leftover_warnings(Some(&container_id)));
-        return Err(error);
-    }
-
     let outcome = if plan.detach {
+        if let Err(error) = start_container(client, &container_id).await {
+            emit_leftover_warnings(&leftover_warnings(Some(&container_id)));
+            return Err(error);
+        }
         render_detached(ctx, client, &plan, pod_id.as_deref(), &container_id)
+    } else if plan.exec_mode == ExecModeArg::Attach {
+        match run_foreground_attach(ctx, client, &plan, &container_id).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                render_stopped_before_streaming(ctx, client, &plan, &container_id, error).await
+            }
+        }
     } else {
-        match run_foreground(ctx, client, &plan, &container_id).await {
+        if let Err(error) = start_container(client, &container_id).await {
+            emit_leftover_warnings(&leftover_warnings(Some(&container_id)));
+            return Err(error);
+        }
+        match run_exec_sync(ctx, client, &plan, &container_id).await {
             Ok(result) => Ok(result),
             Err(error) => {
                 render_stopped_before_streaming(ctx, client, &plan, &container_id, error).await
@@ -168,7 +179,12 @@ impl RunPlan {
             runtime_handler: args.pod_options.runtime_handler,
             cgroup_parent: args.pod_options.cgroup_parent,
             sysctls: args.pod_options.sysctls,
-            container_options: run_container_options(args.container_options, args.name),
+            container_options: run_container_options(
+                args.container_options,
+                args.name,
+                args.stdin,
+                args.tty,
+            ),
         })
     }
 }
@@ -176,6 +192,8 @@ impl RunPlan {
 fn run_container_options(
     options: crate::crs::args::RunContainerCreateOptions,
     name: Option<String>,
+    stdin: bool,
+    tty: bool,
 ) -> ContainerCreateOptions {
     ContainerCreateOptions {
         name,
@@ -191,8 +209,8 @@ fn run_container_options(
         devices: options.devices,
         cdi_devices: options.cdi_devices,
         log_path: options.log_path,
-        stdin: false,
-        tty: false,
+        stdin,
+        tty,
         resources: options.resources,
         security: options.security,
     }
@@ -331,15 +349,7 @@ async fn create_local_container(client: &CrsClient, plan: &RunPlan) -> Result<St
         image: plan.image.clone(),
         command: plan.command.clone(),
     };
-    let mut config = build_container_config(&args).map_err(CliError::invalid_input)?;
-    if let Some(linux) = config.linux.as_mut() {
-        if let Some(security) = linux.security_context.as_mut() {
-            let namespace_options = security
-                .namespace_options
-                .get_or_insert_with(Default::default);
-            namespace_options.network = NamespaceMode::Node as i32;
-        }
-    }
+    let config = build_container_config(&args).map_err(CliError::invalid_input)?;
     let sysctls = parse_local_sysctls(&plan.sysctls).map_err(CliError::invalid_input)?;
     let mut local = client.local()?;
     let response = client
@@ -424,16 +434,41 @@ async fn start_container(client: &CrsClient, container_id: &str) -> Result<(), C
     Ok(())
 }
 
-async fn run_foreground(
-    ctx: &CliContext,
+async fn run_foreground_attach(
+    _ctx: &CliContext,
     client: &CrsClient,
     plan: &RunPlan,
     container_id: &str,
 ) -> Result<CommandResult, CliError> {
-    match plan.exec_mode {
-        ExecModeArg::Sync => run_exec_sync(ctx, client, plan, container_id).await,
-        ExecModeArg::Attach => run_attach(client, plan, container_id).await,
+    let options = prepare_attach(client, plan, container_id).await?;
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let attach_task = tokio::spawn(streaming::attach_ready(options, ready_tx));
+
+    match ready_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            attach_task.abort();
+            return Err(error);
+        }
+        Err(_) => {
+            return match attach_task.await {
+                Ok(result) => result,
+                Err(error) => Err(CliError::internal(format!(
+                    "attach stream task failed before container start: {error}"
+                ))),
+            };
+        }
     }
+
+    if let Err(error) = start_container(client, container_id).await {
+        attach_task.abort();
+        emit_leftover_warnings(&leftover_warnings(Some(container_id)));
+        return Err(error);
+    }
+
+    attach_task
+        .await
+        .map_err(|source| CliError::internal(format!("attach stream task failed: {source}")))?
 }
 
 async fn run_exec_sync(
@@ -618,11 +653,11 @@ async fn read_run_log(client: &CrsClient, container_id: &str) -> Result<Vec<u8>,
     Ok(output)
 }
 
-async fn run_attach(
+async fn prepare_attach(
     client: &CrsClient,
     plan: &RunPlan,
     container_id: &str,
-) -> Result<CommandResult, CliError> {
+) -> Result<streaming::AttachStreamOptions, CliError> {
     let mut options =
         streaming::AttachStreamOptions::from_args(container_id.to_string(), plan.stream.clone())?;
     let mut runtime = client.runtime()?;
@@ -648,7 +683,7 @@ async fn run_attach(
         .into_inner();
 
     options.stream_url = Some(response.url);
-    streaming::attach(options).await
+    Ok(options)
 }
 
 fn render_detached(

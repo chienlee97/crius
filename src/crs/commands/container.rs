@@ -11,7 +11,8 @@ use crate::crs::{
     context::CliContext,
     error::{CliError, CommandResult},
     format::{
-        CommandOutput, ContainerOperationView, ContainerView, InspectView, ResourceUsageView,
+        format_unix_nanos, CommandOutput, ContainerOperationView, ContainerView, InspectView,
+        ResourceUsageView,
     },
     parsers::parse_key_value,
 };
@@ -756,7 +757,7 @@ pub(crate) fn container_view(container: Container) -> ContainerView {
         pod: container.pod_sandbox_id,
         image,
         state: container_state_name(container.state).to_string(),
-        created: container.created_at.to_string(),
+        created: format_unix_nanos(container.created_at, std::time::SystemTime::now()),
         name: metadata.name,
         attempt: metadata.attempt,
     }

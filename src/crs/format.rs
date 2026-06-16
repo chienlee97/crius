@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::crs::{
     args::OutputArg,
     context::CliContext,
-    ids::{short_image_id, truncate_field},
+    ids::{short_id, short_image_id, truncate_field},
 };
 
 pub(crate) const API_VERSION: &str = "crius.io/crs/v1";
@@ -249,22 +249,40 @@ pub(crate) fn format_unix_nanos(unix_nanos: i64, now: SystemTime) -> String {
     };
 
     let age = now.duration_since(timestamp).unwrap_or_default();
-    if age < Duration::from_secs(24 * 60 * 60) {
-        return format_relative_duration(age);
-    }
-
-    let seconds = unix_nanos.div_euclid(1_000_000_000).max(0) as u64;
-    chrono::DateTime::<chrono::Local>::from(UNIX_EPOCH + Duration::from_secs(seconds))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
+    format!("{} ago", format_human_duration(age))
 }
 
-fn format_relative_duration(duration: Duration) -> String {
+fn format_human_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
-    match seconds {
-        0..=59 => format!("{seconds}s ago"),
-        60..=3_599 => format!("{}m ago", seconds / 60),
-        _ => format!("{}h ago", seconds / 3_600),
+
+    if seconds < 1 {
+        "Less than a second".to_string()
+    } else if seconds == 1 {
+        "1 second".to_string()
+    } else if seconds < 60 {
+        format!("{seconds} seconds")
+    } else {
+        let minutes = seconds / 60;
+        if minutes == 1 {
+            "About a minute".to_string()
+        } else if minutes < 60 {
+            format!("{minutes} minutes")
+        } else {
+            let hours = ((duration.as_secs_f64() / 3_600.0) + 0.5) as u64;
+            if hours == 1 {
+                "About an hour".to_string()
+            } else if hours < 48 {
+                format!("{hours} hours")
+            } else if hours < 24 * 7 * 2 {
+                format!("{} days", hours / 24)
+            } else if hours < 24 * 30 * 2 {
+                format!("{} weeks", hours / 24 / 7)
+            } else if hours < 24 * 365 * 2 {
+                format!("{} months", hours / 24 / 30)
+            } else {
+                format!("{} years", hours / 24 / 365)
+            }
+        }
     }
 }
 
@@ -867,6 +885,30 @@ impl TableRow for ContainerView {
             self.attempt.to_string(),
         ]
     }
+
+    fn table_cells(&self, no_trunc: bool) -> Vec<String> {
+        vec![
+            if no_trunc {
+                self.container_id.clone()
+            } else {
+                short_id(&self.container_id).to_string()
+            },
+            if no_trunc || self.pod.is_empty() {
+                self.pod.clone()
+            } else {
+                short_id(&self.pod).to_string()
+            },
+            self.image.clone(),
+            self.state.clone(),
+            self.created.clone(),
+            self.name.clone(),
+            self.attempt.to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.container_id.clone()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -890,6 +932,24 @@ impl TableRow for ContainerOperationView {
         vec![
             self.container_id.clone(),
             self.pod_id.clone(),
+            self.image.clone(),
+            self.action.clone(),
+            format_bool(self.success).to_string(),
+        ]
+    }
+
+    fn table_cells(&self, no_trunc: bool) -> Vec<String> {
+        vec![
+            if no_trunc {
+                self.container_id.clone()
+            } else {
+                short_id(&self.container_id).to_string()
+            },
+            if no_trunc || self.pod_id.is_empty() {
+                self.pod_id.clone()
+            } else {
+                short_id(&self.pod_id).to_string()
+            },
             self.image.clone(),
             self.action.clone(),
             format_bool(self.success).to_string(),
@@ -1260,12 +1320,12 @@ mod tests {
     fn formats_times() {
         let now = UNIX_EPOCH + Duration::from_secs(3_600);
 
-        assert_eq!(format_unix_nanos(3_590_000_000_000, now), "10s ago");
-        assert_eq!(format_unix_nanos(3_000_000_000_000, now), "10m ago");
-        assert_eq!(format_unix_nanos(0, now), "1h ago");
+        assert_eq!(format_unix_nanos(3_590_000_000_000, now), "10 seconds ago");
+        assert_eq!(format_unix_nanos(3_000_000_000_000, now), "10 minutes ago");
+        assert_eq!(format_unix_nanos(0, now), "About an hour ago");
 
         let old_now = UNIX_EPOCH + Duration::from_secs(3 * 24 * 60 * 60);
-        assert!(format_unix_nanos(0, old_now).starts_with("1970-"));
+        assert_eq!(format_unix_nanos(0, old_now), "3 days ago");
     }
 
     #[test]

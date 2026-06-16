@@ -563,54 +563,62 @@ impl RuntimeService for MockRuntimeService {
         self.state
             .list_container_requests
             .fetch_add(1, Ordering::SeqCst);
-        if let Some(state) = request
+        let requested_state = request
             .filter
-            .and_then(|filter| filter.state.map(|state| state.state))
-        {
+            .and_then(|filter| filter.state.map(|state| state.state));
+        if let Some(state) = requested_state {
             assert_eq!(state, ContainerState::ContainerRunning as i32);
         }
 
-        Ok(Response::new(ListContainersResponse {
-            containers: vec![
-                Container {
-                    id: "ctr123456789".into(),
-                    pod_sandbox_id: "pod123456789".into(),
-                    metadata: Some(ContainerMetadata {
-                        name: "ctr-a".into(),
-                        attempt: 2,
-                    }),
-                    image: Some(ImageSpec {
-                        image: "busybox:latest".into(),
-                        user_specified_image: "busybox:latest".into(),
-                        ..Default::default()
-                    }),
-                    image_ref: "sha256:image".into(),
-                    state: ContainerState::ContainerRunning as i32,
-                    created_at: 42,
-                    labels: Default::default(),
-                    annotations: Default::default(),
-                },
-                Container {
-                    id: "e24e56207e5a4ed59d2003fe12e1073d".into(),
-                    pod_sandbox_id: String::new(),
-                    metadata: Some(ContainerMetadata {
-                        name: "v11-2503".into(),
-                        attempt: 0,
-                    }),
-                    image: Some(ImageSpec {
-                        image: "cr.kylinos.cn/kylin/kylin-server-platform:v11-2503".into(),
-                        user_specified_image: "cr.kylinos.cn/kylin/kylin-server-platform:v11-2503"
-                            .into(),
-                        ..Default::default()
-                    }),
-                    image_ref: "sha256:v11".into(),
-                    state: ContainerState::ContainerExited as i32,
-                    created_at: 1_781_516_201_793_380_301,
-                    labels: Default::default(),
-                    annotations: Default::default(),
-                },
-            ],
-        }))
+        let containers = vec![
+            Container {
+                id: "ctr123456789".into(),
+                pod_sandbox_id: "pod123456789".into(),
+                metadata: Some(ContainerMetadata {
+                    name: "ctr-a".into(),
+                    attempt: 2,
+                }),
+                image: Some(ImageSpec {
+                    image: "busybox:latest".into(),
+                    user_specified_image: "busybox:latest".into(),
+                    ..Default::default()
+                }),
+                image_ref: "sha256:image".into(),
+                state: ContainerState::ContainerRunning as i32,
+                created_at: one_hour_ago_unix_nanos(),
+                labels: Default::default(),
+                annotations: Default::default(),
+            },
+            Container {
+                id: "e24e56207e5a4ed59d2003fe12e1073d".into(),
+                pod_sandbox_id: String::new(),
+                metadata: Some(ContainerMetadata {
+                    name: "v11-2503".into(),
+                    attempt: 0,
+                }),
+                image: Some(ImageSpec {
+                    image: "cr.kylinos.cn/kylin/kylin-server-platform:v11-2503".into(),
+                    user_specified_image: "cr.kylinos.cn/kylin/kylin-server-platform:v11-2503"
+                        .into(),
+                    ..Default::default()
+                }),
+                image_ref: "sha256:v11".into(),
+                state: ContainerState::ContainerExited as i32,
+                created_at: one_hour_ago_unix_nanos(),
+                labels: Default::default(),
+                annotations: Default::default(),
+            },
+        ];
+        let containers = containers
+            .into_iter()
+            .filter(|container| {
+                requested_state
+                    .map(|state| container.state == state)
+                    .unwrap_or(true)
+            })
+            .collect();
+
+        Ok(Response::new(ListContainersResponse { containers }))
     }
 
     async fn container_status(
@@ -2592,7 +2600,14 @@ async fn golden_container_list_outputs_are_stable() {
     assert_success(&table);
     assert_stdout(
         &table,
-        "CONTAINER ID  POD           IMAGE           STATE    CREATED  NAME   ATTEMPT\nctr123456789  pod123456789  busybox:latest  running  42       ctr-a  2\n",
+        "CONTAINER ID  POD           IMAGE           STATE    CREATED            NAME   ATTEMPT\nctr123456789  pod123456789  busybox:latest  running  About an hour ago  ctr-a  2\n",
+    );
+
+    let all = run_crs(endpoint, ["ps", "-a"]);
+    assert_success(&all);
+    assert_stdout(
+        &all,
+        "CONTAINER ID  POD           IMAGE                                               STATE    CREATED            NAME      ATTEMPT\nctr123456789  pod123456789  busybox:latest                                      running  About an hour ago  ctr-a     2\ne24e56207e5a  -             cr.kylinos.cn/kylin/kylin-server-platform:v11-2503  exited   About an hour ago  v11-2503  0\n",
     );
 
     let json = run_crs(endpoint, ["--output", "json", "container", "list"]);
@@ -2871,6 +2886,7 @@ async fn run_detach_creates_native_local_container_or_reuses_explicit_pod() {
             "--output",
             "json",
             "run",
+            "-it",
             "--detach",
             "--name",
             "ctr-demo",
@@ -2907,13 +2923,16 @@ async fn run_detach_creates_native_local_container_or_reuses_explicit_pod() {
         "ctr-demo"
     );
     assert_eq!(local_config.command, vec!["echo", "ok"]);
+    assert!(local_config.stdin);
+    assert!(local_config.stdin_once);
+    assert!(local_config.tty);
     let namespace_options = local_config
         .linux
         .as_ref()
         .and_then(|linux| linux.security_context.as_ref())
         .and_then(|security| security.namespace_options.as_ref())
         .expect("container namespace options");
-    assert_eq!(namespace_options.network, NamespaceMode::Node as i32);
+    assert_eq!(namespace_options.network, NamespaceMode::Pod as i32);
 
     assert_eq!(
         last_start_container
@@ -3111,7 +3130,14 @@ async fn run_exec_mode_attach_streams_started_container() {
 
     let output = run_crs(
         endpoint,
-        ["run", "--exec-mode", "attach", "busybox:latest", "true"],
+        [
+            "run",
+            "-it",
+            "--exec-mode",
+            "attach",
+            "busybox:latest",
+            "true",
+        ],
     );
 
     assert_success(&output);
@@ -3122,10 +3148,10 @@ async fn run_exec_mode_attach_streams_started_container() {
         .clone()
         .expect("attach request");
     assert_eq!(request.container_id, "ctr-local-busybox:latest");
-    assert!(!request.stdin);
+    assert!(request.stdin);
     assert!(request.stdout);
-    assert!(request.stderr);
-    assert!(!request.tty);
+    assert!(!request.stderr);
+    assert!(request.tty);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4438,6 +4464,15 @@ fn test_image() -> Image {
         }),
         pinned: false,
     }
+}
+
+fn one_hour_ago_unix_nanos() -> i64 {
+    let timestamp = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(3_600))
+        .unwrap_or(std::time::UNIX_EPOCH)
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    timestamp.as_nanos().min(i64::MAX as u128) as i64
 }
 
 fn test_container_event(

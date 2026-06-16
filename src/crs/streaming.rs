@@ -1,14 +1,10 @@
-use std::{
-    collections::HashMap,
-    future::Future,
-    io::{Read, Write},
-};
+use std::{collections::HashMap, future::Future, io::Write};
 
 use base64::Engine;
 use nix::sys::termios::{self, SetArg, Termios};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::crs::{
     args::{StreamOptions, StreamProtocolArg},
@@ -181,14 +177,18 @@ fn parse_forward_port(source: &str, value: &str) -> Result<u16, String> {
 pub(crate) async fn exec(options: ExecStreamOptions) -> Result<CommandResult, CliError> {
     let _raw_mode = SystemRawModeBackend.enter_raw_mode(options.tty)?;
     let resize = ResizeEvents::start(options.tty);
-    let _initial_size = resize.initial();
-    let _resize_events = resize.into_receiver();
+    let initial_size = resize.initial();
+    let resize_events = options.tty.then(|| resize.into_receiver());
     let url = select_stream_url("exec", options.protocol, options.stream_url.as_deref())?;
     let routing = OutputRouting::exec(&options);
-    let stdin = local_stdin_payload(options.stdin)?;
-    let output =
-        websocket_stream_with_writers(url, WebsocketIo { stdin }, routing, &mut LocalStreamWriters)
-            .await?;
+    let output = websocket_stream_with_writers(
+        url,
+        WebsocketIo::from_options(options.stdin, initial_size, resize_events),
+        routing,
+        &mut LocalStreamWriters,
+        None,
+    )
+    .await?;
     Ok(CommandResult::from_code(
         output.exit_code.unwrap_or_default(),
     ))
@@ -196,6 +196,13 @@ pub(crate) async fn exec(options: ExecStreamOptions) -> Result<CommandResult, Cl
 
 pub(crate) async fn attach(options: AttachStreamOptions) -> Result<CommandResult, CliError> {
     attach_with_interrupt(options, tokio::signal::ctrl_c()).await
+}
+
+pub(crate) async fn attach_ready(
+    options: AttachStreamOptions,
+    ready: oneshot::Sender<Result<(), CliError>>,
+) -> Result<CommandResult, CliError> {
+    attach_with_interrupt_and_ready(options, tokio::signal::ctrl_c(), Some(ready)).await
 }
 
 pub(crate) async fn port_forward(options: PortForwardOptions) -> Result<CommandResult, CliError> {
@@ -215,14 +222,31 @@ async fn attach_with_interrupt<I>(
 where
     I: Future<Output = std::io::Result<()>>,
 {
+    attach_with_interrupt_and_ready(options, interrupt, None).await
+}
+
+async fn attach_with_interrupt_and_ready<I>(
+    options: AttachStreamOptions,
+    interrupt: I,
+    ready: Option<oneshot::Sender<Result<(), CliError>>>,
+) -> Result<CommandResult, CliError>
+where
+    I: Future<Output = std::io::Result<()>>,
+{
     let _raw_mode = SystemRawModeBackend.enter_raw_mode(options.tty)?;
     let resize = ResizeEvents::start(options.tty);
-    let _initial_size = resize.initial();
-    let _resize_events = resize.into_receiver();
+    let initial_size = resize.initial();
+    let resize_events = options.tty.then(|| resize.into_receiver());
     let url = select_stream_url("attach", options.protocol, options.stream_url.as_deref())?;
     let routing = OutputRouting::attach(&options);
     let mut writers = LocalStreamWriters;
-    let stream = websocket_stream_with_writers(url, WebsocketIo::default(), routing, &mut writers);
+    let stream = websocket_stream_with_writers(
+        url,
+        WebsocketIo::from_options(options.stdin, initial_size, resize_events),
+        routing,
+        &mut writers,
+        ready,
+    );
     tokio::pin!(stream);
     tokio::pin!(interrupt);
 
@@ -341,6 +365,7 @@ const WS_CHANNEL_STDIN: u8 = 0;
 const WS_CHANNEL_STDOUT: u8 = 1;
 const WS_CHANNEL_STDERR: u8 = 2;
 const WS_CHANNEL_ERROR: u8 = 3;
+const WS_CHANNEL_RESIZE: u8 = 4;
 const REMOTE_COMMAND_PROTOCOLS: &[&str] = &[
     "v5.channel.k8s.io",
     "v4.channel.k8s.io",
@@ -349,9 +374,38 @@ const REMOTE_COMMAND_PROTOCOLS: &[&str] = &[
     "channel.k8s.io",
 ];
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default)]
 pub(crate) struct WebsocketIo {
-    pub stdin: Option<Vec<u8>>,
+    pub stdin: WebsocketStdin,
+    pub initial_size: Option<TerminalSize>,
+    pub resize_events: Option<mpsc::Receiver<TerminalSize>>,
+}
+
+impl WebsocketIo {
+    fn from_options(
+        stdin: bool,
+        initial_size: Option<TerminalSize>,
+        resize_events: Option<mpsc::Receiver<TerminalSize>>,
+    ) -> Self {
+        Self {
+            stdin: if stdin {
+                WebsocketStdin::Local
+            } else {
+                WebsocketStdin::Disabled
+            },
+            initial_size,
+            resize_events,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) enum WebsocketStdin {
+    #[default]
+    Disabled,
+    Local,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Buffered(Vec<u8>),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -392,15 +446,23 @@ struct LocalStreamWriters;
 
 impl StreamWriters for LocalStreamWriters {
     fn stdout(&mut self, payload: &[u8]) -> Result<(), CliError> {
-        std::io::stdout()
+        let mut stdout = std::io::stdout();
+        stdout
             .write_all(payload)
-            .map_err(|source| CliError::internal(format!("failed to write stdout: {source}")))
+            .map_err(|source| CliError::internal(format!("failed to write stdout: {source}")))?;
+        stdout
+            .flush()
+            .map_err(|source| CliError::internal(format!("failed to flush stdout: {source}")))
     }
 
     fn stderr(&mut self, payload: &[u8]) -> Result<(), CliError> {
-        std::io::stderr()
+        let mut stderr = std::io::stderr();
+        stderr
             .write_all(payload)
-            .map_err(|source| CliError::internal(format!("failed to write stderr: {source}")))
+            .map_err(|source| CliError::internal(format!("failed to write stderr: {source}")))?;
+        stderr
+            .flush()
+            .map_err(|source| CliError::internal(format!("failed to flush stderr: {source}")))
     }
 }
 
@@ -409,6 +471,7 @@ async fn websocket_stream_with_writers<W>(
     io: WebsocketIo,
     routing: OutputRouting,
     writers: &mut W,
+    ready: Option<oneshot::Sender<Result<(), CliError>>>,
 ) -> Result<WebsocketStreamOutput, CliError>
 where
     W: StreamWriters,
@@ -430,16 +493,49 @@ where
     })?;
 
     let response = read_http_response(&mut stream).await?;
-    validate_websocket_handshake(&response, &key)?;
-
-    if let Some(stdin) = io.stdin {
-        write_websocket_channel_frame(&mut stream, WS_CHANNEL_STDIN, &stdin).await?;
-        write_websocket_channel_frame(&mut stream, WS_CHANNEL_STDIN, &[]).await?;
+    if let Err(error) = validate_websocket_handshake(&response, &key) {
+        if let Some(ready) = ready {
+            let _ = ready.send(Err(CliError::internal(error.to_string())));
+        }
+        return Err(error);
+    }
+    let (reader, writer) = stream.into_split();
+    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+    if let Some(size) = io.initial_size {
+        let resize_result = {
+            let mut writer = writer.lock().await;
+            write_resize_frame(&mut *writer, size).await
+        };
+        match resize_result {
+            Ok(()) => {
+                if let Some(ready) = ready {
+                    let _ = ready.send(Ok(()));
+                }
+            }
+            Err(error) => {
+                if let Some(ready) = ready {
+                    let _ = ready.send(Err(CliError::internal(error.to_string())));
+                }
+                return Err(error);
+            }
+        }
+    } else if let Some(ready) = ready {
+        let _ = ready.send(Ok(()));
     }
 
+    let mut tasks = Vec::new();
+    start_stdin_pump(io.stdin, std::sync::Arc::clone(&writer), &mut tasks);
+    start_resize_pump(
+        None,
+        io.resize_events,
+        std::sync::Arc::clone(&writer),
+        &mut tasks,
+    );
+
     let mut output = WebsocketStreamOutput::default();
+    let mut reader = reader;
     loop {
-        let Some(frame) = read_websocket_frame(&mut stream).await? else {
+        let Some(frame) = read_websocket_frame(&mut reader).await? else {
             break;
         };
         match frame.opcode {
@@ -448,13 +544,105 @@ where
             }
             WS_CLOSE_OPCODE => break,
             WS_PING_OPCODE => {
-                write_websocket_frame(&mut stream, WS_PONG_OPCODE, &frame.payload, true).await?;
+                write_websocket_frame(
+                    &mut *writer.lock().await,
+                    WS_PONG_OPCODE,
+                    &frame.payload,
+                    true,
+                )
+                .await?;
             }
             _ => {}
         }
     }
 
+    for task in tasks {
+        task.abort();
+    }
+
     Ok(output)
+}
+
+fn start_stdin_pump(
+    stdin: WebsocketStdin,
+    writer: std::sync::Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    match stdin {
+        WebsocketStdin::Disabled => {}
+        WebsocketStdin::Buffered(payload) => {
+            tasks.push(tokio::spawn(async move {
+                let mut writer = writer.lock().await;
+                let _ =
+                    write_websocket_channel_frame(&mut *writer, WS_CHANNEL_STDIN, &payload).await;
+                let _ = write_websocket_channel_frame(&mut *writer, WS_CHANNEL_STDIN, &[]).await;
+            }));
+        }
+        WebsocketStdin::Local => {
+            tasks.push(tokio::spawn(async move {
+                let mut stdin = tokio::io::stdin();
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let n = match stdin.read(&mut buffer).await {
+                        Ok(0) => {
+                            let mut writer = writer.lock().await;
+                            let _ =
+                                write_websocket_channel_frame(&mut *writer, WS_CHANNEL_STDIN, &[])
+                                    .await;
+                            break;
+                        }
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    let mut writer = writer.lock().await;
+                    if write_websocket_channel_frame(&mut *writer, WS_CHANNEL_STDIN, &buffer[..n])
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+}
+
+fn start_resize_pump(
+    initial_size: Option<TerminalSize>,
+    resize_events: Option<mpsc::Receiver<TerminalSize>>,
+    writer: std::sync::Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    if initial_size.is_none() && resize_events.is_none() {
+        return;
+    }
+
+    tasks.push(tokio::spawn(async move {
+        if let Some(size) = initial_size {
+            let mut writer = writer.lock().await;
+            if write_resize_frame(&mut *writer, size).await.is_err() {
+                return;
+            }
+        }
+
+        let Some(mut resize_events) = resize_events else {
+            return;
+        };
+        while let Some(size) = resize_events.recv().await {
+            let mut writer = writer.lock().await;
+            if write_resize_frame(&mut *writer, size).await.is_err() {
+                break;
+            }
+        }
+    }));
+}
+
+async fn write_resize_frame<W>(writer: &mut W, size: TerminalSize) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let payload = format!(r#"{{"width":{},"height":{}}}"#, size.width, size.height);
+    write_websocket_channel_frame(writer, WS_CHANNEL_RESIZE, payload.as_bytes()).await
 }
 
 async fn write_websocket_channel_frame<W>(
@@ -732,18 +920,6 @@ fn apply_remotecommand_frame(
         _ => {}
     }
     Ok(())
-}
-
-fn local_stdin_payload(enabled: bool) -> Result<Option<Vec<u8>>, CliError> {
-    if !enabled {
-        return Ok(None);
-    }
-
-    let mut payload = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut payload)
-        .map_err(|source| CliError::internal(format!("failed to read stdin: {source}")))?;
-    Ok(Some(payload))
 }
 
 fn parse_remote_exit_code(payload: &[u8]) -> Option<i32> {
@@ -1340,13 +1516,16 @@ mod tests {
         let output = websocket_stream_with_writers(
             &format!("ws://{addr}/exec/token"),
             WebsocketIo {
-                stdin: Some(b"input".to_vec()),
+                stdin: WebsocketStdin::Buffered(b"input".to_vec()),
+                initial_size: None,
+                resize_events: None,
             },
             OutputRouting {
                 stdout: true,
                 stderr: true,
             },
             &mut writers,
+            None,
         )
         .await
         .expect("websocket stream should complete");
@@ -1357,6 +1536,107 @@ mod tests {
         assert_eq!(output.stderr, b"err".to_vec());
         assert_eq!(writers.stdout, b"ok".to_vec());
         assert_eq!(writers.stderr, b"err".to_vec());
+    }
+
+    #[tokio::test]
+    async fn websocket_stream_sends_resize_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr should exist");
+        let (resize_sender, resize_receiver) = mpsc::channel(1);
+        resize_sender
+            .send(TerminalSize {
+                width: 120,
+                height: 40,
+            })
+            .await
+            .expect("resize event should send");
+        drop(resize_sender);
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let received_for_server = Arc::clone(&received);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("client should connect");
+            let mut stream = BufReader::new(stream);
+            let mut request_headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                stream
+                    .read_line(&mut line)
+                    .await
+                    .expect("request line should read");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request_headers.push(line);
+            }
+            let key = request_headers
+                .iter()
+                .find_map(|line| {
+                    line.strip_prefix("Sec-WebSocket-Key:")
+                        .map(|value| value.trim().to_string())
+                })
+                .expect("client should send websocket key");
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {}\r\nSec-WebSocket-Protocol: v4.channel.k8s.io\r\n\r\n",
+                websocket_accept_value(&key)
+            );
+            let mut stream = stream.into_inner();
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("handshake response should write");
+
+            let first = read_websocket_frame(&mut stream)
+                .await
+                .expect("initial resize frame should read")
+                .expect("initial resize frame should exist");
+            let second = read_websocket_frame(&mut stream)
+                .await
+                .expect("resize event frame should read")
+                .expect("resize event frame should exist");
+            *received_for_server.lock().await = vec![first.payload, second.payload];
+            write_websocket_frame(&mut stream, WS_CLOSE_OPCODE, &[], false)
+                .await
+                .expect("close should write");
+        });
+
+        let mut writers = MemoryStreamWriters::default();
+        websocket_stream_with_writers(
+            &format!("ws://{addr}/attach/token"),
+            WebsocketIo {
+                stdin: WebsocketStdin::Disabled,
+                initial_size: Some(TerminalSize {
+                    width: 80,
+                    height: 24,
+                }),
+                resize_events: Some(resize_receiver),
+            },
+            OutputRouting {
+                stdout: true,
+                stderr: true,
+            },
+            &mut writers,
+            None,
+        )
+        .await
+        .expect("websocket stream should complete");
+
+        server.await.expect("server task should finish");
+        let frames = received.lock().await;
+        assert_eq!(frames[0][0], WS_CHANNEL_RESIZE);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&frames[0][1..])
+                .expect("initial resize json should parse"),
+            serde_json::json!({ "width": 80, "height": 24 })
+        );
+        assert_eq!(frames[1][0], WS_CHANNEL_RESIZE);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&frames[1][1..])
+                .expect("event resize json should parse"),
+            serde_json::json!({ "width": 120, "height": 40 })
+        );
     }
 
     #[tokio::test]
@@ -1405,12 +1685,13 @@ mod tests {
         let mut writers = MemoryStreamWriters::default();
         let output = websocket_stream_with_writers(
             &format!("ws://{addr}/attach/token"),
-            WebsocketIo { stdin: None },
+            WebsocketIo::default(),
             OutputRouting {
                 stdout: true,
                 stderr: true,
             },
             &mut writers,
+            None,
         )
         .await
         .expect("websocket stream should complete");
@@ -1471,12 +1752,13 @@ mod tests {
         let mut writers = MemoryStreamWriters::default();
         let output = websocket_stream_with_writers(
             &format!("ws://{addr}/exec/token"),
-            WebsocketIo { stdin: None },
+            WebsocketIo::default(),
             OutputRouting {
                 stdout: true,
                 stderr: true,
             },
             &mut writers,
+            None,
         )
         .await
         .expect("websocket stream should complete");

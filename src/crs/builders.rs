@@ -135,15 +135,9 @@ fn build_container_config_from_parts(
     }
 
     let metadata = ContainerMetadata {
-        name: options
-            .name
-            .clone()
-            .unwrap_or_else(|| default_container_name(image)),
+        name: options.name.clone().unwrap_or_default(),
         attempt: options.attempt.unwrap_or_default(),
     };
-    if metadata.name.is_empty() {
-        return Err("container name must not be empty".into());
-    }
 
     let (command, args) = container_command_and_args(options, positional_command);
     let linux = LinuxContainerConfig {
@@ -187,22 +181,6 @@ fn build_container_config_from_parts(
             .map(|name| CdiDevice { name })
             .collect(),
     })
-}
-
-fn default_container_name(image: &str) -> String {
-    image
-        .rsplit(['/', ':', '@'])
-        .find(|part| !part.is_empty())
-        .unwrap_or("container")
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect()
 }
 
 fn container_command_and_args(
@@ -862,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_container_default_name_from_image() {
+    fn omits_container_default_name_for_daemon_generation() {
         let args = ContainerCreateArgs {
             pod: "pod1".into(),
             image: "registry.example.com/ns/app@sha256:abcd".into(),
@@ -872,7 +850,7 @@ mod tests {
 
         let config = build_container_config(&args).unwrap();
 
-        assert_eq!(config.metadata.unwrap().name, "abcd");
+        assert_eq!(config.metadata.unwrap().name, "");
     }
 
     #[test]

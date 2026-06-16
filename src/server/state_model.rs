@@ -572,6 +572,7 @@ pub(super) struct StoredContainerState {
     pub(super) readonly_rootfs: bool,
     pub(super) cgroup_parent: Option<String>,
     pub(super) network_namespace_path: Option<String>,
+    pub(super) local_network: Option<StoredLocalContainerNetwork>,
     pub(super) linux_resources: Option<StoredLinuxResources>,
     pub(super) mounts: Vec<StoredMount>,
     pub(super) run_as_user: Option<String>,
@@ -589,6 +590,16 @@ pub(super) struct StoredContainerState {
     pub(super) nri_stop_notified: bool,
     pub(super) nri_remove_notified: bool,
     pub(super) broken: Option<StoredBrokenState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct StoredLocalContainerNetwork {
+    pub(super) netns_name: String,
+    pub(super) pod_name: String,
+    pub(super) pod_namespace: String,
+    pub(super) pod_uid: String,
+    pub(super) runtime_handler: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

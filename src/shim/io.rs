@@ -29,6 +29,7 @@ const CRI_LOG_TAG_PARTIAL: &str = "P";
 // into `P` / `F` records at the same boundary `crictl logs` expects.
 const DEFAULT_CRI_LOG_LINE_BUFFER_SIZE: usize = 4096;
 pub const DEFAULT_JOURNALD_SOCKET_PATH: &str = "/run/systemd/journal/socket";
+const MAX_PENDING_ATTACH_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Default)]
 struct PendingLogBytes {
@@ -102,6 +103,8 @@ pub struct IoManager {
     log_file: Arc<Mutex<Option<File>>>,
     /// 尚未形成完整 CRI 记录的 stdout/stderr 缓冲
     pending_logs: Arc<Mutex<PendingLogBytes>>,
+    /// Output produced before the first attach client is accepted.
+    pending_attach_output: Arc<Mutex<Vec<u8>>>,
     /// 当前TTY控制台文件，用于resize
     console_file: Arc<Mutex<Option<File>>>,
     /// attach/resize/reopen listener 生命周期
@@ -415,6 +418,11 @@ impl IoManager {
                 .collect()
         };
 
+        if streams.is_empty() {
+            self.buffer_pending_attach_output(data);
+            return Ok(());
+        }
+
         let mut disconnected = Vec::new();
         for (id, mut stream) in streams {
             if let Err(e) = stream.write_all(data) {
@@ -425,6 +433,22 @@ impl IoManager {
 
         self.remove_clients(&disconnected);
         Ok(())
+    }
+
+    fn buffer_pending_attach_output(&self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let mut pending = self.pending_attach_output.lock().unwrap();
+        pending.extend_from_slice(data);
+        if pending.len() > MAX_PENDING_ATTACH_BYTES {
+            let overflow = pending.len() - MAX_PENDING_ATTACH_BYTES;
+            pending.drain(..overflow);
+        }
+    }
+
+    fn take_pending_attach_output(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.pending_attach_output.lock().unwrap())
     }
 
     fn broadcast_output(&self, pipe: u8, data: &[u8]) -> Result<()> {
@@ -450,6 +474,7 @@ impl IoManager {
             clients: Arc::new(Mutex::new(Vec::new())),
             log_file: Arc::new(Mutex::new(None)),
             pending_logs: Arc::new(Mutex::new(PendingLogBytes::default())),
+            pending_attach_output: Arc::new(Mutex::new(Vec::new())),
             console_file: Arc::new(Mutex::new(None)),
             server_threads: Arc::new(Mutex::new(Vec::new())),
         }
@@ -490,6 +515,7 @@ impl IoManager {
             listener.set_nonblocking(true)?;
             info!("Attach server listening on {:?}", socket);
 
+            let io_manager = self.clone();
             let clients = self.clients.clone();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_for_thread = stop.clone();
@@ -500,7 +526,23 @@ impl IoManager {
                         Ok((stream, _addr)) => {
                             let id = next_id;
                             next_id += 1;
+                            if let Err(err) = stream.set_nonblocking(true) {
+                                debug!("Failed to set attach client {} nonblocking: {}", id, err);
+                                continue;
+                            }
                             debug!("New attach client connected: {}", id);
+                            let pending = io_manager.take_pending_attach_output();
+                            if !pending.is_empty() {
+                                if let Err(err) = stream
+                                    .try_clone()
+                                    .and_then(|mut stream| stream.write_all(&pending))
+                                {
+                                    debug!(
+                                        "Failed to flush pending attach output to client {}: {}",
+                                        id, err
+                                    );
+                                }
+                            }
                             let mut clients = clients.lock().unwrap();
                             clients.push(ClientConnection { id, stream });
                         }
@@ -749,6 +791,8 @@ impl IoManager {
             match stream.read(&mut buffer) {
                 Ok(n) if n > 0 => return Ok(buffer[..n].to_vec()),
                 Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
                     debug!("Client {} disconnected: {}", id, e);
                     self.remove_clients(&[id]);
@@ -911,6 +955,23 @@ mod tests {
         } else {
             (current_uid, current_gid)
         }
+    }
+
+    #[test]
+    fn read_stdin_keeps_nonblocking_client_without_input() {
+        let manager = IoManager::new();
+        let (client, server) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        manager.clients.lock().unwrap().push(ClientConnection {
+            id: 1,
+            stream: server,
+        });
+
+        assert_eq!(manager.read_stdin().unwrap(), Vec::<u8>::new());
+        assert_eq!(manager.clients.lock().unwrap().len(), 1);
+
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        let _ = manager.read_stdin();
     }
 
     #[test]
