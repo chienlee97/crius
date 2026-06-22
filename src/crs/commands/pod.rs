@@ -3,7 +3,10 @@ use crate::crs::{
     args::{PodCommand, PodCreateArgs, PodListArgs, PodStateArg, PodStatsArgs},
     builders::{build_pod_sandbox_config, build_resources_from_specs},
     client::CrsClient,
-    commands::status::{parse_info_map, render_and_print},
+    commands::{
+        port_forward,
+        status::{parse_info_map, render_and_print},
+    },
     context::CliContext,
     error::{CliError, CommandResult},
     format::{CommandOutput, InspectView, PodMetricsView, PodOperationView, PodStatsView, PodView},
@@ -35,7 +38,9 @@ pub(crate) async fn handle(
             overhead,
             pod_resource,
         } => handle_update_resources(ctx, client, pod, overhead, pod_resource).await,
-        PodCommand::PortForward { .. } => Err(CliError::not_implemented("crs pod port-forward")),
+        PodCommand::PortForward { pod, forward } => {
+            port_forward::handle(ctx, client, pod, forward).await
+        }
     }
 }
 
