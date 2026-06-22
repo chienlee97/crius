@@ -184,8 +184,12 @@ pub fn resolve_devices(input: DeviceResolverInput<'_>) -> Result<ResolvedDeviceS
         {
             cgroup_rules = vec![allow_all_devices_rule()];
         }
-    } else if cgroup_rules.is_empty() {
-        cgroup_rules = vec![allow_all_devices_rule()];
+    } else if input.existing_cgroup_rules.is_empty() {
+        if input.requested_devices.is_empty() && input.additional_devices.is_empty() {
+            cgroup_rules = vec![allow_all_devices_rule()];
+        } else {
+            append_default_device_cgroup_rules(&devices, &mut cgroup_rules);
+        }
     }
 
     let mut degraded_reasons = Vec::new();
@@ -199,6 +203,34 @@ pub fn resolve_devices(input: DeviceResolverInput<'_>) -> Result<ResolvedDeviceS
         cgroup_rules,
         degraded_reasons,
     })
+}
+
+fn append_default_device_cgroup_rules(
+    devices: &[OciDevice],
+    cgroup_rules: &mut Vec<LinuxDeviceCgroup>,
+) {
+    for device in devices {
+        let (Some(major), Some(minor)) = (device.major, device.minor) else {
+            continue;
+        };
+        let access = "rwm".to_string();
+        if cgroup_rules.iter().any(|rule| {
+            rule.allow
+                && rule.device_type.as_deref() == Some(device.device_type.as_str())
+                && rule.major == Some(major)
+                && rule.minor == Some(minor)
+                && rule.access.as_deref() == Some(access.as_str())
+        }) {
+            continue;
+        }
+        cgroup_rules.push(LinuxDeviceCgroup {
+            allow: true,
+            device_type: Some(device.device_type.clone()),
+            major: Some(major),
+            minor: Some(minor),
+            access: Some(access),
+        });
+    }
 }
 
 fn validate_rootless_requests(input: &DeviceResolverInput<'_>) -> Result<()> {
@@ -387,6 +419,44 @@ mod tests {
             .any(|device| device.path == "/dev/null"));
         assert_all_devices_allowed(&resolved.cgroup_rules);
         assert!(resolved.degraded_reasons.is_empty());
+    }
+
+    #[test]
+    fn resolver_allows_default_devices_when_explicit_device_is_requested() {
+        let allowed = HashSet::new();
+        let requested = vec![DeviceMapping {
+            source: PathBuf::from("/dev/zero"),
+            destination: PathBuf::from("/dev/test-zero"),
+            permissions: "r".to_string(),
+        }];
+        let resolved = resolve_devices(DeviceResolverInput {
+            privileged: false,
+            tty: false,
+            requested_devices: &requested,
+            additional_devices: &[],
+            existing_cgroup_rules: &[],
+            allowed_devices: &allowed,
+            device_ownership_from_security_context: false,
+            user: None,
+            run_as_group: None,
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            rootless: false,
+        })
+        .expect("explicit device resolution should preserve default device access");
+
+        assert!(resolved.cgroup_rules.iter().any(|rule| {
+            rule.device_type.as_deref() == Some("c")
+                && rule.major == Some(1)
+                && rule.minor == Some(3)
+                && rule.access.as_deref() == Some("rwm")
+        }));
+        assert!(resolved.cgroup_rules.iter().any(|rule| {
+            rule.device_type.as_deref() == Some("c")
+                && rule.major == Some(1)
+                && rule.minor == Some(5)
+                && rule.access.as_deref() == Some("r")
+        }));
     }
 
     #[test]
