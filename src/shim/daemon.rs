@@ -943,11 +943,7 @@ impl Daemon {
         let slave_fd = slave_stderr.as_raw_fd();
 
         let mut command = self.runtime_command();
-        command
-            .arg("exec")
-            .arg("-i")
-            .arg("-t")
-            .arg(&request.container_id);
+        command.arg("exec").arg("-t").arg(&request.container_id);
         for arg in &request.command {
             command.arg(arg);
         }
