@@ -742,16 +742,33 @@ pub(crate) struct InspectView {
 
 impl TableRow for InspectView {
     fn headers() -> &'static [&'static str] {
-        &["TYPE", "ID"]
+        &["TYPE", "ID", "NAME", "STATE", "IMAGE"]
     }
 
     fn cells(&self) -> Vec<String> {
-        vec![self.object_type.clone(), self.id.clone()]
+        let status = self.response.get("status");
+        vec![
+            self.object_type.clone(),
+            self.id.clone(),
+            string_pointer(status, &["/metadata/name"]).unwrap_or_default(),
+            string_pointer(status, &["/state"]).unwrap_or_default(),
+            string_pointer(status, &["/image/image", "/imageRef"]).unwrap_or_default(),
+        ]
     }
 
     fn quiet_cell(&self) -> String {
         self.id.clone()
     }
+}
+
+fn string_pointer(value: Option<&Value>, paths: &[&str]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        value
+            .and_then(|value| value.pointer(path))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1396,6 +1413,30 @@ busybox                                    <none>    68c2fc315e0d  1.0KiB"
         assert_eq!(
             print_quiet(&rows, false),
             "cr.kylinos.cn/kylin/kylin-server-platform:v11...\nbusybox@sha256:abcdef"
+        );
+    }
+
+    #[test]
+    fn inspect_view_table_includes_common_status_fields() {
+        let rows = vec![InspectView {
+            object_type: "container".into(),
+            id: "containerabcdefghijklmnopqrstuvwxyz".into(),
+            response: json!({
+                "status": {
+                    "metadata": { "name": "demo" },
+                    "state": "running",
+                    "image": { "image": "busybox:latest" },
+                    "imageRef": "sha256:abc",
+                }
+            }),
+            info_json: json!({}),
+            info_raw: json!({}),
+        }];
+
+        assert_eq!(
+            print_table(&rows, false),
+            "TYPE       ID                                   NAME  STATE    IMAGE\n\
+container  containerabcdefghijklmnopqrstuvwxyz  demo  running  busybox:latest"
         );
     }
 
