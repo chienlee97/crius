@@ -113,6 +113,13 @@ async fn debug_runtime(ctx: &CliContext, client: &CrsClient) -> Result<CommandRe
     let mut warnings = Vec::new();
     let version = version_json(client, "crs debug runtime").await?;
     let config = runtime_config_json(client, "crs debug runtime").await?;
+    let (status_info, _) = verbose_status(client, "crs debug runtime", &mut warnings).await?;
+    let runtime_backend = runtime_backend_from_status(&status_info)
+        .cloned()
+        .unwrap_or_else(|| {
+            warnings.push("verbose status info did not include runtimeBackend".to_string());
+            serde_json::Value::Null
+        });
     let handlers = match runtime::load_handlers_from_status_for_debug(client, &mut warnings).await {
         Ok(handlers) => handlers,
         Err(error) => {
@@ -123,6 +130,7 @@ async fn debug_runtime(ctx: &CliContext, client: &CrsClient) -> Result<CommandRe
     let details = serde_json::json!({
         "version": version,
         "runtimeConfig": config,
+        "runtimeBackend": runtime_backend,
         "handlers": handlers,
     });
     render_debug(
@@ -137,6 +145,14 @@ async fn debug_runtime(ctx: &CliContext, client: &CrsClient) -> Result<CommandRe
             warnings,
         },
     )
+}
+
+fn runtime_backend_from_status(status_info: &serde_json::Value) -> Option<&serde_json::Value> {
+    status_info
+        .pointer("/runtimeBackend")
+        .or_else(|| status_info.pointer("/config/runtimeBackend"))
+        .or_else(|| status_info.pointer("/config/internalServices/introspection/runtimeBackend"))
+        .or_else(|| status_info.pointer("/internalServices/introspection/runtimeBackend"))
 }
 
 async fn debug_shims(ctx: &CliContext, client: &CrsClient) -> Result<CommandResult, CliError> {

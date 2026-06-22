@@ -186,7 +186,7 @@ async fn load_handlers_from_status(
         .await?
         .into_inner();
     let (info_json, _) = parse_info_map(&response.info, warnings);
-    let Some(runtime_backend) = info_json.get("runtimeBackend") else {
+    let Some(runtime_backend) = runtime_backend_from_status(&info_json) else {
         warnings.push("verbose status info did not include runtimeBackend".to_string());
         return Ok(Vec::new());
     };
@@ -199,6 +199,14 @@ pub(crate) async fn load_handlers_from_status_for_debug(
     warnings: &mut Vec<String>,
 ) -> Result<Vec<RuntimeHandlerView>, CliError> {
     load_handlers_from_status(client, warnings).await
+}
+
+fn runtime_backend_from_status(info_json: &serde_json::Value) -> Option<&serde_json::Value> {
+    info_json
+        .pointer("/runtimeBackend")
+        .or_else(|| info_json.pointer("/config/runtimeBackend"))
+        .or_else(|| info_json.pointer("/config/internalServices/introspection/runtimeBackend"))
+        .or_else(|| info_json.pointer("/internalServices/introspection/runtimeBackend"))
 }
 
 fn runtime_backend_views(value: &serde_json::Value) -> Vec<RuntimeHandlerView> {

@@ -1055,6 +1055,20 @@ impl RuntimeService for MockRuntimeService {
                                 "lastReloadError": null,
                                 "lastCniWatchError": "template pending"
                             },
+                            "internalServices": {
+                                "introspection": {
+                                    "runtimeBackend": {
+                                        "defaultHandler": "runc",
+                                        "handlers": {
+                                            "runc": {
+                                                "runtimeType": "io.containerd.runc.v2",
+                                                "runtimePath": "/usr/bin/runc",
+                                                "runtimeConfigPath": ""
+                                            }
+                                        }
+                                    }
+                                }
+                            },
                             "networkDiagnostics": {
                                 "ready": false,
                                 "reason": "CniNotReady",
@@ -1965,6 +1979,34 @@ async fn config_commands_use_diagnostics_effective_config_and_redact_sensitive_f
     assert_eq!(value["items"][0]["watcher"], "running");
     assert_eq!(value["items"][0]["cniWatcher"], "template pending");
     assert_eq!(config_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_runtime_reads_nested_runtime_backend_from_verbose_status() {
+    let endpoint = spawn_mock_services(MockState::default()).await;
+
+    let output = run_crs(endpoint, ["--output", "json", "debug", "runtime"]);
+
+    assert_success(&output);
+    let stdout = stdout_json(&output);
+    assert_eq!(stdout["kind"], "DebugRuntime");
+    assert_eq!(
+        stdout["summary"]["runtimeBackend"]["defaultHandler"],
+        "runc"
+    );
+    assert_eq!(
+        stdout["summary"]["runtimeBackend"]["handlers"]["runc"]["runtimePath"],
+        "/usr/bin/runc"
+    );
+    assert!(!stdout["warnings"]
+        .as_array()
+        .map(|warnings| warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .unwrap_or_default()
+                .contains("runtimeBackend")
+        }))
+        .unwrap_or(false));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
