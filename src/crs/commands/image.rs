@@ -145,6 +145,38 @@ pub(crate) async fn handle_remove_with_command(
     }
 
     let mut image_client = client.image()?;
+    let exists = client
+        .with_rpc_timeout(async {
+            image_client
+                .image_status(ImageStatusRequest {
+                    image: Some(ImageSpec {
+                        image: image.clone(),
+                        user_specified_image: image.clone(),
+                        ..Default::default()
+                    }),
+                    verbose: false,
+                })
+                .await
+                .map(|response| response.into_inner().image.is_some())
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command(command_name)
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("image {image}"))
+                })
+        })
+        .await?;
+    if !exists {
+        return Err(
+            CliError::from_tonic_status(tonic::Status::not_found(format!(
+                "image {image} not found"
+            )))
+            .with_command(command_name)
+            .with_endpoint(client.endpoint())
+            .with_object(format!("image {image}")),
+        );
+    }
+
     client
         .with_rpc_timeout(async {
             image_client
