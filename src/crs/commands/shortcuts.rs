@@ -83,9 +83,22 @@ pub(crate) async fn handle_stop(
 ) -> Result<CommandResult, CliError> {
     match args.object_type {
         Some(StopObjectType::Container) => {
+            if !container_exists(client, &args.target, "crs stop").await? {
+                return Err(not_found_error(
+                    client,
+                    "crs stop",
+                    "container",
+                    &args.target,
+                ));
+            }
             container::handle_stop(ctx, client, args.target, args.timeout).await
         }
-        Some(StopObjectType::Pod) => pod::handle_stop(ctx, client, args.target, args.timeout).await,
+        Some(StopObjectType::Pod) => {
+            if !pod_exists(client, &args.target, "crs stop").await? {
+                return Err(not_found_error(client, "crs stop", "pod", &args.target));
+            }
+            pod::handle_stop(ctx, client, args.target, args.timeout).await
+        }
         None => match resolve_stop_target(client, &args.target).await? {
             StopCandidate::Container => {
                 container::handle_stop(ctx, client, args.target, args.timeout).await
@@ -152,7 +165,7 @@ async fn resolve_container_remove_target(
 
     match matches.as_slice() {
         [id] => Ok(id.clone()),
-        [] => Ok(target.to_string()),
+        [] => Err(not_found_error(client, "crs rm", "container", target)),
         [_, ..] => Err(CliError::invalid_input(format!(
             "container target {target} is ambiguous; retry with the full container ID"
         ))
@@ -172,11 +185,12 @@ async fn resolve_stop_target(client: &CrsClient, target: &str) -> Result<StopCan
 
     match candidates.as_slice() {
         [candidate] => Ok(*candidate),
-        [] => Err(CliError::invalid_input(format!(
-            "target {target} did not match a container or pod; use --type container|pod with a valid ID"
-        ))
-        .with_command("crs stop")
-        .with_object(target.to_string())),
+        [] => Err(not_found_error(
+            client,
+            "crs stop",
+            "container or pod",
+            target,
+        )),
         [_, ..] => Err(CliError::invalid_input(format!(
             "target {target} is ambiguous; specify --type container|pod"
         ))
@@ -310,4 +324,18 @@ fn candidate_error(
         .with_command(command_name)
         .with_endpoint(client.endpoint())
         .with_object(format!("{object_type} {target}"))
+}
+
+fn not_found_error(
+    client: &CrsClient,
+    command_name: &'static str,
+    object_type: &'static str,
+    target: &str,
+) -> CliError {
+    CliError::from_tonic_status(tonic::Status::not_found(format!(
+        "{object_type} {target} not found"
+    )))
+    .with_command(command_name)
+    .with_endpoint(client.endpoint())
+    .with_object(format!("{object_type} {target}"))
 }
