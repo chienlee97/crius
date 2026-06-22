@@ -1428,6 +1428,41 @@ impl ImageServiceImpl {
         Ok(None)
     }
 
+    fn matching_non_artifact_image(root: &Path, requested_ref: &str) -> Result<bool, Status> {
+        let images_dir = FilesystemImageMetadataStore::image_records_dir(root);
+        if !images_dir.exists() {
+            return Ok(false);
+        }
+
+        for entry in std::fs::read_dir(&images_dir).map_err(|err| {
+            Status::internal(format!(
+                "failed to read image records directory {}: {}",
+                images_dir.display(),
+                err
+            ))
+        })? {
+            let entry = entry.map_err(|err| {
+                Status::internal(format!(
+                    "failed to read image record entry in {}: {}",
+                    images_dir.display(),
+                    err
+                ))
+            })?;
+            let Some(meta) = Self::load_meta_from_record_dir(&entry.path()) else {
+                continue;
+            };
+            if Self::is_artifact_meta(&meta) {
+                continue;
+            }
+            let image = Self::image_from_meta(&meta);
+            if Self::image_matches_ref(&image, requested_ref) {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     fn normalize_artifact_sub_path(raw: Option<&str>) -> Result<Option<PathBuf>, Status> {
         let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(None);
@@ -1467,6 +1502,12 @@ impl ImageServiceImpl {
         for root in search_roots {
             let Some((meta, record_dir)) = Self::artifact_mount_candidates(root, requested_ref)?
             else {
+                if Self::matching_non_artifact_image(root, requested_ref)? {
+                    return Err(Status::failed_precondition(format!(
+                        "image mount {} refers to a regular container image, not an OCI artifact; type=image mounts require an OCI artifact with mountable blobs",
+                        requested_ref
+                    )));
+                }
                 continue;
             };
             let mut mounts = Vec::new();

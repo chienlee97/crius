@@ -118,6 +118,75 @@ fn runtime_mounts_from_proto_rejects_oci_artifact_file_target() {
 }
 
 #[test]
+fn runtime_mounts_from_proto_explains_regular_image_mounts() {
+    let (dir, service) = test_service_with_fake_runtime();
+    let image_dir = service
+        .config
+        .image_root
+        .join("images")
+        .join("sha256:test-image");
+    fs::create_dir_all(&image_dir).unwrap();
+    fs::write(
+        image_dir.join("metadata.json"),
+        serde_json::to_vec(&crate::image::CriusImage {
+            id: "sha256:test-image".to_string(),
+            repo_tags: vec!["registry.example.com/app:latest".to_string()],
+            repo_digests: vec!["registry.example.com/app@sha256:test-image".to_string()],
+            size: 14,
+            pinned: false,
+            pulled_at: 0,
+            source_reference: None,
+            os: Some("linux".to_string()),
+            architecture: Some("amd64".to_string()),
+            config_user: None,
+            config_env: Vec::new(),
+            config_entrypoint: Vec::new(),
+            config_cmd: Vec::new(),
+            config_working_dir: None,
+            annotations: HashMap::new(),
+            declared_volumes: Vec::new(),
+            manifest_media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),
+            selected_manifest_digest: None,
+            selected_platform: None,
+            stored_layers: Vec::new(),
+            artifact_type: None,
+            artifact_blobs: Vec::new(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let err = service
+        .runtime_mounts_from_proto(
+            &[crate::proto::runtime::v1::Mount {
+                container_path: "/root/image".to_string(),
+                host_path: String::new(),
+                readonly: false,
+                selinux_relabel: false,
+                propagation: crate::proto::runtime::v1::MountPropagation::PropagationPrivate as i32,
+                uid_mappings: Vec::new(),
+                gid_mappings: Vec::new(),
+                recursive_read_only: false,
+                image: Some(crate::proto::runtime::v1::ImageSpec {
+                    image: "registry.example.com/app:latest".to_string(),
+                    user_specified_image: "registry.example.com/app:latest".to_string(),
+                    runtime_handler: String::new(),
+                    annotations: HashMap::new(),
+                }),
+                image_sub_path: String::new(),
+            }],
+            true,
+        )
+        .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("regular container image"));
+    assert!(err.message().contains("OCI artifact"));
+
+    drop(dir);
+}
+
+#[test]
 fn runtime_mounts_from_proto_rejects_missing_host_path_for_bind_mount() {
     let (_dir, service) = test_service_with_fake_runtime();
     let err = service
