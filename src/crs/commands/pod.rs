@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::crs::{
     annotations::{LOCAL_NETWORK_DOMAIN, NETWORK_DOMAIN_ANNOTATION},
     args::{PodCommand, PodCreateArgs, PodListArgs, PodStateArg, PodStatsArgs},
@@ -158,20 +160,29 @@ pub(crate) async fn handle_run(
     let metadata = config.metadata.clone().unwrap_or_default();
     let runtime_handler = args.runtime_handler.clone().unwrap_or_default();
     let mut runtime = client.runtime()?;
+    let timeout = if client.rpc_timeout().is_zero() {
+        Duration::from_secs(300)
+    } else {
+        client.rpc_timeout()
+    };
     let response = client
-        .with_rpc_timeout(async {
-            runtime
-                .run_pod_sandbox(RunPodSandboxRequest {
-                    config: Some(config),
-                    runtime_handler,
-                })
-                .await
-                .map_err(|status| {
-                    CliError::from_tonic_status(status)
-                        .with_command("crs pod run")
-                        .with_endpoint(client.endpoint())
-                })
-        })
+        .with_timeout(
+            timeout,
+            format!("pod run timed out after {:?}", timeout),
+            async {
+                runtime
+                    .run_pod_sandbox(RunPodSandboxRequest {
+                        config: Some(config),
+                        runtime_handler,
+                    })
+                    .await
+                    .map_err(|status| {
+                        CliError::from_tonic_status(status)
+                            .with_command("crs pod run")
+                            .with_endpoint(client.endpoint())
+                    })
+            },
+        )
         .await?
         .into_inner();
 

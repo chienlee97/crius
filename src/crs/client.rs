@@ -137,6 +137,25 @@ impl CrsClient {
     }
 
     #[allow(dead_code)]
+    pub(crate) async fn with_timeout<F, T>(
+        &self,
+        timeout: Duration,
+        message: impl Into<String>,
+        future: F,
+    ) -> Result<T, CliError>
+    where
+        F: Future<Output = Result<T, CliError>>,
+    {
+        if timeout.is_zero() {
+            return future.await;
+        }
+
+        tokio::time::timeout(timeout, future)
+            .await
+            .map_err(|_| CliError::timeout(message.into(), self.endpoint()))?
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn diagnostics_unavailable(&self) -> CliError {
         CliError::diagnostics_unavailable(self.endpoint())
     }
@@ -220,6 +239,45 @@ mod tests {
             .expect_err("future should time out");
 
         assert_eq!(error.exit_status().code(), 124);
+    }
+
+    #[tokio::test]
+    async fn maps_custom_timeout_to_cli_error() {
+        let args =
+            Args::try_parse_from(["crs", "--timeout", "0s", "version"]).expect("args should parse");
+        let ctx = CliContext::from_args(&args).expect("context should build");
+        let client = CrsClient::new(&ctx);
+
+        let error = client
+            .with_timeout(
+                Duration::from_millis(1),
+                "custom operation timed out",
+                async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("future should time out");
+
+        assert_eq!(error.exit_status().code(), 124);
+        assert!(error.to_string().contains("custom operation timed out"));
+    }
+
+    #[tokio::test]
+    async fn zero_custom_timeout_waits_for_future() {
+        let args =
+            Args::try_parse_from(["crs", "--timeout", "0s", "version"]).expect("args should parse");
+        let ctx = CliContext::from_args(&args).expect("context should build");
+        let client = CrsClient::new(&ctx);
+
+        client
+            .with_timeout(Duration::ZERO, "custom operation timed out", async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(())
+            })
+            .await
+            .expect("zero timeout should not cancel the future");
     }
 
     #[tokio::test]
