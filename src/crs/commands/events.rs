@@ -31,13 +31,16 @@ pub(crate) async fn handle(
         .await?;
     let mut stream = response.into_inner();
     let mut printed_header = false;
+    let deadline =
+        (!ctx.rpc_timeout().is_zero()).then(|| tokio::time::Instant::now() + ctx.rpc_timeout());
 
     loop {
+        let next_event = stream.message();
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 return Err(CliError::interrupted().with_command("crs events"));
             }
-            event = stream.message() => {
+            event = next_event => {
                 let event = event.map_err(|status| {
                     CliError::from_tonic_status(status)
                         .with_command("crs events")
@@ -49,7 +52,20 @@ pub(crate) async fn handle(
                 let view = event_view(event);
                 print_event(ctx, &view, &mut printed_header)?;
             }
+            _ = sleep_until(deadline), if deadline.is_some() => {
+                return Err(CliError::timeout(
+                    format!("events timed out after {:?}", ctx.rpc_timeout()),
+                    client.endpoint(),
+                )
+                .with_command("crs events"));
+            }
         }
+    }
+}
+
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
     }
 }
 
