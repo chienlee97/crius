@@ -2535,6 +2535,11 @@ async fn shortcut_pull_reuses_image_pull_request_shape() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn image_remove_reports_removed_summary_and_quiet_value() {
     let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("busybox:latest".to_string());
     let remove_requests = Arc::clone(&state.remove_image_requests);
     let last_remove = Arc::clone(&state.last_remove_image);
     let endpoint = spawn_mock_services(state).await;
@@ -2569,7 +2574,13 @@ async fn image_remove_reports_removed_summary_and_quiet_value() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn image_write_errors_map_to_documented_exit_codes() {
-    let endpoint = spawn_mock_services(MockState::default()).await;
+    let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("used".to_string());
+    let endpoint = spawn_mock_services(state).await;
 
     let not_found = run_crs(endpoint, ["image", "remove", "missing"]);
     assert_eq!(not_found.status.code(), Some(4));
@@ -3919,12 +3930,17 @@ async fn shortcut_stop_resolves_unique_container_or_pod_target() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shortcut_rm_rmi_and_rmp_remove_fixed_object_types() {
     let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("image-only".to_string());
     let remove_container_requests = Arc::clone(&state.remove_container_requests);
     let remove_pod_requests = Arc::clone(&state.remove_pod_requests);
     let remove_image_requests = Arc::clone(&state.remove_image_requests);
     let endpoint = spawn_mock_services(state).await;
 
-    let container_rm = run_crs(endpoint, ["--output", "json", "rm", "ctr-only"]);
+    let container_rm = run_crs(endpoint, ["--output", "json", "rm", "v11-2503"]);
     assert_success(&container_rm);
     let container_rm_value = stdout_json(&container_rm);
     assert_eq!(container_rm_value["kind"], "ContainerRemove");
@@ -3970,6 +3986,11 @@ async fn shortcut_rm_resolves_container_name_before_removing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shortcut_rmi_removes_image_directly() {
     let state = MockState::default();
+    state
+        .existing_images
+        .lock()
+        .expect("existing images lock")
+        .insert("busybox:latest".to_string());
     let remove_image_requests = Arc::clone(&state.remove_image_requests);
     let last_remove = Arc::clone(&state.last_remove_image);
     let endpoint = spawn_mock_services(state).await;
