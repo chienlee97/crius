@@ -1049,6 +1049,12 @@ impl RuntimeService for MockRuntimeService {
                         "config".to_string(),
                         serde_json::json!({
                             "cgroupDriver": "systemd",
+                            "reload": {
+                                "watcherStatus": "running",
+                                "lastReloadAtUnixMillis": 1234,
+                                "lastReloadError": null,
+                                "lastCniWatchError": "template pending"
+                            },
                             "networkDiagnostics": {
                                 "ready": false,
                                 "reason": "CniNotReady",
@@ -1482,12 +1488,6 @@ impl DiagnosticsService for MockDiagnosticsService {
 
         Ok(Response::new(EffectiveConfigResponse {
             config_json: serde_json::json!({
-                "reload": {
-                    "watcherStatus": "running",
-                    "lastReloadAtUnixMillis": 1234,
-                    "lastReloadError": null,
-                    "lastCniWatchError": "template pending"
-                },
                 "image": {
                     "snapshotter": "internal-overlay-untar",
                     "signaturePolicy": "/etc/containers/policy.json",

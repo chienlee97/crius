@@ -57,7 +57,8 @@ async fn handle_reload_status(
             CliError::diagnostics_unavailable(client.endpoint())
                 .with_command("crs config reload-status")
         })?;
-    let view = reload_status_view(&config, &mut warnings);
+    let reload = load_reload_status(client, &config, &mut warnings).await;
+    let view = reload_status_view(&reload, &mut warnings);
 
     render_and_print(
         ctx,
@@ -70,6 +71,91 @@ async fn handle_reload_status(
             }))
             .with_warnings(warnings),
     )
+}
+
+async fn load_reload_status(
+    client: &CrsClient,
+    config: &serde_json::Value,
+    warnings: &mut Vec<String>,
+) -> serde_json::Value {
+    if let Some(reload) = config
+        .get("reload")
+        .filter(|reload| reload_has_status_fields(reload))
+    {
+        return reload.clone();
+    }
+
+    if let Some(reload) = verbose_status_reload(client, warnings).await {
+        return reload;
+    }
+
+    warnings
+        .push("reload status is missing from diagnostics config and verbose status".to_string());
+    if let Some(reload) = config.get("reload") {
+        return reload.clone();
+    }
+    serde_json::Value::Null
+}
+
+fn reload_has_status_fields(reload: &serde_json::Value) -> bool {
+    [
+        "watcherStatus",
+        "watcherActive",
+        "watcherBackoffCount",
+        "watcherNextRetryUnixMillis",
+        "watcherLastError",
+        "lastReloadAtUnixMillis",
+        "lastReloadSource",
+        "lastReloadFields",
+        "lastReloadError",
+        "lastCniWatchAtUnixMillis",
+        "lastCniWatchError",
+        "cniWatchDirs",
+    ]
+    .iter()
+    .any(|key| reload.get(*key).is_some())
+}
+
+async fn verbose_status_reload(
+    client: &CrsClient,
+    warnings: &mut Vec<String>,
+) -> Option<serde_json::Value> {
+    let mut runtime = match client.runtime() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to create runtime client for reload status fallback: {error}"
+            ));
+            return None;
+        }
+    };
+    let response = match client
+        .with_rpc_timeout(async {
+            runtime
+                .status(StatusRequest { verbose: true })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs config reload-status")
+                        .with_endpoint(client.endpoint())
+                })
+        })
+        .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(error) => {
+            warnings.push(format!(
+                "failed to read verbose status reload fallback: {error}"
+            ));
+            return None;
+        }
+    };
+
+    let (info_json, _) = parse_info_map(&response.info, warnings);
+    info_json
+        .pointer("/config/reload")
+        .or_else(|| info_json.pointer("/reload"))
+        .cloned()
 }
 
 pub(crate) async fn load_effective_config(
@@ -171,10 +257,9 @@ fn parse_config_json(
 }
 
 fn reload_status_view(
-    config: &serde_json::Value,
+    reload: &serde_json::Value,
     warnings: &mut Vec<String>,
 ) -> ConfigReloadStatusView {
-    let reload = config.get("reload").unwrap_or(config);
     ConfigReloadStatusView {
         watcher: field_string(
             reload,
@@ -184,19 +269,34 @@ fn reload_status_view(
         ),
         last_reload: field_string(
             reload,
-            &["lastReloadAtUnixMillis", "lastReload", "lastReloadSource"],
+            &[
+                "lastReloadAtUnixMillis",
+                "lastReload",
+                "lastReloadSource",
+                "lastReloadFields",
+            ],
             "last reload",
             warnings,
         ),
         last_error: field_string(
             reload,
-            &["lastReloadError", "watcherLastError", "error"],
+            &[
+                "lastReloadError",
+                "watcherLastError",
+                "lastCniWatchError",
+                "error",
+            ],
             "last error",
             warnings,
         ),
         cni_watcher: field_string(
             reload,
-            &["lastCniWatchError", "cniWatcher", "cniWatchDirs"],
+            &[
+                "lastCniWatchError",
+                "lastCniWatchAtUnixMillis",
+                "cniWatcher",
+                "cniWatchDirs",
+            ],
             "CNI watcher",
             warnings,
         ),
