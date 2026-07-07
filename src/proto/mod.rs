@@ -5,6 +5,18 @@ pub mod runtime {
     }
 }
 
+pub mod diagnostics {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/diagnostics.v1.rs"));
+    }
+}
+
+pub mod local {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/local.v1.rs"));
+    }
+}
+
 pub mod nri {
     include!(concat!(env!("OUT_DIR"), "/nri/mod.rs"));
 }

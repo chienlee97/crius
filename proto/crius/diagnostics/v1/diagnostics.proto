@@ -1,0 +1,158 @@
+syntax = "proto3";
+
+package diagnostics.v1;
+
+service DiagnosticsService {
+  rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+  rpc EffectiveConfig(EffectiveConfigRequest) returns (EffectiveConfigResponse);
+  rpc RuntimeHandlers(RuntimeHandlersRequest) returns (RuntimeHandlersResponse);
+  rpc ImageTransfers(ImageTransfersRequest) returns (ImageTransfersResponse);
+  rpc RecoveryStatus(RecoveryStatusRequest) returns (RecoveryStatusResponse);
+  rpc RecoveryCheck(RecoveryCheckRequest) returns (RecoveryCheckResponse);
+  rpc NriStatus(NriStatusRequest) returns (NriStatusResponse);
+  rpc SecurityStatus(SecurityStatusRequest) returns (SecurityStatusResponse);
+  rpc ShimStatus(ShimStatusRequest) returns (ShimStatusResponse);
+  rpc ContentGc(ContentGcRequest) returns (ContentGcResponse);
+  rpc ContainerLog(ContainerLogRequest) returns (stream ContainerLogChunk);
+}
+
+message ServerInfoRequest {}
+message ServerInfoResponse {
+  string version = 1;
+  string git_commit = 2;
+  string config_path = 3;
+  string state_dir = 4;
+  string socket_path = 5;
+}
+
+message EffectiveConfigRequest {
+  bool include_sensitive = 1;
+}
+message EffectiveConfigResponse {
+  string config_json = 1;
+  repeated string redacted_fields = 2;
+  repeated string warnings = 3;
+}
+
+message RuntimeHandlersRequest {}
+message RuntimeHandlerInfo {
+  string name = 1;
+  string runtime_type = 2;
+  string runtime_path = 3;
+  string runtime_config_path = 4;
+  repeated string features = 5;
+  repeated string warnings = 6;
+}
+message RuntimeHandlersResponse {
+  repeated RuntimeHandlerInfo handlers = 1;
+}
+
+message ImageTransfersRequest {
+  bool include_completed = 1;
+}
+message ImageTransferInfo {
+  string image = 1;
+  string status = 2;
+  int64 updated_at_unix_nanos = 3;
+  string error = 4;
+}
+message ImageTransfersResponse {
+  repeated ImageTransferInfo transfers = 1;
+}
+
+message RecoveryStatusRequest {}
+message RecoveryStatusResponse {
+  string status = 1;
+  string last_startup = 2;
+  uint64 unhealthy_object_count = 3;
+  string ledger_summary_json = 4;
+  repeated string warnings = 5;
+}
+
+message RecoveryCheckRequest {
+  bool execute = 1;
+}
+message RecoveryAction {
+  string object_type = 1;
+  string object_id = 2;
+  string action = 3;
+  string reason = 4;
+  bool executed = 5;
+  string error = 6;
+}
+message RecoveryCheckResponse {
+  bool dry_run = 1;
+  repeated RecoveryAction actions = 2;
+  repeated string warnings = 3;
+}
+
+message NriStatusRequest {}
+message NriStatusResponse {
+  bool enabled = 1;
+  bool cdi_enabled = 2;
+  repeated string cdi_spec_dirs = 3;
+  string plugin_path = 4;
+  string plugin_config_path = 5;
+  string blockio_config_path = 6;
+  bool blockio_supported = 7;
+  bool rdt_supported = 8;
+  repeated string warnings = 9;
+}
+
+message SecurityStatusRequest {}
+message SecurityStatusResponse {
+  bool seccomp_available = 1;
+  bool seccomp_notifier_supported = 2;
+  bool apparmor_available = 3;
+  bool selinux_enabled = 4;
+  bool rootless_enabled = 5;
+  string devices_policy_json = 6;
+  repeated string warnings = 7;
+}
+
+message ShimStatusRequest {
+  string container_id = 1;
+}
+message ShimInfo {
+  string container_id = 1;
+  int64 pid = 2;
+  string task_socket = 3;
+  string attach_socket = 4;
+  string state = 5;
+  string error = 6;
+}
+message ShimStatusResponse {
+  repeated ShimInfo shims = 1;
+}
+
+message ContentGcRequest {
+  bool execute = 1;
+}
+message ContentGcCandidate {
+  string object_type = 1;
+  string object_id = 2;
+  string path = 3;
+  uint64 size_bytes = 4;
+  string reason = 5;
+  bool deleted = 6;
+  string error = 7;
+}
+message ContentGcResponse {
+  bool dry_run = 1;
+  repeated ContentGcCandidate candidates = 2;
+  uint64 reclaimed_bytes = 3;
+  repeated string warnings = 4;
+}
+
+message ContainerLogRequest {
+  string container_id = 1;
+  bool follow = 2;
+  int64 tail_lines = 3;
+  int64 since_unix_nanos = 4;
+  bool timestamps = 5;
+}
+message ContainerLogChunk {
+  bytes data = 1;
+  string stream = 2;
+  int64 timestamp_unix_nanos = 3;
+}

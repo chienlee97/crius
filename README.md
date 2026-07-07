@@ -123,42 +123,29 @@ make build
 ```
 
 `make build` currently builds the default `crius` binary. Use
-`cargo build --features shim --bins` when you also need `crius-shim`.
+`cargo build --features shim --bins` when you also need `crius-shim` and the
+local `crs` client.
+
+Build only the local `crs` client:
+
+```bash
+cargo build --bin crs
+```
+
+See [docs/en/operations.md](docs/en/operations.md) for node installation and
+validation, and [docs/en/crs.md](docs/en/crs.md) for the local `crs` client.
 
 ## Quick Start
 
-Build daemon and shim:
+Build the project:
 
 ```bash
 cargo build --features shim --bins
 ```
 
-Install on a validation node:
-
-```bash
-sudo install -Dm755 target/debug/crius /usr/bin/crius
-sudo install -Dm755 target/debug/crius-shim /usr/bin/crius-shim
-sudo install -Dm644 crius.service /etc/systemd/system/crius.service
-```
-
-Export configuration from the current binary:
-
-```bash
-sudo mkdir -p /etc/crius
-sudo /usr/bin/crius --write-default-config /etc/crius/crius.conf
-```
-
-Review `/etc/crius/crius.conf` before connecting kubelet. Pay special attention
-to runtime paths, shim path, CNI paths, pause image, and cgroup driver.
-
-Start the service:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now crius
-```
-
-Default CRI endpoint:
+Install on a validation node, export configuration, and start the service as
+described in [docs/en/operations.md](docs/en/operations.md). The default CRI
+endpoint is:
 
 ```text
 unix:///run/crius/crius.sock
@@ -171,6 +158,9 @@ sudo crictl --runtime-endpoint unix:///run/crius/crius.sock version
 sudo crictl --runtime-endpoint unix:///run/crius/crius.sock info
 sudo crictl --runtime-endpoint unix:///run/crius/crius.sock images
 ```
+
+Use [docs/en/crs.md](docs/en/crs.md) for local `crs` workflows and
+[docs/en/networking.md](docs/en/networking.md) for local `crs` CNI setup.
 
 ## Configuration
 
@@ -223,6 +213,25 @@ cargo test
 make release-gate
 ```
 
+Release gate commands:
+
+```bash
+cargo fmt --check
+cargo build --features shim --bins
+cargo test --features shim
+cargo run --bin crs -- completion bash >/tmp/crs.bash
+test -s /tmp/crs.bash
+```
+
+Optional manual validation on a prepared node:
+
+```bash
+sudo systemctl restart crius
+crs status
+crs version
+crs image list
+```
+
 Additional gated tests are available when the environment has the required
 external dependencies:
 
@@ -241,6 +250,9 @@ make release-soak
 | Document | Description |
 | --- | --- |
 | [docs/en/architecture.md](docs/en/architecture.md) | Architecture, module boundaries, and core request flows |
+| [docs/en/crs.md](docs/en/crs.md) | Local `crs` client usage, containers, Pods, images, diagnostics, recovery, and GC |
+| [docs/en/networking.md](docs/en/networking.md) | Local `crs` CNI, CRI CNI, and network domain boundaries |
+| [docs/en/operations.md](docs/en/operations.md) | Node installation, validation, diagnostics, recovery, and issue report materials |
 | [docs/en/config-matrix.md](docs/en/config-matrix.md) | Configuration precedence, reload policy, and important fields |
 | [docs/en/kubeadm.md](docs/en/kubeadm.md) | kubelet and kubeadm node integration |
 | [docs/en/nri.md](docs/en/nri.md) | NRI configuration, lifecycle, adjustments, validators, and operations |
@@ -255,8 +267,9 @@ Chinese documentation is available under [docs/zh](docs/zh/architecture.md).
 - Deployment is still source-build oriented.
 - The sample systemd unit is suitable for validation nodes and should be
   reviewed against production security baselines before production use.
-- Rootless mode has explicit limitations and is not a direct replacement for
-  rootful kubelet integration.
+- Rootless mode is primarily for development and restricted-environment
+  validation; kubelet/kubeadm node integration should use a `crius` daemon
+  running with root privileges.
 - Checkpoint/restore depends on host, CRIU, and runtime support.
 
 ## License

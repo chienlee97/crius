@@ -306,39 +306,38 @@ impl HostCapabilityReport {
             return SecurityFeatureGate::Allowed;
         }
 
-        if !request.cdi_devices.is_empty() || !request.nri_cdi_devices.is_empty() {
-            if !self.cdi.is_available() {
-                return SecurityFeatureGate::reject(format!(
-                    "CDI devices requested but host CDI capability is {}: {}",
-                    capability_state_name(self.cdi.state),
-                    self.cdi.reason
-                ));
-            }
-        }
-
-        if request.blockio_class.is_some() || request.nri_blockio_class.is_some() {
-            if !self.blockio.is_available() {
-                return SecurityFeatureGate::reject(format!(
-                    "blockio class requested but host blockio capability is {}: {}",
-                    capability_state_name(self.blockio.state),
-                    self.blockio.reason
-                ));
-            }
-        }
-
-        if request.rdt_class.is_some()
-            || request.nri_rdt_class.is_some()
-            || request.nri_rdt_adjustment.is_some()
+        if (!request.cdi_devices.is_empty() || !request.nri_cdi_devices.is_empty())
+            && !self.cdi.is_available()
         {
-            if !self.rdt.is_available() {
-                return SecurityFeatureGate::Degraded {
-                    reasons: vec![format!(
-                        "RDT class requested but host RDT capability is {}: {}",
-                        capability_state_name(self.rdt.state),
-                        self.rdt.reason
-                    )],
-                };
-            }
+            return SecurityFeatureGate::reject(format!(
+                "CDI devices requested but host CDI capability is {}: {}",
+                capability_state_name(self.cdi.state),
+                self.cdi.reason
+            ));
+        }
+
+        if (request.blockio_class.is_some() || request.nri_blockio_class.is_some())
+            && !self.blockio.is_available()
+        {
+            return SecurityFeatureGate::reject(format!(
+                "blockio class requested but host blockio capability is {}: {}",
+                capability_state_name(self.blockio.state),
+                self.blockio.reason
+            ));
+        }
+
+        if (request.rdt_class.is_some()
+            || request.nri_rdt_class.is_some()
+            || request.nri_rdt_adjustment.is_some())
+            && !self.rdt.is_available()
+        {
+            return SecurityFeatureGate::Degraded {
+                reasons: vec![format!(
+                    "RDT class requested but host RDT capability is {}: {}",
+                    capability_state_name(self.rdt.state),
+                    self.rdt.reason
+                )],
+            };
         }
 
         SecurityFeatureGate::Allowed

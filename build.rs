@@ -12,7 +12,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .out_dir(&out_dir)
         .compile_with_config(
             config,
-            &["proto/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto"],
+            &[
+                "proto/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto",
+                "proto/crius/diagnostics/v1/diagnostics.proto",
+                "proto/crius/local/v1/local.proto",
+            ],
             &["proto"],
         )?;
 
@@ -37,6 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-changed=proto/github.com/containerd/nri/pkg/api/api.proto");
     println!("cargo:rerun-if-changed=proto/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto");
+    println!("cargo:rerun-if-changed=proto/crius/diagnostics/v1/diagnostics.proto");
+    println!("cargo:rerun-if-changed=proto/crius/local/v1/local.proto");
 
     Ok(())
 }

@@ -25,7 +25,7 @@ async fn start_container_notifies_nri_before_and_after_runtime_start() {
         .await
         .save_container(
             "container-start",
-            "pod-start",
+            Some("pod-start"),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &Vec::new(),
@@ -119,7 +119,7 @@ async fn start_container_succeeds_when_nri_post_start_fails() {
         .await
         .save_container(
             "container-start-post-fail",
-            "pod-start-post-fail",
+            Some("pod-start-post-fail"),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &Vec::new(),
@@ -175,7 +175,7 @@ async fn start_container_falls_back_to_persistence_when_memory_state_is_missing(
         .await
         .save_container(
             "container-persisted-start",
-            "pod-persisted-start",
+            Some("pod-persisted-start"),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &["sleep".to_string(), "10".to_string()],
@@ -249,7 +249,7 @@ async fn start_container_rejects_repeated_start_for_running_container() {
         .await
         .save_container(
             "container-start-repeat",
-            "pod-start-repeat",
+            Some("pod-start-repeat"),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &Vec::new(),
@@ -334,7 +334,7 @@ async fn start_container_rejects_exited_container_with_failed_precondition() {
         .await
         .save_container(
             "container-start-exited",
-            "pod-start-exited",
+            Some("pod-start-exited"),
             crate::runtime::ContainerStatus::Stopped(17),
             "busybox:latest",
             &Vec::new(),
@@ -394,7 +394,7 @@ async fn start_container_undoes_nri_when_runtime_start_fails() {
         .await
         .save_container(
             "container-start-fail",
-            "pod-start-fail",
+            Some("pod-start-fail"),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &Vec::new(),
@@ -429,7 +429,7 @@ async fn start_container_undoes_nri_when_runtime_start_fails() {
         .await
         .save_container(
             "container-sidecar",
-            "pod-start-fail",
+            Some("pod-start-fail"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -556,7 +556,7 @@ async fn start_container_fails_when_runtime_keeps_container_in_created_state() {
         .await
         .save_container(
             "container-start-created",
-            "pod-start-created",
+            Some("pod-start-created"),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &Vec::new(),
@@ -650,7 +650,7 @@ async fn start_container_fails_when_runtime_exits_immediately_and_persists_exit_
         .await
         .save_container(
             "container-start-stopped",
-            "pod-start-stopped",
+            Some("pod-start-stopped"),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &Vec::new(),
@@ -737,7 +737,7 @@ async fn finalize_container_stop_state_only_sets_finished_at_for_exited_state() 
         .await
         .save_container(
             "container-stop-finalize",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &Vec::new(),
@@ -804,7 +804,7 @@ async fn remove_after_failed_start_does_not_repeat_nri_stop() {
         .await
         .save_container(
             "container-start-remove",
-            "pod-start-remove",
+            Some("pod-start-remove"),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &Vec::new(),
@@ -867,7 +867,7 @@ async fn stop_container_notifies_nri_only_once_across_repeat_calls() {
         .await
         .save_container(
             "container-stop",
-            "pod-stop",
+            Some("pod-stop"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -942,7 +942,7 @@ async fn stop_container_notifies_nri_with_post_stop_state() {
         .await
         .save_container(
             "container-stop-state",
-            "pod-stop-state",
+            Some("pod-stop-state"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -1005,7 +1005,7 @@ async fn stop_container_succeeds_when_nri_stop_fails() {
         .await
         .save_container(
             "container-stop-fail",
-            "pod-stop-fail",
+            Some("pod-stop-fail"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -1056,7 +1056,7 @@ async fn stop_container_skips_nri_for_already_exited_container() {
         .await
         .save_container(
             "container-exited",
-            "pod-exited",
+            Some("pod-exited"),
             crate::runtime::ContainerStatus::Stopped(17),
             "busybox:latest",
             &Vec::new(),
@@ -1109,7 +1109,7 @@ async fn stop_container_converts_unknown_runtime_state_to_exited() {
         .await
         .save_container(
             "container-unknown",
-            "pod-unknown",
+            Some("pod-unknown"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &["sleep".to_string(), "10".to_string()],
@@ -1182,7 +1182,7 @@ async fn stop_container_falls_back_to_persistence_when_memory_state_is_missing()
         .await
         .save_container(
             "container-persisted-stop",
-            "pod-persisted-stop",
+            Some("pod-persisted-stop"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &["sleep".to_string(), "10".to_string()],
@@ -1260,7 +1260,7 @@ async fn stop_container_fallback_is_idempotent_across_repeated_calls() {
         .await
         .save_container(
             "container-persisted-repeat-stop",
-            "pod-persisted-repeat-stop",
+            Some("pod-persisted-repeat-stop"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &["sleep".to_string(), "10".to_string()],
@@ -1319,7 +1319,7 @@ async fn remove_container_notifies_nri_only_once_across_repeat_calls() {
         .await
         .save_container(
             "container-remove",
-            "pod-remove",
+            Some("pod-remove"),
             crate::runtime::ContainerStatus::Stopped(0),
             "busybox:latest",
             &Vec::new(),
@@ -1386,7 +1386,7 @@ async fn remove_container_succeeds_when_nri_remove_fails() {
         .await
         .save_container(
             "container-remove-fail",
-            "pod-remove-fail",
+            Some("pod-remove-fail"),
             crate::runtime::ContainerStatus::Stopped(0),
             "busybox:latest",
             &Vec::new(),
@@ -1437,7 +1437,7 @@ async fn remove_container_notifies_nri_stop_before_remove_for_running_container(
         .await
         .save_container(
             "container-remove-running",
-            "pod-remove-running",
+            Some("pod-remove-running"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -1485,7 +1485,7 @@ async fn remove_container_falls_back_to_persistence_when_memory_state_is_missing
         .await
         .save_container(
             "container-persisted-remove",
-            "pod-persisted-remove",
+            Some("pod-persisted-remove"),
             crate::runtime::ContainerStatus::Stopped(0),
             "busybox:latest",
             &["sleep".to_string(), "10".to_string()],
@@ -1560,7 +1560,7 @@ async fn remove_container_fallback_is_idempotent_across_repeated_calls() {
         .await
         .save_container(
             "container-persisted-repeat-remove",
-            "pod-persisted-repeat-remove",
+            Some("pod-persisted-repeat-remove"),
             crate::runtime::ContainerStatus::Stopped(0),
             "busybox:latest",
             &["sleep".to_string(), "10".to_string()],
@@ -1612,7 +1612,7 @@ async fn stop_pod_sandbox_stops_member_containers_before_pod_notification() {
         .await
         .save_container(
             "container-under-pod-stop",
-            "pod-stop-order",
+            Some("pod-stop-order"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -1661,7 +1661,7 @@ async fn remove_pod_sandbox_removes_member_containers_before_pod_notification() 
         .await
         .save_container(
             "container-under-pod-remove",
-            "pod-remove-order",
+            Some("pod-remove-order"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -1716,7 +1716,7 @@ async fn start_container_clears_nri_stop_notification_marker() {
         .await
         .save_container(
             "container-restart",
-            "pod-restart",
+            Some("pod-restart"),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &Vec::new(),
@@ -1884,7 +1884,7 @@ async fn update_container_resources_validates_state_and_persists_resources() {
         .await
         .save_container(
             "container-running",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -2007,7 +2007,7 @@ async fn update_container_resources_fails_when_hugetlb_is_missing_and_tolerance_
         .await
         .save_container(
             "container-running",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -2065,7 +2065,7 @@ async fn update_container_resources_accepts_paused_container() {
         .await
         .save_container(
             "container-paused",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -2125,7 +2125,7 @@ async fn update_container_resources_applies_nri_result_before_post_update() {
         .await
         .save_container(
             "container-running",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -2152,7 +2152,7 @@ async fn update_container_resources_applies_nri_result_before_post_update() {
         .await
         .save_container(
             "container-sidecar",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -2276,7 +2276,7 @@ async fn update_container_resources_succeeds_when_nri_post_update_fails() {
         .await
         .save_container(
             "container-update-post-fail",
-            "pod-update-post-fail",
+            Some("pod-update-post-fail"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -2336,7 +2336,7 @@ async fn update_container_resources_applies_extended_nri_resources() {
         .await
         .save_container(
             "container-running",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -2479,7 +2479,7 @@ async fn stop_container_applies_nri_update_side_effects() {
         .await
         .save_container(
             "container-stop",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -2493,7 +2493,7 @@ async fn stop_container_applies_nri_update_side_effects() {
         .await
         .save_container(
             "container-sidecar",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),
@@ -2574,7 +2574,7 @@ async fn nri_domain_apply_updates_updates_runtime_and_persistence() {
         .await
         .save_container(
             "container-running",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),

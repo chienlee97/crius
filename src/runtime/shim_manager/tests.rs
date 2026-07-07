@@ -100,7 +100,7 @@ fn test_shim_config_default() {
     let config = ShimConfig::default();
     assert_eq!(config.shim_path, PathBuf::from("crius-shim"));
     assert_eq!(config.work_dir, default_shim_work_dir());
-    assert_eq!(config.attach_socket_dir, default_shim_work_dir());
+    assert_eq!(config.attach_socket_dir, super::default_attach_socket_dir());
     assert_eq!(
         config.container_exits_dir,
         PathBuf::from("/var/run/crius/exits")

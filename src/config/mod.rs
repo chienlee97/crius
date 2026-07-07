@@ -20,7 +20,7 @@ const DEFAULT_PERSISTENT_ROOT_DIR: &str = "/var/lib/crius";
 const DEFAULT_RUNTIME_STATE_DIR: &str = "/run/crius";
 const DEFAULT_CRI_SOCKET_URI: &str = "unix:///run/crius/crius.sock";
 const DEFAULT_RUNTIME_SHIM_DIR: &str = "/run/crius/shims";
-const DEFAULT_RUNTIME_ATTACH_SOCKET_DIR: &str = "/run/crius/shims";
+const DEFAULT_RUNTIME_ATTACH_SOCKET_DIR: &str = "/run/crius/attach";
 const DEFAULT_RUNTIME_CONTAINER_EXITS_DIR: &str = "/run/crius/exits";
 const DEFAULT_RUNTIME_CLEAN_SHUTDOWN_FILE: &str = "/var/lib/crius/clean.shutdown";
 const DEFAULT_RUNTIME_VERSION_FILE: &str = "/run/crius/version";
@@ -469,7 +469,7 @@ impl Default for ResolvedRuntimeHandlerConfig {
             monitor_path: String::new(),
             monitor_cgroup: String::new(),
             monitor_env: Vec::new(),
-            stream_websockets: false,
+            stream_websockets: true,
             allowed_annotations: Vec::new(),
             default_annotations: HashMap::new(),
             privileged_without_host_devices: false,
@@ -581,6 +581,48 @@ pub struct NetworkConfig {
     )]
     pub teardown_timeout: std::time::Duration,
     /// 显式指定默认使用的 CNI 网络名；为空时按文件名字典序选择第一个。
+    #[serde(alias = "cni_default_network")]
+    pub default_network_name: Option<String>,
+    /// 是否全局禁用 hostPort 映射。
+    pub disable_hostport_mapping: bool,
+    /// 是否将 netns 挂载统一放到 runtime state dir 下。
+    #[serde(alias = "netns_mounts_under_state_dir")]
+    pub netns_mounts_under_state_dir: bool,
+    /// `crs` 本地 Pod 使用的网络域。
+    pub local: NetworkDomainConfig,
+    /// kubelet / CRI 调用使用的网络域。
+    pub cri: NetworkDomainConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkDomainConfig {
+    /// CNI 配置目录。
+    #[serde(
+        default,
+        alias = "config_dir",
+        deserialize_with = "deserialize_string_or_vec"
+    )]
+    pub config_dirs: Vec<String>,
+    /// CNI 插件目录。
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub plugin_dirs: Vec<String>,
+    /// CNI 缓存目录。
+    pub cache_dir: String,
+    /// CNI 配置模板文件路径。
+    pub conf_template: String,
+    /// 最大允许加载的 CNI 配置文件数量；0 表示不限制。
+    #[serde(alias = "cni_max_conf_num")]
+    pub max_conf_num: usize,
+    /// Pod 主 IP 选择策略。
+    pub ip_pref: MainIpPreference,
+    /// CNI teardown/DEL 的固定超时。
+    #[serde(
+        deserialize_with = "crate::streaming::deserialize_duration",
+        serialize_with = "crate::streaming::serialize_duration"
+    )]
+    pub teardown_timeout: std::time::Duration,
+    /// 显式指定默认使用的 CNI 网络名。
     #[serde(alias = "cni_default_network")]
     pub default_network_name: Option<String>,
     /// 是否全局禁用 hostPort 映射。
@@ -866,12 +908,53 @@ impl Default for ImageConfig {
 
 impl Default for NetworkConfig {
     fn default() -> Self {
+        let local = NetworkDomainConfig::local_default();
+        let cri = NetworkDomainConfig::cri_default();
         Self {
             plugin: "cni".to_string(),
+            config_dirs: cri.config_dirs.clone(),
+            plugin_dirs: cri.plugin_dirs.clone(),
+            cache_dir: cri.cache_dir.clone(),
+            conf_template: cri.conf_template.clone(),
+            max_conf_num: cri.max_conf_num,
+            ip_pref: cri.ip_pref,
+            teardown_timeout: cri.teardown_timeout,
+            default_network_name: cri.default_network_name.clone(),
+            disable_hostport_mapping: cri.disable_hostport_mapping,
+            netns_mounts_under_state_dir: cri.netns_mounts_under_state_dir,
+            local,
+            cri,
+        }
+    }
+}
+
+impl Default for NetworkDomainConfig {
+    fn default() -> Self {
+        Self::cri_default()
+    }
+}
+
+impl NetworkDomainConfig {
+    fn local_default() -> Self {
+        Self {
+            config_dirs: vec!["/etc/crius/cni/net.d".to_string()],
+            ..Self::common_default()
+        }
+    }
+
+    fn cri_default() -> Self {
+        Self {
             config_dirs: vec![
                 "/etc/cni/net.d".to_string(),
                 "/etc/kubernetes/cni/net.d".to_string(),
             ],
+            ..Self::common_default()
+        }
+    }
+
+    fn common_default() -> Self {
+        Self {
+            config_dirs: Vec::new(),
             plugin_dirs: vec![
                 "/opt/cni/bin".to_string(),
                 "/usr/lib/cni".to_string(),
@@ -886,6 +969,24 @@ impl Default for NetworkConfig {
             disable_hostport_mapping: false,
             netns_mounts_under_state_dir: false,
         }
+    }
+
+    pub fn cni_config(&self) -> CniConfig {
+        let mut cni = CniConfig::new(
+            self.config_dirs.iter().map(PathBuf::from).collect(),
+            self.plugin_dirs.iter().map(PathBuf::from).collect(),
+            PathBuf::from(&self.cache_dir),
+            self.max_conf_num,
+            self.ip_pref,
+            self.default_network_name.clone(),
+            self.disable_hostport_mapping,
+        );
+        cni.set_teardown_timeout(self.teardown_timeout);
+        if !self.conf_template.trim().is_empty() {
+            cni.set_conf_template(Some(PathBuf::from(self.conf_template.trim())));
+        }
+        cni.set_netns_mounts_under_state_dir(self.netns_mounts_under_state_dir);
+        cni
     }
 }
 
@@ -978,7 +1079,7 @@ impl RuntimeConfig {
                 self.effective_cgroup_driver(),
             )?,
             monitor_env: self.monitor_env.clone(),
-            stream_websockets: false,
+            stream_websockets: true,
             allowed_annotations: Vec::new(),
             default_annotations: HashMap::new(),
             privileged_without_host_devices: false,
@@ -1213,21 +1314,47 @@ impl RuntimeConfig {
 
 impl NetworkConfig {
     pub fn cni_config(&self) -> CniConfig {
-        let mut cni = CniConfig::new(
-            self.config_dirs.iter().map(PathBuf::from).collect(),
-            self.plugin_dirs.iter().map(PathBuf::from).collect(),
-            PathBuf::from(&self.cache_dir),
-            self.max_conf_num,
-            self.ip_pref,
-            self.default_network_name.clone(),
-            self.disable_hostport_mapping,
-        );
-        cni.set_teardown_timeout(self.teardown_timeout);
-        if !self.conf_template.trim().is_empty() {
-            cni.set_conf_template(Some(PathBuf::from(self.conf_template.trim())));
+        self.cri_domain().cni_config()
+    }
+
+    pub fn local_cni_config(&self) -> CniConfig {
+        self.local.cni_config()
+    }
+
+    pub fn cri_domain(&self) -> NetworkDomainConfig {
+        let mut domain = self.cri.clone();
+        if !self.config_dirs.is_empty() {
+            domain.config_dirs = self.config_dirs.clone();
         }
-        cni.set_netns_mounts_under_state_dir(self.netns_mounts_under_state_dir);
-        cni
+        if !self.plugin_dirs.is_empty() {
+            domain.plugin_dirs = self.plugin_dirs.clone();
+        }
+        let legacy_default = NetworkDomainConfig::cri_default();
+        if self.cache_dir != legacy_default.cache_dir {
+            domain.cache_dir = self.cache_dir.clone();
+        }
+        if self.conf_template != legacy_default.conf_template {
+            domain.conf_template = self.conf_template.clone();
+        }
+        if self.max_conf_num != legacy_default.max_conf_num {
+            domain.max_conf_num = self.max_conf_num;
+        }
+        if self.ip_pref != legacy_default.ip_pref {
+            domain.ip_pref = self.ip_pref;
+        }
+        if self.teardown_timeout != legacy_default.teardown_timeout {
+            domain.teardown_timeout = self.teardown_timeout;
+        }
+        if self.default_network_name != legacy_default.default_network_name {
+            domain.default_network_name = self.default_network_name.clone();
+        }
+        if self.disable_hostport_mapping != legacy_default.disable_hostport_mapping {
+            domain.disable_hostport_mapping = self.disable_hostport_mapping;
+        }
+        if self.netns_mounts_under_state_dir != legacy_default.netns_mounts_under_state_dir {
+            domain.netns_mounts_under_state_dir = self.netns_mounts_under_state_dir;
+        }
+        domain
     }
 }
 
@@ -1675,6 +1802,7 @@ impl Config {
             "CRIUS_NETNS_MOUNTS_UNDER_STATE_DIR",
             &mut self.network.netns_mounts_under_state_dir,
         )?;
+        self.network.cri = self.network.cri_domain();
 
         apply_string_override("CRIUS_LOG_LEVEL", &mut self.logging.level);
         apply_optional_string_override("CRIUS_LOG_FILE", &mut self.logging.file);
@@ -1735,8 +1863,9 @@ impl Config {
             &[
                 DEFAULT_RUNTIME_ATTACH_SOCKET_DIR,
                 LEGACY_RUNTIME_ATTACH_SOCKET_DIR,
+                DEFAULT_RUNTIME_SHIM_DIR,
             ],
-            runtime_state_dir.join("shims").display().to_string(),
+            runtime_state_dir.join("attach").display().to_string(),
         );
         rewrite_default_string(
             &mut self.runtime.container_exits_dir,

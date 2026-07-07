@@ -617,18 +617,31 @@ impl Daemon {
         }
 
         let daemon = self.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let handle = std::thread::spawn(move || {
             daemon.set_task_state(DaemonTaskState::Running);
+            let mut started_tx = Some(started_tx);
             let result = if daemon.is_terminal().unwrap_or(false) {
                 match daemon.create_terminal_container() {
                     Ok(pid) => {
                         *daemon.container_pid.lock().unwrap() = Some(pid.as_raw());
                         info!("Container created with PID: {}", pid);
+                        if let Some(tx) = started_tx.take() {
+                            let _ = tx.send(Ok(()));
+                        }
                         daemon.monitor_container(pid)
                     }
-                    Err(err) => Err(err),
+                    Err(err) => {
+                        if let Some(tx) = started_tx.take() {
+                            let _ = tx.send(Err(err.to_string()));
+                        }
+                        Err(err)
+                    }
                 }
             } else {
+                if let Some(tx) = started_tx.take() {
+                    let _ = tx.send(Ok(()));
+                }
                 daemon.run_non_terminal_container()
             };
 
@@ -658,6 +671,10 @@ impl Daemon {
 
         let mut guard = self.task_thread.lock().unwrap();
         *guard = Some(handle);
+        started_rx
+            .recv()
+            .map_err(|err| anyhow::anyhow!("task runner exited before start confirmation: {err}"))?
+            .map_err(|err| anyhow::anyhow!("task start failed: {err}"))?;
         Ok(())
     }
 
@@ -788,7 +805,11 @@ impl Daemon {
         io_manager: &IoManager,
     ) -> Result<()> {
         let mut command = self.runtime_command();
-        command.arg("exec").arg(&request.container_id);
+        command.arg("exec");
+        if request.stdin {
+            command.arg("-i");
+        }
+        command.arg(&request.container_id);
         for arg in &request.command {
             command.arg(arg);
         }
@@ -796,7 +817,11 @@ impl Daemon {
             &mut command,
             request.exec_cpu_affinity,
         );
-        command.stdin(std::process::Stdio::piped());
+        command.stdin(if request.stdin {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        });
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         let mut child = command
@@ -858,9 +883,14 @@ impl Daemon {
             })
         });
 
+        let stop_stdin = Arc::new(AtomicBool::new(false));
         let stdin_handle = child.stdin.take().map(|mut stdin| {
             let io_manager = io_manager.clone();
+            let stop_stdin = Arc::clone(&stop_stdin);
             std::thread::spawn(move || loop {
+                if stop_stdin.load(Ordering::Relaxed) {
+                    break;
+                }
                 match io_manager.read_stdin() {
                     Ok(data) if !data.is_empty() => {
                         if let Err(err) = std::io::Write::write_all(&mut stdin, &data) {
@@ -879,6 +909,7 @@ impl Daemon {
         });
 
         let status = child.wait().context("Failed to wait for exec session")?;
+        stop_stdin.store(true, Ordering::Relaxed);
         if let Some(handle) = stdout_handle {
             let _ = handle.join();
         }
@@ -912,11 +943,7 @@ impl Daemon {
         let slave_fd = slave_stderr.as_raw_fd();
 
         let mut command = self.runtime_command();
-        command
-            .arg("exec")
-            .arg("-i")
-            .arg("-t")
-            .arg(&request.container_id);
+        command.arg("exec").arg("-t").arg(&request.container_id);
         for arg in &request.command {
             command.arg(arg);
         }
@@ -998,9 +1025,12 @@ impl Daemon {
     }
 
     fn cleanup_attach_socket_directory(&self) {
-        let Some(_root) = self.attach_socket_dir.as_ref() else {
+        let Some(root) = self.attach_socket_dir.as_ref() else {
             return;
         };
+        if root == &self.work_dir {
+            return;
+        }
         let path = self.attach_socket_container_dir();
         if let Err(err) = fs::remove_dir_all(&path) {
             if err.kind() != std::io::ErrorKind::NotFound {

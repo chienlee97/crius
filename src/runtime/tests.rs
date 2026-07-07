@@ -1281,6 +1281,13 @@ fn test_spec_with_device_mappings() {
     assert!(cgroup_rules.iter().any(|rule| {
         rule.access.as_deref() == Some("rw") && rule.device_type.as_deref() == Some("c")
     }));
+    assert!(cgroup_rules.iter().any(|rule| {
+        rule.allow
+            && rule.device_type.as_deref() == Some("c")
+            && rule.major == Some(1)
+            && rule.minor == Some(3)
+            && rule.access.as_deref() == Some("rwm")
+    }));
 }
 
 #[test]

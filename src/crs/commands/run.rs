@@ -1,0 +1,837 @@
+use futures::StreamExt;
+use std::io::Write;
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
+
+use crate::crs::{
+    args::{
+        ContainerCreateArgs, ContainerCreateOptions, ExecModeArg, PullPolicyArg, RunArgs,
+        StreamOptions,
+    },
+    builders::{build_container_config, parse_local_sysctls},
+    client::CrsClient,
+    commands::status::render_and_print,
+    context::CliContext,
+    error::{CliError, CommandResult},
+    format::CommandOutput,
+    streaming,
+};
+use crate::proto::diagnostics::v1::ContainerLogRequest;
+use crate::proto::local::v1::CreateLocalContainerRequest;
+use crate::proto::runtime::v1::{
+    AttachRequest, ContainerState, ContainerStatusRequest, CreateContainerRequest, ImageSpec,
+    ImageStatusRequest, PodSandboxConfig, PodSandboxStatusRequest, PullImageRequest,
+    RemoveContainerRequest, StartContainerRequest, StopContainerRequest,
+};
+use crate::{CRS_RUN_ANNOTATION, CRS_RUN_ANNOTATION_VALUE};
+
+const STOPPED_STREAMING_STATUS_WAIT: Duration = Duration::from_secs(2);
+const STOPPED_STREAMING_STATUS_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Debug)]
+struct RunPlan {
+    image: String,
+    command: Vec<String>,
+    pull: PullPolicyArg,
+    detach: bool,
+    rm: bool,
+    exec_mode: ExecModeArg,
+    stream: StreamOptions,
+    pod: Option<String>,
+    runtime_handler: Option<String>,
+    cgroup_parent: Option<String>,
+    sysctls: Vec<String>,
+    container_options: ContainerCreateOptions,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalRunView {
+    container_id: String,
+    image: String,
+    action: String,
+    detached: bool,
+}
+
+impl crate::crs::format::TableRow for LocalRunView {
+    fn headers() -> &'static [&'static str] {
+        &["CONTAINER ID", "IMAGE", "ACTION", "DETACHED"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.container_id.clone(),
+            self.image.clone(),
+            self.action.clone(),
+            crate::crs::format::format_bool(self.detached).to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.container_id.clone()
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PodRunView {
+    container_id: String,
+    pod_id: String,
+    image: String,
+    action: String,
+    detached: bool,
+}
+
+impl crate::crs::format::TableRow for PodRunView {
+    fn headers() -> &'static [&'static str] {
+        &["CONTAINER ID", "POD ID", "IMAGE", "ACTION", "DETACHED"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.container_id.clone(),
+            self.pod_id.clone(),
+            self.image.clone(),
+            self.action.clone(),
+            crate::crs::format::format_bool(self.detached).to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.container_id.clone()
+    }
+}
+
+pub(crate) async fn handle(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: RunArgs,
+) -> Result<CommandResult, CliError> {
+    let plan = RunPlan::from_args(args)?;
+    ensure_image(client, &plan).await?;
+    let (container_id, pod_id) = create_run_container(client, &plan).await?;
+    let outcome = if plan.detach {
+        if let Err(error) = start_container(client, &container_id).await {
+            emit_leftover_warnings(&leftover_warnings(Some(&container_id)));
+            return Err(error);
+        }
+        render_detached(ctx, client, &plan, pod_id.as_deref(), &container_id)
+    } else if plan.exec_mode == ExecModeArg::Attach {
+        match run_foreground_attach(ctx, client, &plan, &container_id).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                render_stopped_before_streaming(ctx, client, &plan, &container_id, error).await
+            }
+        }
+    } else {
+        if let Err(error) = start_container(client, &container_id).await {
+            emit_leftover_warnings(&leftover_warnings(Some(&container_id)));
+            return Err(error);
+        }
+        match run_exec_sync(ctx, client, &plan, &container_id).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                render_stopped_before_streaming(ctx, client, &plan, &container_id, error).await
+            }
+        }
+    };
+
+    if plan.rm {
+        let warnings = cleanup_run_resources(client, &container_id).await;
+        emit_cleanup_warnings(ctx, &warnings);
+    }
+
+    outcome
+}
+
+impl RunPlan {
+    fn from_args(args: RunArgs) -> Result<Self, CliError> {
+        if args.image.trim().is_empty() {
+            return Err(CliError::invalid_input("image must not be empty").with_command("crs run"));
+        }
+
+        let pod = match args.pod {
+            Some(pod) if pod.trim().is_empty() => {
+                return Err(
+                    CliError::invalid_input("pod id must not be empty").with_command("crs run")
+                );
+            }
+            Some(pod) => Some(pod),
+            None => None,
+        };
+
+        Ok(Self {
+            image: args.image,
+            command: args.command,
+            pull: args.pull,
+            detach: args.detach,
+            rm: args.rm,
+            exec_mode: args.exec_mode,
+            stream: StreamOptions {
+                stdin: args.stdin,
+                tty: args.tty,
+                stdout: true,
+                stderr: true,
+                resize: None,
+                protocol: args.protocol,
+            },
+            pod,
+            runtime_handler: args.pod_options.runtime_handler,
+            cgroup_parent: args.pod_options.cgroup_parent,
+            sysctls: args.pod_options.sysctls,
+            container_options: run_container_options(
+                args.container_options,
+                args.name,
+                args.stdin,
+                args.tty,
+            ),
+        })
+    }
+}
+
+fn run_container_options(
+    options: crate::crs::args::RunContainerCreateOptions,
+    name: Option<String>,
+    stdin: bool,
+    tty: bool,
+) -> ContainerCreateOptions {
+    ContainerCreateOptions {
+        name,
+        attempt: options.container_attempt,
+        commands: options.commands,
+        args: options.args,
+        workdir: options.workdir,
+        env: options.env,
+        env_files: options.env_files,
+        labels: options.labels,
+        annotations: options.annotations,
+        mounts: options.mounts,
+        devices: options.devices,
+        cdi_devices: options.cdi_devices,
+        log_path: options.log_path,
+        stdin,
+        tty,
+        resources: options.resources,
+        security: options.security,
+    }
+}
+
+async fn ensure_image(client: &CrsClient, plan: &RunPlan) -> Result<(), CliError> {
+    match plan.pull {
+        PullPolicyArg::Always => pull_image(client, &plan.image).await,
+        PullPolicyArg::Never => {
+            image_status(client, &plan.image).await?;
+            Ok(())
+        }
+        PullPolicyArg::Missing => match image_status(client, &plan.image).await {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(error.exit_status(), crate::crs::error::ExitStatus::NotFound) =>
+            {
+                pull_image(client, &plan.image).await
+            }
+            Err(error) => Err(error),
+        },
+    }
+}
+
+async fn image_status(client: &CrsClient, image: &str) -> Result<(), CliError> {
+    let mut image_client = client.image()?;
+    client
+        .with_rpc_timeout(async {
+            image_client
+                .image_status(ImageStatusRequest {
+                    image: Some(ImageSpec {
+                        image: image.to_string(),
+                        user_specified_image: image.to_string(),
+                        ..Default::default()
+                    }),
+                    verbose: false,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("image {image}"))
+                })
+        })
+        .await?;
+    Ok(())
+}
+
+async fn pull_image(client: &CrsClient, image: &str) -> Result<(), CliError> {
+    let mut image_client = client.image()?;
+    client
+        .with_rpc_timeout(async {
+            image_client
+                .pull_image(PullImageRequest {
+                    image: Some(ImageSpec {
+                        image: image.to_string(),
+                        user_specified_image: image.to_string(),
+                        ..Default::default()
+                    }),
+                    auth: None,
+                    sandbox_config: None,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("image {image}"))
+                })
+        })
+        .await?;
+    Ok(())
+}
+
+async fn fetch_sandbox_config(
+    client: &CrsClient,
+    pod_id: &str,
+) -> Result<PodSandboxConfig, CliError> {
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .pod_sandbox_status(PodSandboxStatusRequest {
+                    pod_sandbox_id: pod_id.to_string(),
+                    verbose: false,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("pod {pod_id}"))
+                })
+        })
+        .await?
+        .into_inner();
+
+    response
+        .status
+        .and_then(|status| status.metadata)
+        .map(|metadata| PodSandboxConfig {
+            metadata: Some(metadata),
+            ..Default::default()
+        })
+        .ok_or_else(|| {
+            CliError::invalid_input(format!(
+                "daemon did not return sandbox metadata for pod {pod_id}"
+            ))
+            .with_command("crs run")
+            .with_object(format!("pod {pod_id}"))
+        })
+}
+
+async fn create_run_container(
+    client: &CrsClient,
+    plan: &RunPlan,
+) -> Result<(String, Option<String>), CliError> {
+    match plan.pod.as_deref() {
+        Some(pod_id) => {
+            let sandbox_config = fetch_sandbox_config(client, pod_id).await?;
+            create_container(client, plan, pod_id, sandbox_config)
+                .await
+                .map(|container_id| (container_id, Some(pod_id.to_string())))
+        }
+        None => create_local_container(client, plan)
+            .await
+            .map(|container_id| (container_id, None)),
+    }
+}
+
+async fn create_local_container(client: &CrsClient, plan: &RunPlan) -> Result<String, CliError> {
+    let args = ContainerCreateArgs {
+        options: plan.container_options.clone(),
+        pod: String::new(),
+        image: plan.image.clone(),
+        command: plan.command.clone(),
+    };
+    let config = build_container_config(&args).map_err(CliError::invalid_input)?;
+    let sysctls = parse_local_sysctls(&plan.sysctls).map_err(CliError::invalid_input)?;
+    let mut local = client.local()?;
+    let response = client
+        .with_rpc_timeout(async {
+            local
+                .create_local_container(CreateLocalContainerRequest {
+                    config: Some(config),
+                    runtime_handler: plan.runtime_handler.clone().unwrap_or_default(),
+                    cgroup_parent: plan.cgroup_parent.clone().unwrap_or_default(),
+                    sysctls,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run")
+                        .with_endpoint(client.endpoint())
+                })
+        })
+        .await?
+        .into_inner();
+
+    Ok(response.container_id)
+}
+
+async fn create_container(
+    client: &CrsClient,
+    plan: &RunPlan,
+    pod_id: &str,
+    sandbox_config: PodSandboxConfig,
+) -> Result<String, CliError> {
+    let args = ContainerCreateArgs {
+        options: plan.container_options.clone(),
+        pod: pod_id.to_string(),
+        image: plan.image.clone(),
+        command: plan.command.clone(),
+    };
+    let mut config = build_container_config(&args).map_err(CliError::invalid_input)?;
+    config.annotations.insert(
+        CRS_RUN_ANNOTATION.to_string(),
+        CRS_RUN_ANNOTATION_VALUE.to_string(),
+    );
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .create_container(CreateContainerRequest {
+                    pod_sandbox_id: pod_id.to_string(),
+                    config: Some(config),
+                    sandbox_config: Some(sandbox_config),
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("pod {pod_id}"))
+                })
+        })
+        .await?
+        .into_inner();
+
+    Ok(response.container_id)
+}
+
+async fn start_container(client: &CrsClient, container_id: &str) -> Result<(), CliError> {
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .start_container(StartContainerRequest {
+                    container_id: container_id.to_string(),
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("container {container_id}"))
+                })
+        })
+        .await?;
+    Ok(())
+}
+
+async fn run_foreground_attach(
+    _ctx: &CliContext,
+    client: &CrsClient,
+    plan: &RunPlan,
+    container_id: &str,
+) -> Result<CommandResult, CliError> {
+    let options = prepare_attach(client, plan, container_id).await?;
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let attach_task = tokio::spawn(streaming::attach_ready(options, ready_tx));
+
+    match ready_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            attach_task.abort();
+            return Err(error);
+        }
+        Err(_) => {
+            return match attach_task.await {
+                Ok(result) => result,
+                Err(error) => Err(CliError::internal(format!(
+                    "attach stream task failed before container start: {error}"
+                ))),
+            };
+        }
+    }
+
+    if let Err(error) = start_container(client, container_id).await {
+        attach_task.abort();
+        emit_leftover_warnings(&leftover_warnings(Some(container_id)));
+        return Err(error);
+    }
+
+    attach_task
+        .await
+        .map_err(|source| CliError::internal(format!("attach stream task failed: {source}")))?
+}
+
+async fn run_exec_sync(
+    ctx: &CliContext,
+    client: &CrsClient,
+    plan: &RunPlan,
+    container_id: &str,
+) -> Result<CommandResult, CliError> {
+    let status = wait_for_run_exit(client, container_id).await?;
+    let log = read_run_log(client, container_id).await.unwrap_or_default();
+
+    if matches!(ctx.output(), crate::crs::args::OutputArg::Json) {
+        let envelope = serde_json::json!({
+            "kind": "Run",
+            "apiVersion": crate::crs::format::API_VERSION,
+            "endpoint": client.endpoint(),
+            "summary": {
+                "containerId": container_id,
+                "image": plan.image,
+                "exitCode": status.exit_code,
+                "state": "exited",
+            },
+            "stdout": String::from_utf8_lossy(&log),
+            "stderr": "",
+            "warnings": [],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope).map_err(|source| CliError::internal(
+                format!("failed to render run JSON: {source}")
+            ))?
+        );
+    } else {
+        std::io::stdout()
+            .write_all(&log)
+            .map_err(|source| CliError::internal(format!("failed to write stdout: {source}")))?;
+    }
+
+    Ok(CommandResult::container_exit(status.exit_code))
+}
+
+async fn render_stopped_before_streaming(
+    ctx: &CliContext,
+    client: &CrsClient,
+    plan: &RunPlan,
+    container_id: &str,
+    original_error: CliError,
+) -> Result<CommandResult, CliError> {
+    let Some(status) = wait_for_exited_status(client, container_id).await? else {
+        return Err(original_error);
+    };
+
+    let warning = stopped_before_streaming_warning(plan.exec_mode);
+    if matches!(ctx.output(), crate::crs::args::OutputArg::Json) {
+        let envelope = serde_json::json!({
+            "kind": "RunResult",
+            "apiVersion": crate::crs::format::API_VERSION,
+            "endpoint": client.endpoint(),
+            "items": [],
+            "summary": {
+                "containerId": container_id,
+                "image": plan.image,
+                "exitCode": status.exit_code,
+                "state": "exited",
+                "streamingStarted": false,
+            },
+            "warnings": [warning],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope).map_err(|source| CliError::internal(
+                format!("failed to render run JSON: {source}")
+            ))?
+        );
+    } else {
+        eprintln!("warning: {warning}");
+    }
+
+    Ok(CommandResult::container_exit(status.exit_code))
+}
+
+async fn wait_for_exited_status(
+    client: &CrsClient,
+    container_id: &str,
+) -> Result<Option<crate::proto::runtime::v1::ContainerStatus>, CliError> {
+    let deadline = Instant::now() + STOPPED_STREAMING_STATUS_WAIT;
+    loop {
+        let status = fetch_container_status(client, container_id).await?;
+        if status.state == ContainerState::ContainerExited as i32 {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(STOPPED_STREAMING_STATUS_POLL).await;
+    }
+}
+
+async fn fetch_container_status(
+    client: &CrsClient,
+    container_id: &str,
+) -> Result<crate::proto::runtime::v1::ContainerStatus, CliError> {
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .container_status(ContainerStatusRequest {
+                    container_id: container_id.to_string(),
+                    verbose: false,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("container {container_id}"))
+                })
+        })
+        .await?
+        .into_inner()
+        .status
+        .ok_or_else(|| {
+            CliError::internal(format!(
+                "daemon did not return container status for {container_id}"
+            ))
+            .with_command("crs run")
+            .with_endpoint(client.endpoint())
+            .with_object(format!("container {container_id}"))
+        })
+}
+
+fn stopped_before_streaming_warning(exec_mode: ExecModeArg) -> &'static str {
+    match exec_mode {
+        ExecModeArg::Attach => {
+            "container exited before attach could stream output; use --detach for lifecycle-only checks or run a longer-lived command when interactive output is required"
+        }
+        ExecModeArg::Sync => "container exited before foreground output could be collected",
+    }
+}
+
+async fn wait_for_run_exit(
+    client: &CrsClient,
+    container_id: &str,
+) -> Result<crate::proto::runtime::v1::ContainerStatus, CliError> {
+    loop {
+        let status = fetch_container_status(client, container_id).await?;
+        if status.state == ContainerState::ContainerExited as i32 {
+            return Ok(status);
+        }
+        tokio::time::sleep(STOPPED_STREAMING_STATUS_POLL).await;
+    }
+}
+
+async fn read_run_log(client: &CrsClient, container_id: &str) -> Result<Vec<u8>, CliError> {
+    let mut diagnostics = client.diagnostics()?;
+    let mut stream = client
+        .with_rpc_timeout(async {
+            diagnostics
+                .container_log(ContainerLogRequest {
+                    container_id: container_id.to_string(),
+                    follow: false,
+                    tail_lines: -1,
+                    since_unix_nanos: 0,
+                    timestamps: false,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_diagnostics_status(status, client.endpoint())
+                        .with_command("crs run")
+                        .with_object(format!("container {container_id}"))
+                })
+        })
+        .await?
+        .into_inner();
+
+    let mut output = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|status| CliError::from_tonic_status(status).with_command("crs run"))?;
+        output.extend_from_slice(&chunk.data);
+    }
+    Ok(output)
+}
+
+async fn prepare_attach(
+    client: &CrsClient,
+    plan: &RunPlan,
+    container_id: &str,
+) -> Result<streaming::AttachStreamOptions, CliError> {
+    let mut options =
+        streaming::AttachStreamOptions::from_args(container_id.to_string(), plan.stream.clone())?;
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .attach(AttachRequest {
+                    container_id: options.container_id.clone(),
+                    stdin: options.stdin,
+                    stdout: options.stdout,
+                    stderr: options.stderr,
+                    tty: options.tty,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("container {}", options.container_id))
+                })
+        })
+        .await?
+        .into_inner();
+
+    options.stream_url = Some(response.url);
+    Ok(options)
+}
+
+fn render_detached(
+    ctx: &CliContext,
+    client: &CrsClient,
+    plan: &RunPlan,
+    pod_id: Option<&str>,
+    container_id: &str,
+) -> Result<CommandResult, CliError> {
+    if let Some(pod_id) = pod_id {
+        return render_and_print(
+            ctx,
+            CommandOutput::new(
+                "Run",
+                client.endpoint(),
+                vec![PodRunView {
+                    container_id: container_id.to_string(),
+                    pod_id: pod_id.to_string(),
+                    image: plan.image.clone(),
+                    action: "started".to_string(),
+                    detached: true,
+                }],
+            )
+            .with_summary(serde_json::json!({
+                "containerId": container_id,
+                "podSandboxId": pod_id,
+                "image": plan.image,
+                "detached": true,
+            })),
+        );
+    }
+
+    render_and_print(
+        ctx,
+        CommandOutput::new(
+            "Run",
+            client.endpoint(),
+            vec![LocalRunView {
+                container_id: container_id.to_string(),
+                image: plan.image.clone(),
+                action: "started".to_string(),
+                detached: true,
+            }],
+        )
+        .with_summary(serde_json::json!({
+            "containerId": container_id,
+            "image": plan.image,
+            "detached": true,
+        })),
+    )
+}
+
+async fn cleanup_run_resources(client: &CrsClient, container_id: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    cleanup_stop_container(client, container_id, &mut warnings).await;
+    cleanup_remove_container(client, container_id, &mut warnings).await;
+
+    warnings
+}
+
+async fn cleanup_stop_container(
+    client: &CrsClient,
+    container_id: &str,
+    warnings: &mut Vec<String>,
+) {
+    let Ok(mut runtime) = client.runtime() else {
+        warnings
+            .push("failed to stop run container during cleanup: runtime client unavailable".into());
+        return;
+    };
+    if let Err(error) = client
+        .with_rpc_timeout(async {
+            runtime
+                .stop_container(StopContainerRequest {
+                    container_id: container_id.to_string(),
+                    timeout: 0,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run --rm")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("container {container_id}"))
+                })
+        })
+        .await
+    {
+        warnings.push(format!(
+            "failed to stop run container {container_id}: {error}; run `crs container stop {container_id}`"
+        ));
+    }
+}
+
+async fn cleanup_remove_container(
+    client: &CrsClient,
+    container_id: &str,
+    warnings: &mut Vec<String>,
+) {
+    let Ok(mut runtime) = client.runtime() else {
+        warnings.push(
+            "failed to remove run container during cleanup: runtime client unavailable".into(),
+        );
+        return;
+    };
+    if let Err(error) = client
+        .with_rpc_timeout(async {
+            runtime
+                .remove_container(RemoveContainerRequest {
+                    container_id: container_id.to_string(),
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs run --rm")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("container {container_id}"))
+                })
+        })
+        .await
+    {
+        warnings.push(format!(
+            "failed to remove run container {container_id}: {error}; run `crs container remove {container_id}`"
+        ));
+    }
+}
+
+fn emit_cleanup_warnings(ctx: &CliContext, warnings: &[String]) {
+    if warnings.is_empty() || matches!(ctx.output(), crate::crs::args::OutputArg::Json) {
+        return;
+    }
+
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+fn leftover_warnings(container_id: Option<&str>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(container_id) = container_id {
+        warnings.push(format!(
+            "run created container {container_id} before failing; remove it with `crs container remove {container_id}`"
+        ));
+    }
+    warnings
+}
+
+fn emit_leftover_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+}

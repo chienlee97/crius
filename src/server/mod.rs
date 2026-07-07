@@ -2627,7 +2627,7 @@ impl RuntimeServiceImpl {
                 }
                 crate::runtime::ContainerStatus::Unknown => ContainerState::ContainerUnknown as i32,
             },
-            pod_sandbox_id: record.pod_id.clone(),
+            pod_sandbox_id: record.pod_id.clone().unwrap_or_default(),
             image: Some(ImageSpec {
                 image: record.image.clone(),
                 ..Default::default()

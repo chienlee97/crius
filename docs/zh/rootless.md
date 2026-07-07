@@ -2,8 +2,8 @@
 
 本文档说明 `crius` 当前 rootless 支持的配置、路径解析、网络模式、限制和验证建议。
 
-rootless 模式当前主要面向开发和验证。常规 kubeadm / kubelet 节点接入仍建议使用
-rootful daemon 路径。
+rootless 模式当前主要用于开发和受限环境验证。kubelet/kubeadm 节点接入仍建议
+使用 root 权限运行的 `crius` daemon。
 
 ## 配置
 

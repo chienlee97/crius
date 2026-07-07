@@ -75,7 +75,7 @@ fn resolved_runtimes_merge_default_and_handler_specific_entries() {
             monitor_path: "/usr/bin/crius-shim".to_string(),
             monitor_cgroup: expected_monitor_cgroup.clone(),
             monitor_env: vec!["PATH=/usr/bin".to_string()],
-            stream_websockets: false,
+            stream_websockets: true,
             allowed_annotations: Vec::new(),
             default_annotations: HashMap::new(),
             privileged_without_host_devices: false,
@@ -96,7 +96,7 @@ fn resolved_runtimes_merge_default_and_handler_specific_entries() {
             monitor_path: "/usr/bin/kata-shim".to_string(),
             monitor_cgroup: expected_monitor_cgroup.clone(),
             monitor_env: vec!["RUST_LOG=debug".to_string()],
-            stream_websockets: false,
+            stream_websockets: true,
             allowed_annotations: vec!["io.example.runtime/".to_string()],
             default_annotations: HashMap::from([(
                 "io.example.runtime/default".to_string(),
@@ -120,7 +120,7 @@ fn resolved_runtimes_merge_default_and_handler_specific_entries() {
             monitor_path: "/usr/bin/crius-shim".to_string(),
             monitor_cgroup: expected_monitor_cgroup,
             monitor_env: vec!["PATH=/usr/bin".to_string()],
-            stream_websockets: false,
+            stream_websockets: true,
             allowed_annotations: Vec::new(),
             default_annotations: HashMap::new(),
             privileged_without_host_devices: false,
@@ -171,6 +171,62 @@ fn network_config_accepts_legacy_single_config_dir() {
     .expect("legacy config_dir should deserialize");
 
     assert_eq!(config.network.config_dirs, vec!["/etc/cni/net.d"]);
+    assert_eq!(
+        config
+            .network
+            .cni_config()
+            .config_dirs()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        vec!["/etc/cni/net.d"]
+    );
+}
+
+#[test]
+fn network_config_has_separate_local_and_cri_defaults() {
+    let config = Config::default();
+
+    assert_eq!(
+        config.network.local.config_dirs,
+        vec!["/etc/crius/cni/net.d"]
+    );
+    assert_eq!(
+        config.network.cri.config_dirs,
+        vec!["/etc/cni/net.d", "/etc/kubernetes/cni/net.d"]
+    );
+    assert_eq!(
+        config
+            .network
+            .local_cni_config()
+            .config_dirs()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        vec!["/etc/crius/cni/net.d"]
+    );
+}
+
+#[test]
+fn network_config_accepts_cri_domain_table() {
+    let config: Config = toml::from_str(
+        r#"
+            root = "/var/lib/crius"
+
+            [network.cri]
+            config_dirs = ["/etc/cri/net.d"]
+            plugin_dirs = ["/opt/cri/bin"]
+            cache_dir = "/var/lib/cri-cni/cache"
+            max_conf_num = 2
+            "#,
+    )
+    .expect("network.cri should deserialize");
+
+    let cri = config.network.cri_domain();
+    assert_eq!(cri.config_dirs, vec!["/etc/cri/net.d"]);
+    assert_eq!(cri.plugin_dirs, vec!["/opt/cri/bin"]);
+    assert_eq!(cri.cache_dir, "/var/lib/cri-cni/cache");
+    assert_eq!(cri.max_conf_num, 2);
 }
 
 #[test]
@@ -2341,7 +2397,7 @@ fn default_stateful_paths_follow_runtime_and_persistent_roots() {
 
     assert_eq!(config.api.listen, "unix:///run/custom-crius/crius.sock");
     assert_eq!(config.runtime.shim_dir, "/run/custom-crius/shims");
-    assert_eq!(config.runtime.attach_socket_dir, "/run/custom-crius/shims");
+    assert_eq!(config.runtime.attach_socket_dir, "/run/custom-crius/attach");
     assert_eq!(
         config.runtime.container_exits_dir,
         "/run/custom-crius/exits"

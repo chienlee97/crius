@@ -10,6 +10,7 @@ extern crate self as crius;
 pub mod attach;
 pub mod cgroups;
 pub mod config;
+pub mod crs;
 pub mod error;
 pub mod image;
 pub mod metrics;
@@ -30,6 +31,9 @@ pub mod streaming;
 pub mod trace_export;
 pub mod utils;
 pub use crate::proto::nri as nri_proto;
+
+pub(crate) const CRS_RUN_ANNOTATION: &str = "io.crius.internal/crs-run";
+pub(crate) const CRS_RUN_ANNOTATION_VALUE: &str = "true";
 
 #[cfg(feature = "shim")]
 pub mod shim;

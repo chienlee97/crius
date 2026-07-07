@@ -15,6 +15,10 @@ name = "crius"
 path = "src/main.rs"
 
 [[bin]]
+name = "crs"
+path = "src/crs/main.rs"
+
+[[bin]]
 name = "crius-shim"
 path = "src/shim/main.rs"
 required-features = ["shim"]
@@ -54,7 +58,8 @@ miniz_oxide = "0.8"
 lazy_static = "1.4"
 log = "0.4"
 nix = "0.25"
-clap = { version = "4.0", features = ["derive"] }
+clap = { version = "4.0", features = ["derive", "env"] }
+clap_complete = "4.5.60"
 tower = "0.4"
 hyper = { version = "0.14", features = ["server", "tcp", "http1"] }
 tokio-rustls = "0.25"

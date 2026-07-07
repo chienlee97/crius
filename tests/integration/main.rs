@@ -744,7 +744,7 @@ mod cross_module {
 
         let container1 = ContainerRecord {
             id: container1_id.clone(),
-            pod_id: pod_id.clone(),
+            pod_id: Some(pod_id.clone()),
             state: "running".to_string(),
             image: "nginx:latest".to_string(),
             command: "nginx".to_string(),
@@ -760,7 +760,7 @@ mod cross_module {
 
         let container2 = ContainerRecord {
             id: container2_id.clone(),
-            pod_id: pod_id.clone(),
+            pod_id: Some(pod_id.clone()),
             state: "running".to_string(),
             image: "redis:latest".to_string(),
             command: "redis-server".to_string(),
@@ -814,7 +814,7 @@ mod cross_module {
             let container_id = format!("container-{}", uuid::Uuid::new_v4());
             let container = ContainerRecord {
                 id: container_id.clone(),
-                pod_id: pod_id.clone(),
+                pod_id: Some(pod_id.clone()),
                 state: "running".to_string(),
                 image: "alpine:latest".to_string(),
                 command: "sh".to_string(),
@@ -888,7 +888,7 @@ mod cross_module {
             manager
                 .save_container(
                     &container_id,
-                    &pod_id,
+                    Some(&pod_id),
                     ContainerStatus::Running,
                     "demo:latest",
                     &["sh".to_string(), "-c".to_string(), "sleep 1".to_string()],

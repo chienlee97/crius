@@ -12,11 +12,14 @@ use anyhow::Error;
 use clap::Parser;
 use crius::config::{CgroupDriverConfig, Config};
 use crius::oci::spec::Spec;
+use crius::proto::diagnostics::v1::diagnostics_service_server::DiagnosticsServiceServer;
+use crius::proto::local::v1::local_service_server::LocalServiceServer;
 use crius::proto::runtime::v1::{
     image_service_server::ImageServiceServer, runtime_service_server::RuntimeServiceServer,
 };
 use crius::runtime::ShimConfig;
 use crius::server::{IrqBalanceRestoreStatus, RuntimeConfig, RuntimeServiceImpl};
+use crius::services::{DiagnosticsServiceImpl, DiagnosticsState, LocalServiceImpl};
 use crius::streaming::StreamingServer;
 use tokio::net::UnixListener as TokioUnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -191,14 +194,19 @@ async fn main() -> Result<(), Error> {
         )
     };
     let mut cni_config = config.network.cni_config();
+    let mut local_cni_config = config.network.local_cni_config();
     cni_config.set_rootless_config(Some(effective_rootless.clone()));
+    local_cni_config.set_rootless_config(Some(effective_rootless.clone()));
     if effective_rootless.enabled {
         cni_config.set_netns_mount_dir(effective_rootless.netns_dir.clone());
+        local_cni_config.set_netns_mount_dir(effective_rootless.netns_dir.clone());
     } else if config.network.netns_mounts_under_state_dir {
         cni_config.set_netns_mount_dir(PathBuf::from(&config.runtime.root).join("netns"));
+        local_cni_config.set_netns_mount_dir(PathBuf::from(&config.runtime.root).join("netns"));
     }
     if !config.runtime.pinns_path.trim().is_empty() {
         cni_config.set_namespace_helper_path(Some(PathBuf::from(&config.runtime.pinns_path)));
+        local_cni_config.set_namespace_helper_path(Some(PathBuf::from(&config.runtime.pinns_path)));
     }
     for (handler, handler_config) in &config.runtime.runtimes {
         let cni_conf_dir = handler_config.cni_conf_dir.trim();
@@ -359,6 +367,7 @@ async fn main() -> Result<(), Error> {
         pause_command: config.runtime.pause_command.clone(),
         drop_infra_ctr: config.runtime.drop_infra_ctr,
         cni_config,
+        local_cni_config,
         cgroup_driver: config.runtime.cgroup_driver.map(|driver| driver.as_proto()),
         exec_sync_io_drain_timeout: config.api.exec_sync_io_drain_timeout,
         max_container_log_line_size: config.logging.max_container_log_line_size,
@@ -447,16 +456,36 @@ async fn main() -> Result<(), Error> {
         info!("Metrics unix socket listening on {}", socket_path.display());
     }
 
-    let runtime_service_server = RuntimeServiceServer::new(runtime_service)
+    let diagnostics_state = DiagnosticsState::from_runtime(
+        env!("CARGO_PKG_VERSION"),
+        option_env!("GIT_COMMIT").unwrap_or("unknown"),
+        &config,
+        &runtime_service,
+        listen
+            .strip_prefix("unix://")
+            .unwrap_or(&listen)
+            .to_string(),
+    );
+    let runtime_service_server = RuntimeServiceServer::new(runtime_service.clone())
         .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
         .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
     let image_service_server = ImageServiceServer::new(image_service)
         .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
         .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
+    let diagnostics_service_server =
+        DiagnosticsServiceServer::new(DiagnosticsServiceImpl::new(diagnostics_state))
+            .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
+            .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
+    let local_service_server =
+        LocalServiceServer::new(LocalServiceImpl::new(runtime_service.clone()))
+            .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
+            .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
 
     let server = Server::builder()
         .add_service(runtime_service_server)
         .add_service(image_service_server)
+        .add_service(diagnostics_service_server)
+        .add_service(local_service_server)
         .add_service(reflection_service);
 
     let shutdown_watchdog = spawn_shutdown_watchdog();
@@ -1119,7 +1148,7 @@ mod tests {
                     monitor_path: "/definitely/missing/crius-shim".to_string(),
                     monitor_cgroup: String::new(),
                     monitor_env: Vec::new(),
-                    stream_websockets: false,
+                    stream_websockets: true,
                     allowed_annotations: Vec::new(),
                     default_annotations: std::collections::HashMap::new(),
                     privileged_without_host_devices: false,
@@ -1253,6 +1282,7 @@ mod tests {
             pause_command: "/pause".to_string(),
             drop_infra_ctr: false,
             cni_config: CniConfig::default(),
+            local_cni_config: CniConfig::default(),
             cgroup_driver: None,
             exec_sync_io_drain_timeout: std::time::Duration::ZERO,
             max_container_log_line_size: 4096,
@@ -1349,7 +1379,7 @@ mod tests {
         assert_eq!(config.runtime.root, "/run/custom-crius");
         assert_eq!(config.runtime.pause_image, "registry.example.com/pause:4.0");
         assert_eq!(config.runtime.shim_dir, "/run/custom-crius/shims");
-        assert_eq!(config.runtime.attach_socket_dir, "/run/custom-crius/shims");
+        assert_eq!(config.runtime.attach_socket_dir, "/run/custom-crius/attach");
         assert_eq!(
             config.runtime.container_exits_dir,
             "/run/custom-crius/exits"

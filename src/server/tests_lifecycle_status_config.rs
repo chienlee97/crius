@@ -70,6 +70,52 @@ async fn container_status_verbose_returns_json_info() {
 }
 
 #[tokio::test]
+async fn pod_network_domain_selection_uses_local_or_cri_cni_config() {
+    let mut service = test_service();
+    let mut reloadable = service.current_reloadable_config();
+    reloadable.cni_config_dirs = vec![std::path::PathBuf::from("/cri-cni")];
+    service
+        .apply_reloadable_config(reloadable, "test")
+        .await
+        .expect("reloadable network config should apply");
+    service
+        .config
+        .local_cni_config
+        .set_config_dirs(vec![std::path::PathBuf::from("/local-cni")]);
+
+    assert_eq!(
+        service.pod_network_domain_cni_config(false).config_dirs(),
+        &[std::path::PathBuf::from("/cri-cni")]
+    );
+    assert_eq!(
+        service.pod_network_domain_cni_config(true).config_dirs(),
+        &[std::path::PathBuf::from("/local-cni")]
+    );
+}
+
+#[tokio::test]
+async fn local_network_domain_requires_local_cni_config_for_managed_pods() {
+    let mut service = test_service();
+    service
+        .config
+        .local_cni_config
+        .set_config_dirs(vec![std::path::PathBuf::from("/tmp/crius-missing-local-cni")]);
+
+    let status = service
+        .activate_pod_network_domain(true, true)
+        .await
+        .expect_err("missing local CNI config should fail managed local pod network");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(status.message().contains("local network is not configured"));
+    assert!(status.message().contains("/etc/crius/cni/net.d"));
+
+    service
+        .activate_pod_network_domain(true, false)
+        .await
+        .expect("host-network internal sandbox must not require local CNI config");
+}
+
+#[tokio::test]
 async fn pod_sandbox_status_verbose_returns_json_info() {
     let (dir, service) = test_service_with_fake_runtime();
     let mut annotations = HashMap::new();
@@ -1256,7 +1302,7 @@ async fn status_verbose_reports_recovery_ledger_degraded_objects() {
         persistence
             .save_container(
                 "recovery-broken",
-                "pod-1",
+                Some("pod-1"),
                 crate::runtime::ContainerStatus::Running,
                 "busybox:latest",
                 &Vec::new(),

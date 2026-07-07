@@ -116,40 +116,19 @@ make build
 `make build` 当前构建默认 `crius` binary。需要同时构建 `crius-shim` 时，请使用
 `cargo build --features shim --bins`。
 
+节点安装和验证见 [docs/zh/operations.md](docs/zh/operations.md)，本地 `crs`
+客户端用法见 [docs/zh/crs.md](docs/zh/crs.md)。
+
 ## 快速开始
 
-构建 daemon 和 shim：
+构建项目：
 
 ```bash
 cargo build --features shim --bins
 ```
 
-安装到测试节点：
-
-```bash
-sudo install -Dm755 target/debug/crius /usr/bin/crius
-sudo install -Dm755 target/debug/crius-shim /usr/bin/crius-shim
-sudo install -Dm644 crius.service /etc/systemd/system/crius.service
-```
-
-从当前 binary 导出配置：
-
-```bash
-sudo mkdir -p /etc/crius
-sudo /usr/bin/crius --write-default-config /etc/crius/crius.conf
-```
-
-检查并按节点实际情况修改 `/etc/crius/crius.conf`。接入 kubelet 前，重点确认 runtime
-路径、shim 路径、CNI 路径、pause image 和 cgroup driver。
-
-启动服务：
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now crius
-```
-
-默认 CRI endpoint：
+测试节点安装、配置导出和服务启动流程见
+[docs/zh/operations.md](docs/zh/operations.md)。默认 CRI endpoint：
 
 ```text
 unix:///run/crius/crius.sock
@@ -162,6 +141,9 @@ sudo crictl --runtime-endpoint unix:///run/crius/crius.sock version
 sudo crictl --runtime-endpoint unix:///run/crius/crius.sock info
 sudo crictl --runtime-endpoint unix:///run/crius/crius.sock images
 ```
+
+本地 `crs` 工作流见 [docs/zh/crs.md](docs/zh/crs.md)，本地 `crs` CNI 配置见
+[docs/zh/networking.md](docs/zh/networking.md)。
 
 ## 配置
 
@@ -229,6 +211,9 @@ make release-soak
 | 文档 | 说明 |
 | --- | --- |
 | [docs/zh/architecture.md](docs/zh/architecture.md) | 当前架构、模块边界和核心请求链路 |
+| [docs/zh/crs.md](docs/zh/crs.md) | 本地 `crs` 客户端、容器、Pod、镜像、诊断、恢复和 GC |
+| [docs/zh/networking.md](docs/zh/networking.md) | 本地 `crs` CNI、CRI CNI 与网络域边界 |
+| [docs/zh/operations.md](docs/zh/operations.md) | 节点安装、验证、诊断、恢复维护和问题报告材料 |
 | [docs/zh/config-matrix.md](docs/zh/config-matrix.md) | 配置优先级、重载策略和关键字段 |
 | [docs/zh/kubeadm.md](docs/zh/kubeadm.md) | kubelet 与 kubeadm 节点接入 |
 | [docs/zh/nri.md](docs/zh/nri.md) | NRI 配置、生命周期、adjustment、验证器和运维边界 |
@@ -240,7 +225,8 @@ make release-soak
 - 默认执行路径是 Linux + `runc`。
 - 部署流程仍以源码构建为主。
 - 示例 systemd unit 适合验证节点，生产使用前应按节点安全基线复核。
-- rootless mode 有明确限制，不是 rootful kubelet 集成的直接替代方案。
+- rootless 模式当前主要用于开发和受限环境验证；kubelet/kubeadm 节点接入仍建议
+  使用 root 权限运行的 `crius` daemon。
 - checkpoint / restore 依赖宿主机、CRIU 与 runtime 支持。
 
 ## License

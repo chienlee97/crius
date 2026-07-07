@@ -1411,7 +1411,7 @@ fn effective_runtime_state_for_container_preserves_live_store_state_when_runtime
 fn record_to_container_status_uses_minus_one_for_missing_stopped_exit_code() {
     let record = crate::storage::ContainerRecord {
         id: "container-1".to_string(),
-        pod_id: "pod-1".to_string(),
+        pod_id: Some("pod-1".to_string()),
         state: "stopped".to_string(),
         image: "busybox:latest".to_string(),
         command: "sleep 1".to_string(),

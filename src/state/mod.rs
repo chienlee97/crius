@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -277,7 +277,7 @@ pub struct LedgerCheckReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum LedgerRepairOperation {
-    MarkSnapshotBroken {
+    DeleteOrphanSnapshot {
         key: String,
     },
     MarkRuntimeArtifactBroken {
@@ -320,19 +320,21 @@ impl RecoveryLedgerSnapshot {
 
         for entry in &self.containers {
             let container = &entry.record;
-            if !pod_ids.contains(container.pod_id.as_str()) {
-                push_issue(
-                    &mut issues,
-                    "ownerGraphBroken",
-                    "container",
-                    &container.id,
-                    false,
-                    format!(
-                        "container {} references missing pod {}",
-                        container.id, container.pod_id
-                    ),
-                    json!({ "missingOwnerKind": "pod", "missingOwnerId": container.pod_id }),
-                );
+            if let Some(pod_id) = container.pod_id.as_deref() {
+                if !pod_ids.contains(pod_id) {
+                    push_issue(
+                        &mut issues,
+                        "ownerGraphBroken",
+                        "container",
+                        &container.id,
+                        false,
+                        format!(
+                            "container {} references missing pod {}",
+                            container.id, pod_id
+                        ),
+                        json!({ "missingOwnerKind": "pod", "missingOwnerId": pod_id }),
+                    );
+                }
             }
 
             if let Some(snapshot_key) = &container.snapshot_key {
@@ -429,7 +431,7 @@ impl RecoveryLedgerSnapshot {
                     ),
                     json!({ "missingRefKind": "image", "missingRefId": snapshot.image_id }),
                 );
-                operations.push(LedgerRepairOperation::MarkSnapshotBroken {
+                operations.push(LedgerRepairOperation::DeleteOrphanSnapshot {
                     key: snapshot.key.clone(),
                 });
             }
@@ -457,7 +459,7 @@ impl RecoveryLedgerSnapshot {
                     }),
                 );
                 if snapshot.state != SnapshotLedgerState::Broken.as_str() {
-                    operations.push(LedgerRepairOperation::MarkSnapshotBroken {
+                    operations.push(LedgerRepairOperation::DeleteOrphanSnapshot {
                         key: snapshot.key.clone(),
                     });
                 }
@@ -655,11 +657,11 @@ impl RecoveryLedgerSnapshot {
 impl LedgerRepairOperation {
     fn dry_run_action(&self) -> LedgerRepairAction {
         let (action, subject_kind, subject_id, message) = match self {
-            Self::MarkSnapshotBroken { key } => (
-                "markSnapshotBroken",
+            Self::DeleteOrphanSnapshot { key } => (
+                "deleteOrphanSnapshot",
                 "snapshot",
                 key.as_str(),
-                format!("would mark snapshot {key} broken"),
+                format!("would delete orphan snapshot {key}"),
             ),
             Self::MarkRuntimeArtifactBroken {
                 artifact_kind,
@@ -881,7 +883,7 @@ impl<'a> StateLedgerWriter<'a> {
     pub fn save_container_state(
         &mut self,
         id: &str,
-        pod_id: &str,
+        pod_id: Option<&str>,
         state: ContainerStatus,
         image: &str,
         command: &[String],
@@ -1193,7 +1195,7 @@ impl<'a> StateLedgerWriter<'a> {
         operation: LedgerRepairOperation,
     ) -> Result<LedgerRepairAction> {
         match operation {
-            LedgerRepairOperation::MarkSnapshotBroken { key } => {
+            LedgerRepairOperation::DeleteOrphanSnapshot { key } => {
                 let mut applied = false;
                 if let Some(record) = self
                     .persistence
@@ -1201,20 +1203,36 @@ impl<'a> StateLedgerWriter<'a> {
                     .into_iter()
                     .find(|record| record.key == key)
                 {
-                    if record.state != SnapshotLedgerState::Broken.as_str() {
-                        self.persistence
-                            .storage_mut()
-                            .update_snapshot_state(&key, SnapshotLedgerState::Broken.as_str())?;
-                        applied = true;
+                    if !record.mountpoint.trim().is_empty() {
+                        let path = std::path::Path::new(&record.mountpoint);
+                        if path.exists() {
+                            if path.is_dir() {
+                                std::fs::remove_dir_all(path).with_context(|| {
+                                    format!(
+                                        "failed to remove snapshot mountpoint {}",
+                                        record.mountpoint
+                                    )
+                                })?;
+                            } else {
+                                std::fs::remove_file(path).with_context(|| {
+                                    format!(
+                                        "failed to remove snapshot mountpoint {}",
+                                        record.mountpoint
+                                    )
+                                })?;
+                            }
+                        }
                     }
+                    self.persistence.storage_mut().delete_snapshot(&key)?;
+                    applied = true;
                 }
                 Ok(LedgerRepairAction {
-                    action: "markSnapshotBroken".to_string(),
+                    action: "deleteOrphanSnapshot".to_string(),
                     subject_kind: "snapshot".to_string(),
                     subject_id: key.clone(),
                     dry_run: false,
                     applied,
-                    message: format!("marked snapshot {key} broken"),
+                    message: format!("deleted orphan snapshot {key}"),
                 })
             }
             LedgerRepairOperation::MarkRuntimeArtifactBroken {
@@ -1355,7 +1373,7 @@ mod tests {
         };
         let container = ContainerRecord {
             id: "container-a".to_string(),
-            pod_id: pod.id.clone(),
+            pod_id: Some(pod.id.clone()),
             state: "running".to_string(),
             image: "docker.io/library/busybox:latest".to_string(),
             command: "sleep 60".to_string(),
@@ -1444,20 +1462,23 @@ mod tests {
         let ledger = StateLedger::new(&persistence);
         let snapshot = ledger.recovery_snapshot().unwrap();
 
-        assert_eq!(ledger.schema_version().unwrap(), 1);
+        assert_eq!(ledger.schema_version().unwrap(), 2);
         assert_eq!(
             ledger
                 .latest_schema_migration()
                 .unwrap()
                 .unwrap()
                 .migration_name,
-            "baseline-current-ledger-schema"
+            "local-containers-null-pod-owner"
         );
         assert_eq!(snapshot.pods.len(), 1);
         assert_eq!(snapshot.pods[0].id, pod.id);
         assert_eq!(snapshot.containers.len(), 1);
         assert_eq!(snapshot.containers[0].status, ContainerStatus::Running);
-        assert_eq!(snapshot.containers[0].record.pod_id, "pod-a");
+        assert_eq!(
+            snapshot.containers[0].record.pod_id.as_deref(),
+            Some("pod-a")
+        );
         assert_eq!(
             snapshot.containers[0].record.snapshot_key.as_deref(),
             Some("snapshot-a")
@@ -1699,7 +1720,7 @@ mod tests {
             ledger
                 .save_container(&ContainerRecord {
                     id: "container-check".to_string(),
-                    pod_id: "missing-pod".to_string(),
+                    pod_id: Some("missing-pod".to_string()),
                     state: "running".to_string(),
                     image: "busybox:latest".to_string(),
                     command: "sleep 60".to_string(),
@@ -1869,9 +1890,8 @@ mod tests {
             .snapshots()
             .unwrap()
             .into_iter()
-            .find(|snapshot| snapshot.key == "snapshot-repair")
-            .unwrap();
-        assert_eq!(snapshot.state, SnapshotLedgerState::Broken.as_str());
+            .find(|snapshot| snapshot.key == "snapshot-repair");
+        assert!(snapshot.is_none());
         let artifact = StateLedger::new(&persistence)
             .runtime_artifacts()
             .unwrap()

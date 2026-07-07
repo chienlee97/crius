@@ -1081,7 +1081,7 @@ async fn exit_monitor_publishes_async_stop_events() {
         .await
         .save_container(
             "async-stop",
-            "pod-1",
+            Some("pod-1"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &Vec::new(),

@@ -202,6 +202,16 @@ pub struct RecoveryShimCleanupSummary {
     pub failures: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeShimDiagnostics {
+    pub container_id: String,
+    pub pid: u32,
+    pub task_socket: String,
+    pub attach_socket: String,
+    pub state: String,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryCleanupCounter {
@@ -246,6 +256,27 @@ pub struct RuntimeMetricsProvider {
         Arc<Mutex<HashMap<String, CachedStatsEntry<crate::proto::runtime::v1::PodSandboxStats>>>>,
     pod_metrics_cache:
         Arc<Mutex<HashMap<String, CachedStatsEntry<crate::proto::runtime::v1::PodSandboxMetrics>>>>,
+}
+
+#[derive(Clone)]
+pub struct RuntimeDiagnosticsSnapshot {
+    pub config_path: Option<PathBuf>,
+    pub state_dir: PathBuf,
+    pub socket_path: String,
+    pub image_service: ImageServiceImpl,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSecurityDiagnosticsSnapshot {
+    pub selinux_enabled: bool,
+    pub rootless_enabled: bool,
+    pub allowed_device_count: usize,
+    pub additional_device_count: usize,
+    pub device_ownership_from_security_context: bool,
+    pub default_capability_count: usize,
+    pub privileged_seccomp_profile: String,
+    pub apparmor_default_profile: String,
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +411,7 @@ pub struct RuntimeConfig {
     pub pause_command: String,
     pub drop_infra_ctr: bool,
     pub cni_config: CniConfig,
+    pub local_cni_config: CniConfig,
     pub cgroup_driver: Option<CgroupDriver>,
     pub exec_sync_io_drain_timeout: std::time::Duration,
     pub max_container_log_line_size: usize,
@@ -411,7 +443,7 @@ impl Default for RuntimeConfig {
                     monitor_path: loaded.runtime.shim_path.clone(),
                     monitor_cgroup: loaded.runtime.monitor_cgroup.clone(),
                     monitor_env: loaded.runtime.monitor_env.clone(),
-                    stream_websockets: false,
+                    stream_websockets: true,
                     allowed_annotations: Vec::new(),
                     default_annotations: HashMap::new(),
                     privileged_without_host_devices: false,
@@ -422,11 +454,15 @@ impl Default for RuntimeConfig {
             )])
         });
         let mut cni_config = loaded.network.cni_config();
+        let mut local_cni_config = loaded.network.local_cni_config();
         if loaded.network.netns_mounts_under_state_dir {
             cni_config.set_netns_mount_dir(PathBuf::from(&loaded.runtime.root).join("netns"));
+            local_cni_config.set_netns_mount_dir(PathBuf::from(&loaded.runtime.root).join("netns"));
         }
         if !loaded.runtime.pinns_path.trim().is_empty() {
             cni_config.set_namespace_helper_path(Some(PathBuf::from(&loaded.runtime.pinns_path)));
+            local_cni_config
+                .set_namespace_helper_path(Some(PathBuf::from(&loaded.runtime.pinns_path)));
         }
         for (handler, handler_config) in &loaded.runtime.runtimes {
             let cni_conf_dir = handler_config.cni_conf_dir.trim();
@@ -610,6 +646,7 @@ impl Default for RuntimeConfig {
             pause_command: loaded.runtime.pause_command.clone(),
             drop_infra_ctr: loaded.runtime.drop_infra_ctr,
             cni_config,
+            local_cni_config,
             cgroup_driver,
             exec_sync_io_drain_timeout: loaded.api.exec_sync_io_drain_timeout,
             max_container_log_line_size: loaded.logging.max_container_log_line_size,
@@ -1267,12 +1304,21 @@ impl RuntimeServiceImpl {
                 deadline.timeout_secs
             )));
         }
-        tokio::time::timeout(remaining, future).await.map_err(|_| {
+        let output = tokio::time::timeout(remaining, future).await.map_err(|_| {
             Status::deadline_exceeded(format!(
                 "container create phase {phase} exceeded runtime handler create timeout of {}s",
                 deadline.timeout_secs
             ))
-        })?
+        })?;
+
+        if Instant::now() >= deadline.deadline {
+            return Err(Status::deadline_exceeded(format!(
+                "container create phase {phase} exceeded runtime handler create timeout of {}s",
+                deadline.timeout_secs
+            )));
+        }
+
+        output
     }
 
     pub fn metrics_provider(&self) -> RuntimeMetricsProvider {
@@ -1290,11 +1336,144 @@ impl RuntimeServiceImpl {
     pub fn image_service(&self) -> ImageServiceImpl {
         self.image_service.clone()
     }
+
+    pub fn diagnostics_snapshot(
+        &self,
+        socket_path: impl Into<String>,
+    ) -> RuntimeDiagnosticsSnapshot {
+        RuntimeDiagnosticsSnapshot {
+            config_path: self.config.config_path.clone(),
+            state_dir: self.config.root_dir.clone(),
+            socket_path: socket_path.into(),
+            image_service: self.image_service.clone(),
+        }
+    }
+
+    pub async fn shim_diagnostics(
+        &self,
+        container_id: Option<&str>,
+    ) -> Result<Vec<RuntimeShimDiagnostics>, String> {
+        let mut records = self
+            .persistence
+            .lock()
+            .await
+            .list_shim_process_records()
+            .map_err(|err| format!("failed to inspect shim ledger: {err}"))?;
+        records.sort_by(|left, right| left.container_id.cmp(&right.container_id));
+
+        let shims = records
+            .into_iter()
+            .filter(|record| {
+                container_id
+                    .map(|id| record.container_id == id)
+                    .unwrap_or(true)
+            })
+            .map(|record| {
+                let task_socket = if record.socket_path.is_empty() {
+                    self.task_socket_path(&record.container_id)
+                        .display()
+                        .to_string()
+                } else {
+                    record.socket_path.clone()
+                };
+                let mut errors = Vec::new();
+                if !task_socket.is_empty() && !PathBuf::from(&task_socket).exists() {
+                    errors.push("task socket is missing".to_string());
+                }
+                if record.shim_pid > 0
+                    && !PathBuf::from("/proc")
+                        .join(record.shim_pid.to_string())
+                        .exists()
+                {
+                    errors.push("shim process is not running".to_string());
+                }
+
+                RuntimeShimDiagnostics {
+                    container_id: record.container_id.clone(),
+                    pid: record.shim_pid,
+                    task_socket,
+                    attach_socket: self
+                        .attach_socket_path(&record.container_id)
+                        .display()
+                        .to_string(),
+                    state: record.state,
+                    error: (!errors.is_empty()).then(|| errors.join("; ")),
+                }
+            })
+            .collect();
+
+        Ok(shims)
+    }
+
+    pub async fn container_log_path(&self, container_id: &str) -> Result<PathBuf, tonic::Status> {
+        let container = {
+            let containers = self.containers.lock().await;
+            containers.get(container_id).cloned()
+        }
+        .ok_or_else(|| tonic::Status::not_found("container not found"))?;
+
+        let log_path = Self::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        )
+        .and_then(|state| state.log_path)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            tonic::Status::failed_precondition(format!(
+                "container {container_id} does not have a configured log path"
+            ))
+        })?;
+        let path = PathBuf::from(log_path);
+        if !path.is_absolute() {
+            return Err(tonic::Status::failed_precondition(
+                "container log path is not absolute",
+            ));
+        }
+
+        let allowed_roots = [self.config.root_dir.clone(), self.config.log_dir.clone()];
+        let parent = path.parent().ok_or_else(|| {
+            tonic::Status::failed_precondition("container log path does not have a parent")
+        })?;
+        let canonical_parent = parent
+            .canonicalize()
+            .map_err(|err| tonic::Status::not_found(format!("container log parent: {err}")))?;
+        let allowed = allowed_roots.iter().any(|root| {
+            if root.as_os_str().is_empty() {
+                return false;
+            }
+            let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            canonical_parent.starts_with(canonical_root)
+        });
+        if !allowed {
+            return Err(tonic::Status::permission_denied(
+                "container log path is outside daemon state or log directory",
+            ));
+        }
+
+        Ok(path)
+    }
+
+    #[cfg(test)]
+    pub async fn insert_diagnostics_test_container(
+        &self,
+        container: crate::proto::runtime::v1::Container,
+    ) {
+        self.containers
+            .lock()
+            .await
+            .insert(container.id.clone(), container);
+    }
 }
 
 impl Drop for RuntimeServiceImpl {
     fn drop(&mut self) {
         let _ = self.reload_watcher_shutdown.send(());
+    }
+}
+
+impl Clone for RuntimeServiceImpl {
+    fn clone(&self) -> Self {
+        self.clone_for_background()
     }
 }
 
@@ -2059,7 +2238,7 @@ impl RuntimeServiceImpl {
                 monitor_path: config.shim.shim_path.display().to_string(),
                 monitor_cgroup: config.monitor_cgroup.clone(),
                 monitor_env: config.monitor_env.clone(),
-                stream_websockets: false,
+                stream_websockets: true,
                 allowed_annotations: Vec::new(),
                 default_annotations: HashMap::new(),
                 privileged_without_host_devices: false,
@@ -2464,6 +2643,25 @@ impl RuntimeServiceImpl {
         self.nri.clone()
     }
 
+    pub fn nri_config_snapshot(&self) -> NriConfig {
+        self.nri_config.clone()
+    }
+
+    pub fn security_diagnostics_snapshot(&self) -> RuntimeSecurityDiagnosticsSnapshot {
+        RuntimeSecurityDiagnosticsSnapshot {
+            selinux_enabled: self.config.enable_selinux,
+            rootless_enabled: self.config.rootless.enabled,
+            allowed_device_count: self.config.allowed_devices.len(),
+            additional_device_count: self.config.additional_devices.len(),
+            device_ownership_from_security_context: self
+                .config
+                .device_ownership_from_security_context,
+            default_capability_count: self.config.default_capabilities.len(),
+            privileged_seccomp_profile: self.config.privileged_seccomp_profile.clone(),
+            apparmor_default_profile: self.config.apparmor_default_profile.clone(),
+        }
+    }
+
     pub async fn set_streaming_server(&self, streaming_server: StreamingServer) {
         let mut streaming = self.streaming.lock().await;
         *streaming = Some(streaming_server);
@@ -2495,6 +2693,59 @@ impl RuntimeServiceImpl {
             config.set_netns_mount_dir(self.config.rootless.netns_dir.clone());
         }
         config
+    }
+
+    pub(super) async fn activate_pod_network_domain(
+        &self,
+        local: bool,
+        managed_netns: bool,
+    ) -> Result<(), Status> {
+        let config = self.pod_network_domain_cni_config(local);
+        if local && managed_netns && !Self::cni_config_has_config_file(&config) {
+            return Err(Status::failed_precondition(format!(
+                "local network is not configured: no CNI config file found in {}; install a local CNI conflist such as examples/cni/crius-bridge.conflist under /etc/crius/cni/net.d",
+                config
+                    .config_dirs()
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        let mut pod_manager = self.pod_manager.lock().await;
+        pod_manager.reload_runtime_network_settings(self.config.pause_image.clone(), config);
+        Ok(())
+    }
+
+    pub(super) fn pod_network_domain_cni_config(&self, local: bool) -> crate::network::CniConfig {
+        let mut config = if local {
+            self.config.local_cni_config.clone()
+        } else {
+            self.current_cni_config()
+        };
+        config.set_rootless_config(Some(self.config.rootless.clone()));
+        config.set_event_sink(Some(crate::services::LedgerInternalEventSink::new(
+            self.config.root_dir.join("crius.db"),
+        )));
+        if self.config.rootless.enabled {
+            config.set_netns_mount_dir(self.config.rootless.netns_dir.clone());
+        }
+        config
+    }
+
+    pub(super) fn cni_config_has_config_file(config: &crate::network::CniConfig) -> bool {
+        config.config_dirs().iter().any(|dir| {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return false;
+            };
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| matches!(extension, "conf" | "json" | "conflist"))
+                    .unwrap_or(false)
+            })
+        })
     }
 
     fn update_reload_state(&self, update: impl FnOnce(&mut RuntimeReloadState)) {

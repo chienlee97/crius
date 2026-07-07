@@ -89,7 +89,7 @@ impl RecoveryFixture {
         };
         let container = ContainerRecord {
             id: container_id.clone(),
-            pod_id: pod_id.clone(),
+            pod_id: Some(pod_id.clone()),
             state: "running".to_string(),
             image: "docker.io/library/busybox:latest".to_string(),
             command: "sleep 60".to_string(),
@@ -435,7 +435,7 @@ fn recovery_fixture_schema_migration_is_idempotent_across_reopen() {
         auto_save_interval: 30,
     })
     .unwrap();
-    assert_eq!(StateLedger::new(&first).schema_version().unwrap(), 1);
+    assert_eq!(StateLedger::new(&first).schema_version().unwrap(), 2);
     let first_migration = StateLedger::new(&first)
         .latest_schema_migration()
         .unwrap()

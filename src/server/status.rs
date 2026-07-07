@@ -3,6 +3,24 @@ use super::*;
 const STATUS_RECENT_NETWORK_EVENT_LIMIT: usize = 16;
 
 impl RuntimeServiceImpl {
+    fn cni_config_summary(config: &crate::network::CniConfig) -> serde_json::Value {
+        json!({
+            "configDirs": config
+                .config_dirs()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            "pluginDirs": config
+                .plugin_dirs()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            "cacheDir": config.cache_dir().display().to_string(),
+            "maxConfNum": config.max_conf_num(),
+            "defaultNetworkName": config.default_network_name(),
+        })
+    }
+
     async fn recent_internal_events_for_status(
         &self,
         subject_kind: &str,
@@ -260,7 +278,7 @@ impl RuntimeServiceImpl {
         let pod_has_required_netns = Self::pod_has_required_netns(pod);
 
         match pause_status {
-            ContainerStatus::Running if pod_has_required_netns => {
+            ContainerStatus::Running | ContainerStatus::Created if pod_has_required_netns => {
                 PodSandboxState::SandboxReady as i32
             }
             ContainerStatus::Unknown
@@ -432,7 +450,7 @@ impl RuntimeServiceImpl {
         )
     }
 
-    pub(super) async fn recovery_ledger_health_summary(
+    pub async fn recovery_ledger_health_summary(
         &self,
     ) -> Result<crate::services::RecoveryLedgerHealthSummary, String> {
         let snapshot = {
@@ -516,7 +534,7 @@ impl RuntimeServiceImpl {
         })
     }
 
-    pub(super) async fn recovery_ledger_check_report(
+    pub async fn recovery_ledger_check_report(
         &self,
     ) -> Result<crate::state::LedgerCheckReport, String> {
         let persistence = self.persistence.lock().await;
@@ -525,8 +543,31 @@ impl RuntimeServiceImpl {
             .map_err(|err| format!("failed to check recovery ledger: {err}"))
     }
 
+    pub async fn recovery_check_report(
+        &self,
+        execute: bool,
+    ) -> Result<crate::state::LedgerCheckReport, String> {
+        let mut persistence = self.persistence.lock().await;
+        crate::state::StateLedgerWriter::new(&mut persistence)
+            .repair(crate::state::LedgerRepairOptions::default(), !execute)
+            .map_err(|err| {
+                if execute {
+                    format!("failed to repair recovery ledger: {err}")
+                } else {
+                    format!("failed to check recovery ledger: {err}")
+                }
+            })
+    }
+
     pub(super) async fn probe_cni_load_status(&self) -> crate::network::CniLoadStatus {
-        let cni_config = self.current_cni_config();
+        self.probe_cni_load_status_for_config(self.current_cni_config())
+            .await
+    }
+
+    pub(super) async fn probe_cni_load_status_for_config(
+        &self,
+        cni_config: crate::network::CniConfig,
+    ) -> crate::network::CniLoadStatus {
         if let Some(status) = cni_config.rootless_load_status() {
             return status;
         }
@@ -864,6 +905,12 @@ impl RuntimeServiceImpl {
                     Ok(report) => (Some(report), None),
                     Err(err) => (None, Some(err)),
                 };
+            let local_network_config = self.pod_network_domain_cni_config(true);
+            let cri_network_config = self.pod_network_domain_cni_config(false);
+            let local_cni_load_status = self
+                .probe_cni_load_status_for_config(local_network_config.clone())
+                .await;
+            let cri_cni_load_status = cni_load_status.clone();
             let (recent_network_runtime_events, recent_network_runtime_events_error) = self
                 .recent_internal_events_for_status(
                     "network",
@@ -1307,6 +1354,18 @@ impl RuntimeServiceImpl {
                     "ready": network_condition.ready,
                     "reason": network_condition.reason.clone(),
                     "message": network_condition.message.clone(),
+                    "domains": {
+                        "local": {
+                            "purpose": "crs pod and CRS local explicit Pod networking; uses crius local CNI config and containernetworking-plugins such as bridge, host-local, loopback, and portmap",
+                            "config": Self::cni_config_summary(&local_network_config),
+                            "loadStatus": local_cni_load_status,
+                        },
+                        "cri": {
+                            "purpose": "CRI consumers such as crictl/kubelet; uses standard CRI CNI config dirs and may select Kubernetes/Calico configs if configured there",
+                            "config": Self::cni_config_summary(&cri_network_config),
+                            "loadStatus": cri_cni_load_status,
+                        },
+                    },
                     "lastCniLoadStatus": cni_load_status.clone(),
                     "reload": self.internal_services.introspection.reload(
                         self.config.config_path.as_deref(),

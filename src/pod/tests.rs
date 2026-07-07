@@ -473,6 +473,36 @@ async fn create_pause_container_propagates_pod_metadata_to_runtime() {
 }
 
 #[tokio::test]
+async fn create_pause_container_leaves_cgroup_parent_unset_by_default() {
+    let temp_dir = tempdir().unwrap();
+    let runtime = RecordingRuntime::default();
+    let manager = PodSandboxManager::new(
+        runtime.clone(),
+        temp_dir.path().join("pods"),
+        "registry.k8s.io/pause:3.9".to_string(),
+        "/pause".to_string(),
+        String::new(),
+        CniConfig::default(),
+    );
+    tokio::fs::create_dir_all(temp_dir.path().join("pods").join("pod-1"))
+        .await
+        .unwrap();
+
+    manager
+        .create_pause_container(
+            "pod-1",
+            &test_pod_config(),
+            Path::new("/var/run/netns/pod-1"),
+        )
+        .await
+        .unwrap();
+
+    let created = runtime.take_created();
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0].1.cgroup_parent, None);
+}
+
+#[tokio::test]
 async fn create_pause_container_uses_configured_pause_command() {
     let temp_dir = tempdir().unwrap();
     let runtime = RecordingRuntime::default();

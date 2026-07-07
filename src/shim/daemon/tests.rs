@@ -494,6 +494,92 @@ async fn shim_daemon_records_task_and_exec_internal_events() {
 }
 
 #[test]
+fn pipe_exec_session_only_opens_interactive_stdin_when_requested() {
+    let temp_dir = tempdir().unwrap();
+    let bundle_dir = temp_dir.path().join("bundle");
+    fs::create_dir_all(&bundle_dir).unwrap();
+
+    let args_path = temp_dir.path().join("runtime.args");
+    let runtime_path = temp_dir.path().join("fake-runtime.sh");
+    fs::write(
+        &runtime_path,
+        format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "{}"
+exit 0
+"#,
+            args_path.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let daemon = Daemon::new(
+        "container-1".to_string(),
+        bundle_dir,
+        runtime_path,
+        DaemonOptions {
+            runtime_config_path: PathBuf::new(),
+            monitor_cgroup: String::new(),
+            work_dir: temp_dir.path().join("shim"),
+            state_db_path: None,
+            exit_code_file: None,
+            attach_socket_dir: None,
+            io_uid: 0,
+            io_gid: 0,
+            max_container_log_line_size: 4096,
+            log_to_journald: false,
+            no_sync_log: false,
+            no_pivot: false,
+            no_new_keyring: false,
+            systemd_cgroup: false,
+        },
+    );
+    let io_manager = IoManager::new();
+
+    daemon
+        .serve_pipe_exec_session(
+            &OpenExecSessionRequest {
+                container_id: "container-1".to_string(),
+                command: vec!["/bin/true".to_string()],
+                tty: false,
+                stdin: false,
+                stdout: true,
+                stderr: true,
+                exec_cpu_affinity: None,
+            },
+            &io_manager,
+        )
+        .unwrap();
+    let args = fs::read_to_string(&args_path).unwrap();
+    assert_eq!(
+        args.lines().collect::<Vec<_>>(),
+        vec!["exec", "container-1", "/bin/true"]
+    );
+
+    daemon
+        .serve_pipe_exec_session(
+            &OpenExecSessionRequest {
+                container_id: "container-1".to_string(),
+                command: vec!["/bin/cat".to_string()],
+                tty: false,
+                stdin: true,
+                stdout: true,
+                stderr: true,
+                exec_cpu_affinity: None,
+            },
+            &io_manager,
+        )
+        .unwrap();
+    let args = fs::read_to_string(&args_path).unwrap();
+    assert_eq!(
+        args.lines().collect::<Vec<_>>(),
+        vec!["exec", "-i", "container-1", "/bin/cat"]
+    );
+}
+
+#[test]
 fn test_non_terminal_container_stdio_capture() {
     let temp_dir = tempdir().unwrap();
     let bundle_dir = temp_dir.path().join("bundle");

@@ -135,7 +135,7 @@ async fn rollback_failed_container_create_undoes_nri_and_local_state() {
         .await
         .save_container(
             &container_id,
-            &pod_id,
+            Some(&pod_id),
             crate::runtime::ContainerStatus::Created,
             "busybox:latest",
             &["/bin/sh".to_string()],
@@ -153,7 +153,7 @@ async fn rollback_failed_container_create_undoes_nri_and_local_state() {
         .await
         .save_container(
             &sidecar_id,
-            &pod_id,
+            Some(&pod_id),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &["sleep".to_string()],
@@ -936,7 +936,7 @@ async fn nri_create_result_applies_adjustments_and_side_effects() {
         .await
         .save_container(
             "container-update",
-            "pod-create",
+            Some("pod-create"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &["sleep".to_string(), "10".to_string()],
@@ -950,7 +950,7 @@ async fn nri_create_result_applies_adjustments_and_side_effects() {
         .await
         .save_container(
             "container-evict",
-            "pod-create",
+            Some("pod-create"),
             crate::runtime::ContainerStatus::Running,
             "busybox:latest",
             &["sleep".to_string(), "10".to_string()],

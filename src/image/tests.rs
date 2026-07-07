@@ -1914,7 +1914,7 @@ async fn remove_image_reports_in_use_when_container_references_it() {
     storage
         .save_container(&ContainerRecord {
             id: "container-1".to_string(),
-            pod_id: "pod-1".to_string(),
+            pod_id: Some("pod-1".to_string()),
             state: "running".to_string(),
             image: "busybox:latest".to_string(),
             command: "sleep 60".to_string(),
